@@ -69,30 +69,34 @@ def extract_features(json_data, debug=False):
         np.mean(op_histogram) if op_histogram else 0
     ])
     
-    # Target: Execution Time (Flexible Extraction)
+    # Target: Execution Time (Broad Search)
     execution_time = None
-    schedule_feature = json_data.get('schedule_feature', [])
     
     if debug:
-        print(f"schedule_feature content: {schedule_feature}")
+        print(f"Full JSON structure: {json.dumps(json_data, indent=2)[:1000]}...")  # Truncate for readability
+        print(f"schedule_feature content: {json_data.get('schedule_feature', 'Not found')}")
     
-    # Try the original structure (list of dicts)
-    for item in schedule_feature:
-        if isinstance(item, dict) and item.get('name') == 'total_execution_time_ms':
-            execution_time = float(item.get('value', 0))
-            break
+    # Try multiple possible locations for execution time
+    possible_keys = [
+        ('schedule_feature', lambda d: next((float(item['value']) for item in d.get('schedule_feature', []) 
+                                             if isinstance(item, dict) and item.get('name') == 'total_execution_time_ms'), None)),
+        ('total_execution_time_ms', lambda d: float(d.get('total_execution_time_ms', 0))),
+        ('Details', lambda d: float(d.get('Details', {}).get('total_execution_time_ms', 0))),
+        ('execution_time', lambda d: float(d.get('execution_time', 0))),  # Alternative key
+        ('time_ms', lambda d: float(d.get('time_ms', 0))),  # Another possible key
+    ]
     
-    # If not found, try alternative locations
+    for key, extractor in possible_keys:
+        try:
+            execution_time = extractor(json_data)
+            if execution_time is not None:
+                break
+        except (TypeError, ValueError, KeyError):
+            continue
+    
     if execution_time is None:
-        # Check if it's a top-level key
-        if 'total_execution_time_ms' in json_data:
-            execution_time = float(json_data.get('total_execution_time_ms', 0))
-        # Check nested structures (e.g., under 'Details')
-        elif 'Details' in json_data and 'total_execution_time_ms' in json_data['Details']:
-            execution_time = float(json_data['Details'].get('total_execution_time_ms', 0))
-        else:
-            print("Warning: No execution time found in JSON")
-            return np.array(features, dtype=float), None  # Return None to skip this schedule
+        print("Warning: No execution time found in JSON")
+        return np.array(features, dtype=float), None
     
     return np.array(features, dtype=float), execution_time
 
@@ -106,7 +110,7 @@ def prepare_lstm_data(data):
         for j, schedule in enumerate(program_data):
             # Enable debug for the first schedule of the first program
             features, exec_time = extract_features(schedule, debug=(i == 0 and j == 0))
-            if exec_time is None:  # Skip schedules with no execution time
+            if exec_time is None:
                 continue
             if feature_dim is None:
                 feature_dim = len(features)
@@ -122,12 +126,12 @@ def prepare_lstm_data(data):
             print(f"Warning: No valid schedules with execution time in program {i}")
     
     if not X or not y:
-        raise ValueError("No valid sequences with execution times prepared from the data")
+        raise ValueError(f"No valid sequences with execution times prepared from the data. Sample JSON structure:\n{json.dumps(data[0][0], indent=2)[:1000]}...")
     
     X = np.array(X, dtype=object)  # Allow ragged arrays temporarily
     y = np.array(y, dtype=object)
     
-    # Pad sequences to the same length (max num_schedules)
+    # Pad sequences to the same length
     max_seq_len = max(len(seq) for seq in X)
     X_padded = np.zeros((len(X), max_seq_len, feature_dim))
     y_padded = np.zeros((len(y), max_seq_len))
