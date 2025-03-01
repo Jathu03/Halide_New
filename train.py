@@ -13,57 +13,84 @@ def get_feature_keys(json_path):
     """Extract sorted feature keys from 'scheduling_feature' or 'Op histogram' in a JSON file."""
     with open(json_path, 'r') as f:
         data = json.load(f)
-    if not isinstance(data, list):
-        return []
-    feature_keys = None
-    for item in data:
-        if isinstance(item, dict) and "programming_details" in item:
-            # Try 'scheduling_feature' first
-            for node in item["programming_details"]["Nodes"]:
-                if "Details" in node and "scheduling_feature" in node["Details"]:
-                    feature_keys = sorted(node["Details"]["scheduling_feature"].keys())
-                    break
-            # Fallback to 'Op histogram' if no 'scheduling_feature'
-            if not feature_keys:
-                for node in item["programming_details"]["Nodes"]:
-                    if "Details" in node and "Op histogram" in node["Details"]:
-                        feature_keys = sorted(
-                            [line.split(":")[0].strip() for line in node["Details"]["Op histogram"]]
-                        )
-                        break
-            break
-    return feature_keys if feature_keys else []
+    
+    # Handle dictionary structure
+    if isinstance(data, dict) and "programming_details" in data:
+        nodes = data["programming_details"].get("Nodes", [])
+        # Try 'scheduling_feature' first
+        for node in nodes:
+            if "Details" in node and "scheduling_feature" in node["Details"]:
+                return sorted(node["Details"]["scheduling_feature"].keys())
+        # Fallback to 'Op histogram'
+        for node in nodes:
+            if "Details" in node and "Op histogram" in node["Details"]:
+                return sorted([line.split(":")[0].strip() for line in node["Details"]["Op histogram"]])
+    
+    # Handle list structure (for compatibility with your sample)
+    elif isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict) and "programming_details" in item:
+                nodes = item["programming_details"].get("Nodes", [])
+                for node in nodes:
+                    if "Details" in node and "scheduling_feature" in node["Details"]:
+                        return sorted(node["Details"]["scheduling_feature"].keys())
+                    elif "Details" in node and "Op histogram" in node["Details"]:
+                        return sorted([line.split(":")[0].strip() for line in node["Details"]["Op histogram"]])
+    
+    return []
 
 #### Extract Features and Target
 def extract_features_from_json(json_path, feature_keys):
     """
-    Extract feature sequences and speedup from a JSON file.
-    Speedup = baseline_time / execution_time, where baseline is the max time across all schedules.
+    Extract feature sequences and execution time from a JSON file.
     """
     with open(json_path, 'r') as f:
         data = json.load(f)
-    if not isinstance(data, list):
-        return None, None
     
     sequence = []
     execution_time = None
-    for item in data:
-        if isinstance(item, dict):
-            if "programming_details" in item:
-                nodes = item["programming_details"]["Nodes"]
-                for node in nodes:
-                    if "Details" in node:
-                        if "scheduling_feature" in node["Details"]:
-                            features = node["Details"]["scheduling_feature"]
-                            feature_vector = [features.get(key, 0) for key in feature_keys]
-                            sequence.append(feature_vector)
-                        elif "Op histogram" in node["Details"]:
-                            features = {line.split(":")[0].strip(): float(line.split(":")[1].strip())
-                                        for line in node["Details"]["Op histogram"]}
-                            feature_vector = [features.get(key, 0) for key in feature_keys]
-                            sequence.append(feature_vector)
-            if "name" in item and item["name"] == "total_execution_time_ms":
-                execution_time = item["value"]
+    
+    # Handle dictionary structure
+    if isinstance(data, dict) and "programming_details" in data:
+        nodes = data["programming_details"].get("Nodes", [])
+        for node in nodes:
+            if "Details" in node:
+                if "scheduling_feature" in node["Details"]:
+                    features = node["Details"]["scheduling_feature"]
+                    feature_vector = [features.get(key, 0) for key in feature_keys]
+                    sequence.append(feature_vector)
+                elif "Op histogram" in node["Details"]:
+                    features = {line.split(":")[0].strip(): float(line.split(":")[1].strip())
+                                for line in node["Details"]["Op histogram"]}
+                    feature_vector = [features.get(key, 0) for key in feature_keys]
+                    sequence.append(feature_vector)
+        # Look for execution time in the list items
+        if isinstance(data["programming_details"], list):
+            for item in data["programming_details"]:
+                if isinstance(item, dict) and "name" in item and item["name"] == "total_execution_time_ms":
+                    execution_time = item["value"]
+        else:
+            execution_time = data.get("total_execution_time_ms")
+    
+    # Handle list structure
+    elif isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict):
+                if "programming_details" in item:
+                    nodes = item["programming_details"].get("Nodes", [])
+                    for node in nodes:
+                        if "Details" in node:
+                            if "scheduling_feature" in node["Details"]:
+                                features = node["Details"]["scheduling_feature"]
+                                feature_vector = [features.get(key, 0) for key in feature_keys]
+                                sequence.append(feature_vector)
+                            elif "Op histogram" in node["Details"]:
+                                features = {line.split(":")[0].strip(): float(line.split(":")[1].strip())
+                                            for line in node["Details"]["Op histogram"]}
+                                feature_vector = [features.get(key, 0) for key in feature_keys]
+                                sequence.append(feature_vector)
+                if "name" in item and item["name"] == "total_execution_time_ms":
+                    execution_time = item["value"]
     
     if not sequence or execution_time is None:
         return None, None
@@ -83,13 +110,28 @@ def load_data(output_folder):
             for json_file in os.listdir(program_path):
                 if json_file.endswith('.json'):
                     json_path = os.path.join(program_path, json_file)
-                    keys = get_feature_keys(json_path)
-                    if keys:
-                        feature_keys = keys
-                        break
+                    try:
+                        keys = get_feature_keys(json_path)
+                        if keys:
+                            feature_keys = keys
+                            break
+                    except Exception as e:
+                        print(f"Error processing {json_path}: {e}")
             if feature_keys:
                 break
     if not feature_keys:
+        # Debug: Print contents of a sample JSON file
+        for program_folder in os.listdir(output_folder):
+            program_path = os.path.join(output_folder, program_folder)
+            if os.path.isdir(program_path):
+                for json_file in os.listdir(program_path):
+                    if json_file.endswith('.json'):
+                        json_path = os.path.join(program_path, json_file)
+                        with open(json_path, 'r') as f:
+                            data = json.load(f)
+                        print(f"Sample JSON content from {json_path}: {json.dumps(data, indent=2)[:1000]}...")
+                        break
+                break
         raise ValueError("No valid feature keys ('scheduling_feature' or 'Op histogram') found in any JSON file.")
 
     # Step 2: Load data from all JSON files
@@ -166,7 +208,7 @@ class LSTMModel(nn.Module):
 ### Main Execution
 def main():
     # Set the output folder path (update this to your actual path)
-    output_folder = "Output_Programs"  # Example: "/home/user/Halide_New/Output_Programs"
+    output_folder = "Output_Programs"  # Example: "/home/kowrisaan/jathu/Halide_New/Output_Programs"
     
     # Load data
     all_sequences, all_speedups, feature_keys = load_data(output_folder)
