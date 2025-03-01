@@ -144,7 +144,7 @@ class HalideDataset(Dataset):
 class LSTMModel(nn.Module):
     def __init__(self, input_size, hidden_size1=128, hidden_size2=64):
         super(LSTMModel, self).__init__()
-        self.lstm1 = nn.LSTM(input_size, hidden_size1, batch_first=True, return_sequences=True)
+        self.lstm1 = nn.LSTM(input_size, hidden_size1, batch_first=True)  # Removed return_sequences
         self.dropout1 = nn.Dropout(0.2)
         self.lstm2 = nn.LSTM(hidden_size1, hidden_size2, batch_first=True)
         self.dropout2 = nn.Dropout(0.2)
@@ -153,13 +153,13 @@ class LSTMModel(nn.Module):
         self.fc2 = nn.Linear(32, 1)
     
     def forward(self, x):
-        out, _ = self.lstm1(x)
+        out, _ = self.lstm1(x)  # out: (batch_size, seq_len, hidden_size1)
         out = self.dropout1(out)
-        out, _ = self.lstm2(out)
-        out = self.dropout2(out[:, -1, :])  # Take the last timestep
-        out = self.fc1(out)
+        out, _ = self.lstm2(out)  # out: (batch_size, seq_len, hidden_size2)
+        out = self.dropout2(out[:, -1, :])  # Take the last timestep: (batch_size, hidden_size2)
+        out = self.fc1(out)  # (batch_size, 32)
         out = self.relu(out)
-        out = self.fc2(out)
+        out = self.fc2(out)  # (batch_size, 1)
         return out
 
 # Step 6: Training and Evaluation
