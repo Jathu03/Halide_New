@@ -69,24 +69,25 @@ def extract_features(json_data):
         np.mean(op_histogram) if op_histogram else 0
     ])
     
-    # Extract Scheduling Features
-    sched_features = []
-    for item in json_data.get('schedule_feature', []):
-        if isinstance(item, dict) and 'Details' in item and 'scheduling_feature' in item['Details']:
-            sched_features.append(item['Details']['scheduling_feature'])
-    if sched_features:
-        avg_sched_features = {k: np.mean([sf[k] for sf in sched_features]) 
-                              for k in sched_features[0].keys()}
-        features.extend(list(avg_sched_features.values()))
+    # Extract Scheduling Features (optional expansion commented out)
+    # sched_features = []
+    # for item in json_data.get('schedule_feature', []):
+    #     if isinstance(item, dict) and 'Details' in item and 'scheduling_feature' in item['Details']:
+    #         sched_features.append(item['Details']['scheduling_feature'])
+    # if sched_features:
+    #     avg_sched_features = {k: np.mean([sf[k] for sf in sched_features]) 
+    #                           for k in sched_features[0].keys()}
+    #     features.extend(list(avg_sched_features.values()))
     
     # Target: Execution Time
     execution_time = None
     for item in json_data.get('schedule_feature', []):
         if isinstance(item, dict) and item.get('name') == 'total_execution_time_ms':
-            execution_time = item.get('value', 0)
+            execution_time = float(item.get('value', 0))  # Ensure float
             break
     if execution_time is None:
-        execution_time = 0
+        execution_time = 0.0
+        print("Warning: No execution time found in JSON, defaulting to 0")
     
     return np.array(features, dtype=float), execution_time
 
@@ -116,6 +117,11 @@ def prepare_lstm_data(data):
     X = np.array(X)  # Shape: (num_programs, num_schedules, feature_dim)
     y = np.array(y)  # Shape: (num_programs, num_schedules)
     
+    # Debug target values
+    print(f"Target values range: min={y.min()}, max={y.max()}, mean={y.mean()}")
+    if y.max() == 0:
+        raise ValueError("All execution times are 0, check data extraction")
+    
     # Normalize features
     scaler_X = MinMaxScaler()
     X_reshaped = X.reshape(-1, X.shape[-1])
@@ -144,7 +150,7 @@ class HalideDataset(Dataset):
 class LSTMModel(nn.Module):
     def __init__(self, input_size, hidden_size1=128, hidden_size2=64):
         super(LSTMModel, self).__init__()
-        self.lstm1 = nn.LSTM(input_size, hidden_size1, batch_first=True)  # Removed return_sequences
+        self.lstm1 = nn.LSTM(input_size, hidden_size1, batch_first=True)
         self.dropout1 = nn.Dropout(0.2)
         self.lstm2 = nn.LSTM(hidden_size1, hidden_size2, batch_first=True)
         self.dropout2 = nn.Dropout(0.2)
@@ -153,13 +159,13 @@ class LSTMModel(nn.Module):
         self.fc2 = nn.Linear(32, 1)
     
     def forward(self, x):
-        out, _ = self.lstm1(x)  # out: (batch_size, seq_len, hidden_size1)
+        out, _ = self.lstm1(x)
         out = self.dropout1(out)
-        out, _ = self.lstm2(out)  # out: (batch_size, seq_len, hidden_size2)
-        out = self.dropout2(out[:, -1, :])  # Take the last timestep: (batch_size, hidden_size2)
-        out = self.fc1(out)  # (batch_size, 32)
+        out, _ = self.lstm2(out)
+        out = self.dropout2(out[:, -1, :])  # Take the last timestep
+        out = self.fc1(out)
         out = self.relu(out)
-        out = self.fc2(out)  # (batch_size, 1)
+        out = self.fc2(out)
         return out
 
 # Step 6: Training and Evaluation
