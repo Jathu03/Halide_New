@@ -105,13 +105,16 @@ def get_halide_schedule_representation(program_dict, comps_repr_templates, comps
                     sched_dict[item["Name"]] = item["Details"]["scheduling_feature"]
                 elif item.get("name") == "total_execution_time_ms":
                     exec_time = item["value"]
+                elif "value" in item and isinstance(item["value"], (int, float)) and exec_time is None:
+                    exec_time = item["value"]
+                    print(f"Warning: Using generic 'value' {exec_time} as execution time for lack of 'total_execution_time_ms'")
         if nodes is None:
             raise ValueError("Missing 'programming_details' in JSON list")
     else:
         nodes = program_dict["programming_details"]["Nodes"]
         node_dict = {node["Name"]: node["Details"] for node in nodes}
         sched_dict = {}  # Assume no scheduling_feature in dict format
-        exec_time = program_dict.get("total_execution_time_ms")
+        exec_time = program_dict.get("total_execution_time_ms") or program_dict.get("value")
 
     # If exec_time still not found, return None to skip this file
     if exec_time is None:
@@ -170,7 +173,7 @@ def load_halide_dataset(data_dir="Output_Programs"):
                             program_reprs.append(comps_tensor.squeeze(0).numpy())
                             program_times.append(exec_time)
                         else:
-                            print(f"Error processing {file_path}: Execution time ('total_execution_time_ms') not found in JSON")
+                            print(f"Error processing {file_path}: Execution time not found in JSON")
                     except ValueError as e:
                         print(f"Error processing {file_path}: {e}")
                         continue
