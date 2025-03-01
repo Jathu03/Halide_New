@@ -1,277 +1,249 @@
-import os
 import json
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-from sklearn.model_selection import train_test_split
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+import os
+from sklearn.preprocessing import MinMaxScaler
 
-### Helper Functions
+# Device configuration
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-#### Extract Feature Keys
-def get_feature_keys(json_path):
-    """Extract sorted feature keys from 'scheduling_feature' or 'Op histogram' in a JSON file."""
-    with open(json_path, 'r') as f:
+# Constants for representation
+MAX_NODES = 20  # Max number of nodes (computations)
+MAX_LOOPS = 5   # Max loop depth
+MAX_TRANSFORMS = 4  # Max number of transformations per computation
+MAX_TAGS = 8    # Size of transformation tag vector
+
+# Load JSON data from a file
+def load_data(file_path):
+    with open(file_path, 'r') as f:
         data = json.load(f)
-    
-    # Handle dictionary structure
-    if isinstance(data, dict) and "programming_details" in data:
-        nodes = data["programming_details"].get("Nodes", [])
-        # Try 'scheduling_feature' first
-        for node in nodes:
-            if "Details" in node and "scheduling_feature" in node["Details"]:
-                return sorted(node["Details"]["scheduling_feature"].keys())
-        # Fallback to 'Op histogram'
-        for node in nodes:
-            if "Details" in node and "Op histogram" in node["Details"]:
-                return sorted([line.split(":")[0].strip() for line in node["Details"]["Op histogram"]])
-    
-    # Handle list structure (for compatibility with your sample)
-    elif isinstance(data, list):
-        for item in data:
-            if isinstance(item, dict) and "programming_details" in item:
-                nodes = item["programming_details"].get("Nodes", [])
-                for node in nodes:
-                    if "Details" in node and "scheduling_feature" in node["Details"]:
-                        return sorted(node["Details"]["scheduling_feature"].keys())
-                    elif "Details" in node and "Op histogram" in node["Details"]:
-                        return sorted([line.split(":")[0].strip() for line in node["Details"]["Op histogram"]])
-    
-    return []
+    return data
 
-#### Extract Features and Target
-def extract_features_from_json(json_path, feature_keys):
-    """
-    Extract feature sequences and execution time from a JSON file.
-    """
-    with open(json_path, 'r') as f:
-        data = json.load(f)
-    
-    sequence = []
-    execution_time = None
-    
-    # Handle dictionary structure
-    if isinstance(data, dict) and "programming_details" in data:
-        nodes = data["programming_details"].get("Nodes", [])
-        for node in nodes:
-            if "Details" in node:
-                if "scheduling_feature" in node["Details"]:
-                    features = node["Details"]["scheduling_feature"]
-                    feature_vector = [features.get(key, 0) for key in feature_keys]
-                    sequence.append(feature_vector)
-                elif "Op histogram" in node["Details"]:
-                    features = {line.split(":")[0].strip(): float(line.split(":")[1].strip())
-                                for line in node["Details"]["Op histogram"]}
-                    feature_vector = [features.get(key, 0) for key in feature_keys]
-                    sequence.append(feature_vector)
-        # Look for execution time in the list items
-        if isinstance(data["programming_details"], list):
-            for item in data["programming_details"]:
-                if isinstance(item, dict) and "name" in item and item["name"] == "total_execution_time_ms":
-                    execution_time = item["value"]
-        else:
-            execution_time = data.get("total_execution_time_ms")
-    
-    # Handle list structure
-    elif isinstance(data, list):
-        for item in data:
-            if isinstance(item, dict):
-                if "programming_details" in item:
-                    nodes = item["programming_details"].get("Nodes", [])
-                    for node in nodes:
-                        if "Details" in node:
-                            if "scheduling_feature" in node["Details"]:
-                                features = node["Details"]["scheduling_feature"]
-                                feature_vector = [features.get(key, 0) for key in feature_keys]
-                                sequence.append(feature_vector)
-                            elif "Op histogram" in node["Details"]:
-                                features = {line.split(":")[0].strip(): float(line.split(":")[1].strip())
-                                            for line in node["Details"]["Op histogram"]}
-                                feature_vector = [features.get(key, 0) for key in feature_keys]
-                                sequence.append(feature_vector)
-                if "name" in item and item["name"] == "total_execution_time_ms":
-                    execution_time = item["value"]
-    
-    if not sequence or execution_time is None:
-        return None, None
-    return sequence, execution_time
+# Create a template for Halide program representation
+def get_halide_representation_template(program_dict):
+    nodes = program_dict["programming_details"]["Nodes"]
+    edges = program_dict["programming_details"]["Edges"]
+    # Scheduling data is in the list under "programming_details"
+    scheduling = [item for item in program_dict["programming_details"] if isinstance(item, dict) and "Name" in item]
 
-#### Load Data and Calculate Speedup
-def load_data(output_folder):
-    """Load sequences, execution times, calculate speedup, and return feature keys."""
-    all_sequences = []
-    all_execution_times = []
-    feature_keys = None
+    node_dict = {node["Name"]: node["Details"] for node in nodes}
+    sched_dict = {item["Name"]: item["Details"]["scheduling_feature"] for item in scheduling if "Name" in item}
 
-    # Step 1: Find feature keys from any JSON file
-    for program_folder in os.listdir(output_folder):
-        program_path = os.path.join(output_folder, program_folder)
-        if os.path.isdir(program_path):
-            for json_file in os.listdir(program_path):
-                if json_file.endswith('.json'):
-                    json_path = os.path.join(program_path, json_file)
-                    try:
-                        keys = get_feature_keys(json_path)
-                        if keys:
-                            feature_keys = keys
-                            break
-                    except Exception as e:
-                        print(f"Error processing {json_path}: {e}")
-            if feature_keys:
-                break
-    if not feature_keys:
-        # Debug: Print contents of a sample JSON file
-        for program_folder in os.listdir(output_folder):
-            program_path = os.path.join(output_folder, program_folder)
-            if os.path.isdir(program_path):
-                for json_file in os.listdir(program_path):
-                    if json_file.endswith('.json'):
-                        json_path = os.path.join(program_path, json_file)
-                        with open(json_path, 'r') as f:
-                            data = json.load(f)
-                        print(f"Sample JSON content from {json_path}: {json.dumps(data, indent=2)[:1000]}...")
-                        break
-                break
-        raise ValueError("No valid feature keys ('scheduling_feature' or 'Op histogram') found in any JSON file.")
+    comps_repr_templates = []
+    comps_indices_dict = {}
+    comps_placeholders_indices_dict = {}
 
-    # Step 2: Load data from all JSON files
-    for program_folder in os.listdir(output_folder):
-        program_path = os.path.join(output_folder, program_folder)
+    for comp_idx, node_name in enumerate(node_dict.keys()):
+        node = node_dict[node_name]
+        sched = sched_dict.get(node_name, {})
+
+        op_hist = {}
+        for entry in node["Op histogram"]:
+            parts = entry.split(':')
+            if len(parts) == 2:
+                key, value = parts[0].strip(), int(parts[1].strip().split()[0])
+                op_hist[key] = value
+
+        comp_repr = [
+            op_hist.get("Add", 0),
+            op_hist.get("Mul", 0),
+            op_hist.get("Div", 0),
+            op_hist.get("Min", 0),
+            op_hist.get("Max", 0),
+            op_hist.get("FuncCall", 0),
+            len([e for e in edges if e["To"] == node_name or e["To"].startswith(node_name)]),  # Inputs
+            1 if any(e["To"] == f"{node_name}.update(0)" for e in edges) else 0  # Reduction
+        ]
+
+        loop_repr = []
+        c_code = f"C{comp_idx}"
+        for loop_idx in range(MAX_LOOPS):
+            l_code = f"{c_code}-L{loop_idx}"
+            loop_repr.extend([
+                f"{l_code}-Parallel",
+                f"{l_code}-Tile",
+                f"{l_code}-TileFactor",
+                f"{l_code}-Vectorize",
+                f"{l_code}-VectorSize",
+                f"{l_code}-Unroll",
+                f"{l_code}-UnrollFactor"
+            ])
+        comp_repr.extend(loop_repr)
+
+        comp_repr.append(f"{c_code}-TransformTagsStart")
+        comp_repr.extend(["T"] * (MAX_TRANSFORMS * MAX_TAGS - 2))
+        comp_repr.append(f"{c_code}-TransformTagsEnd")
+
+        comps_repr_templates.append(comp_repr)
+        comps_indices_dict[node_name] = comp_idx
+        for j, element in enumerate(comp_repr):
+            if isinstance(element, str):
+                comps_placeholders_indices_dict[element] = (comp_idx, j)
+
+    return comps_repr_templates, comps_indices_dict, comps_placeholders_indices_dict
+
+# Fill the template with schedule-specific features
+def get_halide_schedule_representation(program_dict, comps_repr_templates, comps_indices_dict, comps_placeholders_indices_dict):
+    nodes = program_dict["programming_details"]["Nodes"]
+    # Scheduling data is in the list under "programming_details"
+    scheduling = [item for item in program_dict["programming_details"] if isinstance(item, dict) and "Name" in item]
+    node_dict = {node["Name"]: node["Details"] for node in nodes}
+    sched_dict = {item["Name"]: item["Details"]["scheduling_feature"] for item in scheduling if "Name" in item}
+    exec_time = next(item["value"] for item in program_dict["programming_details"] if isinstance(item, dict) and item.get("name") == "total_execution_time_ms")
+
+    comps_repr = [list(template) for template in comps_repr_templates]
+
+    for comp_idx, node_name in enumerate(node_dict.keys()):
+        sched = sched_dict.get(node_name, {})
+        c_code = f"C{comp_idx}"
+
+        for loop_idx in range(min(MAX_LOOPS, 2)):  # Assume 2D loops (x, y)
+            l_code = f"{c_code}-L{loop_idx}"
+            comps_repr[comp_idx][comps_placeholders_indices_dict[f"{l_code}-Parallel"][1]] = sched.get("inner_parallelism", 1.0) > 1.0
+            comps_repr[comp_idx][comps_placeholders_indices_dict[f"{l_code}-Tile"][1]] = 1 if sched.get("unrolled_loop_extent", 1.0) > 1.0 else 0
+            comps_repr[comp_idx][comps_placeholders_indices_dict[f"{l_code}-TileFactor"][1]] = sched.get("unrolled_loop_extent", 1.0)
+            comps_repr[comp_idx][comps_placeholders_indices_dict[f"{l_code}-Vectorize"][1]] = 1 if sched.get("vector_size", 16.0) > 16.0 else 0
+            comps_repr[comp_idx][comps_placeholders_indices_dict[f"{l_code}-VectorSize"][1]] = sched.get("vector_size", 16.0)
+            comps_repr[comp_idx][comps_placeholders_indices_dict[f"{l_code}-Unroll"][1]] = 1 if sched.get("unrolled_loop_extent", 1.0) > 1.0 else 0
+            comps_repr[comp_idx][comps_placeholders_indices_dict[f"{l_code}-UnrollFactor"][1]] = sched.get("unrolled_loop_extent", 1.0)
+
+        tags = [0] * (MAX_TRANSFORMS * MAX_TAGS)
+        tags_start = comps_placeholders_indices_dict[f"{c_code}-TransformTagsStart"]
+        tags_end = comps_placeholders_indices_dict[f"{c_code}-TransformTagsEnd"]
+        comps_repr[comp_idx][tags_start[1]:tags_end[1] + 1] = tags
+
+    padded_comps = []
+    for comp in comps_repr:
+        padded_comps.append([float(x) if not isinstance(x, str) else 0.0 for x in comp])
+    if len(padded_comps) < MAX_NODES:
+        padded_comps.extend([[0.0] * len(padded_comps[0])] * (MAX_NODES - len(padded_comps)))
+    elif len(padded_comps) > MAX_NODES:
+        padded_comps = padded_comps[:MAX_NODES]
+
+    return torch.FloatTensor(padded_comps).unsqueeze(0), float(exec_time)
+
+# Load and preprocess Halide dataset
+def load_halide_dataset(data_dir="Output_Programs"):
+    X_data = []
+    y_data = []
+
+    for program_folder in os.listdir(data_dir):
+        program_path = os.path.join(data_dir, program_folder)
         if os.path.isdir(program_path):
             program_times = []
-            program_sequences = []
-            for json_file in os.listdir(program_path):
-                if json_file.endswith('.json'):
-                    json_path = os.path.join(program_path, json_file)
-                    try:
-                        sequence, execution_time = extract_features_from_json(json_path, feature_keys)
-                        if sequence and execution_time is not None:
-                            program_sequences.append(sequence)
-                            program_times.append(execution_time)
-                    except Exception as e:
-                        print(f"Error processing {json_path}: {e}")
+            program_reprs = []
+            for filename in os.listdir(program_path):
+                if filename.endswith(".json"):
+                    file_path = os.path.join(program_path, filename)
+                    program_dict = load_data(file_path)
+                    templates, indices_dict, placeholders_dict = get_halide_representation_template(program_dict)
+                    comps_tensor, exec_time = get_halide_schedule_representation(program_dict, templates, indices_dict, placeholders_dict)
+                    program_reprs.append(comps_tensor.squeeze(0).numpy())
+                    program_times.append(exec_time)
             # Calculate speedup within each program
             if program_times:
                 baseline_time = max(program_times)  # Max time as baseline
-                all_sequences.extend(program_sequences)
-                all_execution_times.extend([baseline_time / time for time in program_times])
+                X_data.extend(program_reprs)
+                y_data.extend([baseline_time / time for time in program_times])
 
-    if not all_sequences:
-        raise ValueError("No valid sequences loaded from the data.")
-    return all_sequences, all_execution_times, feature_keys
+    X_data = np.array(X_data)  # Shape: (samples, MAX_NODES, features)
+    y_data = np.array(y_data).reshape(-1, 1)  # Shape: (samples, 1)
 
-#### Pad Sequences
-def pad_sequences(sequences, max_len, feature_dim):
-    """Pad sequences to a uniform length with zeros and create masks."""
-    padded_sequences = []
-    masks = []
-    for seq in sequences:
-        seq_len = len(seq)
-        padded_seq = seq + [[0] * feature_dim] * (max_len - seq_len)
-        mask = [1] * seq_len + [0] * (max_len - seq_len)
-        padded_sequences.append(padded_seq)
-        masks.append(mask)
-    return np.array(padded_sequences), np.array(masks)
+    # Normalize
+    scaler_X = MinMaxScaler()
+    X_flat = X_data.reshape(-1, X_data.shape[-1])
+    X_normalized = scaler_X.fit_transform(X_flat).reshape(X_data.shape)
+    scaler_y = MinMaxScaler()
+    y_normalized = scaler_y.fit_transform(y_data)
 
-### Custom Dataset Class
-class ScheduleDataset(Dataset):
-    def __init__(self, sequences, masks, targets):
-        self.sequences = sequences
-        self.masks = masks
-        self.targets = targets
-    
-    def __len__(self):
-        return len(self.targets)
-    
-    def __getitem__(self, idx):
-        return {
-            'sequence': torch.tensor(self.sequences[idx], dtype=torch.float32),
-            'mask': torch.tensor(self.masks[idx], dtype=torch.float32),
-            'target': torch.tensor(self.targets[idx], dtype=torch.float32)
-        }
+    return X_normalized, y_normalized, scaler_X, scaler_y
 
-### LSTM Model
-class LSTMModel(nn.Module):
-    def __init__(self, input_dim, hidden_dim, num_layers, output_dim):
-        super(LSTMModel, self).__init__()
-        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers, batch_first=True)
-        self.fc = nn.Linear(hidden_dim, output_dim)
-    
-    def forward(self, x, mask):
-        outputs, (hn, cn) = self.lstm(x)
-        seq_lengths = mask.sum(dim=1).long() - 1
-        batch_size = x.size(0)
-        last_outputs = outputs[torch.arange(batch_size), seq_lengths]
-        prediction = self.fc(last_outputs)
-        return prediction
+# LSTM Model
+class LSTMSpeedupPredictor(nn.Module):
+    def __init__(self, input_size, hidden_size=64, num_layers=2):
+        super(LSTMSpeedupPredictor, self).__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
+        self.dropout = nn.Dropout(0.2)
+        self.fc1 = nn.Linear(hidden_size, 16)
+        self.relu = nn.ReLU()
+        self.fc2 = nn.Linear(16, 1)
 
-### Main Execution
-def main():
-    # Set the output folder path (update this to your actual path)
-    output_folder = "Output_Programs"  # Example: "/home/kowrisaan/jathu/Halide_New/Output_Programs"
-    
-    # Load data
-    all_sequences, all_speedups, feature_keys = load_data(output_folder)
-    print(f"Loaded {len(all_sequences)} sequences with {len(feature_keys)} features each.")
+    def forward(self, x):
+        h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(device)
+        c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(device)
+        out, _ = self.lstm(x, (h0, c0))
+        out = self.dropout(out[:, -1, :])
+        out = self.fc1(out)
+        out = self.relu(out)
+        out = self.fc2(out)
+        return out
 
-    # Prepare data: Pad sequences
-    max_len = max(len(seq) for seq in all_sequences)
-    feature_dim = len(feature_keys)
-    padded_sequences, masks = pad_sequences(all_sequences, max_len, feature_dim)
-    
-    # Split into training and testing sets
-    train_sequences, test_sequences, train_masks, test_masks, train_targets, test_targets = train_test_split(
-        padded_sequences, masks, all_speedups, test_size=0.2, random_state=42
-    )
-    
-    # Create datasets and data loaders
-    train_dataset = ScheduleDataset(train_sequences, train_masks, train_targets)
-    test_dataset = ScheduleDataset(test_sequences, test_masks, test_targets)
-    batch_size = 32
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-    
-    # Define the model
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = LSTMModel(input_dim=feature_dim, hidden_dim=128, num_layers=2, output_dim=1).to(device)
+# Training function
+def train_model(model, X_train, y_train, epochs=100, batch_size=8):
+    dataset = TensorDataset(torch.FloatTensor(X_train), torch.FloatTensor(y_train))
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
     criterion = nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-    
-    # Training loop
-    num_epochs = 50
-    for epoch in range(num_epochs):
-        model.train()
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+    model.train()
+    for epoch in range(epochs):
         total_loss = 0
-        for batch in train_loader:
-            sequences = batch['sequence'].to(device)
-            masks = batch['mask'].to(device)
-            targets = batch['target'].to(device)
-            
+        for X_batch, y_batch in loader:
+            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
             optimizer.zero_grad()
-            predictions = model(sequences, masks)
-            loss = criterion(predictions.squeeze(), targets)
+            outputs = model(X_batch)
+            loss = criterion(outputs, y_batch)
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
-        
-        avg_loss = total_loss / len(train_loader)
-        print(f'Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}')
-    
-    # Testing
+        if (epoch + 1) % 10 == 0:
+            avg_loss = total_loss / len(loader)
+            print(f"Epoch [{epoch+1}/{epochs}], Loss: {avg_loss:.4f}")
+
+# Predict speedup for test data
+def predict_halide_speedup(data_dir="Output_Programs"):
+    # Load and preprocess data
+    X_data, y_data, scaler_X, scaler_y = load_halide_dataset(data_dir)
+    print(f"Loaded {X_data.shape[0]} samples with shape {X_data.shape}")
+
+    # Train-test split (80% train, 20% test)
+    split_idx = int(0.8 * len(X_data))
+    X_train, X_test = X_data[:split_idx], X_data[split_idx:]
+    y_train, y_test = y_data[:split_idx], y_data[split_idx:]
+    print(f"Training samples: {X_train.shape[0]}, Test samples: {X_test.shape[0]}")
+
+    # Initialize and train model
+    input_size = X_data.shape[2]
+    model = LSTMSpeedupPredictor(input_size).to(device)
+    train_model(model, X_train, y_train, epochs=100)
+
+    # Predict on test set
     model.eval()
-    test_loss = 0
     with torch.no_grad():
-        for batch in test_loader:
-            sequences = batch['sequence'].to(device)
-            masks = batch['mask'].to(device)
-            targets = batch['target'].to(device)
-            
-            predictions = model(sequences, masks)
-            loss = criterion(predictions.squeeze(), targets)
-            test_loss += loss.item()
-    
-    avg_test_loss = test_loss / len(test_loader)
-    print(f'Test Loss: {avg_test_loss:.4f}')
+        X_test_tensor = torch.FloatTensor(X_test).to(device)
+        y_test_tensor = torch.FloatTensor(y_test).to(device)
+        y_pred = model(X_test_tensor)
+        test_loss = nn.MSELoss()(y_pred, y_test_tensor)
+        print(f"Test Loss (Normalized): {test_loss.item():.4f}")
+
+        # Denormalize predictions and actual values
+        y_pred_denorm = scaler_y.inverse_transform(y_pred.cpu().numpy())
+        y_test_denorm = scaler_y.inverse_transform(y_test)
+        rmse = np.sqrt(np.mean((y_pred_denorm - y_test_denorm) ** 2))
+        print(f"Test RMSE (Speedup): {rmse:.2f}")
+
+        # Compute speedups for test data
+        print("\nSpeedup Predictions for Test Data:")
+        for i in range(min(5, len(y_test_denorm))):  # Show first 5 test samples
+            actual_speedup = y_test_denorm[i][0]
+            pred_speedup = y_pred_denorm[i][0]
+            print(f"Test Sample {i+1}: Actual Speedup: {actual_speedup:.2f}x, "
+                  f"Predicted Speedup: {pred_speedup:.2f}x")
 
 if __name__ == "__main__":
-    main()
+    predict_halide_speedup(data_dir="Output_Programs")
