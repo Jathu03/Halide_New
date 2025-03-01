@@ -7,7 +7,19 @@ from torch.utils.data import Dataset, DataLoader
 import os
 import json
 
-# 1. Feature Extraction Function (Same as before)
+# Helper function to parse fractions
+def parse_number(s):
+    try:
+        # If it's a simple number, convert to float
+        return float(s)
+    except ValueError:
+        # If it's a fraction (e.g., '1/8'), evaluate it
+        if '/' in s:
+            num, denom = s.split('/')
+            return float(num) / float(denom)
+        raise ValueError(f"Cannot convert {s} to float")
+
+# 1. Feature Extraction Function (Modified)
 def extract_features(file_path):
     with open(file_path, 'r') as f:
         data = json.load(f)
@@ -20,7 +32,8 @@ def extract_features(file_path):
         jacobian = edge['Details']['Load Jacobians']
         jacobian_vals = []
         for row in jacobian:
-            nums = [float(x) for x in row.split() if x not in ['_', '0', '1']]
+            # Handle both numbers and fractions, exclude '_', '0', '1'
+            nums = [parse_number(x) for x in row.split() if x not in ['_', '0', '1']]
             jacobian_vals.extend(nums)
         edge_features.extend(jacobian_vals)
     
@@ -54,7 +67,7 @@ def extract_features(file_path):
     
     return np.array(features), execution_time
 
-# 2. Load and Process All Files (Same as before)
+# 2. Load and Process All Files
 def load_data(folder_path):
     X_data = []
     y_data = []
@@ -72,7 +85,7 @@ def load_data(folder_path):
     
     return X_data_padded, np.array(y_data)
 
-# 3. Prepare Sequences for LSTM (Same as before)
+# 3. Prepare Sequences for LSTM
 def create_sequences(X, y, sequence_length=5):
     X_seq, y_seq = [], []
     for i in range(len(X) - sequence_length):
@@ -96,9 +109,9 @@ class ScheduleDataset(Dataset):
 class LSTMModel(nn.Module):
     def __init__(self, input_size, hidden_size1=100, hidden_size2=50, dropout=0.2):
         super(LSTMModel, self).__init__()
-        self.lstm1 = nn.LSTM(input_size, hidden_size1, batch_first=True, return_sequences=True)
+        self.lstm1 = nn.LSTM(input_size, hidden_size1, batch_first=True, num_layers=1)
         self.dropout1 = nn.Dropout(dropout)
-        self.lstm2 = nn.LSTM(hidden_size1, hidden_size2, batch_first=True)
+        self.lstm2 = nn.LSTM(hidden_size1, hidden_size2, batch_first=True, num_layers=1)
         self.dropout2 = nn.Dropout(dropout)
         self.fc = nn.Linear(hidden_size2, 1)
     
