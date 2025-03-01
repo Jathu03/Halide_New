@@ -6,73 +6,92 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
 
-# Function to extract feature keys from the first JSON file
+# Function to extract feature keys from the first valid item in the JSON list
 def get_feature_keys(json_path):
     """
-    Extract and sort feature keys from the first node's scheduling_feature dictionary.
+    Extract and sort feature keys from the first item that has a scheduling_feature dictionary.
+    
+    Args:
+        json_path (str): Path to the JSON file.
+    
+    Returns:
+        list: Sorted list of feature keys, or empty list if none found.
     """
     with open(json_path, 'r') as f:
         data = json.load(f)
-    # Handle the case where the JSON is a list
-    if isinstance(data, list):
-        for item in data:
-            if "programming_details" in item:
-                data = item
-                break
-    first_node = data["programming_details"]["Nodes"][0]
-    if "scheduling_feature" in first_node["Details"]:
-        features = first_node["Details"]["scheduling_feature"]
-        return sorted(features.keys())
+    if not isinstance(data, list):
+        return []  # Return empty list if JSON is not a list
+    for item in data:
+        if isinstance(item, dict) and "Details" in item and "scheduling_feature" in item["Details"]:
+            features = item["Details"]["scheduling_feature"]
+            return sorted(features.keys())
     return []
 
 # Function to extract sequence and target from a JSON file
 def extract_features_from_json(json_path, feature_keys):
     """
     Extract the sequence of feature vectors and the target execution time from a JSON file.
+    
+    Args:
+        json_path (str): Path to the JSON file.
+        feature_keys (list): List of feature keys to extract.
+    
+    Returns:
+        tuple: (sequence of feature vectors, target execution time), or (None, None) if invalid.
     """
     with open(json_path, 'r') as f:
         data = json.load(f)
-    
-    # Handle JSON as a list by finding the dict with programming_details
-    if isinstance(data, list):
-        nodes = None
-        target = None
-        for item in data:
-            if isinstance(item, dict):
-                if "programming_details" in item:
-                    nodes = item["programming_details"]["Nodes"]
-                if "name" in item and item["name"] == "total_execution_time_ms":
-                    target = item["value"]
-        if nodes is None or target is None:
-            raise ValueError(f"Invalid JSON structure in {json_path}")
-    else:
-        nodes = data["programming_details"]["Nodes"]
-        target = data["total_execution_time_ms"]
-    
+    if not isinstance(data, list):
+        return None, None
     sequence = []
-    for node in nodes:
-        if "scheduling_feature" in node["Details"]:
-            features = node["Details"]["scheduling_feature"]
-            feature_vector = [features.get(key, 0) for key in feature_keys]  # Default to 0 if key missing
-            sequence.append(feature_vector)
-    
+    target = None
+    for item in data:
+        if isinstance(item, dict):
+            if "Details" in item and "scheduling_feature" in item["Details"]:
+                features = item["Details"]["scheduling_feature"]
+                feature_vector = [features.get(key, 0) for key in feature_keys]
+                sequence.append(feature_vector)
+            if "name" in item and item["name"] == "total_execution_time_ms":
+                target = item["value"]
+    if not sequence or target is None:
+        return None, None  # Return None if no features or target found
     return sequence, target
 
 # Function to load all data from the folder structure
 def load_data(output_folder):
     """
     Load all sequences and targets from JSON files in the output folder.
+    
+    Args:
+        output_folder (str): Path to the folder containing JSON files.
+    
+    Returns:
+        tuple: (list of sequences, list of targets, list of feature keys).
     """
     all_sequences = []
     all_targets = []
-    
-    # Get feature keys from the first JSON file
-    first_program_folder = os.path.join(output_folder, os.listdir(output_folder)[0])
-    first_json_path = os.path.join(first_program_folder, os.listdir(first_program_folder)[0])
-    feature_keys = get_feature_keys(first_json_path)
+    feature_keys = None
+
+    # Step 1: Find feature keys from any JSON file that has them
+    for program_folder in os.listdir(output_folder):
+        program_path = os.path.join(output_folder, program_folder)
+        if os.path.isdir(program_path):
+            for json_file in os.listdir(program_path):
+                if json_file.endswith('.json'):
+                    json_path = os.path.join(program_path, json_file)
+                    try:
+                        keys = get_feature_keys(json_path)
+                        if keys:
+                            feature_keys = keys
+                            break
+                    except Exception as e:
+                        print(f"Error processing {json_path}: {e}")
+            if feature_keys:
+                break
     if not feature_keys:
-        raise ValueError("No scheduling_feature found in the first JSON file.")
-    
+        raise ValueError("No scheduling_feature found in any JSON file in the output folder.")
+
+    # Step 2: Load data from all JSON files using the feature keys
     for program_folder in os.listdir(output_folder):
         program_path = os.path.join(output_folder, program_folder)
         if os.path.isdir(program_path):
@@ -81,18 +100,28 @@ def load_data(output_folder):
                     json_path = os.path.join(program_path, json_file)
                     try:
                         sequence, target = extract_features_from_json(json_path, feature_keys)
-                        if sequence:  # Only append if there are features
+                        if sequence and target is not None:
                             all_sequences.append(sequence)
                             all_targets.append(target)
                     except Exception as e:
                         print(f"Error processing {json_path}: {e}")
-    
+
+    if not all_sequences:
+        raise ValueError("No valid sequences loaded from the data.")
     return all_sequences, all_targets, feature_keys
 
 # Function to pad sequences to the same length
 def pad_sequences(sequences, max_len, feature_dim):
     """
     Pad sequences with zeros and create masks for valid elements.
+    
+    Args:
+        sequences (list): List of sequences.
+        max_len (int): Maximum sequence length.
+        feature_dim (int): Number of features per vector.
+    
+    Returns:
+        tuple: (padded sequences as numpy array, masks as numpy array).
     """
     padded_sequences = []
     masks = []
@@ -146,9 +175,8 @@ def main():
     
     # Load data
     all_sequences, all_targets, feature_keys = load_data(output_folder)
-    if not all_sequences:
-        raise ValueError("No valid sequences loaded from the data.")
-    
+    print(f"Loaded {len(all_sequences)} sequences with {len(feature_keys)} features each.")
+
     # Prepare data: Pad sequences
     max_len = max(len(seq) for seq in all_sequences)
     feature_dim = len(feature_keys)
