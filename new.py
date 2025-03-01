@@ -53,27 +53,77 @@ def extract_execution_time(program_dict):
     # Case 2: In a list of dictionaries with "name" and "value" fields
     if isinstance(program_dict, list):
         for item in program_dict:
-            if isinstance(item, dict) and item.get("name") == "total_execution_time_ms" and "value" in item:
-                return float(item["value"])
-            # Also check for execution_time or similar fields
-            if isinstance(item, dict) and "execution_time" in item:
-                return float(item["execution_time"])
-            if isinstance(item, dict) and "Details" in item and "execution_time" in item["Details"]:
-                return float(item["Details"]["execution_time"])
+            if isinstance(item, dict):
+                # Check for "name" and "value" structure
+                if item.get("name") == "total_execution_time_ms" and "value" in item:
+                    return float(item["value"])
+                # Check for direct "value" field for execution time
+                if "value" in item and isinstance(item["value"], (int, float)):
+                    if "execution_time" in str(item).lower() or "runtime" in str(item).lower():
+                        return float(item["value"])
+                # Also check for execution_time or similar fields
+                if "execution_time" in item:
+                    # Handle case where execution_time is directly the value
+                    if isinstance(item["execution_time"], (int, float)):
+                        return float(item["execution_time"])
+                    # Handle case where execution_time contains a value field
+                    elif isinstance(item["execution_time"], dict) and "value" in item["execution_time"]:
+                        return float(item["execution_time"]["value"])
+                if "Details" in item and "execution_time" in item["Details"]:
+                    if isinstance(item["Details"]["execution_time"], (int, float)):
+                        return float(item["Details"]["execution_time"])
+                    elif isinstance(item["Details"]["execution_time"], dict) and "value" in item["Details"]["execution_time"]:
+                        return float(item["Details"]["execution_time"]["value"])
     
     # Case 3: In a nested structure
-    if isinstance(program_dict, dict) and "performance_metrics" in program_dict:
-        metrics = program_dict["performance_metrics"]
-        if isinstance(metrics, dict) and "execution_time_ms" in metrics:
-            return float(metrics["execution_time_ms"])
+    if isinstance(program_dict, dict):
+        # Check in performance_metrics
+        if "performance_metrics" in program_dict:
+            metrics = program_dict["performance_metrics"]
+            if isinstance(metrics, dict):
+                if "execution_time_ms" in metrics:
+                    return float(metrics["execution_time_ms"])
+                # Check if metrics contains a value field
+                if "value" in metrics:
+                    return float(metrics["value"])
+            
+        # Check for nested values
+        for key, value in program_dict.items():
+            if isinstance(value, dict) and "value" in value:
+                if "time" in key.lower() or "execution" in key.lower() or "runtime" in key.lower():
+                    return float(value["value"])
     
     # Case 4: Check for alternative field names
     for field in ["execution_time_ms", "runtime_ms", "execution_time", "runtime"]:
         if isinstance(program_dict, dict) and field in program_dict:
-            return float(program_dict[field])
+            if isinstance(program_dict[field], (int, float)):
+                return float(program_dict[field])
+            elif isinstance(program_dict[field], dict) and "value" in program_dict[field]:
+                return float(program_dict[field]["value"])
     
-    # Add more cases as necessary based on your JSON structure
-    return None
+    # Case 5: Recursive search for "value" in nested structures
+    def recursive_search(obj, key_hint=""):
+        if isinstance(obj, dict):
+            # If we find a structure with a "value" field and the parent key suggests time
+            if "value" in obj and isinstance(obj["value"], (int, float)) and (
+                "time" in key_hint.lower() or 
+                "execution" in key_hint.lower() or 
+                "runtime" in key_hint.lower()):
+                return float(obj["value"])
+            
+            # Search in all dictionary items
+            for k, v in obj.items():
+                result = recursive_search(v, k)
+                if result is not None:
+                    return result
+        elif isinstance(obj, list):
+            for item in obj:
+                result = recursive_search(item, key_hint)
+                if result is not None:
+                    return result
+        return None
+    
+    return recursive_search(program_dict)
 
 # Create a template for Halide program representation
 def get_halide_representation_template(program_dict):
@@ -171,6 +221,7 @@ def get_halide_schedule_representation(program_dict, comps_repr_templates, comps
         # Extract execution time
         exec_time = extract_execution_time(program_dict)
         if exec_time is None:
+            logger.warning(f"No execution time found in program data")
             return None, None
 
         # Handle both list and dict structures for scheduling features
