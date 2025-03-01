@@ -45,24 +45,34 @@ def extract_features(file_path):
                 hist_vals.append(val)
         node_features.extend(hist_vals)
     
-    # Extract Scheduling Features (from scheduling_feature in Schedules)
+    # Extract Scheduling Features and Execution Time
     scheduling_features = []
+    execution_time = None
+    
+    # Check if 'Schedules' exists in 'programming_details'
+    if 'Schedules' not in data['programming_details']:
+        raise KeyError(f"'Schedules' key not found in {file_path}. Available keys: {list(data['programming_details'].keys())}")
+    
     for schedule in data['programming_details']['Schedules']:
-        if isinstance(schedule, dict) and 'Details' in schedule and 'scheduling_feature' in schedule['Details']:
+        if not isinstance(schedule, dict):
+            continue  # Skip if schedule is not a dictionary
+        # Extract scheduling features if available
+        if 'Details' in schedule and 'scheduling_feature' in schedule['Details']:
             sched_data = schedule['Details']['scheduling_feature']
             sched_vals = [float(v) for v in sched_data.values()]
             scheduling_features.extend(sched_vals)
+        # Extract execution time if available
+        if 'name' in schedule and schedule['name'] == 'total_execution_time_ms':
+            execution_time = schedule['value']
+    
+    # Validate that execution time was found
+    if execution_time is None:
+        raise ValueError(f"Execution time ('total_execution_time_ms') not found in 'Schedules' of {file_path}")
     
     # Combine all features
     features.extend(edge_features)
     features.extend(node_features)
     features.extend(scheduling_features)
-    
-    # Get execution time (y_data) from Schedules list
-    execution_time = next(
-        item['value'] for item in data['programming_details']['Schedules']
-        if 'name' in item and item['name'] == 'total_execution_time_ms'
-    )
     
     return np.array(features), execution_time
 
@@ -74,11 +84,17 @@ def load_data(folder_path):
     for filename in os.listdir(folder_path):
         if filename.endswith('.json'):
             file_path = os.path.join(folder_path, filename)
-            features, exec_time = extract_features(file_path)
-            X_data.append(features)
-            y_data.append(exec_time)
+            try:
+                features, exec_time = extract_features(file_path)
+                X_data.append(features)
+                y_data.append(exec_time)
+            except (KeyError, ValueError) as e:
+                print(f"Skipping {file_path}: {str(e)}")
+                continue
     
     # Pad sequences to same length
+    if not X_data:
+        raise ValueError("No valid data loaded from files.")
     max_length = max(len(x) for x in X_data)
     X_data_padded = np.array([np.pad(x, (0, max_length - len(x)), 'constant') 
                             for x in X_data])
