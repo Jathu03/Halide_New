@@ -1,280 +1,154 @@
+import os
 import json
 import numpy as np
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
-import os
+import pandas as pd
+from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from tensorflow.keras.optimizers import Adam
 
-# Device configuration
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# Constants for representation
-MAX_NODES = 20  # Max number of nodes (computations)
-MAX_LOOPS = 5   # Max loop depth
-MAX_TRANSFORMS = 4  # Max number of transformations per computation
-MAX_TAGS = 8    # Size of transformation tag vector
-
-# Load JSON data from a file
-def load_data(file_path):
-    with open(file_path, 'r') as f:
-        data = json.load(f)
-    return data
-
-# Create a template for Halide program representation
-def get_halide_representation_template(program_dict):
-    # Expect a list structure
-    if not isinstance(program_dict, list):
-        raise ValueError("JSON must be a list")
+# Step 1: Load JSON Files from Directory
+def load_json_files(directory):
+    data = []
+    program_names = []
     
-    nodes = None
-    edges = None
-    for item in program_dict:
-        if isinstance(item, dict) and "programming_details" in item:
-            nodes = item["programming_details"]["Nodes"]
-            edges = item["programming_details"]["Edges"]
-            break
-    if nodes is None or edges is None:
-        raise ValueError("No 'programming_details' with 'Nodes' and 'Edges' found in JSON list")
-
-    node_dict = {node["Name"]: node["Details"] for node in nodes}
-    comps_repr_templates = []
-    comps_indices_dict = {}
-    comps_placeholders_indices_dict = {}
-
-    for comp_idx, node_name in enumerate(node_dict.keys()):
-        node = node_dict[node_name]
-        op_hist = {}
-        for entry in node["Op histogram"]:
-            parts = entry.split(':')
-            if len(parts) == 2:
-                key, value = parts[0].strip(), int(parts[1].strip().split()[0])
-                op_hist[key] = value
-
-        comp_repr = [
-            op_hist.get("Add", 0),
-            op_hist.get("Mul", 0),
-            op_hist.get("Div", 0),
-            op_hist.get("Min", 0),
-            op_hist.get("Max", 0),
-            op_hist.get("FuncCall", 0),
-            len([e for e in edges if e["To"] == node_name or e["To"].startswith(node_name)]),  # Inputs
-            1 if any(e["To"] == f"{node_name}.update(0)" for e in edges) else 0  # Reduction
-        ]
-
-        loop_repr = []
-        c_code = f"C{comp_idx}"
-        for loop_idx in range(MAX_LOOPS):
-            l_code = f"{c_code}-L{loop_idx}"
-            loop_repr.extend([
-                f"{l_code}-Parallel",
-                f"{l_code}-Tile",
-                f"{l_code}-TileFactor",
-                f"{l_code}-Vectorize",
-                f"{l_code}-VectorSize",
-                f"{l_code}-Unroll",
-                f"{l_code}-UnrollFactor"
-            ])
-        comp_repr.extend(loop_repr)
-
-        comp_repr.append(f"{c_code}-TransformTagsStart")
-        comp_repr.extend(["T"] * (MAX_TRANSFORMS * MAX_TAGS - 2))
-        comp_repr.append(f"{c_code}-TransformTagsEnd")
-
-        comps_repr_templates.append(comp_repr)
-        comps_indices_dict[node_name] = comp_idx
-        for j, element in enumerate(comp_repr):
-            if isinstance(element, str):
-                comps_placeholders_indices_dict[element] = (comp_idx, j)
-
-    return comps_repr_templates, comps_indices_dict, comps_placeholders_indices_dict
-
-# Fill the template with schedule-specific features
-def get_halide_schedule_representation(program_dict, comps_repr_templates, comps_indices_dict, comps_placeholders_indices_dict):
-    # Expect a list structure
-    if not isinstance(program_dict, list):
-        raise ValueError("JSON must be a list")
-
-    nodes = None
-    sched_dict = {}
-    exec_time = None
-    for item in program_dict:
-        if isinstance(item, dict):
-            if "programming_details" in item:
-                nodes = item["programming_details"]["Nodes"]
-                node_dict = {node["Name"]: node["Details"] for node in nodes}
-            elif "Name" in item and "scheduling_feature" in item["Details"]:
-                sched_dict[item["Name"]] = item["Details"]["scheduling_feature"]
-            elif item.get("name") == "total_execution_time_ms":
-                exec_time = item["value"]
-
-    if nodes is None:
-        raise ValueError("Missing 'programming_details' with 'Nodes' in JSON list")
-    if exec_time is None:
-        return None, None  # Skip this file if no execution time
-
-    comps_repr = [list(template) for template in comps_repr_templates]
-
-    for comp_idx, node_name in enumerate(node_dict.keys()):
-        sched = sched_dict.get(node_name, {})
-        c_code = f"C{comp_idx}"
-
-        for loop_idx in range(min(MAX_LOOPS, 2)):  # Assume 2D loops (x, y)
-            l_code = f"{c_code}-L{loop_idx}"
-            comps_repr[comp_idx][comps_placeholders_indices_dict[f"{l_code}-Parallel"][1]] = sched.get("inner_parallelism", 1.0) > 1.0
-            comps_repr[comp_idx][comps_placeholders_indices_dict[f"{l_code}-Tile"][1]] = 1 if sched.get("unrolled_loop_extent", 1.0) > 1.0 else 0
-            comps_repr[comp_idx][comps_placeholders_indices_dict[f"{l_code}-TileFactor"][1]] = sched.get("unrolled_loop_extent", 1.0)
-            comps_repr[comp_idx][comps_placeholders_indices_dict[f"{l_code}-Vectorize"][1]] = 1 if sched.get("vector_size", 16.0) > 16.0 else 0
-            comps_repr[comp_idx][comps_placeholders_indices_dict[f"{l_code}-VectorSize"][1]] = sched.get("vector_size", 16.0)
-            comps_repr[comp_idx][comps_placeholders_indices_dict[f"{l_code}-Unroll"][1]] = 1 if sched.get("unrolled_loop_extent", 1.0) > 1.0 else 0
-            comps_repr[comp_idx][comps_placeholders_indices_dict[f"{l_code}-UnrollFactor"][1]] = sched.get("unrolled_loop_extent", 1.0)
-
-        tags = [0] * (MAX_TRANSFORMS * MAX_TAGS)
-        tags_start = comps_placeholders_indices_dict[f"{c_code}-TransformTagsStart"]
-        tags_end = comps_placeholders_indices_dict[f"{c_code}-TransformTagsEnd"]
-        comps_repr[comp_idx][tags_start[1]:tags_end[1] + 1] = tags
-
-    padded_comps = []
-    for comp in comps_repr:
-        padded_comps.append([float(x) if not isinstance(x, str) else 0.0 for x in comp])
-    if padded_comps:  # Only pad if there’s data
-        if len(padded_comps) < MAX_NODES:
-            padded_comps.extend([[0.0] * len(padded_comps[0])] * (MAX_NODES - len(padded_comps)))
-        elif len(padded_comps) > MAX_NODES:
-            padded_comps = padded_comps[:MAX_NODES]
-
-    return torch.FloatTensor(padded_comps).unsqueeze(0), float(exec_time)
-
-# Load and preprocess Halide dataset
-def load_halide_dataset(data_dir="Output_Programs"):
-    X_data = []
-    y_data = []
-
-    for program_folder in os.listdir(data_dir):
-        program_path = os.path.join(data_dir, program_folder)
+    for program_folder in os.listdir(directory):
+        program_path = os.path.join(directory, program_folder)
         if os.path.isdir(program_path):
-            program_times = []
-            program_reprs = []
-            for filename in os.listdir(program_path):
-                if filename.endswith(".json"):
-                    file_path = os.path.join(program_path, filename)
-                    try:
-                        program_dict = load_data(file_path)
-                        templates, indices_dict, placeholders_dict = get_halide_representation_template(program_dict)
-                        comps_tensor, exec_time = get_halide_schedule_representation(program_dict, templates, indices_dict, placeholders_dict)
-                        if comps_tensor is not None and exec_time is not None:  # Only append if valid
-                            program_reprs.append(comps_tensor.squeeze(0).numpy())
-                            program_times.append(exec_time)
-                        else:
-                            print(f"Skipping {file_path}: Execution time ('total_execution_time_ms') not found in JSON")
-                    except ValueError as e:
-                        print(f"Skipping {file_path}: {e}")
-                        continue
-            # Calculate speedup within each program
-            if program_times:
-                baseline_time = max(program_times)  # Max time as baseline
-                X_data.extend(program_reprs)
-                y_data.extend([baseline_time / time for time in program_times])
+            program_data = []
+            for json_file in os.listdir(program_path):
+                if json_file.endswith('.json'):
+                    file_path = os.path.join(program_path, json_file)
+                    with open(file_path, 'r') as f:
+                        json_data = json.load(f)
+                        program_data.append(json_data)
+            if program_data:  # Ensure there's data for the program
+                data.append(program_data)
+                program_names.append(program_folder)
+    return data, program_names
 
-    if not X_data:
-        raise ValueError("No valid data loaded from Output_Programs folder")
+# Step 2: Feature Extraction
+def extract_features(json_data):
+    features = []
     
-    X_data = np.array(X_data)  # Shape: (samples, MAX_NODES, features)
-    y_data = np.array(y_data).reshape(-1, 1)  # Shape: (samples, 1)
+    # Extract from Edges (e.g., number of edges, footprint size, Jacobian complexity)
+    edges = json_data.get('programming_details', {}).get('Edges', [])
+    num_edges = len(edges)
+    footprint_sizes = [len(edge['Details']['Footprint']) for edge in edges]
+    jacobian_sizes = [len(edge['Details']['Load Jacobians']) for edge in edges]
+    
+    features.extend([
+        num_edges,
+        np.mean(footprint_sizes) if footprint_sizes else 0,
+        np.mean(jacobian_sizes) if jacobian_sizes else 0
+    ])
+    
+    # Extract from Nodes (e.g., memory patterns, op histogram)
+    nodes = json_data.get('programming_details', {}).get('Nodes', [])
+    num_nodes = len(nodes)
+    memory_patterns = [sum(map(int, node['Details']['Memory access patterns'][0].split()[1:])) 
+                       for node in nodes if node['Details'].get('Memory access patterns')]
+    op_histogram = [sum(int(op.split()[-1]) for op in node['Details']['Op histogram']) 
+                    for node in nodes if node['Details'].get('Op histogram')]
+    
+    features.extend([
+        num_nodes,
+        np.mean(memory_patterns) if memory_patterns else 0,
+        np.mean(op_histogram) if op_histogram else 0
+    ])
+    
+    # Extract from Scheduling Features (numerical values)
+    scheduling_features = [item['Details']['scheduling_feature'] 
+                          for item in json_data.get('schedule_feature', []) 
+                          if 'scheduling_feature' in item['Details']]
+    if scheduling_features:
+        avg_sched_features = {k: np.mean([sf[k] for sf in scheduling_features]) 
+                              for k in scheduling_features[0].keys()}
+        features.extend(list(avg_sched_features.values()))
+    
+    # Target: Execution Time
+    execution_time = next((item['value'] for item in json_data.get('schedule_feature', []) 
+                           if item.get('name') == 'total_execution_time_ms'), 0)
+    
+    return np.array(features, dtype=float), execution_time
 
-    # Normalize
+# Step 3: Prepare Data for LSTM
+def prepare_lstm_data(data):
+    X, y = [], []
+    feature_dim = None
+    
+    for program_data in data:  # Each program has a sequence of schedules
+        program_X, program_y = [], []
+        for schedule in program_data:
+            features, exec_time = extract_features(schedule)
+            if feature_dim is None:
+                feature_dim = len(features)
+            elif len(features) != feature_dim:
+                # Pad or truncate to ensure consistent feature dimension
+                features = np.pad(features, (0, feature_dim - len(features)), 'constant')[:feature_dim]
+            program_X.append(features)
+            program_y.append(exec_time)
+        
+        X.append(program_X)  # Shape: (num_schedules, feature_dim)
+        y.append(program_y)  # Shape: (num_schedules,)
+    
+    # Convert to numpy arrays
+    X = np.array(X)  # Shape: (num_programs, num_schedules, feature_dim)
+    y = np.array(y)  # Shape: (num_programs, num_schedules)
+    
+    # Normalize features
     scaler_X = MinMaxScaler()
-    X_flat = X_data.reshape(-1, X_data.shape[-1])
-    X_normalized = scaler_X.fit_transform(X_flat).reshape(X_data.shape)
+    X_reshaped = X.reshape(-1, X.shape[-1])
+    X_normalized = scaler_X.fit_transform(X_reshaped).reshape(X.shape)
+    
+    # Normalize target
     scaler_y = MinMaxScaler()
-    y_normalized = scaler_y.fit_transform(y_data)
-
+    y_reshaped = y.reshape(-1, 1)
+    y_normalized = scaler_y.fit_transform(y_reshaped).reshape(y.shape)
+    
     return X_normalized, y_normalized, scaler_X, scaler_y
 
-# LSTM Model
-class LSTMSpeedupPredictor(nn.Module):
-    def __init__(self, input_size, hidden_size=64, num_layers=2):
-        super(LSTMSpeedupPredictor, self).__init__()
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
-        self.dropout = nn.Dropout(0.2)
-        self.fc1 = nn.Linear(hidden_size, 16)
-        self.relu = nn.ReLU()
-        self.fc2 = nn.Linear(16, 1)
+# Step 4: Build and Train LSTM Model
+def build_lstm_model(input_shape):
+    model = Sequential([
+        LSTM(128, input_shape=input_shape, return_sequences=True),
+        Dropout(0.2),
+        LSTM(64),
+        Dropout(0.2),
+        Dense(32, activation='relu'),
+        Dense(1)  # Predict execution time
+    ])
+    model.compile(optimizer=Adam(learning_rate=0.001), loss='mse')
+    return model
 
-    def forward(self, x):
-        h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(device)
-        c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(device)
-        out, _ = self.lstm(x, (h0, c0))
-        out = self.dropout(out[:, -1, :])
-        out = self.fc1(out)
-        out = self.relu(out)
-        out = self.fc2(out)
-        return out
+# Main Execution
+directory = 'Output_Programs'  # Adjust path as needed
+data, program_names = load_json_files(directory)
+X, y, scaler_X, scaler_y = prepare_lstm_data(data)
 
-# Training function
-def train_model(model, X_train, y_train, epochs=100, batch_size=8):
-    dataset = TensorDataset(torch.FloatTensor(X_train), torch.FloatTensor(y_train))
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-    criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
+# Split into train and test sets (80% train, 20% test)
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
 
-    model.train()
-    for epoch in range(epochs):
-        total_loss = 0
-        for X_batch, y_batch in loader:
-            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-            optimizer.zero_grad()
-            outputs = model(X_batch)
-            loss = criterion(outputs, y_batch)
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-        if (epoch + 1) % 10 == 0:
-            avg_loss = total_loss / len(loader)
-            print(f"Epoch [{epoch+1}/{epochs}], Loss: {avg_loss:.4f}")
+# Build model
+input_shape = (X.shape[1], X.shape[2])  # (num_schedules, feature_dim)
+model = build_lstm_model(input_shape)
 
-# Predict speedup for test data
-def predict_halide_speedup(data_dir="Output_Programs"):
-    # Load and preprocess data
-    X_data, y_data, scaler_X, scaler_y = load_halide_dataset(data_dir)
-    print(f"Loaded {X_data.shape[0]} samples with shape {X_data.shape}")
+# Train model
+history = model.fit(X_train, y_train, epochs=50, batch_size=32, validation_split=0.2, verbose=1)
 
-    # Train-test split (80% train, 20% test)
-    split_idx = int(0.8 * len(X_data))
-    X_train, X_test = X_data[:split_idx], X_data[split_idx:]
-    y_train, y_test = y_data[:split_idx], y_data[split_idx:]
-    print(f"Training samples: {X_train.shape[0]}, Test samples: {X_test.shape[0]}")
+# Evaluate model
+test_loss = model.evaluate(X_test, y_test, verbose=0)
+print(f"Test Loss (MSE): {test_loss}")
 
-    # Initialize and train model
-    input_size = X_data.shape[2]
-    model = LSTMSpeedupPredictor(input_size).to(device)
-    train_model(model, X_train, y_train, epochs=100)
+# Predict and inverse transform to get actual time values
+y_pred = model.predict(X_test)
+y_pred_rescaled = scaler_y.inverse_transform(y_pred.reshape(-1, 1)).reshape(y_test.shape)
+y_test_rescaled = scaler_y.inverse_transform(y_test.reshape(-1, 1)).reshape(y_test.shape)
 
-    # Predict on test set
-    model.eval()
-    with torch.no_grad():
-        X_test_tensor = torch.FloatTensor(X_test).to(device)
-        y_test_tensor = torch.FloatTensor(y_test).to(device)
-        y_pred = model(X_test_tensor)
-        test_loss = nn.MSELoss()(y_pred, y_test_tensor)
-        print(f"Test Loss (Normalized): {test_loss.item():.4f}")
+# Print some example predictions
+for i in range(min(5, len(y_test))):
+    print(f"Program {i+1}: True Time: {y_test_rescaled[i,0]:.2f} ms, Predicted Time: {y_pred_rescaled[i,0]:.2f} ms")
 
-        # Denormalize predictions and actual values
-        y_pred_denorm = scaler_y.inverse_transform(y_pred.cpu().numpy())
-        y_test_denorm = scaler_y.inverse_transform(y_test)
-        rmse = np.sqrt(np.mean((y_pred_denorm - y_test_denorm) ** 2))
-        print(f"Test RMSE (Speedup): {rmse:.2f}")
-
-        # Compute speedups for test data
-        print("\nSpeedup Predictions for Test Data:")
-        for i in range(min(5, len(y_test_denorm))):  # Show first 5 test samples
-            actual_speedup = y_test_denorm[i][0]
-            pred_speedup = y_pred_denorm[i][0]
-            print(f"Test Sample {i+1}: Actual Speedup: {actual_speedup:.2f}x, "
-                  f"Predicted Speedup: {pred_speedup:.2f}x")
-
-if __name__ == "__main__":
-    predict_halide_speedup(data_dir="Output_Programs")
+# Optional: Save model
+model.save('lstm_execution_time_predictor.h5')
