@@ -6,32 +6,121 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
 
-# Function to extract unique feature keys from the first JSON file
+### Helper Functions
+
+#### Extract Feature Keys
 def get_feature_keys(json_path):
+    """Extract sorted feature keys from 'scheduling_feature' or 'Op histogram' in a JSON file."""
     with open(json_path, 'r') as f:
         data = json.load(f)
+    if not isinstance(data, list):
+        return []
+    feature_keys = None
     for item in data:
-        if "Details" in item and "scheduling_feature" in item["Details"]:
-            return sorted(item["Details"]["scheduling_feature"].keys())
-    return []
+        if isinstance(item, dict) and "programming_details" in item:
+            # Try 'scheduling_feature' first
+            for node in item["programming_details"]["Nodes"]:
+                if "Details" in node and "scheduling_feature" in node["Details"]:
+                    feature_keys = sorted(node["Details"]["scheduling_feature"].keys())
+                    break
+            # Fallback to 'Op histogram' if no 'scheduling_feature'
+            if not feature_keys:
+                for node in item["programming_details"]["Nodes"]:
+                    if "Details" in node and "Op histogram" in node["Details"]:
+                        feature_keys = sorted(
+                            [line.split(":")[0].strip() for line in node["Details"]["Op histogram"]]
+                        )
+                        break
+            break
+    return feature_keys if feature_keys else []
 
-# Function to extract sequence and target from a JSON file
+#### Extract Features and Target
 def extract_features_from_json(json_path, feature_keys):
+    """
+    Extract feature sequences and speedup from a JSON file.
+    Speedup = baseline_time / execution_time, where baseline is the max time across all schedules.
+    """
     with open(json_path, 'r') as f:
         data = json.load(f)
+    if not isinstance(data, list):
+        return None, None
+    
     sequence = []
-    target = None
+    execution_time = None
     for item in data:
-        if "Details" in item and "scheduling_feature" in item["Details"]:
-            features = item["Details"]["scheduling_feature"]
-            feature_vector = [float(features.get(key, 0)) for key in feature_keys]
-            sequence.append(feature_vector)
-        if "name" in item and item["name"] == "total_execution_time_ms":
-            target = float(item["value"])
-    return sequence, target
+        if isinstance(item, dict):
+            if "programming_details" in item:
+                nodes = item["programming_details"]["Nodes"]
+                for node in nodes:
+                    if "Details" in node:
+                        if "scheduling_feature" in node["Details"]:
+                            features = node["Details"]["scheduling_feature"]
+                            feature_vector = [features.get(key, 0) for key in feature_keys]
+                            sequence.append(feature_vector)
+                        elif "Op histogram" in node["Details"]:
+                            features = {line.split(":")[0].strip(): float(line.split(":")[1].strip())
+                                        for line in node["Details"]["Op histogram"]}
+                            feature_vector = [features.get(key, 0) for key in feature_keys]
+                            sequence.append(feature_vector)
+            if "name" in item and item["name"] == "total_execution_time_ms":
+                execution_time = item["value"]
+    
+    if not sequence or execution_time is None:
+        return None, None
+    return sequence, execution_time
 
-# Function to pad sequences
+#### Load Data and Calculate Speedup
+def load_data(output_folder):
+    """Load sequences, execution times, calculate speedup, and return feature keys."""
+    all_sequences = []
+    all_execution_times = []
+    feature_keys = None
+
+    # Step 1: Find feature keys from any JSON file
+    for program_folder in os.listdir(output_folder):
+        program_path = os.path.join(output_folder, program_folder)
+        if os.path.isdir(program_path):
+            for json_file in os.listdir(program_path):
+                if json_file.endswith('.json'):
+                    json_path = os.path.join(program_path, json_file)
+                    keys = get_feature_keys(json_path)
+                    if keys:
+                        feature_keys = keys
+                        break
+            if feature_keys:
+                break
+    if not feature_keys:
+        raise ValueError("No valid feature keys ('scheduling_feature' or 'Op histogram') found in any JSON file.")
+
+    # Step 2: Load data from all JSON files
+    for program_folder in os.listdir(output_folder):
+        program_path = os.path.join(output_folder, program_folder)
+        if os.path.isdir(program_path):
+            program_times = []
+            program_sequences = []
+            for json_file in os.listdir(program_path):
+                if json_file.endswith('.json'):
+                    json_path = os.path.join(program_path, json_file)
+                    try:
+                        sequence, execution_time = extract_features_from_json(json_path, feature_keys)
+                        if sequence and execution_time is not None:
+                            program_sequences.append(sequence)
+                            program_times.append(execution_time)
+                    except Exception as e:
+                        print(f"Error processing {json_path}: {e}")
+            # Calculate speedup within each program
+            if program_times:
+                baseline_time = max(program_times)  # Max time as baseline
+                all_sequences.extend(program_sequences)
+                all_execution_times.extend([baseline_time / time for time in program_times])
+
+    if not all_sequences:
+        raise ValueError("No valid sequences loaded from the data.")
+    return all_sequences, all_execution_times, feature_keys
+
+#### Pad Sequences
 def pad_sequences(sequences, max_len, feature_dim):
+    """Pad sequences to a uniform length with zeros and create masks."""
     padded_sequences = []
     masks = []
     for seq in sequences:
@@ -42,7 +131,7 @@ def pad_sequences(sequences, max_len, feature_dim):
         masks.append(mask)
     return np.array(padded_sequences), np.array(masks)
 
-# Custom Dataset class
+### Custom Dataset Class
 class ScheduleDataset(Dataset):
     def __init__(self, sequences, masks, targets):
         self.sequences = sequences
@@ -59,7 +148,7 @@ class ScheduleDataset(Dataset):
             'target': torch.tensor(self.targets[idx], dtype=torch.float32)
         }
 
-# LSTM Model definition
+### LSTM Model
 class LSTMModel(nn.Module):
     def __init__(self, input_dim, hidden_dim, num_layers, output_dim):
         super(LSTMModel, self).__init__()
@@ -67,52 +156,30 @@ class LSTMModel(nn.Module):
         self.fc = nn.Linear(hidden_dim, output_dim)
     
     def forward(self, x, mask):
-        # x: [batch_size, seq_len, input_dim]
-        # mask: [batch_size, seq_len]
-        outputs, (hn, cn) = self.lstm(x)  # outputs: [batch_size, seq_len, hidden_dim]
-        seq_lengths = mask.sum(dim=1).long() - 1  # Last valid index
+        outputs, (hn, cn) = self.lstm(x)
+        seq_lengths = mask.sum(dim=1).long() - 1
         batch_size = x.size(0)
         last_outputs = outputs[torch.arange(batch_size), seq_lengths]
-        prediction = self.fc(last_outputs)  # [batch_size, output_dim]
+        prediction = self.fc(last_outputs)
         return prediction
 
-# Main function
+### Main Execution
 def main():
-    output_folder = "Output_Programs"
+    # Set the output folder path (update this to your actual path)
+    output_folder = "Output_Programs"  # Example: "/home/user/Halide_New/Output_Programs"
     
-    # Get feature keys from the first JSON file
-    first_program_folder = os.path.join(output_folder, os.listdir(output_folder)[0])
-    first_json_path = os.path.join(first_program_folder, os.listdir(first_program_folder)[0])
-    feature_keys = get_feature_keys(first_json_path)
-    if not feature_keys:
-        raise ValueError("No scheduling_feature found in the first JSON file.")
-    
-    all_sequences = []
-    all_targets = []
-    
-    # Traverse all program folders and JSON files
-    for program_folder in os.listdir(output_folder):
-        program_path = os.path.join(output_folder, program_folder)
-        if os.path.isdir(program_path):
-            for json_file in os.listdir(program_path):
-                if json_file.endswith('.json'):
-                    json_path = os.path.join(program_path, json_file)
-                    sequence, target = extract_features_from_json(json_path, feature_keys)
-                    if sequence and target is not None:
-                        all_sequences.append(sequence)
-                        all_targets.append(target)
-    
-    if not all_sequences:
-        raise ValueError("No valid sequences loaded from the data.")
-    
-    # Pad sequences
+    # Load data
+    all_sequences, all_speedups, feature_keys = load_data(output_folder)
+    print(f"Loaded {len(all_sequences)} sequences with {len(feature_keys)} features each.")
+
+    # Prepare data: Pad sequences
     max_len = max(len(seq) for seq in all_sequences)
     feature_dim = len(feature_keys)
     padded_sequences, masks = pad_sequences(all_sequences, max_len, feature_dim)
     
     # Split into training and testing sets
     train_sequences, test_sequences, train_masks, test_masks, train_targets, test_targets = train_test_split(
-        padded_sequences, masks, all_targets, test_size=0.2, random_state=42
+        padded_sequences, masks, all_speedups, test_size=0.2, random_state=42
     )
     
     # Create datasets and data loaders
@@ -146,7 +213,7 @@ def main():
             total_loss += loss.item()
         
         avg_loss = total_loss / len(train_loader)
-        print(f'Epoch {epoch+1}/{num_epochs}, Training Loss: {avg_loss:.4f}')
+        print(f'Epoch {epoch+1}/{num_epochs}, Loss: {avg_loss:.4f}')
     
     # Testing
     model.eval()
