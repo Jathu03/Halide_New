@@ -10,16 +10,14 @@ import json
 # Helper function to parse fractions
 def parse_number(s):
     try:
-        # If it's a simple number, convert to float
         return float(s)
     except ValueError:
-        # If it's a fraction (e.g., '1/8'), evaluate it
         if '/' in s:
             num, denom = s.split('/')
             return float(num) / float(denom)
         raise ValueError(f"Cannot convert {s} to float")
 
-# 1. Feature Extraction Function (Modified)
+# 1. Feature Extraction Function (Corrected)
 def extract_features(file_path):
     with open(file_path, 'r') as f:
         data = json.load(f)
@@ -32,7 +30,6 @@ def extract_features(file_path):
         jacobian = edge['Details']['Load Jacobians']
         jacobian_vals = []
         for row in jacobian:
-            # Handle both numbers and fractions, exclude '_', '0', '1'
             nums = [parse_number(x) for x in row.split() if x not in ['_', '0', '1']]
             jacobian_vals.extend(nums)
         edge_features.extend(jacobian_vals)
@@ -48,10 +45,10 @@ def extract_features(file_path):
                 hist_vals.append(val)
         node_features.extend(hist_vals)
     
-    # Extract Scheduling Features
+    # Extract Scheduling Features (from scheduling_feature in Schedules)
     scheduling_features = []
     for schedule in data['programming_details']['Schedules']:
-        if isinstance(schedule, dict) and 'Details' in schedule:
+        if isinstance(schedule, dict) and 'Details' in schedule and 'scheduling_feature' in schedule['Details']:
             sched_data = schedule['Details']['scheduling_feature']
             sched_vals = [float(v) for v in sched_data.values()]
             scheduling_features.extend(sched_vals)
@@ -61,9 +58,11 @@ def extract_features(file_path):
     features.extend(node_features)
     features.extend(scheduling_features)
     
-    # Get execution time (y_data)
-    execution_time = next(item['value'] for item in data['programming_details']['Schedules'] 
-                         if item.get('name') == 'total_execution_time_ms')
+    # Get execution time (y_data) from Schedules list
+    execution_time = next(
+        item['value'] for item in data['programming_details']['Schedules']
+        if 'name' in item and item['name'] == 'total_execution_time_ms'
+    )
     
     return np.array(features), execution_time
 
@@ -79,6 +78,7 @@ def load_data(folder_path):
             X_data.append(features)
             y_data.append(exec_time)
     
+    # Pad sequences to same length
     max_length = max(len(x) for x in X_data)
     X_data_padded = np.array([np.pad(x, (0, max_length - len(x)), 'constant') 
                             for x in X_data])
@@ -238,6 +238,6 @@ if __name__ == "__main__":
     model, scaler_X, scaler_y = train_lstm_model(folder_path)
     
     # Example prediction
-    new_file = 'path/to/new/schedule.json'
+    new_file = 'Output_Programs/program_50002/0_0.json'
     predicted_time = predict_execution_time(model, scaler_X, scaler_y, new_file)
     print(f"Predicted Execution Time: {predicted_time} ms")
