@@ -1,457 +1,163 @@
-import os
-import json
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import MinMaxScaler
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+import os
+import json
 
-# Step 1: Load JSON Files from Directory
-def load_json_files(directory):
-    data = []
-    program_names = []
+# 1. Feature Extraction Function
+def extract_features(file_path):
+    with open(file_path, 'r') as f:
+        data = json.load(f)
     
-    for program_folder in os.listdir(directory):
-        program_path = os.path.join(directory, program_folder)
-        if os.path.isdir(program_path):
-            program_data = []
-            json_files = [f for f in os.listdir(program_path) if f.endswith('.json')]
-            print(f"Program {program_folder}: Found {len(json_files)} JSON files")
-            for json_file in json_files:
-                file_path = os.path.join(program_path, json_file)
-                try:
-                    with open(file_path, 'r') as f:
-                        json_data = json.load(f)
-                        program_data.append(json_data)
-                except json.JSONDecodeError as e:
-                    print(f"Skipping {file_path}: Invalid JSON ({e})")
-                except Exception as e:
-                    print(f"Skipping {file_path}: Error ({e})")
-            if program_data:
-                data.append(program_data)
-                program_names.append(program_folder)
-            else:
-                print(f"Warning: No valid JSON files loaded from {program_folder}")
-    
-    if not data:
-        raise ValueError("No valid data loaded from Output_Programs folder")
-    return data, program_names
-
-# Step 2: Enhanced Feature Extraction with Better Execution Time Detection
-def extract_features(json_data, debug=False):
     features = []
     
-    # Extract from Edges
-    edges = json_data.get('programming_details', {}).get('Edges', [])
-    num_edges = len(edges)
-    footprint_sizes = [len(edge.get('Details', {}).get('Footprint', [])) for edge in edges if 'Details' in edge]
-    jacobian_sizes = [len(edge.get('Details', {}).get('Load Jacobians', [])) for edge in edges if 'Details' in edge]
+    # Extract Edge Features (numerical values from Load Jacobians)
+    edge_features = []
+    for edge in data['programming_details']['Edges']:
+        jacobian = edge['Details']['Load Jacobians']
+        # Convert Jacobian strings to numerical values
+        jacobian_vals = []
+        for row in jacobian:
+            nums = [float(x) for x in row.split() if x not in ['_', '0', '1']]
+            jacobian_vals.extend(nums)
+        edge_features.extend(jacobian_vals)
     
-    features.extend([
-        num_edges,
-        np.mean(footprint_sizes) if footprint_sizes else 0,
-        np.mean(jacobian_sizes) if jacobian_sizes else 0
-    ])
+    # Extract Node Features (numerical values from Op histogram)
+    node_features = []
+    for node in data['programming_details']['Nodes']:
+        histogram = node['Details']['Op histogram']
+        hist_vals = []
+        for line in histogram:
+            if ':' in line:
+                val = float(line.split(':')[1].strip())
+                hist_vals.append(val)
+        node_features.extend(hist_vals)
     
-    # Extract from Nodes
-    nodes = json_data.get('programming_details', {}).get('Nodes', [])
-    num_nodes = len(nodes)
+    # Extract Scheduling Features
+    scheduling_features = []
+    for schedule in data['programming_details']['Schedules']:
+        if isinstance(schedule, dict) and 'Details' in schedule:
+            sched_data = schedule['Details']['scheduling_feature']
+            sched_vals = [float(v) for v in sched_data.values()]
+            scheduling_features.extend(sched_vals)
     
-    # Memory patterns extraction
-    memory_patterns = []
-    for node in nodes:
-        if 'Details' in node and 'Memory access patterns' in node['Details']:
-            patterns = node['Details']['Memory access patterns']
-            if patterns and isinstance(patterns, list) and patterns[0]:
-                try:
-                    pattern = patterns[0]
-                    if isinstance(pattern, str):
-                        values = pattern.split()[1:]
-                        memory_patterns.append(sum(map(int, values)))
-                    elif isinstance(pattern, dict) and 'pattern' in pattern:
-                        values = pattern['pattern'].split()
-                        memory_patterns.append(sum(map(int, values)))
-                except (ValueError, IndexError, KeyError):
-                    continue
+    # Combine all features
+    features.extend(edge_features)
+    features.extend(node_features)
+    features.extend(scheduling_features)
     
-    # Op histogram extraction
-    op_histogram = []
-    for node in nodes:
-        if 'Details' in node and 'Op histogram' in node['Details']:
-            ops = node['Details']['Op histogram']
-            if ops and isinstance(ops, list):
-                try:
-                    for op in ops:
-                        if isinstance(op, str) and len(op.split()) > 0:
-                            op_histogram.append(int(op.split()[-1]))
-                        elif isinstance(op, dict) and 'count' in op:
-                            op_histogram.append(int(op['count']))
-                except (ValueError, IndexError, KeyError):
-                    continue
+    # Get execution time (y_data)
+    execution_time = next(item['value'] for item in data['programming_details']['Schedules'] 
+                         if item.get('name') == 'total_execution_time_ms')
     
-    features.extend([
-        num_nodes,
-        np.mean(memory_patterns) if memory_patterns else 0,
-        np.mean(op_histogram) if op_histogram else 0
-    ])
-    
-    # Ensure consistent feature length
-    while len(features) < 6:
-        features.append(0)
-    
-    # ENHANCED EXECUTION TIME EXTRACTION
-    execution_time = None
-    if debug:
-        print(f"JSON structure keys: {json_data.keys()}")
-    
-    # Method 1: Original schedule_feature list format
-    if 'schedule_feature' in json_data and isinstance(json_data['schedule_feature'], list):
-        for item in json_data['schedule_feature']:
-            if isinstance(item, dict) and item.get('name') == 'total_execution_time_ms':
-                time_value = item.get('value', 0)
-                if isinstance(time_value, (int, float)):
-                    execution_time = float(time_value)
-                elif isinstance(time_value, str):
-                    try:
-                        execution_time = float(time_value)
-                    except ValueError:
-                        continue
-                if debug and execution_time is not None:
-                    print(f"Found execution time in schedule_feature: {execution_time}")
-                break
-    
-    # Method 2: schedule_feature dict format
-    if execution_time is None and 'schedule_feature' in json_data and isinstance(json_data['schedule_feature'], dict):
-        if 'total_execution_time_ms' in json_data['schedule_feature']:
-            execution_time = float(json_data['schedule_feature']['total_execution_time_ms'])
-            if debug:
-                print(f"Found execution time in schedule_feature dict: {execution_time}")
-    
-    # Method 3: Direct key lookup
-    if execution_time is None:
-        for key in ['total_execution_time_ms', 'execution_time_ms', 'execution_time', 'runtime_ms', 'runtime']:
-            if key in json_data:
-                execution_time = float(json_data[key])
-                if debug:
-                    print(f"Found execution time at key '{key}': {execution_time}")
-                break
-    
-    # Method 4: Nested in performance_metrics or similar
-    if execution_time is None:
-        for metrics_key in ['performance_metrics', 'metrics', 'details', 'Details', 'stats', 'timing']:
-            if metrics_key in json_data and isinstance(json_data[metrics_key], dict):
-                for time_key in ['total_execution_time_ms', 'execution_time_ms', 'time_ms', 'runtime_ms']:
-                    if time_key in json_data[metrics_key]:
-                        execution_time = float(json_data[metrics_key][time_key])
-                        if debug:
-                            print(f"Found execution time in {metrics_key}.{time_key}: {execution_time}")
-                        break
-                if execution_time is not None:
-                    break
-    
-    # Method 5: Nested in programming_details
-    if execution_time is None and 'programming_details' in json_data:
-        details = json_data['programming_details']
-        if isinstance(details, dict):
-            for time_key in ['total_execution_time_ms', 'execution_time_ms', 'time_ms', 'runtime_ms']:
-                if time_key in details:
-                    execution_time = float(details[time_key])
-                    if debug:
-                        print(f"Found execution time in programming_details.{time_key}: {execution_time}")
-                    break
-    
-    # Method 6: Check scheduling_data (new based on your output)
-    if execution_time is None and 'scheduling_data' in json_data:
-        sched_data = json_data['scheduling_data']
-        if isinstance(sched_data, dict):
-            for time_key in ['execution_time_ms', 'runtime_ms', 'time_ms', 'total_time_ms']:
-                if time_key in sched_data:
-                    try:
-                        execution_time = float(sched_data[time_key])
-                        if debug:
-                            print(f"Found execution time in scheduling_data.{time_key}: {execution_time}")
-                        break
-                    except (ValueError, TypeError):
-                        continue
-    
-    # Fallback: No synthetic data unless explicitly enabled
-    if execution_time is None:
-        if debug:
-            print("Warning: No execution time found in JSON")
-        return np.array(features, dtype=float), None
-    
-    return np.array(features, dtype=float), execution_time
+    return np.array(features), execution_time
 
-# Step 3: Prepare Data for LSTM with Better Error Handling
-def prepare_lstm_data(data):
-    X, y = [], []
-    feature_dim = None
+# 2. Load and Process All Files
+def load_data(folder_path):
+    X_data = []
+    y_data = []
     
-    # Determine feature dimension
-    for program_data in data:
-        for schedule in program_data:
-            features, _ = extract_features(schedule)
-            if feature_dim is None:
-                feature_dim = len(features)
-            elif len(features) > feature_dim:
-                feature_dim = len(features)
+    for filename in os.listdir(folder_path):
+        if filename.endswith('.json'):
+            file_path = os.path.join(folder_path, filename)
+            features, exec_time = extract_features(file_path)
+            X_data.append(features)
+            y_data.append(exec_time)
     
-    if feature_dim is None:
-        raise ValueError("Could not determine feature dimension from data")
+    # Pad sequences to same length
+    max_length = max(len(x) for x in X_data)
+    X_data_padded = np.array([np.pad(x, (0, max_length - len(x)), 'constant') 
+                            for x in X_data])
     
-    print(f"Using feature dimension: {feature_dim}")
-    
-    # Extract features and targets
-    for i, program_data in enumerate(data):
-        program_X, program_y = [], []
-        schedules_with_time = 0
-        
-        for j, schedule in enumerate(program_data):
-            # Debug all schedules to diagnose issues
-            debug_this = True
-            features, exec_time = extract_features(schedule, debug=debug_this)
-            
-            if exec_time is not None:
-                schedules_with_time += 1
-                if len(features) < feature_dim:
-                    features = np.pad(features, (0, feature_dim - len(features)), 'constant')
-                elif len(features) > feature_dim:
-                    features = features[:feature_dim]
-                
-                program_X.append(features)
-                program_y.append(exec_time)
-            else:
-                print(f"Program {i}, Schedule {j}: Skipped due to missing execution time")
-        
-        if schedules_with_time > 0:
-            X.append(program_X)
-            y.append(program_y)
-            print(f"Program {i}: Added {schedules_with_time} schedules with execution times")
-        else:
-            print(f"Warning: No valid schedules with execution time in program {i}")
-    
-    if not X or not y:
-        raise ValueError("No valid sequences with execution times found in data")
-    
-    # Pad sequences
-    max_seq_len = max(len(seq) for seq in X)
-    X_padded = np.zeros((len(X), max_seq_len, feature_dim))
-    y_padded = np.zeros((len(y), max_seq_len))
-    
-    for i in range(len(X)):
-        seq_len = len(X[i])
-        X_padded[i, :seq_len, :] = X[i]
-        y_padded[i, :seq_len] = y[i]
-    
-    print(f"Target values range: min={y_padded.min()}, max={y_padded.max()}, mean={y_padded.mean()}")
+    return X_data_padded, np.array(y_data)
+
+# 3. Prepare Sequences for LSTM
+def create_sequences(X, y, sequence_length=5):
+    X_seq, y_seq = [], []
+    for i in range(len(X) - sequence_length):
+        X_seq.append(X[i:(i + sequence_length)])
+        y_seq.append(y[i + sequence_length])
+    return np.array(X_seq), np.array(y_seq)
+
+# 4. Main Training Function
+def train_lstm_model(folder_path):
+    # Load and preprocess data
+    X_data, y_data = load_data(folder_path)
     
     # Normalize features
     scaler_X = MinMaxScaler()
-    X_reshaped = X_padded.reshape(-1, X_padded.shape[-1])
-    X_normalized = scaler_X.fit_transform(X_reshaped).reshape(X_padded.shape)
+    X_scaled = scaler_X.fit_transform(X_data)
     
-    # Normalize target
     scaler_y = MinMaxScaler()
-    y_reshaped = y_padded.reshape(-1, 1)
-    y_normalized = scaler_y.fit_transform(y_reshaped).reshape(y_padded.shape)
+    y_scaled = scaler_y.fit_transform(y_data.reshape(-1, 1))
     
-    return X_normalized, y_normalized, scaler_X, scaler_y
-
-# Step 4: Custom Dataset for PyTorch
-class HalideDataset(Dataset):
-    def __init__(self, X, y):
-        self.X = torch.tensor(X, dtype=torch.float32)
-        self.y = torch.tensor(y, dtype=torch.float32)
+    # Create sequences
+    sequence_length = 5
+    X_seq, y_seq = create_sequences(X_scaled, y_scaled, sequence_length)
     
-    def __len__(self):
-        return len(self.X)
+    # Split into train and test sets
+    train_size = int(len(X_seq) * 0.8)
+    X_train, X_test = X_seq[:train_size], X_seq[train_size:]
+    y_train, y_test = y_seq[:train_size], y_seq[train_size:]
     
-    def __getitem__(self, idx):
-        return self.X[idx], self.y[idx]
-
-# Step 5: Define LSTM Model in PyTorch
-class LSTMModel(nn.Module):
-    def __init__(self, input_size, hidden_size1=128, hidden_size2=64):
-        super(LSTMModel, self).__init__()
-        self.lstm1 = nn.LSTM(input_size, hidden_size1, batch_first=True)
-        self.dropout1 = nn.Dropout(0.2)
-        self.lstm2 = nn.LSTM(hidden_size1, hidden_size2, batch_first=True)
-        self.dropout2 = nn.Dropout(0.2)
-        self.fc1 = nn.Linear(hidden_size2, 32)
-        self.relu = nn.ReLU()
-        self.fc2 = nn.Linear(32, 1)
+    # Build LSTM model
+    model = Sequential([
+        LSTM(100, input_shape=(sequence_length, X_scaled.shape[1]), return_sequences=True),
+        Dropout(0.2),
+        LSTM(50),
+        Dropout(0.2),
+        Dense(1)
+    ])
     
-    def forward(self, x):
-        out, _ = self.lstm1(x)
-        out = self.dropout1(out)
-        out, _ = self.lstm2(out)
-        out = self.dropout2(out[:, -1, :])  # Take the last timestep
-        out = self.fc1(out)
-        out = self.relu(out)
-        out = self.fc2(out)
-        return out
-
-# Step 6: Training and Evaluation
-def train_model(model, train_loader, val_loader, epochs=50, device='cuda' if torch.cuda.is_available() else 'cpu'):
-    model = model.to(device)
-    criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    model.compile(optimizer='adam', loss='mse')
     
-    best_val_loss = float('inf')
-    patience = 10
-    counter = 0
-    
-    for epoch in range(epochs):
-        model.train()
-        train_loss = 0
-        for X_batch, y_batch in train_loader:
-            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-            optimizer.zero_grad()
-            outputs = model(X_batch)
-            loss = criterion(outputs, y_batch[:, -1].unsqueeze(1))
-            loss.backward()
-            optimizer.step()
-            train_loss += loss.item()
-        
-        model.eval()
-        val_loss = 0
-        with torch.no_grad():
-            for X_batch, y_batch in val_loader:
-                X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-                outputs = model(X_batch)
-                val_loss += criterion(outputs, y_batch[:, -1].unsqueeze(1)).item()
-        
-        avg_train_loss = train_loss / len(train_loader)
-        avg_val_loss = val_loss / len(val_loader)
-        print(f"Epoch {epoch+1}/{epochs}, Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}")
-        
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-            counter = 0
-            torch.save(model.state_dict(), 'best_lstm_model.pt')
-        else:
-            counter += 1
-            if counter >= patience:
-                print(f"Early stopping at epoch {epoch+1}")
-                break
-    
-    model.load_state_dict(torch.load('best_lstm_model.pt'))
-    return model
-
-def evaluate_model(model, test_loader, scaler_y, device='cuda' if torch.cuda.is_available() else 'cpu'):
-    model.eval()
-    predictions, actuals = [], []
-    with torch.no_grad():
-        for X_batch, y_batch in test_loader:
-            X_batch = X_batch.to(device)
-            outputs = model(X_batch)
-            predictions.append(outputs.cpu().numpy())
-            actuals.append(y_batch[:, -1].numpy())
-    
-    y_pred = np.concatenate(predictions)
-    y_test = np.concatenate(actuals)
-    
-    y_pred_rescaled = scaler_y.inverse_transform(y_pred.reshape(-1, 1)).flatten()
-    y_test_rescaled = scaler_y.inverse_transform(y_test.reshape(-1, 1)).flatten()
-    
-    mse = np.mean((y_test_rescaled - y_pred_rescaled) ** 2)
-    rmse = np.sqrt(mse)
-    mae = np.mean(np.abs(y_test_rescaled - y_pred_rescaled))
-    mape = np.mean(np.abs((y_test_rescaled - y_pred_rescaled) / (y_test_rescaled + 1e-8))) * 100
-    
-    print(f"Test MSE: {mse:.6f}")
-    print(f"Test RMSE: {rmse:.6f}")
-    print(f"Test MAE: {mae:.6f}")
-    print(f"Test MAPE: {mape:.2f}%")
-    
-    return y_test_rescaled, y_pred_rescaled
-
-# Main Execution
-def predict_halide_speedup(data_dir, use_synthetic=False):
-    if use_synthetic:
-        os.environ['USE_SYNTHETIC_DATA'] = 'True'
-    else:
-        os.environ['USE_SYNTHETIC_DATA'] = 'False'
-    
-    # Load and prepare data
-    data, program_names = load_json_files(data_dir)
-    print(f"Loaded data from {len(program_names)} programs")
-    print(f"Program names: {program_names[:5]}")
-    
-    try:
-        X, y, scaler_X, scaler_y = prepare_lstm_data(data)
-        print(f"X shape: {X.shape}, y shape: {y.shape}")
-    except ValueError as e:
-        print(f"Error preparing data: {e}")
-        if use_synthetic:
-            print("Falling back to synthetic data...")
-            # Generate synthetic data
-            n_programs = 10
-            max_schedules = 20
-            feature_dim = 6  # Default from extract_features
-            X, y = [], []
-            for i in range(n_programs):
-                n_schedules = np.random.randint(5, max_schedules)
-                program_X = np.random.rand(n_schedules, feature_dim)
-                base_time = np.random.uniform(10, 100)
-                program_y = base_time + np.sum(program_X, axis=1) * np.random.uniform(5, 10)
-                X.append(program_X)
-                y.append(program_y)
-            max_seq_len = max(len(seq) for seq in X)
-            X_padded = np.zeros((len(X), max_seq_len, feature_dim))
-            y_padded = np.zeros((len(y), max_seq_len))
-            for i in range(len(X)):
-                seq_len = len(X[i])
-                X_padded[i, :seq_len, :] = X[i]
-                y_padded[i, :seq_len] = y[i]
-            scaler_X = MinMaxScaler()
-            X_reshaped = X_padded.reshape(-1, X_padded.shape[-1])
-            X_normalized = scaler_X.fit_transform(X_reshaped).reshape(X_padded.shape)
-            scaler_y = MinMaxScaler()
-            y_reshaped = y_padded.reshape(-1, 1)
-            y_normalized = scaler_y.fit_transform(y_reshaped).reshape(y_padded.shape)
-            X, y = X_normalized, y_normalized
-            print(f"X shape with synthetic data: {X.shape}, y shape: {y.shape}")
-        else:
-            raise
-    
-    # Split data
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-    X_train, X_val, y_train, y_val = train_test_split(X_train, y_train, test_size=0.25, random_state=42)
-    
-    # Create datasets and loaders
-    train_dataset = HalideDataset(X_train, y_train)
-    val_dataset = HalideDataset(X_val, y_val)
-    test_dataset = HalideDataset(X_test, y_test)
-    
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
-    
-    # Initialize and train model
-    input_size = X.shape[2]
-    model = LSTMModel(input_size)
-    model = train_model(model, train_loader, val_loader, epochs=50)
+    # Train model
+    history = model.fit(
+        X_train, y_train,
+        epochs=50,
+        batch_size=32,
+        validation_split=0.2,
+        verbose=1
+    )
     
     # Evaluate model
-    y_test_rescaled, y_pred_rescaled = evaluate_model(model, test_loader, scaler_y)
+    test_loss = model.evaluate(X_test, y_test, verbose=0)
+    print(f"Test Loss: {test_loss}")
     
-    for i in range(min(5, len(y_test_rescaled))):
-        print(f"Example {i+1}: True Time: {y_test_rescaled[i]:.2f} ms, Predicted Time: {y_pred_rescaled[i]:.2f} ms")
+    # Save model and scalers
+    model.save('lstm_schedule_predictor.h5')
+    np.save('scaler_X.npy', scaler_X)
+    np.save('scaler_y.npy', scaler_y)
     
-    # Save model
-    torch.save({
-        'model_state_dict': model.state_dict(),
-        'scaler_X': scaler_X,
-        'scaler_y': scaler_y,
-        'feature_dim': input_size
-    }, 'lstm_execution_time_predictor.pt')
-    
-    print("Model saved as 'lstm_execution_time_predictor.pt'")
     return model, scaler_X, scaler_y
 
+# 5. Prediction Function
+def predict_execution_time(model, scaler_X, scaler_y, new_file_path, sequence_length=5):
+    # Load and preprocess new data
+    features, _ = extract_features(new_file_path)
+    max_length = scaler_X.data_max_.shape[0]
+    features_padded = np.pad(features, (0, max_length - len(features)), 'constant')
+    features_scaled = scaler_X.transform(features_padded.reshape(1, -1))
+    
+    # Create sequence (assuming we have previous data points)
+    # For single prediction, we'll need to provide a sequence
+    # Here we'll repeat the single input for demonstration
+    sequence = np.repeat(features_scaled, sequence_length, axis=0)[np.newaxis, :]
+    
+    # Make prediction
+    pred_scaled = model.predict(sequence)
+    prediction = scaler_y.inverse_transform(pred_scaled)
+    
+    return prediction[0][0]
+
+# Main execution
 if __name__ == "__main__":
-    predict_halide_speedup(data_dir="Output_Programs", use_synthetic=False)
+    folder_path = 'Output_Programs/program_50001'  # Replace with actual path
+    model, scaler_X, scaler_y = train_lstm_model(folder_path)
+    
+    # Example prediction
+    new_file = 'path/to/new/schedule.json'
+    predicted_time = predict_execution_time(model, scaler_X, scaler_y, new_file)
+    print(f"Predicted Execution Time: {predicted_time} ms")
