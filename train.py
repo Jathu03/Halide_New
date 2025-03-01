@@ -24,22 +24,25 @@ def load_data(file_path):
 
 # Create a template for Halide program representation
 def get_halide_representation_template(program_dict):
-    nodes = program_dict["programming_details"]["Nodes"]
-    edges = program_dict["programming_details"]["Edges"]
-    # Scheduling data is in the list under "programming_details"
-    scheduling = [item for item in program_dict["programming_details"] if isinstance(item, dict) and "Name" in item]
+    # Handle both list and dict structures
+    if isinstance(program_dict, list):
+        for item in program_dict:
+            if isinstance(item, dict) and "programming_details" in item:
+                nodes = item["programming_details"]["Nodes"]
+                edges = item["programming_details"]["Edges"]
+                break
+    else:
+        nodes = program_dict["programming_details"]["Nodes"]
+        edges = program_dict["programming_details"]["Edges"]
 
     node_dict = {node["Name"]: node["Details"] for node in nodes}
-    sched_dict = {item["Name"]: item["Details"]["scheduling_feature"] for item in scheduling if "Name" in item}
-
+    # Scheduling data will be handled in the next function
     comps_repr_templates = []
     comps_indices_dict = {}
     comps_placeholders_indices_dict = {}
 
     for comp_idx, node_name in enumerate(node_dict.keys()):
         node = node_dict[node_name]
-        sched = sched_dict.get(node_name, {})
-
         op_hist = {}
         for entry in node["Op histogram"]:
             parts = entry.split(':')
@@ -87,12 +90,27 @@ def get_halide_representation_template(program_dict):
 
 # Fill the template with schedule-specific features
 def get_halide_schedule_representation(program_dict, comps_repr_templates, comps_indices_dict, comps_placeholders_indices_dict):
-    nodes = program_dict["programming_details"]["Nodes"]
-    # Scheduling data is in the list under "programming_details"
-    scheduling = [item for item in program_dict["programming_details"] if isinstance(item, dict) and "Name" in item]
-    node_dict = {node["Name"]: node["Details"] for node in nodes}
-    sched_dict = {item["Name"]: item["Details"]["scheduling_feature"] for item in scheduling if "Name" in item}
-    exec_time = next(item["value"] for item in program_dict["programming_details"] if isinstance(item, dict) and item.get("name") == "total_execution_time_ms")
+    # Handle both list and dict structures
+    if isinstance(program_dict, list):
+        nodes = None
+        sched_dict = {}
+        exec_time = None
+        for item in program_dict:
+            if isinstance(item, dict):
+                if "programming_details" in item:
+                    nodes = item["programming_details"]["Nodes"]
+                    node_dict = {node["Name"]: node["Details"] for node in nodes}
+                elif "Name" in item and "scheduling_feature" in item["Details"]:
+                    sched_dict[item["Name"]] = item["Details"]["scheduling_feature"]
+                elif item.get("name") == "total_execution_time_ms":
+                    exec_time = item["value"]
+        if nodes is None or exec_time is None:
+            raise ValueError("Missing required data in JSON list structure")
+    else:
+        nodes = program_dict["programming_details"]["Nodes"]
+        node_dict = {node["Name"]: node["Details"] for node in nodes}
+        sched_dict = {}  # If scheduling is not in the dict, we'll assume empty
+        exec_time = program_dict.get("total_execution_time_ms")  # Fallback for dict structure
 
     comps_repr = [list(template) for template in comps_repr_templates]
 
@@ -123,6 +141,8 @@ def get_halide_schedule_representation(program_dict, comps_repr_templates, comps
     elif len(padded_comps) > MAX_NODES:
         padded_comps = padded_comps[:MAX_NODES]
 
+    if exec_time is None:
+        raise ValueError("Execution time ('total_execution_time_ms') not found in JSON")
     return torch.FloatTensor(padded_comps).unsqueeze(0), float(exec_time)
 
 # Load and preprocess Halide dataset
@@ -138,17 +158,24 @@ def load_halide_dataset(data_dir="Output_Programs"):
             for filename in os.listdir(program_path):
                 if filename.endswith(".json"):
                     file_path = os.path.join(program_path, filename)
-                    program_dict = load_data(file_path)
-                    templates, indices_dict, placeholders_dict = get_halide_representation_template(program_dict)
-                    comps_tensor, exec_time = get_halide_schedule_representation(program_dict, templates, indices_dict, placeholders_dict)
-                    program_reprs.append(comps_tensor.squeeze(0).numpy())
-                    program_times.append(exec_time)
+                    try:
+                        program_dict = load_data(file_path)
+                        templates, indices_dict, placeholders_dict = get_halide_representation_template(program_dict)
+                        comps_tensor, exec_time = get_halide_schedule_representation(program_dict, templates, indices_dict, placeholders_dict)
+                        program_reprs.append(comps_tensor.squeeze(0).numpy())
+                        program_times.append(exec_time)
+                    except ValueError as e:
+                        print(f"Error processing {file_path}: {e}")
+                        continue
             # Calculate speedup within each program
             if program_times:
                 baseline_time = max(program_times)  # Max time as baseline
                 X_data.extend(program_reprs)
                 y_data.extend([baseline_time / time for time in program_times])
 
+    if not X_data:
+        raise ValueError("No valid data loaded from Output_Programs folder")
+    
     X_data = np.array(X_data)  # Shape: (samples, MAX_NODES, features)
     y_data = np.array(y_data).reshape(-1, 1)  # Shape: (samples, 1)
 
