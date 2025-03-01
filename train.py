@@ -24,18 +24,19 @@ def load_data(file_path):
 
 # Create a template for Halide program representation
 def get_halide_representation_template(program_dict):
-    # Handle both list and dict structures
-    if isinstance(program_dict, list):
-        for item in program_dict:
-            if isinstance(item, dict) and "programming_details" in item:
-                nodes = item["programming_details"]["Nodes"]
-                edges = item["programming_details"]["Edges"]
-                break
-        else:
-            raise ValueError("No 'programming_details' found in JSON list")
-    else:
-        nodes = program_dict["programming_details"]["Nodes"]
-        edges = program_dict["programming_details"]["Edges"]
+    # Expect a list structure
+    if not isinstance(program_dict, list):
+        raise ValueError("JSON must be a list")
+    
+    nodes = None
+    edges = None
+    for item in program_dict:
+        if isinstance(item, dict) and "programming_details" in item:
+            nodes = item["programming_details"]["Nodes"]
+            edges = item["programming_details"]["Edges"]
+            break
+    if nodes is None or edges is None:
+        raise ValueError("No 'programming_details' with 'Nodes' and 'Edges' found in JSON list")
 
     node_dict = {node["Name"]: node["Details"] for node in nodes}
     comps_repr_templates = []
@@ -91,34 +92,27 @@ def get_halide_representation_template(program_dict):
 
 # Fill the template with schedule-specific features
 def get_halide_schedule_representation(program_dict, comps_repr_templates, comps_indices_dict, comps_placeholders_indices_dict):
-    # Handle both list and dict structures
-    if isinstance(program_dict, list):
-        nodes = None
-        sched_dict = {}
-        exec_time = None
-        for item in program_dict:
-            if isinstance(item, dict):
-                if "programming_details" in item:
-                    nodes = item["programming_details"]["Nodes"]
-                    node_dict = {node["Name"]: node["Details"] for node in nodes}
-                elif "Name" in item and "scheduling_feature" in item["Details"]:
-                    sched_dict[item["Name"]] = item["Details"]["scheduling_feature"]
-                elif item.get("name") == "total_execution_time_ms":
-                    exec_time = item["value"]
-                elif "value" in item and isinstance(item["value"], (int, float)) and exec_time is None:
-                    exec_time = item["value"]
-                    print(f"Warning: Using generic 'value' {exec_time} as execution time for lack of 'total_execution_time_ms'")
-        if nodes is None:
-            raise ValueError("Missing 'programming_details' in JSON list")
-    else:
-        nodes = program_dict["programming_details"]["Nodes"]
-        node_dict = {node["Name"]: node["Details"] for node in nodes}
-        sched_dict = {}  # Assume no scheduling_feature in dict format
-        exec_time = program_dict.get("total_execution_time_ms") or program_dict.get("value")
+    # Expect a list structure
+    if not isinstance(program_dict, list):
+        raise ValueError("JSON must be a list")
 
-    # If exec_time still not found, return None to skip this file
+    nodes = None
+    sched_dict = {}
+    exec_time = None
+    for item in program_dict:
+        if isinstance(item, dict):
+            if "programming_details" in item:
+                nodes = item["programming_details"]["Nodes"]
+                node_dict = {node["Name"]: node["Details"] for node in nodes}
+            elif "Name" in item and "scheduling_feature" in item["Details"]:
+                sched_dict[item["Name"]] = item["Details"]["scheduling_feature"]
+            elif item.get("name") == "total_execution_time_ms":
+                exec_time = item["value"]
+
+    if nodes is None:
+        raise ValueError("Missing 'programming_details' with 'Nodes' in JSON list")
     if exec_time is None:
-        return None, None
+        return None, None  # Skip this file if no execution time
 
     comps_repr = [list(template) for template in comps_repr_templates]
 
@@ -173,9 +167,9 @@ def load_halide_dataset(data_dir="Output_Programs"):
                             program_reprs.append(comps_tensor.squeeze(0).numpy())
                             program_times.append(exec_time)
                         else:
-                            print(f"Error processing {file_path}: Execution time not found in JSON")
+                            print(f"Skipping {file_path}: Execution time ('total_execution_time_ms') not found in JSON")
                     except ValueError as e:
-                        print(f"Error processing {file_path}: {e}")
+                        print(f"Skipping {file_path}: {e}")
                         continue
             # Calculate speedup within each program
             if program_times:
