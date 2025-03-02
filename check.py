@@ -174,24 +174,21 @@ class EnhancedLSTMModel(nn.Module):
     def __init__(self, input_size, hidden_size1=128, hidden_size2=64, output_size=1):
         super(EnhancedLSTMModel, self).__init__()
         self.lstm1 = nn.LSTM(input_size, hidden_size1, batch_first=True)
-        self.bn1 = nn.BatchNorm1d(hidden_size1)
         self.dropout1 = nn.Dropout(0.3)
         self.lstm2 = nn.LSTM(hidden_size1, hidden_size2, batch_first=True)
-        self.bn2 = nn.BatchNorm1d(hidden_size2)
         self.dropout2 = nn.Dropout(0.3)
+        self.bn = nn.BatchNorm1d(hidden_size2)  # Apply BN after LSTM on hidden size
         self.fc = nn.Linear(hidden_size2, output_size)
         self.relu = nn.ReLU()  # Ensure non-negative output
     
     def forward(self, x):
-        out, _ = self.lstm1(x)
-        out = out.transpose(1, 2)  # [batch, hidden_size1, seq_len]
-        out = self.bn1(out.transpose(1, 2))  # [batch, seq_len, hidden_size1]
+        out, _ = self.lstm1(x)  # [batch_size, seq_len=1, hidden_size1]
         out = self.dropout1(out)
-        out, _ = self.lstm2(out)
-        out = out.transpose(1, 2)  # [batch, hidden_size2, seq_len]
-        out = self.bn2(out.transpose(1, 2))  # [batch, seq_len, hidden_size2]
+        out, _ = self.lstm2(out)  # [batch_size, seq_len=1, hidden_size2]
         out = self.dropout2(out)
-        out = self.fc(out[:, -1, :])
+        out = out[:, -1, :]  # Take last timestep: [batch_size, hidden_size2]
+        out = self.bn(out)  # Apply batch norm: [batch_size, hidden_size2]
+        out = self.fc(out)  # [batch_size, output_size]
         out = self.relu(out)  # Clamp to non-negative
         return out
 
@@ -215,7 +212,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, schedule
             outputs = model(inputs)
             loss = criterion(outputs, targets)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             running_loss += loss.item() * inputs.size(0)
         
@@ -269,7 +266,6 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, orig_y_test
     y_test_actual = y_scaler.inverse_transform(y_test)
     y_pred_actual = y_scaler.inverse_transform(y_pred_scaled)
     
-    # Clamp predictions to non-negative
     y_pred_actual = np.clip(y_pred_actual, 0, None)
     
     print("\nPredicted vs Actual Execution Times for Test Files:")
@@ -296,14 +292,13 @@ def main(main_dir, model_type='lstm', train_ratio=0.9):
     
     train_loader, test_loader = create_data_loaders(X_train, y_train, X_test, y_test, batch_size=16)
     
-    # Use a simpler LSTM model for stability
     if model_type == 'lstm':
         model = EnhancedLSTMModel(input_size=input_size, hidden_size1=128, hidden_size2=64)
     else:
         raise ValueError(f"Unknown model type: {model_type}. Using 'lstm' for now.")
     
     criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.0005)  # Reduced LR
+    optimizer = optim.Adam(model.parameters(), lr=0.0005)
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10, verbose=True)
     
     print(f"Training {model_type} model...")
@@ -320,6 +315,6 @@ def main(main_dir, model_type='lstm', train_ratio=0.9):
 
 if __name__ == "__main__":
     main_dir = "Output_Programs"
-    model, y_test_actual, y_pred_actual = main(main_dir, model_type='lstm')  # Switched to 'lstm' for stability
+    model, y_test_actual, y_pred_actual = main(main_dir, model_type='lstm')
     if model is not None:
         print("\nModel training and prediction completed!")
