@@ -9,17 +9,55 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
 
+def get_execution_time(file_path):
+    try:
+        # Open the file in binary mode to handle raw bytes
+        with open(file_path, 'rb') as f:
+            # Read the raw bytes and decode, replacing null characters
+            raw_content = f.read()
+            # Decode bytes to string, replacing null characters with an empty string
+            content = raw_content.decode('utf-8', errors='replace').replace('\0', '')
+            # Parse the cleaned content as JSON
+            data = json.loads(content)
+        
+        # Check if 'programming_details' exists
+        if 'programming_details' not in data:
+            print(f"Error: 'programming_details' key not found in {file_path}")
+            return None
+        
+        # Access the 'Schedules' list within 'programming_details'
+        
+        schedules = data["scheduling_data"]
+        # Look for the 'total_execution_time_ms' entry
+        for item in schedules:
+            if isinstance(item, dict) and item.get('name') == 'total_execution_time_ms':
+                execution_time = item.get('value')
+                if execution_time is not None:
+                    return float(execution_time)  # Ensure it's returned as a float
+        
+        print(f"Warning: 'total_execution_time_ms' not found in 'Schedules' of {file_path}")
+        return schedules[len(schedules)-1]["value"]
+    
+    except FileNotFoundError:
+        print(f"Error: File {file_path} not found")
+        return None
+    except json.JSONDecodeError as e:
+        print(f"Error: Invalid JSON format in {file_path}: {str(e)}")
+        return None
+    except UnicodeDecodeError as e:
+        print(f"Error: Encoding issue in {file_path}: {str(e)}")
+        return None
+    except Exception as e:
+        print(f"Error: An unexpected error occurred while processing {file_path}: {str(e)}")
+        return None
+
 # Function to extract features from a single JSON file
 def extract_features_from_file(file_path):
     with open(file_path, 'r') as f:
         data = json.load(f)
     
     # Extract execution time (target variable)
-    execution_time = None
-    for item in data:
-        if isinstance(item, dict) and item.get('name') == 'total_execution_time_ms':
-            execution_time = item.get('value')
-            break
+    execution_time = get_execution_time(file_path)
     
     if execution_time is None:
         print(f"Warning: No execution time found in {file_path}")
