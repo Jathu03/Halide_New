@@ -8,11 +8,6 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
 
-# Constants for representation
-MAX_LOOPS = 2  # Adjust based on your programs
-MAX_TRANSFORMS = 2  # Simplified for reorder-like transforms
-MAX_TAGS = 1  # One tag per transform
-
 def get_execution_time(file_path):
     try:
         with open(file_path, 'rb') as f:
@@ -47,10 +42,9 @@ def extract_optimized_features(file_path):
         node_dict = {node["Name"]: node["Details"] for node in nodes}
         sched_dict = {item["Name"]: item["Details"]["scheduling_feature"] for item in scheduling if "Name" in item and "Details" in item}
         
-        # Aggregate features
         features = {'execution_time': execution_time}
         
-        # Operation counts (aggregated)
+        # Operation counts
         op_counts = {}
         for node_name, details in node_dict.items():
             op_hist = details.get("Op histogram", [])
@@ -62,20 +56,20 @@ def extract_optimized_features(file_path):
                     op_counts[f'op_{op_name}'] = op_counts.get(f'op_{op_name}', 0) + op_count
         features.update(op_counts)
         
-        # Node and edge counts
+        # Structural features
         features['nodes_count'] = len(nodes)
         features['edges_count'] = len(edges)
         features['avg_inputs'] = np.mean([len([e for e in edges if e["To"] == n["Name"]]) for n in nodes]) if nodes else 0
         features['reductions_count'] = sum(1 for e in edges if ".update(" in e["To"])
         
-        # Scheduling features (per computation, then aggregated)
+        # Scheduling features
         loop_features = {
             'parallel_count': 0, 'tile_count': 0, 'total_tile_factor': 0,
             'vectorize_count': 0, 'total_vector_size': 0, 'unroll_count': 0, 'total_unroll_factor': 0
         }
         for node_name in node_dict:
             sched = sched_dict.get(node_name, {})
-            for loop_idx in range(min(MAX_LOOPS, 2)):
+            for _ in range(2):  # Assuming up to 2 loops
                 if sched.get("inner_parallelism", 1.0) > 1.0:
                     loop_features['parallel_count'] += 1
                 tile_factor = sched.get("unrolled_loop_extent", 1.0)
@@ -86,12 +80,11 @@ def extract_optimized_features(file_path):
                 if vector_size > 1.0:
                     loop_features['vectorize_count'] += 1
                     loop_features['total_vector_size'] += vector_size
-                if tile_factor > 1.0:  # Assuming unroll uses same metric
+                if tile_factor > 1.0:
                     loop_features['unroll_count'] += 1
                     loop_features['total_unroll_factor'] += tile_factor
         features.update(loop_features)
         
-        # Coarse scheduling metrics (from original)
         features['total_bytes_at_production'] = sum(sched.get('bytes_at_production', 0) for sched in sched_dict.values())
         features['total_vectors'] = sum(sched.get('num_vectors', 0) for sched in sched_dict.values())
         features['total_parallelism'] = sum(sched.get('inner_parallelism', 0) * sched.get('outer_parallelism', 1) for sched in sched_dict.values())
@@ -102,44 +95,41 @@ def extract_optimized_features(file_path):
         print(f"Error extracting features from {file_path}: {str(e)}")
         return None
 
-def process_all_files(directory_path):
-    all_features = []
-    file_names = []
-    for filename in sorted(os.listdir(directory_path)):  # Sort for consistency
-        if filename.endswith('.json'):
-            file_path = os.path.join(directory_path, filename)
-            features = extract_optimized_features(file_path)
-            if features is not None:
-                all_features.append(features)
-                file_names.append(filename)
-    return all_features, file_names
-
 def process_main_directory(main_dir):
-    all_features = []
-    all_file_names = []
+    train_features = []
+    test_features = []
+    test_file_names = []
+    
     subdirs = sorted([d for d in os.listdir(main_dir) if os.path.isdir(os.path.join(main_dir, d))])
     
-    if len(subdirs) < 30:
-        raise ValueError(f"Expected at least 30 subdirectories in {main_dir}, found {len(subdirs)}")
+    if not subdirs:
+        raise ValueError(f"No subdirectories found in {main_dir}")
     
-    for subdir in subdirs[:29]:
+    for subdir in subdirs:
         subdir_path = os.path.join(main_dir, subdir)
-        features, file_names = process_all_files(subdir_path)
-        if len(features) != 32:
-            print(f"Warning: Expected 32 files in {subdir_path}, found {len(features)}")
-        all_features.extend(features)
-        all_file_names.extend([os.path.join(subdir, fname) for fname in file_names])
-        print(f"Processed {len(features)} files from {subdir} for training")
+        all_features = []
+        all_file_names = []
+        
+        # Process all files in the subdirectory
+        for filename in sorted(os.listdir(subdir_path)):  # Sort for consistency
+            if filename.endswith('.json'):
+                file_path = os.path.join(subdir_path, filename)
+                features = extract_optimized_features(file_path)
+                if features is not None:
+                    all_features.append(features)
+                    all_file_names.append(filename)
+        
+        if len(all_features) != 32:
+            print(f"Warning: Expected 32 files in {subdir_path}, found {len(all_features)}")
+            continue
+        
+        # Split into train (first 30) and test (last 2)
+        train_features.extend(all_features[:30])
+        test_features.extend(all_features[30:])
+        test_file_names.extend([os.path.join(subdir, fname) for fname in all_file_names[30:]])
+        print(f"Processed {len(all_features)} files from {subdir}: 30 for training, 2 for testing")
     
-    test_subdir = subdirs[-1]
-    test_subdir_path = os.path.join(main_dir, test_subdir)
-    test_features, test_file_names = process_all_files(test_subdir_path)
-    if len(test_features) != 32:
-        print(f"Warning: Expected 32 files in {test_subdir_path}, found {len(test_features)}")
-    test_file_names = [os.path.join(test_subdir, fname) for fname in test_file_names]
-    print(f"Processed {len(test_features)} files from {test_subdir} for testing")
-    
-    return all_features, test_features, test_file_names
+    return train_features, test_features, test_file_names
 
 def prepare_data_for_lstm(train_features, test_features):
     all_features_df = pd.DataFrame(train_features + test_features)
@@ -172,7 +162,7 @@ def prepare_data_for_lstm(train_features, test_features):
     return X_train_tensor, y_train_tensor, X_test_tensor, y_test_tensor, scaler_y, X_train_scaled.shape[1]
 
 class LSTMModel(nn.Module):
-    def __init__(self, input_size, hidden_size1=128, hidden_size2=64, output_size=1):  # Increased hidden sizes
+    def __init__(self, input_size, hidden_size1=128, hidden_size2=64, output_size=1):
         super(LSTMModel, self).__init__()
         self.lstm1 = nn.LSTM(input_size, hidden_size1, batch_first=True)
         self.dropout1 = nn.Dropout(0.3)
@@ -200,7 +190,7 @@ def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=32):
     
     return train_loader, test_loader
 
-def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=200, patience=20):  # Increased epochs and patience
+def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=200, patience=20):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     model.to(device)
@@ -267,34 +257,26 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test):
     y_test_actual = y_scaler.inverse_transform(y_test)
     y_pred_actual = y_scaler.inverse_transform(y_pred_scaled)
     
-    ref_true_value = y_test_actual[0][0]
-    ref_pred_value = y_pred_actual[0][0]
-    
-    print(f"\nSpeedup for the Last Program ({file_names_test[0].split('/')[0]}):")
-    print(f"Reference True Value (File 1 Actual): {ref_true_value:.2f} ms")
-    print(f"Reference Predicted Value (File 1 Predicted): {ref_pred_value:.2f} ms")
-    print("\nFile Speedups (relative to first file):")
+    print("\nPredicted vs Actual Execution Times for Test Files:")
     for i, file_name in enumerate(file_names_test):
-        actual_speedup = ref_true_value / y_test_actual[i][0] if y_test_actual[i][0] != 0 else float('inf')
-        pred_speedup = ref_pred_value / y_pred_actual[i][0] if y_pred_actual[i][0] != 0 else float('inf')
         print(f"File: {file_name}")
-        print(f"  Actual Speedup: {actual_speedup:.2f}x")
-        print(f"  Predicted Speedup: {pred_speedup:.2f}x")
+        print(f"  Actual Execution Time: {y_test_actual[i][0]:.2f} ms")
+        print(f"  Predicted Execution Time: {y_pred_actual[i][0]:.2f} ms")
     
     return y_test_actual, y_pred_actual
 
 def main(main_dir):
     print(f"Processing main directory: {main_dir}")
     train_features, test_features, test_file_names = process_main_directory(main_dir)
-    print(f"Total training samples: {len(train_features)} (from 29 programs)")
-    print(f"Test samples (last program): {len(test_features)}")
+    print(f"Total training samples: {len(train_features)} (30 files from each program)")
+    print(f"Test samples: {len(test_features)} (2 files from each program)")
     
     X_train, y_train, X_test, y_test, y_scaler, input_size = prepare_data_for_lstm(train_features, test_features)
     
     train_loader, test_loader = create_data_loaders(X_train, y_train, X_test, y_test, batch_size=32)
     model = LSTMModel(input_size=input_size)
     criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.0005)  # Reduced learning rate
+    optimizer = optim.Adam(model.parameters(), lr=0.0005)
     
     print("Building and training LSTM model...")
     model = train_model(model, train_loader, test_loader, criterion, optimizer)
