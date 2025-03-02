@@ -190,20 +190,22 @@ def prepare_data_for_model(train_features, test_features):
     y_train_scaled = scaler_y.fit_transform(y_train)
     y_test_scaled = scaler_y.transform(y_test)
     
-    # Simulate tree structure for Model_Recursive_LSTM_v2
+    # Prepare tensors for Model_Recursive_LSTM_v2
     input_size = X_train_scaled.shape[1]
     batch_size_train = X_train_scaled.shape[0]
     batch_size_test = X_test_scaled.shape[0]
     
-    # Simplified tree: single root, all features as computations
+    # Simplified tree structure
     tree = {"roots": [{"child_list": [], "has_comps": True, "computations_indices": torch.arange(input_size), "loop_index": torch.tensor([0])}]}
-    comps_tensor_first_part = torch.FloatTensor(X_train_scaled).unsqueeze(1)  # [batch_size, 1, input_size]
-    comps_tensor_vectors = torch.zeros(batch_size_train, MAX_NUM_TRANSFORMATIONS, MAX_TAGS)  # Dummy transformation vectors
-    comps_tensor_third_part = torch.zeros(batch_size_train, 1, 1)  # Dummy third part
-    loops_tensor = torch.zeros(batch_size_train, 1, 8)  # Dummy loops tensor (loops_tensor_size=8)
-    functions_comps_expr_tree = torch.zeros(batch_size_train, 1, 1, 11)  # Dummy expr tree (expr_embed_size=11)
     
-    X_train_tensors = (tree, comps_tensor_first_part, comps_tensor_vectors, comps_tensor_third_part, loops_tensor, functions_comps_expr_tree)
+    # Tensors without the tree dictionary
+    comps_tensor_first_part = torch.FloatTensor(X_train_scaled).unsqueeze(1)  # [batch_size, 1, input_size]
+    comps_tensor_vectors = torch.zeros(batch_size_train, MAX_NUM_TRANSFORMATIONS, MAX_TAGS)
+    comps_tensor_third_part = torch.zeros(batch_size_train, 1, 1)
+    loops_tensor = torch.zeros(batch_size_train, 1, 8)
+    functions_comps_expr_tree = torch.zeros(batch_size_train, 1, 1, 11)
+    
+    X_train_tensor_tuple = (comps_tensor_first_part, comps_tensor_vectors, comps_tensor_third_part, loops_tensor, functions_comps_expr_tree)
     y_train_tensor = torch.FloatTensor(y_train_scaled)
     
     comps_tensor_first_part_test = torch.FloatTensor(X_test_scaled).unsqueeze(1)
@@ -212,10 +214,10 @@ def prepare_data_for_model(train_features, test_features):
     loops_tensor_test = torch.zeros(batch_size_test, 1, 8)
     functions_comps_expr_tree_test = torch.zeros(batch_size_test, 1, 1, 11)
     
-    X_test_tensors = (tree, comps_tensor_first_part_test, comps_tensor_vectors_test, comps_tensor_third_part_test, loops_tensor_test, functions_comps_expr_tree_test)
+    X_test_tensor_tuple = (comps_tensor_first_part_test, comps_tensor_vectors_test, comps_tensor_third_part_test, loops_tensor_test, functions_comps_expr_tree_test)
     y_test_tensor = torch.FloatTensor(y_test_scaled)
     
-    return X_train_tensors, y_train_tensor, X_test_tensors, y_test_tensor, scaler_y, input_size
+    return tree, X_train_tensor_tuple, y_train_tensor, X_test_tensor_tuple, y_test_tensor, scaler_y, input_size
 
 def initialization_function_xavier(x):
     return nn.init.xavier_uniform_(x)
@@ -359,16 +361,17 @@ class Model_Recursive_LSTM_v2(nn.Module):
         out = self.predict(x)
         return self.LeakyReLU(out[:, 0, 0])
 
-def create_data_loaders(X_train_tensors, y_train, X_test_tensors, y_test, batch_size=16):
-    train_dataset = TensorDataset(*X_train_tensors, y_train)
-    test_dataset = TensorDataset(*X_test_tensors, y_test)
+def create_data_loaders(tree, X_train_tensor_tuple, y_train, X_test_tensor_tuple, y_test, batch_size=16):
+    # Separate tree from tensor tuple since TensorDataset needs only tensors
+    train_dataset = TensorDataset(*X_train_tensor_tuple, y_train)
+    test_dataset = TensorDataset(*X_test_tensor_tuple, y_test)
     
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
     
-    return train_loader, test_loader
+    return tree, train_loader, test_loader
 
-def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=150, patience=20):
+def train_model(model, tree, train_loader, test_loader, criterion, optimizer, num_epochs=150, patience=20):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     model.to(device)
@@ -382,8 +385,9 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
         model.train()
         running_loss = 0.0
         for batch in train_loader:
-            tree_tensors = tuple(t.to(device) if isinstance(t, torch.Tensor) else t for t in batch[:-1])
+            tensor_batch = tuple(t.to(device) for t in batch[:-1])
             targets = batch[-1].to(device)
+            tree_tensors = (tree, *tensor_batch)  # Prepend tree to tensor batch
             optimizer.zero_grad()
             outputs = model(tree_tensors)
             loss = criterion(outputs, targets.squeeze())
@@ -398,8 +402,9 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
         val_loss = 0.0
         with torch.no_grad():
             for batch in test_loader:
-                tree_tensors = tuple(t.to(device) if isinstance(t, torch.Tensor) else t for t in batch[:-1])
+                tensor_batch = tuple(t.to(device) for t in batch[:-1])
                 targets = batch[-1].to(device)
+                tree_tensors = (tree, *tensor_batch)
                 outputs = model(tree_tensors)
                 loss = criterion(outputs, targets.squeeze())
                 val_loss += loss.item() * targets.size(0)
@@ -425,13 +430,14 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
     
     return model
 
-def evaluate_model(model, X_test_tensors, y_test, y_scaler, file_names_test, is_log_transformed=True):
+def evaluate_model(model, tree, X_test_tensor_tuple, y_test, y_scaler, file_names_test, is_log_transformed=True):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.to(device)
     model.eval()
     
     with torch.no_grad():
-        tree_tensors = tuple(t.to(device) if isinstance(t, torch.Tensor) else t for t in X_test_tensors)
+        tensor_tuple = tuple(t.to(device) for t in X_test_tensor_tuple)
+        tree_tensors = (tree, *tensor_tuple)
         y_pred_scaled = model(tree_tensors)
     
     y_pred_scaled = y_pred_scaled.cpu().numpy()
@@ -472,9 +478,9 @@ def main(main_dir):
         print("Error: No valid data found")
         return None
     
-    X_train_tensors, y_train, X_test_tensors, y_test, y_scaler, input_size = prepare_data_for_model(train_features, test_features)
+    tree, X_train_tensor_tuple, y_train, X_test_tensor_tuple, y_test, y_scaler, input_size = prepare_data_for_model(train_features, test_features)
     
-    train_loader, test_loader = create_data_loaders(X_train_tensors, y_train, X_test_tensors, y_test, batch_size=16)
+    tree, train_loader, test_loader = create_data_loaders(tree, X_train_tensor_tuple, y_train, X_test_tensor_tuple, y_test, batch_size=16)
     
     model = Model_Recursive_LSTM_v2(
         input_size=input_size,
@@ -491,10 +497,10 @@ def main(main_dir):
     optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-5)
     
     print("Training Model_Recursive_LSTM_v2...")
-    model = train_model(model, train_loader, test_loader, criterion, optimizer)
+    model = train_model(model, tree, train_loader, test_loader, criterion, optimizer)
     
     print("\nEvaluating model:")
-    y_test_actual, y_pred_actual = evaluate_model(model, X_test_tensors, y_test, y_scaler, test_file_names)
+    y_test_actual, y_pred_actual = evaluate_model(model, tree, X_test_tensor_tuple, y_test, y_scaler, test_file_names)
     
     return model, y_test_actual, y_pred_actual
 
