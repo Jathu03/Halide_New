@@ -9,10 +9,6 @@ import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
-# Constants from data_utils (assumed values, adjust as needed)
-MAX_NUM_TRANSFORMATIONS = 2  # Number of transformation types (e.g., tile, vectorize)
-MAX_TAGS = 5  # Number of tags per transformation (e.g., parameters)
-
 def get_execution_time(file_path):
     try:
         with open(file_path, 'rb') as f:
@@ -48,17 +44,7 @@ def extract_optimized_features(file_path):
         node_dict = {node["Name"]: node["Details"] for node in nodes}
         sched_dict = {item["Name"]: item["Details"]["scheduling_feature"] for item in scheduling if "Name" in item and "Details" in item}
         
-        # Tree structure: single root with all computations as a flat level
-        tree = {
-            "roots": [{
-                "has_comps": True,
-                "computations_indices": torch.tensor(list(range(len(nodes))), dtype=torch.long),
-                "child_list": [],  # No child loops for simplicity
-                "loop_index": torch.tensor([0], dtype=torch.long)  # Single loop level
-            }]
-        }
-        
-        # Computation features (first part: operation counts)
+        # Computation features (operation counts)
         op_counts = []
         for node_name, details in node_dict.items():
             op_hist = details.get("Op histogram", [])
@@ -71,56 +57,32 @@ def extract_optimized_features(file_path):
                     if op_name in ops:
                         ops[op_name] = op_count
             op_counts.append([ops['add'], ops['mul'], ops['div'], ops['min'], ops['max']])
-        comps_tensor_first_part = torch.tensor(op_counts, dtype=torch.float32)  # [num_comps, 5]
+        comps_tensor = torch.tensor(op_counts, dtype=torch.float32).mean(dim=0)  # [5]
         
-        # Transformation vectors (simplified as scheduling features)
-        comps_tensor_vectors = []
-        for node_name in node_dict:
-            sched = sched_dict.get(node_name, {})
-            vector = [
-                1 if sched.get("inner_parallelism", 1.0) > 1.0 else 0,
-                1 if sched.get("unrolled_loop_extent", 1.0) > 1.0 else 0,
-                1 if sched.get("vector_size", 1.0) > 1.0 else 0,
-                0, 0  # Pad to MAX_TAGS=5
-            ]
-            comps_tensor_vectors.append(vector[:MAX_TAGS])
-        comps_tensor_vectors = torch.tensor(comps_tensor_vectors, dtype=torch.float32)  # [num_comps, MAX_TAGS]
-        
-        # Third part: structural features per computation
-        comps_tensor_third_part = []
-        for node in nodes:
-            inputs = len([e for e in edges if e["To"] == node["Name"]])
-            reductions = 1 if any(".update(" in e["To"] for e in edges if e["To"] == node["Name"]) else 0
-            comps_tensor_third_part.append([inputs, reductions])
-        comps_tensor_third_part = torch.tensor(comps_tensor_third_part, dtype=torch.float32)  # [num_comps, 2]
-        
-        # Loops tensor (simplified to scheduling aggregates)
-        loops_tensor = torch.tensor([[
+        # Scheduling features (simplified transformation vector)
+        sched_vector = [
             sum(1 for sched in sched_dict.values() if sched.get("inner_parallelism", 1.0) > 1.0),
             sum(sched.get("unrolled_loop_extent", 1.0) for sched in sched_dict.values()),
             sum(sched.get("vector_size", 1.0) for sched in sched_dict.values()),
             sum(1 for sched in sched_dict.values() if sched.get("unrolled_loop_extent", 1.0) > 1.0),
-            len(nodes), len(edges),
             sum(sched.get('bytes_at_production', 0) for sched in sched_dict.values()),
             sum(sched.get('num_vectors', 0) for sched in sched_dict.values())
-        ]], dtype=torch.float32)  # [1, loops_tensor_size=8]
+        ]
+        sched_tensor = torch.tensor(sched_vector, dtype=torch.float32)  # [6]
         
-        # Expression embedding (simplified as operation counts again)
-        functions_comps_expr_tree = comps_tensor_first_part.unsqueeze(1).expand(-1, 1, -1)  # [num_comps, seq_len=1, 5]
-        # Pad to match expected input size (11)
-        padding = torch.zeros(functions_comps_expr_tree.shape[0], 1, 11 - functions_comps_expr_tree.shape[2])
-        functions_comps_expr_tree = torch.cat((functions_comps_expr_tree, padding), dim=2)  # [num_comps, 1, 11]
+        # Structural features
+        struct_vector = [
+            len(nodes),
+            len(edges),
+            np.mean([len([e for e in edges if e["To"] == n["Name"]]) for n in nodes]) if nodes else 0,
+            sum(1 for e in edges if ".update(" in e["To"])
+        ]
+        struct_tensor = torch.tensor(struct_vector, dtype=torch.float32)  # [4]
         
-        tree_tensors = (
-            tree,
-            comps_tensor_first_part.unsqueeze(0),  # [1, num_comps, 5]
-            comps_tensor_vectors.unsqueeze(0),     # [1, num_comps, MAX_TAGS]
-            comps_tensor_third_part.unsqueeze(0),  # [1, num_comps, 2]
-            loops_tensor,                          # [1, 8]
-            functions_comps_expr_tree.unsqueeze(0) # [1, num_comps, 1, 11]
-        )
+        # Combine into a single feature vector
+        features = torch.cat([comps_tensor, sched_tensor, struct_tensor])  # [15]
         
-        return {"tree_tensors": tree_tensors, "execution_time": execution_time}
+        return {"features": features, "execution_time": execution_time}
     
     except Exception as e:
         print(f"Error extracting features from {file_path}: {str(e)}")
@@ -161,167 +123,74 @@ def process_main_directory(main_dir):
     return train_data, test_data, test_file_names
 
 def prepare_data_for_model(train_data, test_data):
-    # Separate tree tensors and execution times
-    X_train = [item["tree_tensors"] for item in train_data]
+    X_train = torch.stack([item["features"] for item in train_data])  # [N_train, input_size]
     y_train = torch.tensor([item["execution_time"] for item in train_data], dtype=torch.float32).view(-1, 1)
-    X_test = [item["tree_tensors"] for item in test_data]
+    X_test = torch.stack([item["features"] for item in test_data])    # [N_test, input_size]
     y_test = torch.tensor([item["execution_time"] for item in test_data], dtype=torch.float32).view(-1, 1)
     
+    scaler_X = StandardScaler()
     scaler_y = StandardScaler()
+    
+    X_train_scaled = scaler_X.fit_transform(X_train.numpy())
     y_train_scaled = scaler_y.fit_transform(y_train.numpy())
+    X_test_scaled = scaler_X.transform(X_test.numpy())
     y_test_scaled = scaler_y.transform(y_test.numpy())
     
+    X_train_tensor = torch.FloatTensor(X_train_scaled).unsqueeze(1)  # [N_train, 1, input_size]
     y_train_tensor = torch.FloatTensor(y_train_scaled)
+    X_test_tensor = torch.FloatTensor(X_test_scaled).unsqueeze(1)   # [N_test, 1, input_size]
     y_test_tensor = torch.FloatTensor(y_test_scaled)
     
-    return X_train, y_train_tensor, X_test, y_test_tensor, scaler_y
+    return X_train_tensor, y_train_tensor, X_test_tensor, y_test_tensor, scaler_y
 
 def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=16):
-    train_dataset = TensorDataset(torch.tensor([0]*len(X_train), dtype=torch.long), y_train)  # Dummy indices
-    test_dataset = TensorDataset(torch.tensor([0]*len(X_test), dtype=torch.long), y_test)     # Dummy indices
+    train_dataset = TensorDataset(X_train, y_train)
+    test_dataset = TensorDataset(X_test, y_test)
     
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
     
-    return train_loader, test_loader, X_train, X_test
+    return train_loader, test_loader
 
-class Model_Recursive_LSTM_v2(nn.Module):
-    def __init__(
-        self,
-        input_size=5,  # Adjusted for comps_tensor_first_part
-        comp_embed_layer_sizes=[600, 350, 200, 180],
-        drops=[0.225, 0.225, 0.225, 0.225],
-        output_size=1,
-        lstm_embedding_size=100,
-        expr_embed_size=100,
-        loops_tensor_size=8,
-        device="cpu",
-        num_layers=1,
-        bidirectional=True,
-    ):
-        super().__init__()
+class SchedulePredictor(nn.Module):
+    def __init__(self, input_size=15, hidden_sizes=[128, 64], lstm_hidden_size=100, output_size=1, device="cpu"):
+        super(SchedulePredictor, self).__init__()
         self.device = device
-        embedding_size = comp_embed_layer_sizes[-1]
         
-        regression_layer_sizes = [embedding_size] + comp_embed_layer_sizes[-2:]
-        concat_layer_sizes = [embedding_size * 2 + loops_tensor_size] + comp_embed_layer_sizes[-2:]
+        # LSTM to process scheduling features
+        self.lstm = nn.LSTM(input_size, lstm_hidden_size, batch_first=True, bidirectional=True)
+        self.lstm_dropout = nn.Dropout(0.3)
         
-        comp_embed_layer_sizes = [
-            input_size + lstm_embedding_size * (2 if bidirectional else 1) * num_layers + expr_embed_size
-        ] + comp_embed_layer_sizes
+        # Feedforward layers for regression
+        layer_sizes = [lstm_hidden_size * 2] + hidden_sizes  # *2 for bidirectional
+        self.ff_layers = nn.ModuleList()
+        self.ff_dropouts = nn.ModuleList()
+        for i in range(len(layer_sizes) - 1):
+            self.ff_layers.append(nn.Linear(layer_sizes[i], layer_sizes[i + 1], bias=True))
+            nn.init.xavier_uniform_(self.ff_layers[i].weight)
+            self.ff_dropouts.append(nn.Dropout(0.3))
         
-        self.comp_embedding_layers = nn.ModuleList()
-        self.comp_embedding_dropouts = nn.ModuleList()
-        self.regression_layers = nn.ModuleList()
-        self.regression_dropouts = nn.ModuleList()
-        self.concat_layers = nn.ModuleList()
-        self.concat_dropouts = nn.ModuleList()
-        
-        self.encode_vectors = nn.Linear(MAX_TAGS, MAX_TAGS, bias=True)
-        for i in range(len(comp_embed_layer_sizes) - 1):
-            self.comp_embedding_layers.append(
-                nn.Linear(comp_embed_layer_sizes[i], comp_embed_layer_sizes[i + 1], bias=True)
-            )
-            nn.init.xavier_uniform_(self.comp_embedding_layers[i].weight)
-            self.comp_embedding_dropouts.append(nn.Dropout(drops[i]))
-        for i in range(len(regression_layer_sizes) - 1):
-            self.regression_layers.append(
-                nn.Linear(regression_layer_sizes[i], regression_layer_sizes[i + 1], bias=True)
-            )
-            nn.init.xavier_uniform_(self.regression_layers[i].weight)
-            self.regression_dropouts.append(nn.Dropout(drops[i]))
-        for i in range(len(concat_layer_sizes) - 1):
-            self.concat_layers.append(
-                nn.Linear(concat_layer_sizes[i], concat_layer_sizes[i + 1], bias=True)
-            )
-            nn.init.xavier_uniform_(self.concat_layers[i].weight)
-            nn.init.zeros_(self.concat_layers[i].weight)
-            self.concat_dropouts.append(nn.Dropout(drops[i]))
-        
-        self.predict = nn.Linear(regression_layer_sizes[-1], output_size, bias=True)
+        # Output layer
+        self.predict = nn.Linear(hidden_sizes[-1], output_size, bias=True)
         nn.init.xavier_uniform_(self.predict.weight)
-        self.ELU = nn.ELU()
-        self.LeakyReLU = nn.LeakyReLU(0.01)
         
-        self.no_comps_tensor = nn.Parameter(nn.init.xavier_uniform_(torch.zeros(1, embedding_size)))
-        self.no_nodes_tensor = nn.Parameter(nn.init.xavier_uniform_(torch.zeros(1, embedding_size)))
-        
-        self.comps_lstm = nn.LSTM(comp_embed_layer_sizes[-1], embedding_size, batch_first=True)
-        self.nodes_lstm = nn.LSTM(comp_embed_layer_sizes[-1], embedding_size, batch_first=True)
-        self.roots_lstm = nn.LSTM(comp_embed_layer_sizes[-1], embedding_size, batch_first=True)
-        self.transformation_vectors_embed = nn.LSTM(
-            MAX_TAGS, lstm_embedding_size, batch_first=True, bidirectional=bidirectional, num_layers=num_layers
-        )
-        self.exprs_embed = nn.LSTM(11, expr_embed_size, batch_first=True)
+        self.elu = nn.ELU()
+        self.leaky_relu = nn.LeakyReLU(0.01)
     
-    def get_hidden_state(self, node, comps_embeddings, loops_tensor):
-        nodes_list = []
-        for n in node["child_list"]:
-            nodes_list.append(self.get_hidden_state(n, comps_embeddings, loops_tensor))
+    def forward(self, x):
+        # x: [batch_size, seq_len=1, input_size]
+        lstm_out, _ = self.lstm(x)  # [batch_size, seq_len=1, lstm_hidden_size * 2]
+        lstm_out = self.lstm_dropout(lstm_out[:, -1, :])  # [batch_size, lstm_hidden_size * 2]
         
-        if nodes_list:
-            nodes_tensor = torch.cat(nodes_list, 1)
-            _, (nodes_h_n, _) = self.nodes_lstm(nodes_tensor)
-            nodes_h_n = nodes_h_n.permute(1, 0, 2)
-        else:
-            nodes_h_n = torch.unsqueeze(self.no_nodes_tensor, 0).expand(comps_embeddings.shape[0], -1, -1)
+        x = lstm_out
+        for i in range(len(self.ff_layers)):
+            x = self.ff_layers[i](x)
+            x = self.ff_dropouts[i](self.elu(x))
         
-        if node["has_comps"]:
-            selected_comps_tensor = torch.index_select(
-                comps_embeddings, 1, node["computations_indices"].to(self.device)
-            )
-            _, (comps_h_n, _) = self.comps_lstm(selected_comps_tensor)
-            comps_h_n = comps_h_n.permute(1, 0, 2)
-        else:
-            comps_h_n = torch.unsqueeze(self.no_comps_tensor, 0).expand(comps_embeddings.shape[0], -1, -1)
-        
-        selected_loop_tensor = torch.index_select(loops_tensor, 1, node["loop_index"].to(self.device))
-        x = torch.cat((nodes_h_n, comps_h_n, selected_loop_tensor), 2)
-        
-        for i in range(len(self.concat_layers)):
-            x = self.concat_layers[i](x)
-            x = self.concat_dropouts[i](self.ELU(x))
-        return x
-    
-    def forward(self, tree_tensors):
-        tree, comps_tensor_first_part, comps_tensor_vectors, comps_tensor_third_part, loops_tensor, functions_comps_expr_tree = tree_tensors
-        
-        batch_size, num_comps, len_sequence, len_vector = functions_comps_expr_tree.shape
-        x = functions_comps_expr_tree.view(batch_size * num_comps, len_sequence, len_vector)
-        _, (expr_embedding, _) = self.exprs_embed(x)
-        expr_embedding = expr_embedding.permute(1, 0, 2).reshape(batch_size * num_comps, -1)
-        
-        batch_size, num_comps, _ = comps_tensor_first_part.shape
-        first_part = comps_tensor_first_part.to(self.device).view(batch_size * num_comps, -1)
-        vectors = comps_tensor_vectors.to(self.device)
-        third_part = comps_tensor_third_part.to(self.device).view(batch_size * num_comps, -1)
-        
-        vectors = self.encode_vectors(vectors)
-        _, (prog_embedding, _) = self.transformation_vectors_embed(vectors)
-        prog_embedding = prog_embedding.permute(1, 0, 2).reshape(batch_size * num_comps, -1)
-        
-        x = torch.cat((first_part, prog_embedding, third_part, expr_embedding), dim=1).view(batch_size, num_comps, -1)
-        for i in range(len(self.comp_embedding_layers)):
-            x = self.comp_embedding_layers[i](x)
-            x = self.comp_embedding_dropouts[i](self.ELU(x))
-        comps_embeddings = x
-        
-        roots_list = []
-        for root in tree["roots"]:
-            roots_list.append(self.get_hidden_state(root, comps_embeddings, loops_tensor))
-        
-        roots_tensor = torch.cat(roots_list, 1)
-        _, (roots_h_n, _) = self.roots_lstm(roots_tensor)
-        roots_h_n = roots_h_n.permute(1, 0, 2)
-        
-        x = roots_h_n
-        for i in range(len(self.regression_layers)):
-            x = self.regression_layers[i](x)
-            x = self.regression_dropouts[i](self.ELU(x))
         out = self.predict(x)
-        return self.LeakyReLU(out[:, 0, 0])
+        return self.leaky_relu(out)  # Ensure non-negative output
 
-def train_model(model, train_loader, test_loader, X_train, X_test, criterion, optimizer, scheduler, num_epochs=200, patience=20):
+def train_model(model, train_loader, test_loader, criterion, optimizer, scheduler, num_epochs=200, patience=20):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     model.to(device)
@@ -333,38 +202,26 @@ def train_model(model, train_loader, test_loader, X_train, X_test, criterion, op
     for epoch in range(num_epochs):
         model.train()
         running_loss = 0.0
-        for indices, targets in train_loader:
-            tree_tensors = [X_train[i] for i in indices]
-            tree_tensors = tuple(
-                torch.cat([t[i].to(device) if isinstance(t[i], torch.Tensor) else t[i] for i in indices], dim=0) 
-                if isinstance(t[0], torch.Tensor) else t[0] 
-                for t in tree_tensors
-            )
-            targets = targets.to(device)
+        for inputs, targets in train_loader:
+            inputs, targets = inputs.to(device), targets.to(device)
             optimizer.zero_grad()
-            outputs = model(tree_tensors)
+            outputs = model(inputs)
             loss = criterion(outputs, targets.squeeze())
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
-            running_loss += loss.item() * indices.size(0)
+            running_loss += loss.item() * inputs.size(0)
         
         train_loss = running_loss / len(train_loader.dataset)
         
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
-            for indices, targets in test_loader:
-                tree_tensors = [X_test[i] for i in indices]
-                tree_tensors = tuple(
-                    torch.cat([t[i].to(device) if isinstance(t[i], torch.Tensor) else t[i] for i in indices], dim=0) 
-                    if isinstance(t[0], torch.Tensor) else t[0] 
-                    for t in tree_tensors
-                )
-                targets = targets.to(device)
-                outputs = model(tree_tensors)
+            for inputs, targets in test_loader:
+                inputs, targets = inputs.to(device), targets.to(device)
+                outputs = model(inputs)
                 loss = criterion(outputs, targets.squeeze())
-                val_loss += loss.item() * indices.size(0)
+                val_loss += loss.item() * inputs.size(0)
         
         val_loss /= len(test_loader.dataset)
         print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
@@ -393,18 +250,12 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test):
     model.to(device)
     model.eval()
     
-    y_pred_scaled = []
     with torch.no_grad():
-        for i in range(len(X_test)):
-            tree_tensors = tuple(
-                t[i].unsqueeze(0).to(device) if isinstance(t[i], torch.Tensor) else t[i] 
-                for t in X_test
-            )
-            output = model(tree_tensors)
-            y_pred_scaled.append(output.item())
+        X_test = X_test.to(device)
+        y_pred_scaled = model(X_test)
     
-    y_pred_scaled = np.array(y_pred_scaled).reshape(-1, 1)
-    y_test = y_test.numpy()
+    y_pred_scaled = y_pred_scaled.cpu().numpy()
+    y_test = y_test.cpu().numpy()
     
     y_test_actual = y_scaler.inverse_transform(y_test)
     y_pred_actual = y_scaler.inverse_transform(y_pred_scaled)
@@ -430,15 +281,15 @@ def main(main_dir):
         return None, None, None
     
     X_train, y_train, X_test, y_test, y_scaler = prepare_data_for_model(train_data, test_data)
-    train_loader, test_loader, X_train, X_test = create_data_loaders(X_train, y_train, X_test, y_test, batch_size=16)
+    train_loader, test_loader = create_data_loaders(X_train, y_train, X_test, y_test, batch_size=16)
     
-    model = Model_Recursive_LSTM_v2(input_size=5, device="cuda" if torch.cuda.is_available() else "cpu")
+    model = SchedulePredictor(input_size=15, device="cuda" if torch.cuda.is_available() else "cpu")
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=0.0005)
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10, verbose=True)
     
-    print("Training Recursive LSTM model...")
-    model = train_model(model, train_loader, test_loader, X_train, X_test, criterion, optimizer, scheduler)
+    print("Training Schedule Predictor model...")
+    model = train_model(model, train_loader, test_loader, criterion, optimizer, scheduler)
     
     print("\nEvaluating the model...")
     y_test_actual, y_pred_actual = evaluate_model(model, X_test, y_test, y_scaler, test_file_names)
