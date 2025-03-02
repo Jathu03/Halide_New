@@ -160,7 +160,7 @@ def process_directory(directory_path):
     # Ensure we have at least 32 files to work with
     if len(all_features) < 32:
         print(f"Warning: Only {len(all_features)} valid files found in {directory_path}")
-        return None, None
+        return None, None, None
     
     # Split into training (first 30) and testing (last 2)
     train_features = all_features[:30]
@@ -346,26 +346,10 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test):
     # Print results for each subfolder
     for subfolder, results in results_by_subfolder.items():
         print(f"\nResults for {subfolder}:")
-        
-        # Use the first file in each subfolder as reference for speedup calculation
-        if len(results) > 0:
-            ref_file = results[0]
-            ref_actual = ref_file['actual']
-            ref_predicted = ref_file['predicted']
-            
-            print(f"Reference file: {ref_file['file']}")
-            print(f"  Actual execution time: {ref_actual:.2f} ms")
-            print(f"  Predicted execution time: {ref_predicted:.2f} ms")
-            
-            for result in results:
-                actual_speedup = ref_actual / result['actual'] if result['actual'] != 0 else float('inf')
-                pred_speedup = ref_predicted / result['predicted'] if result['predicted'] != 0 else float('inf')
-                
-                print(f"File: {result['file']}")
-                print(f"  Actual execution time: {result['actual']:.2f} ms")
-                print(f"  Predicted execution time: {result['predicted']:.2f} ms")
-                print(f"  Actual speedup vs reference: {actual_speedup:.2f}x")
-                print(f"  Predicted speedup vs reference: {pred_speedup:.2f}x")
+        for result in results:
+            print(f"File: {result['file']}")
+            print(f"  Actual execution time: {result['actual']:.2f} ms")
+            print(f"  Predicted execution time: {result['predicted']:.2f} ms")
     
     # Calculate overall metrics
     mse = np.mean((y_test_actual - y_pred_actual) ** 2)
