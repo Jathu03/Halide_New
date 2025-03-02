@@ -68,12 +68,15 @@ def extract_features_from_file(file_path):
     # Extract scheduling details
     scheduling_features = []
     
-    # Look for scheduling_data
+    # Look for scheduling_data or use programming_details for Schedules
     scheduling_data = None
     for key, value in data.items():
         if key == "scheduling_data":
             scheduling_data = value
             break
+    
+    if not scheduling_data and 'Schedules' in programming_details:
+        scheduling_data = programming_details['Schedules']
     
     if scheduling_data:
         for sched in scheduling_data:
@@ -106,14 +109,14 @@ def extract_features_from_file(file_path):
     
     # Add important scheduling features (aggregate or take first few entries)
     if scheduling_features:
-        # Common scheduling metrics to extract (based on your sample data)
+        # Common scheduling metrics to extract
         important_metrics = [
             'bytes_at_production', 'bytes_at_realization', 'bytes_at_root', 'bytes_at_task',
             'inner_parallelism', 'outer_parallelism', 'num_productions', 'num_realizations',
             'num_scalars', 'num_vectors', 'points_computed_total', 'working_set'
         ]
         
-        # Take the first scheduling feature for these metrics (can be modified to use aggregation)
+        # Take the first scheduling feature for these metrics
         if scheduling_features and scheduling_features[0]:
             for metric in important_metrics:
                 if metric in scheduling_features[0]:
@@ -159,7 +162,7 @@ def prepare_data_for_lstm(all_features, test_indices=None):
     X = df.drop('execution_time', axis=1)
     y = df['execution_time']
     
-    # Handle missing values (replace with mean or 0)
+    # Handle missing values (replace with 0)
     X = X.fillna(0)
     
     # Normalize features
@@ -271,4 +274,137 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
             outputs = model(inputs)
             loss = criterion(outputs, targets)
             
-            # Backward and
+            # Backward and optimize
+            loss.backward()
+            optimizer.step()
+            
+            running_loss += loss.item() * inputs.size(0)
+        
+        train_loss = running_loss / len(train_loader.dataset)
+        train_losses.append(train_loss)
+        
+        # Validation
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for inputs, targets in test_loader:
+                inputs, targets = inputs.to(device), targets.to(device)
+                outputs = model(inputs)
+                loss = criterion(outputs, targets)
+                val_loss += loss.item() * inputs.size(0)
+        
+        val_loss /= len(test_loader.dataset)
+        val_losses.append(val_loss)
+        
+        print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
+        
+        # Early stopping
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            epochs_no_improve = 0
+            best_model_state = model.state_dict().copy()
+        else:
+            epochs_no_improve += 1
+        
+        if epochs_no_improve >= patience:
+            print(f'Early stopping after {epoch+1} epochs')
+            model.load_state_dict(best_model_state)
+            break
+    
+    # If we completed all epochs, use the best model
+    if best_model_state is not None and epochs_no_improve > 0:
+        model.load_state_dict(best_model_state)
+    
+    return train_losses, val_losses
+
+# Function to evaluate the model
+def evaluate_model(model, X_test, y_test, y_scaler, file_names_test=None):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model.to(device)
+    model.eval()
+    
+    # Move data to device
+    X_test = X_test.to(device)
+    
+    # Predict
+    with torch.no_grad():
+        y_pred_scaled = model(X_test)
+    
+    # Convert to numpy
+    y_pred_scaled = y_pred_scaled.cpu().numpy()
+    y_test = y_test.cpu().numpy()
+    
+    # Inverse transform to get actual values
+    y_test_actual = y_scaler.inverse_transform(y_test)
+    y_pred_actual = y_scaler.inverse_transform(y_pred_scaled)
+    
+    # Calculate metrics
+    mse = np.mean((y_test_actual - y_pred_actual) ** 2)
+    mae = np.mean(np.abs(y_test_actual - y_pred_actual))
+    mape = np.mean(np.abs((y_test_actual - y_pred_actual) / y_test_actual)) * 100
+    
+    print(f"Mean Squared Error: {mse:.2f}")
+    print(f"Mean Absolute Error: {mae:.2f}")
+    print(f"Mean Absolute Percentage Error: {mape:.2f}%")
+    
+    return mse, mae, mape, y_test_actual, y_pred_actual
+
+# Main function
+def main(data_dir, test_file_indices=None):
+    # Process all files
+    print(f"Processing files in directory: {data_dir}")
+    all_features, file_names = process_all_files(data_dir)
+    print(f"Processed {len(all_features)} files")
+    
+    # If test_file_indices is provided, use it; otherwise, use random split
+    if test_file_indices is not None:
+        X_train, y_train, X_test, y_test, y_scaler, input_size = prepare_data_for_lstm(all_features, test_file_indices)
+        file_names_test = [file_names[i] for i in test_file_indices]
+    else:
+        X_train, y_train, X_test, y_test, y_scaler, input_size = prepare_data_for_lstm(all_features)
+        file_names_test = None
+    
+    # Create data loaders
+    train_loader, test_loader = create_data_loaders(X_train, y_train, X_test, y_test, batch_size=4)
+    
+    # Initialize the model
+    model = LSTMModel(input_size=input_size)
+    
+    # Define loss function and optimizer
+    criterion = nn.MSELoss()
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    
+    # Train the model
+    print("Building and training LSTM model...")
+    train_losses, val_losses = train_model(
+        model, 
+        train_loader, 
+        test_loader, 
+        criterion, 
+        optimizer, 
+        num_epochs=100,
+        patience=10
+    )
+    
+    # Evaluate the model
+    print("\nEvaluating model:")
+    mse, mae, mape, y_test_actual, y_pred_actual = evaluate_model(model, X_test, y_test, y_scaler, file_names_test)
+    
+    return model, y_scaler, mse, mae, mape
+
+# Example usage
+if __name__ == "__main__":
+    # Directory containing the JSON files
+    data_dir = "Output_Programs/program_50001"
+    
+    # Specify the indices of test files (e.g., the last two files)
+    # For 32 files (0-31), the last two would be indices 30 and 31
+    test_file_indices = [30, 31]
+    
+    # Run the main function
+    model, y_scaler, mse, mae, mape = main(data_dir, test_file_indices)
+    
+    print("\nModel training completed!")
+    print(f"Final Mean Squared Error: {mse:.2f}")
+    print(f"Final Mean Absolute Error: {mae:.2f}")
+    print(f"Final Mean Absolute Percentage Error: {mape:.2f}%")
