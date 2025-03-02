@@ -27,7 +27,26 @@ def get_execution_time(file_path):
         print(f"Error processing {file_path}: {str(e)}")
         return None
 
-def extract_optimized_features(file_path):
+def create_program_template(subdir_path):
+    """Create a template from the first JSON file in the folder."""
+    json_files = [f for f in sorted(os.listdir(subdir_path)) if f.endswith('.json')]
+    if not json_files:
+        print(f"No JSON files found in {subdir_path}")
+        return None
+    
+    first_file = os.path.join(subdir_path, json_files[0])
+    try:
+        with open(first_file, 'r') as f:
+            data = json.load(f)
+        # Template is just the programming_details, which is constant across all schedules
+        template = {"programming_details": data["programming_details"]}
+        return template
+    except Exception as e:
+        print(f"Error creating template from {first_file}: {str(e)}")
+        return None
+
+def extract_features_from_scheduling(file_path, template):
+    """Extract features from scheduling_data and combine with template."""
     try:
         with open(file_path, 'r') as f:
             data = json.load(f)
@@ -37,14 +56,15 @@ def extract_optimized_features(file_path):
             print(f"Invalid execution time in {file_path}: {execution_time}")
             return None
         
-        nodes = data["programming_details"]["Nodes"]
-        edges = data["programming_details"]["Edges"]
-        scheduling = data["scheduling_data"]
+        # Extract scheduling features
+        sched_dict = {item["Name"]: item["Details"]["scheduling_feature"] 
+                     for item in data["scheduling_data"] if "Name" in item and "Details" in item}
         
+        # Computation features from programming_details (template)
+        nodes = template["programming_details"]["Nodes"]
+        edges = template["programming_details"]["Edges"]
         node_dict = {node["Name"]: node["Details"] for node in nodes}
-        sched_dict = {item["Name"]: item["Details"]["scheduling_feature"] for item in scheduling if "Name" in item and "Details" in item}
         
-        # Computation features (operation counts)
         op_counts = []
         for node_name, details in node_dict.items():
             op_hist = details.get("Op histogram", [])
@@ -59,7 +79,7 @@ def extract_optimized_features(file_path):
             op_counts.append([ops['add'], ops['mul'], ops['div'], ops['min'], ops['max']])
         comps_tensor = torch.tensor(op_counts, dtype=torch.float32).mean(dim=0)  # [5]
         
-        # Scheduling features (simplified transformation vector)
+        # Scheduling features
         sched_vector = [
             sum(1 for sched in sched_dict.values() if sched.get("inner_parallelism", 1.0) > 1.0),
             sum(sched.get("unrolled_loop_extent", 1.0) for sched in sched_dict.values()),
@@ -70,7 +90,7 @@ def extract_optimized_features(file_path):
         ]
         sched_tensor = torch.tensor(sched_vector, dtype=torch.float32)  # [6]
         
-        # Structural features
+        # Structural features from edges
         struct_vector = [
             len(nodes),
             len(edges),
@@ -79,7 +99,7 @@ def extract_optimized_features(file_path):
         ]
         struct_tensor = torch.tensor(struct_vector, dtype=torch.float32)  # [4]
         
-        # Combine into a single feature vector
+        # Combine features
         features = torch.cat([comps_tensor, sched_tensor, struct_tensor])  # [15]
         
         return {"features": features, "execution_time": execution_time}
@@ -88,7 +108,7 @@ def extract_optimized_features(file_path):
         print(f"Error extracting features from {file_path}: {str(e)}")
         return None
 
-def process_main_directory(main_dir):
+def process_main_directory(main_dir, train_ratio=30/32):
     train_data = []
     test_data = []
     test_file_names = []
@@ -100,13 +120,17 @@ def process_main_directory(main_dir):
     
     for subdir in subdirs:
         subdir_path = os.path.join(main_dir, subdir)
+        template = create_program_template(subdir_path)
+        if template is None:
+            continue
+        
         all_data = []
         all_file_names = []
         
         for filename in sorted(os.listdir(subdir_path)):
             if filename.endswith('.json'):
                 file_path = os.path.join(subdir_path, filename)
-                data = extract_optimized_features(file_path)
+                data = extract_features_from_scheduling(file_path, template)
                 if data is not None:
                     all_data.append(data)
                     all_file_names.append(filename)
@@ -115,10 +139,11 @@ def process_main_directory(main_dir):
             print(f"Warning: Expected 32 files in {subdir_path}, found {len(all_data)}")
             continue
         
-        train_data.extend(all_data[:30])
-        test_data.extend(all_data[30:])
-        test_file_names.extend([os.path.join(subdir, fname) for fname in all_file_names[30:]])
-        print(f"Processed {len(all_data)} files from {subdir}: 30 for training, 2 for testing")
+        train_size = int(train_ratio * 32)  # 30 files for training
+        train_data.extend(all_data[:train_size])
+        test_data.extend(all_data[train_size:])
+        test_file_names.extend([os.path.join(subdir, fname) for fname in all_file_names[train_size:]])
+        print(f"Processed {len(all_data)} files from {subdir}: {train_size} for training, {32 - train_size} for testing")
     
     return train_data, test_data, test_file_names
 
@@ -157,11 +182,9 @@ class SchedulePredictor(nn.Module):
         super(SchedulePredictor, self).__init__()
         self.device = device
         
-        # LSTM to process scheduling features
         self.lstm = nn.LSTM(input_size, lstm_hidden_size, batch_first=True, bidirectional=True)
         self.lstm_dropout = nn.Dropout(0.3)
         
-        # Feedforward layers for regression
         layer_sizes = [lstm_hidden_size * 2] + hidden_sizes  # *2 for bidirectional
         self.ff_layers = nn.ModuleList()
         self.ff_dropouts = nn.ModuleList()
@@ -170,7 +193,6 @@ class SchedulePredictor(nn.Module):
             nn.init.xavier_uniform_(self.ff_layers[i].weight)
             self.ff_dropouts.append(nn.Dropout(0.3))
         
-        # Output layer
         self.predict = nn.Linear(hidden_sizes[-1], output_size, bias=True)
         nn.init.xavier_uniform_(self.predict.weight)
         
@@ -178,7 +200,6 @@ class SchedulePredictor(nn.Module):
         self.leaky_relu = nn.LeakyReLU(0.01)
     
     def forward(self, x):
-        # x: [batch_size, seq_len=1, input_size]
         lstm_out, _ = self.lstm(x)  # [batch_size, seq_len=1, lstm_hidden_size * 2]
         lstm_out = self.lstm_dropout(lstm_out[:, -1, :])  # [batch_size, lstm_hidden_size * 2]
         
@@ -188,7 +209,7 @@ class SchedulePredictor(nn.Module):
             x = self.ff_dropouts[i](self.elu(x))
         
         out = self.predict(x)
-        return self.leaky_relu(out)  # Ensure non-negative output
+        return self.leaky_relu(out)
 
 def train_model(model, train_loader, test_loader, criterion, optimizer, scheduler, num_epochs=200, patience=20):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
