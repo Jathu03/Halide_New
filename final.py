@@ -157,36 +157,31 @@ def process_main_directory(main_dir):
     all_file_names = []
     subdirs = sorted([d for d in os.listdir(main_dir) if os.path.isdir(os.path.join(main_dir, d))])
     
-    if not subdirs:
-        raise ValueError(f"No subdirectories found in {main_dir}")
+    if len(subdirs) < 30:
+        raise ValueError(f"Expected at least 30 subdirectories in {main_dir}, found {len(subdirs)}")
     
-    # Process all subdirectories except the last one for training
-    for subdir in subdirs[:-1]:
+    # Use the first 29 subdirectories for training
+    for subdir in subdirs[:29]:
         subdir_path = os.path.join(main_dir, subdir)
         features, file_names = process_all_files(subdir_path)
         if len(features) != 32:
             print(f"Warning: Expected 32 files in {subdir_path}, found {len(features)}")
         all_features.extend(features)
         all_file_names.extend([os.path.join(subdir, fname) for fname in file_names])
-        print(f"Processed {len(features)} files from {subdir}")
+        print(f"Processed {len(features)} files from {subdir} for training")
     
-    # Process the last subdirectory for testing
+    # Use the last subdirectory for testing
     test_subdir = subdirs[-1]
     test_subdir_path = os.path.join(main_dir, test_subdir)
     test_features, test_file_names = process_all_files(test_subdir_path)
     if len(test_features) != 32:
         print(f"Warning: Expected 32 files in {test_subdir_path}, found {len(test_features)}")
+    test_file_names = [os.path.join(test_subdir, fname) for fname in test_file_names]
     print(f"Processed {len(test_features)} files from {test_subdir} for testing")
     
-    # Use the last 2 files from the test subdirectory
-    test_indices = [len(test_features) - 2, len(test_features) - 1]  # Last 2 files (30, 31 if 32 files)
-    test_file_names = [test_file_names[i] for i in test_indices]
-    test_features_selected = [test_features[i] for i in test_indices]
-    
-    return all_features, test_features_selected, test_file_names
+    return all_features, test_features, test_file_names
 
 def prepare_data_for_lstm(train_features, test_features):
-    # Combine all features into a single DataFrame
     all_features_df = pd.DataFrame(train_features + test_features)
     if len(all_features_df) <= 5:
         raise ValueError("Not enough data samples to train the model")
@@ -198,7 +193,6 @@ def prepare_data_for_lstm(train_features, test_features):
     scaler_X = StandardScaler()
     scaler_y = StandardScaler()
     
-    # Split into train and test based on indices
     train_size = len(train_features)
     X_train = X.iloc[:train_size]
     y_train = y.iloc[:train_size].values.reshape(-1, 1)
@@ -237,7 +231,7 @@ class LSTMModel(nn.Module):
         output = self.fc2(fc1_out)
         return output
 
-def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=4):
+def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=32):  # Increased batch size for larger dataset
     train_dataset = TensorDataset(X_train, y_train)
     test_dataset = TensorDataset(X_test, y_test)
     
@@ -318,7 +312,7 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test):
     y_test_actual = y_scaler.inverse_transform(y_test)
     y_pred_actual = y_scaler.inverse_transform(y_pred_scaled)
     
-    print(f"\nPredicted vs Actual Execution Times for the Last Program's Test Files:")
+    print(f"\nPredicted vs Actual Execution Times for the Last Program ({file_names_test[0].split('/')[0]}):")
     for i, file_name in enumerate(file_names_test):
         print(f"File: {file_name}")
         print(f"  Predicted Time: {y_pred_actual[i][0]:.2f} ms")
@@ -329,12 +323,12 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test):
 def main(main_dir):
     print(f"Processing main directory: {main_dir}")
     train_features, test_features, test_file_names = process_main_directory(main_dir)
-    print(f"Total training samples: {len(train_features)}")
-    print(f"Test samples (last 2 files from last program): {len(test_features)}")
+    print(f"Total training samples: {len(train_features)} (from 29 programs)")
+    print(f"Test samples (last program): {len(test_features)}")
     
     X_train, y_train, X_test, y_test, y_scaler, input_size = prepare_data_for_lstm(train_features, test_features)
     
-    train_loader, test_loader = create_data_loaders(X_train, y_train, X_test, y_test, batch_size=4)
+    train_loader, test_loader = create_data_loaders(X_train, y_train, X_test, y_test, batch_size=32)
     model = LSTMModel(input_size=input_size)
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=0.001)
@@ -348,11 +342,10 @@ def main(main_dir):
     return model, y_scaler, y_test_actual, y_pred_actual
 
 if __name__ == "__main__":
-    # Main directory containing subfolders for each program
+    # Main directory containing 30 subfolders for each program
     main_dir = "Output_Programs"
     
-    # Run the main function to train on all programs except the last, predict for the last program's last 2 files
+    # Run the main function to train on 29 programs, test on the last program
     model, y_scaler, y_test_actual, y_pred_actual = main(main_dir)
     
     print("\nModel training and prediction completed!")
-  
