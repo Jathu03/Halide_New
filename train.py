@@ -284,7 +284,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
     
     return train_losses, val_losses
 
-def evaluate_model(model, X_test, y_test, y_scaler, file_names_test=None):
+def evaluate_model(model, X_test, y_test, y_scaler, file_names_test):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.to(device)
     model.eval()
@@ -299,15 +299,14 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test=None):
     y_test_actual = y_scaler.inverse_transform(y_test)
     y_pred_actual = y_scaler.inverse_transform(y_pred_scaled)
     
-    mse = np.mean((y_test_actual - y_pred_actual) ** 2)
-    mae = np.mean(np.abs(y_test_actual - y_pred_actual))
-    mape = np.mean(np.abs((y_test_actual - y_pred_actual) / y_test_actual)) * 100
+    # Print predictions for the test files
+    print("\nPredicted vs Actual Execution Times for Test Files:")
+    for i, file_name in enumerate(file_names_test):
+        print(f"File: {file_name}")
+        print(f"  Predicted Time: {y_pred_actual[i][0]:.2f} ms")
+        print(f"  Actual Time: {y_test_actual[i][0]:.2f} ms")
     
-    print(f"Mean Squared Error: {mse:.2f}")
-    print(f"Mean Absolute Error: {mae:.2f}")
-    print(f"Mean Absolute Percentage Error: {mape:.2f}%")
-    
-    return mse, mae, mape, y_test_actual, y_pred_actual
+    return y_test_actual, y_pred_actual
 
 def main(data_dir, test_file_indices=None):
     print(f"Processing files in directory: {data_dir}")
@@ -333,9 +332,9 @@ def main(data_dir, test_file_indices=None):
     train_losses, val_losses = train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=100, patience=10)
     
     print("\nEvaluating model:")
-    mse, mae, mape, y_test_actual, y_pred_actual = evaluate_model(model, X_test, y_test, y_scaler, file_names_test)
+    y_test_actual, y_pred_actual = evaluate_model(model, X_test, y_test, y_scaler, file_names_test)
     
-    return model, y_scaler, mse, mae, mape
+    return model, y_scaler, y_test_actual, y_pred_actual
 
 if __name__ == "__main__":
     # Directory containing exactly 32 JSON files
@@ -345,9 +344,6 @@ if __name__ == "__main__":
     test_file_indices = [30, 31]  # Files are indexed 0-31, so 30 and 31 are the last two
     
     # Run the main function with 30 training files and 2 test files
-    model, y_scaler, mse, mae, mape = main(data_dir, test_file_indices)
+    model, y_scaler, y_test_actual, y_pred_actual = main(data_dir, test_file_indices)
     
-    print("\nModel training completed!")
-    print(f"Final Mean Squared Error: {mse:.2f}")
-    print(f"Final Mean Absolute Error: {mae:.2f}")
-    print(f"Final Mean Absolute Percentage Error: {mape:.2f}%")
+    print("\nModel training and prediction completed!")
