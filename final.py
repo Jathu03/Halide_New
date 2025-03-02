@@ -142,7 +142,7 @@ def process_all_files(directory_path):
     all_features = []
     file_names = []
     
-    for filename in os.listdir(directory_path):
+    for filename in sorted(os.listdir(directory_path)):  # Sort to ensure first file is consistent
         if filename.endswith('.json'):
             file_path = os.path.join(directory_path, filename)
             features = extract_features_from_file(file_path)
@@ -179,7 +179,10 @@ def process_main_directory(main_dir):
     test_file_names = [os.path.join(test_subdir, fname) for fname in test_file_names]
     print(f"Processed {len(test_features)} files from {test_subdir} for testing")
     
-    return all_features, test_features, test_file_names
+    # Get reference time from the first file of the test subfolder
+    reference_time = test_features[0]['execution_time'] if test_features else None
+    
+    return all_features, test_features, test_file_names, reference_time
 
 def prepare_data_for_lstm(train_features, test_features):
     all_features_df = pd.DataFrame(train_features + test_features)
@@ -231,7 +234,7 @@ class LSTMModel(nn.Module):
         output = self.fc2(fc1_out)
         return output
 
-def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=32):  # Increased batch size for larger dataset
+def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=32):
     train_dataset = TensorDataset(X_train, y_train)
     test_dataset = TensorDataset(X_test, y_test)
     
@@ -297,7 +300,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
     
     return train_losses, val_losses
 
-def evaluate_model(model, X_test, y_test, y_scaler, file_names_test):
+def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, reference_time):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.to(device)
     model.eval()
@@ -312,17 +315,24 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test):
     y_test_actual = y_scaler.inverse_transform(y_test)
     y_pred_actual = y_scaler.inverse_transform(y_pred_scaled)
     
-    print(f"\nPredicted vs Actual Execution Times for the Last Program ({file_names_test[0].split('/')[0]}):")
+    if reference_time is None or reference_time == 0:
+        print("Error: Invalid reference time for speedup calculation")
+        return y_test_actual, y_pred_actual
+    
+    print(f"\nSpeedup for the Last Program ({file_names_test[0].split('/')[0]}):")
+    print(f"Reference Time (first file): {reference_time:.2f} ms")
     for i, file_name in enumerate(file_names_test):
+        actual_speedup = reference_time / y_test_actual[i][0] if y_test_actual[i][0] != 0 else float('inf')
+        predicted_speedup = reference_time / y_pred_actual[i][0] if y_pred_actual[i][0] != 0 else float('inf')
         print(f"File: {file_name}")
-        print(f"  Predicted Time: {y_pred_actual[i][0]:.2f} ms")
-        print(f"  Actual Time: {y_test_actual[i][0]:.2f} ms")
+        print(f"  Predicted Speedup: {predicted_speedup:.2f}x")
+        print(f"  Actual Speedup: {actual_speedup:.2f}x")
     
     return y_test_actual, y_pred_actual
 
 def main(main_dir):
     print(f"Processing main directory: {main_dir}")
-    train_features, test_features, test_file_names = process_main_directory(main_dir)
+    train_features, test_features, test_file_names, reference_time = process_main_directory(main_dir)
     print(f"Total training samples: {len(train_features)} (from 29 programs)")
     print(f"Test samples (last program): {len(test_features)}")
     
@@ -337,7 +347,7 @@ def main(main_dir):
     train_losses, val_losses = train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=100, patience=10)
     
     print("\nEvaluating model:")
-    y_test_actual, y_pred_actual = evaluate_model(model, X_test, y_test, y_scaler, test_file_names)
+    y_test_actual, y_pred_actual = evaluate_model(model, X_test, y_test, y_scaler, test_file_names, reference_time)
     
     return model, y_scaler, y_test_actual, y_pred_actual
 
