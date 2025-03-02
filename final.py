@@ -138,50 +138,68 @@ def extract_features_from_file(file_path):
     
     return features
 
-def process_all_files(directory_path):
+def process_directory(directory_path):
+    """Process all JSON files in a directory and split into train and test sets."""
     all_features = []
     file_names = []
     
-    for filename in os.listdir(directory_path):
-        if filename.endswith('.json'):
-            file_path = os.path.join(directory_path, filename)
-            features = extract_features_from_file(file_path)
-            if features is not None:
-                all_features.append(features)
-                file_names.append(filename)
+    # Get all JSON files in the directory
+    json_files = sorted([f for f in os.listdir(directory_path) if f.endswith('.json')])
     
-    return all_features, file_names
+    if len(json_files) < 32:
+        print(f"Warning: Expected at least 32 files in {directory_path}, found {len(json_files)}")
+    
+    # Process each file and extract features
+    for filename in json_files:
+        file_path = os.path.join(directory_path, filename)
+        features = extract_features_from_file(file_path)
+        if features is not None:
+            all_features.append(features)
+            file_names.append(filename)
+    
+    # Ensure we have at least 32 files to work with
+    if len(all_features) < 32:
+        print(f"Warning: Only {len(all_features)} valid files found in {directory_path}")
+        return None, None, None
+    
+    # Split into training (first 30) and testing (last 2)
+    train_features = all_features[:30]
+    test_features = all_features[30:32]
+    test_file_names = file_names[30:32]
+    
+    return train_features, test_features, test_file_names
 
 def process_main_directory(main_dir):
-    all_features = []
-    all_file_names = []
+    """Process all subdirectories, splitting each into train/test sets."""
+    all_train_features = []
+    all_test_features = []
+    all_test_file_names = []
+    
+    # Get all subdirectories
     subdirs = sorted([d for d in os.listdir(main_dir) if os.path.isdir(os.path.join(main_dir, d))])
     
-    if len(subdirs) < 30:
-        raise ValueError(f"Expected at least 30 subdirectories in {main_dir}, found {len(subdirs)}")
+    if len(subdirs) < 1:
+        raise ValueError(f"Expected at least 1 subdirectory in {main_dir}, found {len(subdirs)}")
     
-    # Use the first 29 subdirectories for training
-    for subdir in subdirs[:29]:
+    # Process each subdirectory
+    for subdir in subdirs:
         subdir_path = os.path.join(main_dir, subdir)
-        features, file_names = process_all_files(subdir_path)
-        if len(features) != 32:
-            print(f"Warning: Expected 32 files in {subdir_path}, found {len(features)}")
-        all_features.extend(features)
-        all_file_names.extend([os.path.join(subdir, fname) for fname in file_names])
-        print(f"Processed {len(features)} files from {subdir} for training")
+        train_features, test_features, test_file_names = process_directory(subdir_path)
+        
+        if train_features is None or test_features is None:
+            print(f"Skipping {subdir} due to insufficient data")
+            continue
+        
+        all_train_features.extend(train_features)
+        all_test_features.extend(test_features)
+        all_test_file_names.extend([os.path.join(subdir, fname) for fname in test_file_names])
+        
+        print(f"Processed subdir {subdir}: {len(train_features)} training files, {len(test_features)} test files")
     
-    # Use the last subdirectory for testing
-    test_subdir = subdirs[-1]
-    test_subdir_path = os.path.join(main_dir, test_subdir)
-    test_features, test_file_names = process_all_files(test_subdir_path)
-    if len(test_features) != 32:
-        print(f"Warning: Expected 32 files in {test_subdir_path}, found {len(test_features)}")
-    test_file_names = [os.path.join(test_subdir, fname) for fname in test_file_names]
-    print(f"Processed {len(test_features)} files from {test_subdir} for testing")
-    
-    return all_features, test_features, test_file_names
+    return all_train_features, all_test_features, all_test_file_names
 
 def prepare_data_for_lstm(train_features, test_features):
+    """Prepare the training and testing data for the LSTM model."""
     all_features_df = pd.DataFrame(train_features + test_features)
     if len(all_features_df) <= 5:
         raise ValueError("Not enough data samples to train the model")
@@ -312,28 +330,49 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test):
     y_test_actual = y_scaler.inverse_transform(y_test)
     y_pred_actual = y_scaler.inverse_transform(y_pred_scaled)
     
-    # Reference values: first file's actual and predicted times
-    ref_true_value = y_test_actual[0][0]
-    ref_pred_value = y_pred_actual[0][0]
+    # Group results by subfolder
+    results_by_subfolder = {}
+    for i, file_path in enumerate(file_names_test):
+        subfolder = file_path.split('/')[0]
+        if subfolder not in results_by_subfolder:
+            results_by_subfolder[subfolder] = []
+        
+        results_by_subfolder[subfolder].append({
+            'file': file_path,
+            'actual': y_test_actual[i][0],
+            'predicted': y_pred_actual[i][0]
+        })
     
-    print(f"\nSpeedup for the Last Program ({file_names_test[0].split('/')[0]}):")
-    print(f"Reference True Value (File 1): {ref_true_value:.2f} ms")
-    print(f"Reference Predicted Value (File 1): {ref_pred_value:.2f} ms")
-    print("\nFile-wise Speedup (Reference True / Actual, Reference Predicted / Predicted):")
-    for i, file_name in enumerate(file_names_test):
-        actual_speedup = ref_true_value / y_test_actual[i][0] if y_test_actual[i][0] != 0 else float('inf')
-        pred_speedup = ref_pred_value / y_pred_actual[i][0] if y_pred_actual[i][0] != 0 else float('inf')
-        print(f"File: {file_name}")
-        print(f"  Actual Speedup: {actual_speedup:.2f}x")
-        print(f"  Predicted Speedup: {pred_speedup:.2f}x")
+    # Print results for each subfolder
+    for subfolder, results in results_by_subfolder.items():
+        print(f"\nResults for {subfolder}:")
+        for result in results:
+            print(f"File: {result['file']}")
+            print(f"  Actual execution time: {result['actual']:.2f} ms")
+            print(f"  Predicted execution time: {result['predicted']:.2f} ms")
+    
+    # Calculate overall metrics
+    mse = np.mean((y_test_actual - y_pred_actual) ** 2)
+    rmse = np.sqrt(mse)
+    mae = np.mean(np.abs(y_test_actual - y_pred_actual))
+    
+    print("\nOverall Model Performance:")
+    print(f"MSE: {mse:.2f}")
+    print(f"RMSE: {rmse:.2f}")
+    print(f"MAE: {mae:.2f}")
     
     return y_test_actual, y_pred_actual
 
 def main(main_dir):
     print(f"Processing main directory: {main_dir}")
     train_features, test_features, test_file_names = process_main_directory(main_dir)
-    print(f"Total training samples: {len(train_features)} (from 29 programs)")
-    print(f"Test samples (last program): {len(test_features)}")
+    
+    print(f"Total training samples: {len(train_features)} (30 files from each program)")
+    print(f"Total test samples: {len(test_features)} (2 files from each program)")
+    
+    if len(train_features) == 0 or len(test_features) == 0:
+        print("Error: No valid training or test data found")
+        return None
     
     X_train, y_train, X_test, y_test, y_scaler, input_size = prepare_data_for_lstm(train_features, test_features)
     
@@ -351,10 +390,10 @@ def main(main_dir):
     return model, y_scaler, y_test_actual, y_pred_actual
 
 if __name__ == "__main__":
-    # Main directory containing 30 subfolders for each program
+    # Main directory containing subfolders for each program
     main_dir = "Output_Programs"
     
-    # Run the main function to train on 29 programs, test on the last program
+    # Run the main function to train and test
     model, y_scaler, y_test_actual, y_pred_actual = main(main_dir)
     
     print("\nModel training and prediction completed!")
