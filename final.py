@@ -110,8 +110,7 @@ def process_main_directory(main_dir):
         all_features = []
         all_file_names = []
         
-        # Process all files in the subdirectory
-        for filename in sorted(os.listdir(subdir_path)):  # Sort for consistency
+        for filename in sorted(os.listdir(subdir_path)):
             if filename.endswith('.json'):
                 file_path = os.path.join(subdir_path, filename)
                 features = extract_optimized_features(file_path)
@@ -123,7 +122,6 @@ def process_main_directory(main_dir):
             print(f"Warning: Expected 32 files in {subdir_path}, found {len(all_features)}")
             continue
         
-        # Split into train (first 30) and test (last 2)
         train_features.extend(all_features[:30])
         test_features.extend(all_features[30:])
         test_file_names.extend([os.path.join(subdir, fname) for fname in all_file_names[30:]])
@@ -154,32 +152,66 @@ def prepare_data_for_lstm(train_features, test_features):
     X_test_scaled = scaler_X.transform(X_test)
     y_test_scaled = scaler_y.transform(y_test)
     
-    X_train_tensor = torch.FloatTensor(X_train_scaled).unsqueeze(1)
+    # Remove unsqueeze since we're not using LSTM with sequence length
+    X_train_tensor = torch.FloatTensor(X_train_scaled)
     y_train_tensor = torch.FloatTensor(y_train_scaled)
-    X_test_tensor = torch.FloatTensor(X_test_scaled).unsqueeze(1)
+    X_test_tensor = torch.FloatTensor(X_test_scaled)
     y_test_tensor = torch.FloatTensor(y_test_scaled)
     
     return X_train_tensor, y_train_tensor, X_test_tensor, y_test_tensor, scaler_y, X_train_scaled.shape[1]
 
-class LSTMModel(nn.Module):
-    def __init__(self, input_size, hidden_size1=128, hidden_size2=64, output_size=1):
-        super(LSTMModel, self).__init__()
-        self.lstm1 = nn.LSTM(input_size, hidden_size1, batch_first=True)
+class ResidualDNN(nn.Module):
+    def __init__(self, input_size, hidden_size1=256, hidden_size2=128, hidden_size3=64, output_size=1):
+        super(ResidualDNN, self).__init__()
+        # Input layer
+        self.fc1 = nn.Linear(input_size, hidden_size1)
+        self.bn1 = nn.BatchNorm1d(hidden_size1)
+        self.relu1 = nn.ReLU()
         self.dropout1 = nn.Dropout(0.3)
-        self.lstm2 = nn.LSTM(hidden_size1, hidden_size2, batch_first=True)
+        
+        # Hidden layer 1 with residual connection
+        self.fc2 = nn.Linear(hidden_size1, hidden_size2)
+        self.bn2 = nn.BatchNorm1d(hidden_size2)
+        self.relu2 = nn.ReLU()
         self.dropout2 = nn.Dropout(0.3)
-        self.fc1 = nn.Linear(hidden_size2, 32)
-        self.relu = nn.ReLU()
-        self.fc2 = nn.Linear(32, output_size)
+        self.fc2_residual = nn.Linear(hidden_size1, hidden_size2)  # Residual projection
+        
+        # Hidden layer 2 with residual connection
+        self.fc3 = nn.Linear(hidden_size2, hidden_size3)
+        self.bn3 = nn.BatchNorm1d(hidden_size3)
+        self.relu3 = nn.ReLU()
+        self.dropout3 = nn.Dropout(0.3)
+        self.fc3_residual = nn.Linear(hidden_size2, hidden_size3)  # Residual projection
+        
+        # Output layer
+        self.fc4 = nn.Linear(hidden_size3, output_size)
     
     def forward(self, x):
-        lstm_out1, _ = self.lstm1(x)
-        lstm_out1 = self.dropout1(lstm_out1)
-        lstm_out2, _ = self.lstm2(lstm_out1)
-        lstm_out2 = self.dropout2(lstm_out2[:, -1, :])
-        fc1_out = self.relu(self.fc1(lstm_out2))
-        output = self.fc2(fc1_out)
-        return output
+        # Input layer
+        out = self.fc1(x)
+        out = self.bn1(out)
+        out = self.relu1(out)
+        out = self.dropout1(out)
+        
+        # Hidden layer 1 with residual
+        residual = self.fc2_residual(out)
+        out = self.fc2(out)
+        out = self.bn2(out)
+        out = out + residual  # Residual connection
+        out = self.relu2(out)
+        out = self.dropout2(out)
+        
+        # Hidden layer 2 with residual
+        residual = self.fc3_residual(out)
+        out = self.fc3(out)
+        out = self.bn3(out)
+        out = out + residual  # Residual connection
+        out = self.relu3(out)
+        out = self.dropout3(out)
+        
+        # Output layer
+        out = self.fc4(out)
+        return out
 
 def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=32):
     train_dataset = TensorDataset(X_train, y_train)
@@ -274,11 +306,11 @@ def main(main_dir):
     X_train, y_train, X_test, y_test, y_scaler, input_size = prepare_data_for_lstm(train_features, test_features)
     
     train_loader, test_loader = create_data_loaders(X_train, y_train, X_test, y_test, batch_size=32)
-    model = LSTMModel(input_size=input_size)
+    model = ResidualDNN(input_size=input_size)
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=0.0005)
     
-    print("Building and training LSTM model...")
+    print("Building and training Residual DNN model...")
     model = train_model(model, train_loader, test_loader, criterion, optimizer)
     
     print("\nEvaluating model:")
