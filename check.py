@@ -33,7 +33,8 @@ def extract_optimized_features(file_path):
             data = json.load(f)
         
         execution_time = get_execution_time(file_path)
-        if execution_time is None:
+        if execution_time is None or execution_time < 0:
+            print(f"Invalid execution time in {file_path}: {execution_time}")
             return None
         
         nodes = data["programming_details"]["Nodes"]
@@ -120,7 +121,6 @@ def process_main_directory(main_dir, train_ratio=0.9):
             print(f"Warning: Expected 32 files in {subdir_path}, found {len(all_features)}")
             continue
         
-        # Fixed split: first 30 for training, last 2 for testing
         train_features.extend(all_features[:30])
         test_features.extend(all_features[30:])
         test_file_names.extend([os.path.join(subdir, fname) for fname in all_file_names[30:]])
@@ -146,7 +146,7 @@ def prepare_data_for_model(train_features, test_features):
     X_test = X.iloc[train_size:]
     y_test = y.iloc[train_size:].values.reshape(-1, 1)
     
-    orig_y_train = y_train.copy()  # Unscaled targets
+    orig_y_train = y_train.copy()
     orig_y_test = y_test.copy()
     
     X_train_scaled = scaler_X.fit_transform(X_train)
@@ -154,10 +154,9 @@ def prepare_data_for_model(train_features, test_features):
     X_test_scaled = scaler_X.transform(X_test)
     y_test_scaled = scaler_y.transform(y_test)
     
-    # For LSTM/CNN-LSTM, add sequence dimension; for Ensemble, keep flat
-    X_train_tensor = torch.FloatTensor(X_train_scaled).unsqueeze(1)  # [batch, 1, features]
+    X_train_tensor = torch.FloatTensor(X_train_scaled).unsqueeze(1)
     y_train_tensor = torch.FloatTensor(y_train_scaled)
-    X_test_tensor = torch.FloatTensor(X_test_scaled).unsqueeze(1)  # [batch, 1, features]
+    X_test_tensor = torch.FloatTensor(X_test_scaled).unsqueeze(1)
     y_test_tensor = torch.FloatTensor(y_test_scaled)
     
     return X_train_tensor, y_train_tensor, X_test_tensor, y_test_tensor, scaler_y, X_train_scaled.shape[1], X.columns.tolist(), orig_y_train, orig_y_test
@@ -171,82 +170,29 @@ def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=16):
     
     return train_loader, test_loader
 
-# Model Definitions
 class EnhancedLSTMModel(nn.Module):
     def __init__(self, input_size, hidden_size1=128, hidden_size2=64, output_size=1):
         super(EnhancedLSTMModel, self).__init__()
         self.lstm1 = nn.LSTM(input_size, hidden_size1, batch_first=True)
+        self.bn1 = nn.BatchNorm1d(hidden_size1)
         self.dropout1 = nn.Dropout(0.3)
         self.lstm2 = nn.LSTM(hidden_size1, hidden_size2, batch_first=True)
+        self.bn2 = nn.BatchNorm1d(hidden_size2)
         self.dropout2 = nn.Dropout(0.3)
         self.fc = nn.Linear(hidden_size2, output_size)
+        self.relu = nn.ReLU()  # Ensure non-negative output
     
     def forward(self, x):
         out, _ = self.lstm1(x)
+        out = out.transpose(1, 2)  # [batch, hidden_size1, seq_len]
+        out = self.bn1(out.transpose(1, 2))  # [batch, seq_len, hidden_size1]
         out = self.dropout1(out)
         out, _ = self.lstm2(out)
+        out = out.transpose(1, 2)  # [batch, hidden_size2, seq_len]
+        out = self.bn2(out.transpose(1, 2))  # [batch, seq_len, hidden_size2]
         out = self.dropout2(out)
-        out = self.fc(out[:, -1, :])  # Last timestep
-        return out
-
-class CNNLSTMModel(nn.Module):
-    def __init__(self, input_size, hidden_size=128, output_size=1):
-        super(CNNLSTMModel, self).__init__()
-        self.conv1 = nn.Conv1d(input_size, 64, kernel_size=1)  # 1D conv over features
-        self.bn1 = nn.BatchNorm1d(64)
-        self.relu = nn.ReLU()
-        self.lstm = nn.LSTM(64, hidden_size, batch_first=True)
-        self.dropout = nn.Dropout(0.3)
-        self.fc = nn.Linear(hidden_size, output_size)
-    
-    def forward(self, x):
-        # x: [batch, seq_len=1, input_size]
-        out = x.transpose(1, 2)  # [batch, input_size, seq_len=1]
-        out = self.conv1(out)    # [batch, 64, 1]
-        out = self.bn1(out)
-        out = self.relu(out)
-        out = out.transpose(1, 2)  # [batch, 1, 64]
-        out, _ = self.lstm(out)
-        out = self.dropout(out)
         out = self.fc(out[:, -1, :])
-        return out
-
-class EnsembleModel(nn.Module):
-    def __init__(self, input_size, hidden_size=128, output_size=1):
-        super(EnsembleModel, self).__init__()
-        # LSTM branch
-        self.lstm = nn.LSTM(input_size, hidden_size, batch_first=True)
-        self.lstm_dropout = nn.Dropout(0.3)
-        
-        # CNN branch
-        self.conv1 = nn.Conv1d(input_size, 64, kernel_size=1)
-        self.conv_bn1 = nn.BatchNorm1d(64)
-        self.conv_relu = nn.ReLU()
-        self.conv_fc = nn.Linear(64, hidden_size)
-        
-        # Combined
-        self.fc1 = nn.Linear(hidden_size * 2, 64)
-        self.fc_dropout = nn.Dropout(0.3)
-        self.fc2 = nn.Linear(64, output_size)
-    
-    def forward(self, x):
-        # LSTM branch
-        lstm_out, _ = self.lstm(x)
-        lstm_out = self.lstm_dropout(lstm_out[:, -1, :])  # [batch, hidden_size]
-        
-        # CNN branch
-        cnn_out = x.transpose(1, 2)  # [batch, input_size, 1]
-        cnn_out = self.conv1(cnn_out)  # [batch, 64, 1]
-        cnn_out = self.conv_bn1(cnn_out)
-        cnn_out = self.conv_relu(cnn_out)
-        cnn_out = cnn_out.squeeze(2)  # [batch, 64]
-        cnn_out = self.conv_fc(cnn_out)  # [batch, hidden_size]
-        
-        # Combine
-        combined = torch.cat((lstm_out, cnn_out), dim=1)  # [batch, hidden_size * 2]
-        out = self.fc1(combined)
-        out = self.fc_dropout(out)
-        out = self.fc2(out)
+        out = self.relu(out)  # Clamp to non-negative
         return out
 
 def train_model(model, train_loader, test_loader, criterion, optimizer, scheduler, num_epochs=200, patience=20):
@@ -269,6 +215,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, schedule
             outputs = model(inputs)
             loss = criterion(outputs, targets)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # Gradient clipping
             optimizer.step()
             running_loss += loss.item() * inputs.size(0)
         
@@ -322,6 +269,9 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, orig_y_test
     y_test_actual = y_scaler.inverse_transform(y_test)
     y_pred_actual = y_scaler.inverse_transform(y_pred_scaled)
     
+    # Clamp predictions to non-negative
+    y_pred_actual = np.clip(y_pred_actual, 0, None)
+    
     print("\nPredicted vs Actual Execution Times for Test Files:")
     for i, file_name in enumerate(file_names_test):
         print(f"File: {file_name}")
@@ -330,7 +280,7 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, orig_y_test
     
     return y_test_actual, y_pred_actual
 
-def main(main_dir, model_type='ensemble', train_ratio=0.9):
+def main(main_dir, model_type='lstm', train_ratio=0.9):
     print(f"Processing main directory: {main_dir}")
     train_features, test_features, test_file_names = process_main_directory(main_dir, train_ratio)
     
@@ -341,35 +291,26 @@ def main(main_dir, model_type='ensemble', train_ratio=0.9):
         print("Error: No valid training or test data found")
         return None, None, None
     
-    # Prepare data for model
     data = prepare_data_for_model(train_features, test_features)
     X_train, y_train, X_test, y_test, y_scaler, input_size, feature_names, orig_y_train, orig_y_test = data
     
-    # Create data loaders
     train_loader, test_loader = create_data_loaders(X_train, y_train, X_test, y_test, batch_size=16)
     
-    # Select model type
+    # Use a simpler LSTM model for stability
     if model_type == 'lstm':
         model = EnhancedLSTMModel(input_size=input_size, hidden_size1=128, hidden_size2=64)
-    elif model_type == 'cnn_lstm':
-        model = CNNLSTMModel(input_size=input_size, hidden_size=128)
-    elif model_type == 'ensemble':
-        model = EnsembleModel(input_size=input_size, hidden_size=128)
     else:
-        raise ValueError(f"Unknown model type: {model_type}")
+        raise ValueError(f"Unknown model type: {model_type}. Using 'lstm' for now.")
     
-    # Define loss function, optimizer, and scheduler
     criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    optimizer = optim.Adam(model.parameters(), lr=0.0005)  # Reduced LR
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10, verbose=True)
     
-    # Train the model
     print(f"Training {model_type} model...")
     train_losses, val_losses = train_model(
         model, train_loader, test_loader, criterion, optimizer, scheduler, num_epochs=200, patience=20
     )
     
-    # Evaluate the model
     print("\nEvaluating the model...")
     y_test_actual, y_pred_actual = evaluate_model(
         model, X_test, y_test, y_scaler, test_file_names, orig_y_test
@@ -377,9 +318,8 @@ def main(main_dir, model_type='ensemble', train_ratio=0.9):
     
     return model, y_test_actual, y_pred_actual
 
-# Run the main function
 if __name__ == "__main__":
-    main_dir = "Output_Programs"  # Replace with your actual path if different
-    model, y_test_actual, y_pred_actual = main(main_dir, model_type='ensemble')
+    main_dir = "Output_Programs"
+    model, y_test_actual, y_pred_actual = main(main_dir, model_type='lstm')  # Switched to 'lstm' for stability
     if model is not None:
         print("\nModel training and prediction completed!")
