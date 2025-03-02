@@ -3,7 +3,6 @@ import json
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -139,62 +138,94 @@ def extract_features_from_file(file_path):
     
     return features
 
-def process_all_files(directory_path):
+def process_directory(directory_path):
+    """Process all JSON files in a directory and split into train and test sets."""
     all_features = []
     file_names = []
     
-    for filename in os.listdir(directory_path):
-        if filename.endswith('.json'):
-            file_path = os.path.join(directory_path, filename)
-            features = extract_features_from_file(file_path)
-            if features is not None:
-                all_features.append(features)
-                file_names.append(filename)
+    # Get all JSON files in the directory
+    json_files = sorted([f for f in os.listdir(directory_path) if f.endswith('.json')])
     
-    return all_features, file_names
+    if len(json_files) < 32:
+        print(f"Warning: Expected at least 32 files in {directory_path}, found {len(json_files)}")
+    
+    # Process each file and extract features
+    for filename in json_files:
+        file_path = os.path.join(directory_path, filename)
+        features = extract_features_from_file(file_path)
+        if features is not None:
+            all_features.append(features)
+            file_names.append(filename)
+    
+    # Ensure we have at least 32 files to work with
+    if len(all_features) < 32:
+        print(f"Warning: Only {len(all_features)} valid files found in {directory_path}")
+        return None, None
+    
+    # Split into training (first 30) and testing (last 2)
+    train_features = all_features[:30]
+    test_features = all_features[30:32]
+    test_file_names = file_names[30:32]
+    
+    return train_features, test_features, test_file_names
 
-def prepare_data_for_lstm(all_features, test_indices=None):
-    df = pd.DataFrame(all_features)
-    if len(df) <= 5:
+def process_main_directory(main_dir):
+    """Process all subdirectories, splitting each into train/test sets."""
+    all_train_features = []
+    all_test_features = []
+    all_test_file_names = []
+    
+    # Get all subdirectories
+    subdirs = sorted([d for d in os.listdir(main_dir) if os.path.isdir(os.path.join(main_dir, d))])
+    
+    if len(subdirs) < 1:
+        raise ValueError(f"Expected at least 1 subdirectory in {main_dir}, found {len(subdirs)}")
+    
+    # Process each subdirectory
+    for subdir in subdirs:
+        subdir_path = os.path.join(main_dir, subdir)
+        train_features, test_features, test_file_names = process_directory(subdir_path)
+        
+        if train_features is None or test_features is None:
+            print(f"Skipping {subdir} due to insufficient data")
+            continue
+        
+        all_train_features.extend(train_features)
+        all_test_features.extend(test_features)
+        all_test_file_names.extend([os.path.join(subdir, fname) for fname in test_file_names])
+        
+        print(f"Processed subdir {subdir}: {len(train_features)} training files, {len(test_features)} test files")
+    
+    return all_train_features, all_test_features, all_test_file_names
+
+def prepare_data_for_lstm(train_features, test_features):
+    """Prepare the training and testing data for the LSTM model."""
+    all_features_df = pd.DataFrame(train_features + test_features)
+    if len(all_features_df) <= 5:
         raise ValueError("Not enough data samples to train the model")
     
-    X = df.drop('execution_time', axis=1)
-    y = df['execution_time']
+    X = all_features_df.drop('execution_time', axis=1)
+    y = all_features_df['execution_time']
     X = X.fillna(0)
     
     scaler_X = StandardScaler()
     scaler_y = StandardScaler()
     
-    if test_indices is not None:
-        test_mask = np.zeros(len(df), dtype=bool)
-        test_mask[test_indices] = True
-        train_mask = ~test_mask
-        
-        X_train = X[train_mask]
-        y_train = y[train_mask].values.reshape(-1, 1)
-        X_test = X[test_mask]
-        y_test = y[test_mask].values.reshape(-1, 1)
-        
-        X_train_scaled = scaler_X.fit_transform(X_train)
-        y_train_scaled = scaler_y.fit_transform(y_train)
-        X_test_scaled = scaler_X.transform(X_test)
-        y_test_scaled = scaler_y.transform(y_test)
-    else:
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-        y_train = y_train.values.reshape(-1, 1)
-        y_test = y_test.values.reshape(-1, 1)
-        X_train_scaled = scaler_X.fit_transform(X_train)
-        y_train_scaled = scaler_y.fit_transform(y_train)
-        X_test_scaled = scaler_X.transform(X_test)
-        y_test_scaled = scaler_y.transform(y_test)
+    train_size = len(train_features)
+    X_train = X.iloc[:train_size]
+    y_train = y.iloc[:train_size].values.reshape(-1, 1)
+    X_test = X.iloc[train_size:]
+    y_test = y.iloc[train_size:].values.reshape(-1, 1)
     
-    X_train_tensor = torch.FloatTensor(X_train_scaled)
+    X_train_scaled = scaler_X.fit_transform(X_train)
+    y_train_scaled = scaler_y.fit_transform(y_train)
+    X_test_scaled = scaler_X.transform(X_test)
+    y_test_scaled = scaler_y.transform(y_test)
+    
+    X_train_tensor = torch.FloatTensor(X_train_scaled).unsqueeze(1)
     y_train_tensor = torch.FloatTensor(y_train_scaled)
-    X_test_tensor = torch.FloatTensor(X_test_scaled)
+    X_test_tensor = torch.FloatTensor(X_test_scaled).unsqueeze(1)
     y_test_tensor = torch.FloatTensor(y_test_scaled)
-    
-    X_train_tensor = X_train_tensor.unsqueeze(1)
-    X_test_tensor = X_test_tensor.unsqueeze(1)
     
     return X_train_tensor, y_train_tensor, X_test_tensor, y_test_tensor, scaler_y, X_train_scaled.shape[1]
 
@@ -218,7 +249,7 @@ class LSTMModel(nn.Module):
         output = self.fc2(fc1_out)
         return output
 
-def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=4):
+def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=32):
     train_dataset = TensorDataset(X_train, y_train)
     test_dataset = TensorDataset(X_test, y_test)
     
@@ -299,31 +330,69 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test):
     y_test_actual = y_scaler.inverse_transform(y_test)
     y_pred_actual = y_scaler.inverse_transform(y_pred_scaled)
     
-    # Print predictions for the test files
-    print("\nPredicted vs Actual Execution Times for Test Files:")
-    for i, file_name in enumerate(file_names_test):
-        print(f"File: {file_name}")
-        print(f"  Predicted Time: {y_pred_actual[i][0]:.2f} ms")
-        print(f"  Actual Time: {y_test_actual[i][0]:.2f} ms")
+    # Group results by subfolder
+    results_by_subfolder = {}
+    for i, file_path in enumerate(file_names_test):
+        subfolder = file_path.split('/')[0]
+        if subfolder not in results_by_subfolder:
+            results_by_subfolder[subfolder] = []
+        
+        results_by_subfolder[subfolder].append({
+            'file': file_path,
+            'actual': y_test_actual[i][0],
+            'predicted': y_pred_actual[i][0]
+        })
+    
+    # Print results for each subfolder
+    for subfolder, results in results_by_subfolder.items():
+        print(f"\nResults for {subfolder}:")
+        
+        # Use the first file in each subfolder as reference for speedup calculation
+        if len(results) > 0:
+            ref_file = results[0]
+            ref_actual = ref_file['actual']
+            ref_predicted = ref_file['predicted']
+            
+            print(f"Reference file: {ref_file['file']}")
+            print(f"  Actual execution time: {ref_actual:.2f} ms")
+            print(f"  Predicted execution time: {ref_predicted:.2f} ms")
+            
+            for result in results:
+                actual_speedup = ref_actual / result['actual'] if result['actual'] != 0 else float('inf')
+                pred_speedup = ref_predicted / result['predicted'] if result['predicted'] != 0 else float('inf')
+                
+                print(f"File: {result['file']}")
+                print(f"  Actual execution time: {result['actual']:.2f} ms")
+                print(f"  Predicted execution time: {result['predicted']:.2f} ms")
+                print(f"  Actual speedup vs reference: {actual_speedup:.2f}x")
+                print(f"  Predicted speedup vs reference: {pred_speedup:.2f}x")
+    
+    # Calculate overall metrics
+    mse = np.mean((y_test_actual - y_pred_actual) ** 2)
+    rmse = np.sqrt(mse)
+    mae = np.mean(np.abs(y_test_actual - y_pred_actual))
+    
+    print("\nOverall Model Performance:")
+    print(f"MSE: {mse:.2f}")
+    print(f"RMSE: {rmse:.2f}")
+    print(f"MAE: {mae:.2f}")
     
     return y_test_actual, y_pred_actual
 
-def main(data_dir, test_file_indices=None):
-    print(f"Processing files in directory: {data_dir}")
-    all_features, file_names = process_all_files(data_dir)
-    print(f"Processed {len(all_features)} files")
+def main(main_dir):
+    print(f"Processing main directory: {main_dir}")
+    train_features, test_features, test_file_names = process_main_directory(main_dir)
     
-    if len(all_features) != 32:
-        raise ValueError(f"Expected 32 files, but found {len(all_features)} files in {data_dir}")
+    print(f"Total training samples: {len(train_features)} (30 files from each program)")
+    print(f"Total test samples: {len(test_features)} (2 files from each program)")
     
-    if test_file_indices is not None:
-        X_train, y_train, X_test, y_test, y_scaler, input_size = prepare_data_for_lstm(all_features, test_file_indices)
-        file_names_test = [file_names[i] for i in test_file_indices]
-    else:
-        X_train, y_train, X_test, y_test, y_scaler, input_size = prepare_data_for_lstm(all_features)
-        file_names_test = None
+    if len(train_features) == 0 or len(test_features) == 0:
+        print("Error: No valid training or test data found")
+        return None
     
-    train_loader, test_loader = create_data_loaders(X_train, y_train, X_test, y_test, batch_size=4)
+    X_train, y_train, X_test, y_test, y_scaler, input_size = prepare_data_for_lstm(train_features, test_features)
+    
+    train_loader, test_loader = create_data_loaders(X_train, y_train, X_test, y_test, batch_size=32)
     model = LSTMModel(input_size=input_size)
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=0.001)
@@ -332,18 +401,15 @@ def main(data_dir, test_file_indices=None):
     train_losses, val_losses = train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=100, patience=10)
     
     print("\nEvaluating model:")
-    y_test_actual, y_pred_actual = evaluate_model(model, X_test, y_test, y_scaler, file_names_test)
+    y_test_actual, y_pred_actual = evaluate_model(model, X_test, y_test, y_scaler, test_file_names)
     
     return model, y_scaler, y_test_actual, y_pred_actual
 
 if __name__ == "__main__":
-    # Directory containing exactly 32 JSON files
-    data_dir = "Output_Programs/program_50001"
+    # Main directory containing subfolders for each program
+    main_dir = "Output_Programs"
     
-    # Use the last 2 files (indices 30 and 31) for testing, remaining 30 for training
-    test_file_indices = [30, 31]  # Files are indexed 0-31, so 30 and 31 are the last two
-    
-    # Run the main function with 30 training files and 2 test files
-    model, y_scaler, y_test_actual, y_pred_actual = main(data_dir, test_file_indices)
+    # Run the main function to train and test
+    model, y_scaler, y_test_actual, y_pred_actual = main(main_dir)
     
     print("\nModel training and prediction completed!")
