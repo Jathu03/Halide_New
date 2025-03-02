@@ -1,259 +1,437 @@
-import numpy as np
-import pandas as pd
-from sklearn.preprocessing import MinMaxScaler
-import torch
-import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
 import os
 import json
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import TensorDataset, DataLoader
+import matplotlib.pyplot as plt
 
-# Helper function to parse fractions
-def parse_number(s):
-    try:
-        return float(s)
-    except ValueError:
-        if '/' in s:
-            num, denom = s.split('/')
-            return float(num) / float(denom)
-        raise ValueError(f"Cannot convert {s} to float")
-
-# 1. Feature Extraction Function (Corrected)
-def extract_features(file_path):
+# Function to extract features from a single JSON file
+def extract_features_from_file(file_path):
     with open(file_path, 'r') as f:
         data = json.load(f)
     
-    features = []
-    
-    # Extract Edge Features (numerical values from Load Jacobians)
-    edge_features = []
-    for edge in data['programming_details']['Edges']:
-        jacobian = edge['Details']['Load Jacobians']
-        jacobian_vals = []
-        for row in jacobian:
-            nums = [parse_number(x) for x in row.split() if x not in ['_', '0', '1']]
-            jacobian_vals.extend(nums)
-        edge_features.extend(jacobian_vals)
-    
-    # Extract Node Features (numerical values from Op histogram)
-    node_features = []
-    for node in data['programming_details']['Nodes']:
-        histogram = node['Details']['Op histogram']
-        hist_vals = []
-        for line in histogram:
-            if ':' in line:
-                val = float(line.split(':')[1].strip())
-                hist_vals.append(val)
-        node_features.extend(hist_vals)
-    
-    # Extract Scheduling Features and Execution Time
-    scheduling_features = []
+    # Extract execution time (target variable)
     execution_time = None
+    for item in data:
+        if isinstance(item, dict) and item.get('name') == 'total_execution_time_ms':
+            execution_time = item.get('value')
+            break
     
-    # Check if 'Schedules' exists in 'programming_details'
-    if 'Schedules' not in data['programming_details']:
-        raise KeyError(f"'Schedules' key not found in {file_path}. Available keys: {list(data['programming_details'].keys())}")
-    
-    for schedule in data['programming_details']['Schedules']:
-        if not isinstance(schedule, dict):
-            continue  # Skip if schedule is not a dictionary
-        # Extract scheduling features if available
-        if 'Details' in schedule and 'scheduling_feature' in schedule['Details']:
-            sched_data = schedule['Details']['scheduling_feature']
-            sched_vals = [float(v) for v in sched_data.values()]
-            scheduling_features.extend(sched_vals)
-        # Extract execution time if available
-        if 'name' in schedule and schedule['name'] == 'total_execution_time_ms':
-            execution_time = schedule['value']
-    
-    # Validate that execution time was found
     if execution_time is None:
-        raise ValueError(f"Execution time ('total_execution_time_ms') not found in 'Schedules' of {file_path}")
+        print(f"Warning: No execution time found in {file_path}")
+        return None
     
-    # Combine all features
-    features.extend(edge_features)
-    features.extend(node_features)
-    features.extend(scheduling_features)
+    # Extract programming details (node and edge features)
+    nodes_features = []
+    edges_features = []
     
-    return np.array(features), execution_time
+    # Look for programming_details
+    programming_details = None
+    for key, value in data.items():
+        if key == "programming_details":
+            programming_details = value
+            break
+    
+    if programming_details:
+        # Process nodes
+        if 'Nodes' in programming_details:
+            for node in programming_details['Nodes']:
+                node_feature = {}
+                node_feature['Name'] = node.get('Name', '')
+                
+                # Extract op histogram if available
+                if 'Details' in node and 'Op histogram' in node['Details']:
+                    op_hist = node['Details']['Op histogram']
+                    for op_line in op_hist:
+                        parts = op_line.strip().split(':')
+                        if len(parts) == 2:
+                            op_name = parts[0].strip()
+                            op_count = int(parts[1].strip())
+                            node_feature[f'op_{op_name.lower()}'] = op_count
+                
+                nodes_features.append(node_feature)
+        
+        # Process edges
+        if 'Edges' in programming_details:
+            for edge in programming_details['Edges']:
+                edge_feature = {}
+                edge_feature['From'] = edge.get('From', '')
+                edge_feature['To'] = edge.get('To', '')
+                edge_feature['Name'] = edge.get('Name', '')
+                
+                edges_features.append(edge_feature)
+    
+    # Extract scheduling details
+    scheduling_features = []
+    
+    # Look for scheduling_data
+    scheduling_data = None
+    for key, value in data.items():
+        if key == "scheduling_data":
+            scheduling_data = value
+            break
+    
+    if scheduling_data:
+        for sched in scheduling_data:
+            sched_feature = {}
+            sched_feature['Name'] = sched.get('Name', '')
+            
+            if 'Details' in sched and 'scheduling_feature' in sched['Details']:
+                sf = sched['Details']['scheduling_feature']
+                for key, value in sf.items():
+                    sched_feature[key] = value
+            
+            scheduling_features.append(sched_feature)
+    
+    # Create a feature dictionary
+    features = {
+        'execution_time': execution_time,
+        'nodes_count': len(nodes_features),
+        'edges_count': len(edges_features),
+        'scheduling_count': len(scheduling_features)
+    }
+    
+    # Add aggregated node features
+    op_counts = {}
+    for node in nodes_features:
+        for key, value in node.items():
+            if key.startswith('op_'):
+                op_counts[key] = op_counts.get(key, 0) + value
+    
+    features.update(op_counts)
+    
+    # Add important scheduling features (aggregate or take first few entries)
+    if scheduling_features:
+        # Common scheduling metrics to extract (based on your sample data)
+        important_metrics = [
+            'bytes_at_production', 'bytes_at_realization', 'bytes_at_root', 'bytes_at_task',
+            'inner_parallelism', 'outer_parallelism', 'num_productions', 'num_realizations',
+            'num_scalars', 'num_vectors', 'points_computed_total', 'working_set'
+        ]
+        
+        # Take the first scheduling feature for these metrics (can be modified to use aggregation)
+        if scheduling_features and scheduling_features[0]:
+            for metric in important_metrics:
+                if metric in scheduling_features[0]:
+                    features[f'sched_{metric}'] = scheduling_features[0][metric]
+        
+        # Aggregate some metrics across all scheduling features
+        total_bytes_at_production = sum(sf.get('bytes_at_production', 0) for sf in scheduling_features if isinstance(sf, dict))
+        total_vectors = sum(sf.get('num_vectors', 0) for sf in scheduling_features if isinstance(sf, dict))
+        total_parallelism = sum(sf.get('inner_parallelism', 0) * sf.get('outer_parallelism', 1) for sf in scheduling_features if isinstance(sf, dict))
+        
+        features['total_bytes_at_production'] = total_bytes_at_production
+        features['total_vectors'] = total_vectors
+        features['total_parallelism'] = total_parallelism
+    
+    return features
 
-# 2. Load and Process All Files
-def load_data(folder_path):
-    X_data = []
-    y_data = []
+# Function to process all JSON files in a directory
+def process_all_files(directory_path):
+    all_features = []
+    file_names = []
     
-    for filename in os.listdir(folder_path):
+    for filename in os.listdir(directory_path):
         if filename.endswith('.json'):
-            file_path = os.path.join(folder_path, filename)
-            try:
-                features, exec_time = extract_features(file_path)
-                X_data.append(features)
-                y_data.append(exec_time)
-            except (KeyError, ValueError) as e:
-                print(f"Skipping {file_path}: {str(e)}")
-                continue
+            file_path = os.path.join(directory_path, filename)
+            features = extract_features_from_file(file_path)
+            
+            if features is not None:
+                all_features.append(features)
+                file_names.append(filename)
     
-    # Pad sequences to same length
-    if not X_data:
-        raise ValueError("No valid data loaded from files.")
-    max_length = max(len(x) for x in X_data)
-    X_data_padded = np.array([np.pad(x, (0, max_length - len(x)), 'constant') 
-                            for x in X_data])
-    
-    return X_data_padded, np.array(y_data)
+    return all_features, file_names
 
-# 3. Prepare Sequences for LSTM
-def create_sequences(X, y, sequence_length=5):
-    X_seq, y_seq = [], []
-    for i in range(len(X) - sequence_length):
-        X_seq.append(X[i:(i + sequence_length)])
-        y_seq.append(y[i + sequence_length])
-    return np.array(X_seq), np.array(y_seq)
-
-# 4. Custom Dataset Class for PyTorch
-class ScheduleDataset(Dataset):
-    def __init__(self, X, y):
-        self.X = torch.tensor(X, dtype=torch.float32)
-        self.y = torch.tensor(y, dtype=torch.float32)
+# Function to prepare data for LSTM
+def prepare_data_for_lstm(all_features, test_indices=None):
+    # Convert to dataframe
+    df = pd.DataFrame(all_features)
     
-    def __len__(self):
-        return len(self.X)
+    # Check if we have enough data
+    if len(df) <= 5:  # arbitrary small number
+        raise ValueError("Not enough data samples to train the model")
     
-    def __getitem__(self, idx):
-        return self.X[idx], self.y[idx]
-
-# 5. LSTM Model Definition in PyTorch
-class LSTMModel(nn.Module):
-    def __init__(self, input_size, hidden_size1=100, hidden_size2=50, dropout=0.2):
-        super(LSTMModel, self).__init__()
-        self.lstm1 = nn.LSTM(input_size, hidden_size1, batch_first=True, num_layers=1)
-        self.dropout1 = nn.Dropout(dropout)
-        self.lstm2 = nn.LSTM(hidden_size1, hidden_size2, batch_first=True, num_layers=1)
-        self.dropout2 = nn.Dropout(dropout)
-        self.fc = nn.Linear(hidden_size2, 1)
+    # Separate features and target
+    X = df.drop('execution_time', axis=1)
+    y = df['execution_time']
     
-    def forward(self, x):
-        out, _ = self.lstm1(x)
-        out = self.dropout1(out)
-        out, _ = self.lstm2(out)
-        out = self.dropout2(out)
-        out = self.fc(out[:, -1, :])  # Take the last time step output
-        return out
-
-# 6. Main Training Function
-def train_lstm_model(folder_path):
-    # Load and preprocess data
-    X_data, y_data = load_data(folder_path)
+    # Handle missing values (replace with mean or 0)
+    X = X.fillna(0)
     
     # Normalize features
-    scaler_X = MinMaxScaler()
-    X_scaled = scaler_X.fit_transform(X_data)
+    scaler_X = StandardScaler()
+    scaler_y = StandardScaler()
     
-    scaler_y = MinMaxScaler()
-    y_scaled = scaler_y.fit_transform(y_data.reshape(-1, 1))
+    # If test_indices is provided, split data accordingly
+    if test_indices is not None:
+        test_mask = np.zeros(len(df), dtype=bool)
+        test_mask[test_indices] = True
+        train_mask = ~test_mask
+        
+        X_train = X[train_mask]
+        y_train = y[train_mask].values.reshape(-1, 1)
+        X_test = X[test_mask]
+        y_test = y[test_mask].values.reshape(-1, 1)
+        
+        # Fit scalers on training data only
+        X_train_scaled = scaler_X.fit_transform(X_train)
+        y_train_scaled = scaler_y.fit_transform(y_train)
+        
+        # Transform test data using the same scalers
+        X_test_scaled = scaler_X.transform(X_test)
+        y_test_scaled = scaler_y.transform(y_test)
+    else:
+        # Random split if test_indices not provided
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+        
+        # Reshape y for scaling
+        y_train = y_train.values.reshape(-1, 1)
+        y_test = y_test.values.reshape(-1, 1)
+        
+        # Scale the data
+        X_train_scaled = scaler_X.fit_transform(X_train)
+        y_train_scaled = scaler_y.fit_transform(y_train)
+        X_test_scaled = scaler_X.transform(X_test)
+        y_test_scaled = scaler_y.transform(y_test)
     
-    # Create sequences
-    sequence_length = 5
-    X_seq, y_seq = create_sequences(X_scaled, y_scaled, sequence_length)
+    # Convert to PyTorch tensors
+    X_train_tensor = torch.FloatTensor(X_train_scaled)
+    y_train_tensor = torch.FloatTensor(y_train_scaled)
+    X_test_tensor = torch.FloatTensor(X_test_scaled)
+    y_test_tensor = torch.FloatTensor(y_test_scaled)
     
-    # Split into train and test sets
-    train_size = int(len(X_seq) * 0.8)
-    X_train, X_test = X_seq[:train_size], X_seq[train_size:]
-    y_train, y_test = y_seq[:train_size], y_seq[train_size:]
+    # Reshape for LSTM [batch, seq_len, features]
+    X_train_tensor = X_train_tensor.unsqueeze(1)  # Add sequence dimension of 1
+    X_test_tensor = X_test_tensor.unsqueeze(1)   # Add sequence dimension of 1
     
-    # Create PyTorch datasets and dataloaders
-    train_dataset = ScheduleDataset(X_train, y_train)
-    test_dataset = ScheduleDataset(X_test, y_test)
+    return X_train_tensor, y_train_tensor, X_test_tensor, y_test_tensor, scaler_y, X_train_scaled.shape[1]
+
+# Define the LSTM model class
+class LSTMModel(nn.Module):
+    def __init__(self, input_size, hidden_size1=64, hidden_size2=32, output_size=1):
+        super(LSTMModel, self).__init__()
+        self.lstm1 = nn.LSTM(input_size, hidden_size1, batch_first=True)
+        self.dropout1 = nn.Dropout(0.2)
+        self.lstm2 = nn.LSTM(hidden_size1, hidden_size2, batch_first=True)
+        self.dropout2 = nn.Dropout(0.2)
+        self.fc1 = nn.Linear(hidden_size2, 16)
+        self.relu = nn.ReLU()
+        self.fc2 = nn.Linear(16, output_size)
+        
+    def forward(self, x):
+        # Input shape: [batch_size, seq_len, input_size]
+        lstm_out1, _ = self.lstm1(x)
+        lstm_out1 = self.dropout1(lstm_out1)
+        lstm_out2, _ = self.lstm2(lstm_out1)
+        lstm_out2 = self.dropout2(lstm_out2[:, -1, :])  # Take the last time step output
+        fc1_out = self.relu(self.fc1(lstm_out2))
+        output = self.fc2(fc1_out)
+        return output
+
+# Function to create data loaders
+def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=4):
+    train_dataset = TensorDataset(X_train, y_train)
+    test_dataset = TensorDataset(X_test, y_test)
     
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
     
-    # Initialize model
+    return train_loader, test_loader
+
+# Function to train the model
+def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=100, patience=10):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = LSTMModel(input_size=X_scaled.shape[1]).to(device)
+    print(f"Using device: {device}")
     
-    # Loss and optimizer
-    criterion = nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    model.to(device)
     
-    # Training loop
-    num_epochs = 50
+    # To track the best validation loss
+    best_val_loss = float('inf')
+    epochs_no_improve = 0
+    best_model_state = None
+    
+    train_losses = []
+    val_losses = []
+    
     for epoch in range(num_epochs):
+        # Training
         model.train()
-        train_loss = 0
-        for X_batch, y_batch in train_loader:
-            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+        running_loss = 0.0
+        for inputs, targets in train_loader:
+            inputs, targets = inputs.to(device), targets.to(device)
             
+            # Zero the parameter gradients
             optimizer.zero_grad()
-            outputs = model(X_batch)
-            loss = criterion(outputs, y_batch)
+            
+            # Forward pass
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+            
+            # Backward and optimize
             loss.backward()
             optimizer.step()
             
-            train_loss += loss.item() * X_batch.size(0)
+            running_loss += loss.item() * inputs.size(0)
         
-        train_loss /= len(train_loader.dataset)
+        train_loss = running_loss / len(train_loader.dataset)
+        train_losses.append(train_loss)
         
-        # Validation (using test set as validation here)
+        # Validation
         model.eval()
-        val_loss = 0
+        val_loss = 0.0
         with torch.no_grad():
-            for X_batch, y_batch in test_loader:
-                X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-                outputs = model(X_batch)
-                val_loss += criterion(outputs, y_batch).item() * X_batch.size(0)
+            for inputs, targets in test_loader:
+                inputs, targets = inputs.to(device), targets.to(device)
+                outputs = model(inputs)
+                loss = criterion(outputs, targets)
+                val_loss += loss.item() * inputs.size(0)
         
         val_loss /= len(test_loader.dataset)
+        val_losses.append(val_loss)
         
-        print(f'Epoch [{epoch+1}/{num_epochs}], Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}')
+        print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
+        
+        # Early stopping
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            epochs_no_improve = 0
+            best_model_state = model.state_dict().copy()
+        else:
+            epochs_no_improve += 1
+        
+        if epochs_no_improve >= patience:
+            print(f'Early stopping after {epoch+1} epochs')
+            model.load_state_dict(best_model_state)
+            break
     
-    # Final evaluation
-    model.eval()
-    test_loss = 0
-    with torch.no_grad():
-        for X_batch, y_batch in test_loader:
-            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-            outputs = model(X_batch)
-            test_loss += criterion(outputs, y_batch).item() * X_batch.size(0)
+    # If we completed all epochs, we still want to use the best model
+    if best_model_state is not None and epochs_no_improve > 0:
+        model.load_state_dict(best_model_state)
     
-    test_loss /= len(test_loader.dataset)
-    print(f"Test Loss: {test_loss}")
-    
-    # Save model and scalers
-    torch.save(model.state_dict(), 'lstm_schedule_predictor.pt')
-    np.save('scaler_X.npy', scaler_X)
-    np.save('scaler_y.npy', scaler_y)
-    
-    return model, scaler_X, scaler_y
+    return train_losses, val_losses
 
-# 7. Prediction Function
-def predict_execution_time(model, scaler_X, scaler_y, new_file_path, sequence_length=5):
-    # Load and preprocess new data
-    features, _ = extract_features(new_file_path)
-    max_length = scaler_X.data_max_.shape[0]
-    features_padded = np.pad(features, (0, max_length - len(features)), 'constant')
-    features_scaled = scaler_X.transform(features_padded.reshape(1, -1))
-    
-    # Create sequence
-    sequence = np.repeat(features_scaled, sequence_length, axis=0)[np.newaxis, :]
-    sequence_tensor = torch.tensor(sequence, dtype=torch.float32)
-    
-    # Make prediction
+# Function to evaluate the model
+def evaluate_model(model, X_test, y_test, y_scaler, file_names_test=None):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model.to(device)
     model.eval()
+    
+    # Move data to device
+    X_test = X_test.to(device)
+    
+    # Predict
     with torch.no_grad():
-        sequence_tensor = sequence_tensor.to(device)
-        pred_scaled = model(sequence_tensor)
-        pred_scaled = pred_scaled.cpu().numpy()
+        y_pred_scaled = model(X_test)
     
-    prediction = scaler_y.inverse_transform(pred_scaled)
-    return prediction[0][0]
+    # Convert to numpy
+    y_pred_scaled = y_pred_scaled.cpu().numpy()
+    y_test = y_test.cpu().numpy()
+    
+    # Inverse transform to get actual values
+    y_test_actual = y_scaler.inverse_transform(y_test)
+    y_pred_actual = y_scaler.inverse_transform(y_pred_scaled)
+    
+    # Calculate metrics
+    mse = np.mean((y_test_actual - y_pred_actual) ** 2)
+    mae = np.mean(np.abs(y_test_actual - y_pred_actual))
+    mape = np.mean(np.abs((y_test_actual - y_pred_actual) / y_test_actual)) * 100
+    
+    print(f"Mean Squared Error: {mse:.2f}")
+    print(f"Mean Absolute Error: {mae:.2f}")
+    print(f"Mean Absolute Percentage Error: {mape:.2f}%")
+    
+    # Plot results
+    plt.figure(figsize=(10, 6))
+    
+    if file_names_test is not None:
+        x_labels = [f"{i+1}\n{name}" for i, name in enumerate(file_names_test)]
+        plt.xticks(range(len(file_names_test)), x_labels, rotation=45)
+    else:
+        x_labels = range(len(y_test_actual))
+        plt.xticks(range(len(y_test_actual)), x_labels)
+    
+    plt.plot(y_test_actual, label='Actual Time')
+    plt.plot(y_pred_actual, label='Predicted Time')
+    plt.title('Execution Time: Actual vs Predicted')
+    plt.xlabel('Test Samples')
+    plt.ylabel('Execution Time (ms)')
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+    
+    return mse, mae, mape, y_test_actual, y_pred_actual
 
-# Main execution
-if __name__ == "__main__":
-    folder_path = 'Output_Programs/program_50001'  # Replace with actual path
-    model, scaler_X, scaler_y = train_lstm_model(folder_path)
+# Main function
+def main(data_dir, test_file_indices=None):
+    # Process all files
+    print(f"Processing files in directory: {data_dir}")
+    all_features, file_names = process_all_files(data_dir)
+    print(f"Processed {len(all_features)} files")
     
-    # Example prediction
-    new_file = 'Output_Programs/program_50002/0_0.json'
-    predicted_time = predict_execution_time(model, scaler_X, scaler_y, new_file)
-    print(f"Predicted Execution Time: {predicted_time} ms")
+    # If test_file_indices is provided, use it; otherwise, use random split
+    if test_file_indices is not None:
+        X_train, y_train, X_test, y_test, y_scaler, input_size = prepare_data_for_lstm(all_features, test_file_indices)
+        file_names_test = [file_names[i] for i in test_file_indices]
+    else:
+        X_train, y_train, X_test, y_test, y_scaler, input_size = prepare_data_for_lstm(all_features)
+        file_names_test = None
+    
+    # Create data loaders
+    train_loader, test_loader = create_data_loaders(X_train, y_train, X_test, y_test, batch_size=4)
+    
+    # Initialize the model
+    model = LSTMModel(input_size=input_size)
+    
+    # Define loss function and optimizer
+    criterion = nn.MSELoss()
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    
+    # Train the model
+    print("Building and training LSTM model...")
+    train_losses, val_losses = train_model(
+        model, 
+        train_loader, 
+        test_loader, 
+        criterion, 
+        optimizer, 
+        num_epochs=100,
+        patience=10
+    )
+    
+    # Evaluate the model
+    print("\nEvaluating model:")
+    mse, mae, mape, y_test_actual, y_pred_actual = evaluate_model(model, X_test, y_test, y_scaler, file_names_test)
+    
+    # Plot training history
+    plt.figure(figsize=(10, 6))
+    plt.plot(train_losses, label='Training Loss')
+    plt.plot(val_losses, label='Validation Loss')
+    plt.title('Model Loss During Training')
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.show()
+    
+    return model, y_scaler, mse, mae, mape
+
+# Example usage
+if __name__ == "__main__":
+    # Directory containing the JSON files
+    data_dir = "Output_Programs/program_50001"
+    
+    # Specify the indices of test files (e.g., the last two files)
+    # For 32 files (0-31), the last two would be indices 30 and 31
+    test_file_indices = [30, 31]
+    
+    # Run the main function
+    model, y_scaler, mse, mae, mape = main(data_dir, test_file_indices)
+    
+    print("\nModel training completed!")
+    print(f"Final Mean Squared Error: {mse:.2f}")
+    print(f"Final Mean Absolute Error: {mae:.2f}")
+    print(f"Final Mean Absolute Percentage Error: {mape:.2f}%")
