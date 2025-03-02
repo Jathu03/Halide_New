@@ -9,9 +9,9 @@ import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
-# Simulated constants from data_utils (adjust as needed)
-MAX_TAGS = 50  # Number of unique transformation tags (assumed)
-MAX_NUM_TRANSFORMATIONS = 10  # Max transformations per computation (assumed)
+# Simulated constants (adjust based on your data if known)
+MAX_TAGS = 50
+MAX_NUM_TRANSFORMATIONS = 10
 
 def get_execution_time(file_path):
     try:
@@ -63,7 +63,6 @@ def extract_features_from_file(file_path):
     programming_details = data.get("programming_details", {})
     scheduling_data = data.get("scheduling_data", [])
     
-    # Extract node features
     for node in programming_details.get('Nodes', []):
         node_feature = {'Name': node.get('Name', '')}
         if 'Details' in node and 'Op histogram' in node['Details']:
@@ -76,7 +75,6 @@ def extract_features_from_file(file_path):
                     node_feature[f'op_{op_name}'] = op_count
         nodes_features.append(node_feature)
     
-    # Extract edge features
     for edge in programming_details.get('Edges', []):
         edge_feature = {
             'From': edge.get('From', ''),
@@ -85,14 +83,12 @@ def extract_features_from_file(file_path):
         }
         edges_features.append(edge_feature)
     
-    # Extract scheduling features
     for sched in scheduling_data:
         if isinstance(sched, dict) and 'Details' in sched and 'scheduling_feature' in sched['Details']:
             sched_feature = {'Name': sched.get('Name', '')}
             sched_feature.update(sched['Details']['scheduling_feature'])
             scheduling_features.append(sched_feature)
     
-    # Aggregate features
     features = {
         'execution_time': execution_time,
         'nodes_count': len(nodes_features),
@@ -190,18 +186,24 @@ def prepare_data_for_model(train_features, test_features):
     y_train_scaled = scaler_y.fit_transform(y_train)
     y_test_scaled = scaler_y.transform(y_test)
     
-    # Prepare tensors for Model_Recursive_LSTM_v2
     input_size = X_train_scaled.shape[1]
     batch_size_train = X_train_scaled.shape[0]
     batch_size_test = X_test_scaled.shape[0]
     
-    # Simplified tree structure
+    # Define tree structure
     tree = {"roots": [{"child_list": [], "has_comps": True, "computations_indices": torch.arange(input_size), "loop_index": torch.tensor([0])}]}
     
-    # Tensors without the tree dictionary
+    # Prepare tensors
+    lstm_embedding_size = 32
+    expr_embed_size = 11
+    num_layers = 1
+    bidirectional = True
+    expected_input_size = input_size + lstm_embedding_size * (2 if bidirectional else 1) * num_layers + expr_embed_size
+    
+    # Adjust comps_tensor_third_part to match expected size
     comps_tensor_first_part = torch.FloatTensor(X_train_scaled).unsqueeze(1)  # [batch_size, 1, input_size]
     comps_tensor_vectors = torch.zeros(batch_size_train, MAX_NUM_TRANSFORMATIONS, MAX_TAGS)
-    comps_tensor_third_part = torch.zeros(batch_size_train, 1, 1)
+    comps_tensor_third_part = torch.zeros(batch_size_train, 1, expected_input_size - input_size - lstm_embedding_size * 2)  # Adjust size
     loops_tensor = torch.zeros(batch_size_train, 1, 8)
     functions_comps_expr_tree = torch.zeros(batch_size_train, 1, 1, 11)
     
@@ -210,7 +212,7 @@ def prepare_data_for_model(train_features, test_features):
     
     comps_tensor_first_part_test = torch.FloatTensor(X_test_scaled).unsqueeze(1)
     comps_tensor_vectors_test = torch.zeros(batch_size_test, MAX_NUM_TRANSFORMATIONS, MAX_TAGS)
-    comps_tensor_third_part_test = torch.zeros(batch_size_test, 1, 1)
+    comps_tensor_third_part_test = torch.zeros(batch_size_test, 1, expected_input_size - input_size - lstm_embedding_size * 2)
     loops_tensor_test = torch.zeros(batch_size_test, 1, 8)
     functions_comps_expr_tree_test = torch.zeros(batch_size_test, 1, 1, 11)
     
@@ -362,7 +364,6 @@ class Model_Recursive_LSTM_v2(nn.Module):
         return self.LeakyReLU(out[:, 0, 0])
 
 def create_data_loaders(tree, X_train_tensor_tuple, y_train, X_test_tensor_tuple, y_test, batch_size=16):
-    # Separate tree from tensor tuple since TensorDataset needs only tensors
     train_dataset = TensorDataset(*X_train_tensor_tuple, y_train)
     test_dataset = TensorDataset(*X_test_tensor_tuple, y_test)
     
@@ -387,7 +388,7 @@ def train_model(model, tree, train_loader, test_loader, criterion, optimizer, nu
         for batch in train_loader:
             tensor_batch = tuple(t.to(device) for t in batch[:-1])
             targets = batch[-1].to(device)
-            tree_tensors = (tree, *tensor_batch)  # Prepend tree to tensor batch
+            tree_tensors = (tree, *tensor_batch)
             optimizer.zero_grad()
             outputs = model(tree_tensors)
             loss = criterion(outputs, targets.squeeze())
