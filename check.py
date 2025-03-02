@@ -2,468 +2,384 @@ import os
 import json
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import MinMaxScaler
+from sklearn.preprocessing import StandardScaler
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import TensorDataset, DataLoader
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 
-# Step 1: Load JSON Files from Directory
-def load_json_files(directory):
-    data = []
-    program_names = []
-    
-    for program_folder in os.listdir(directory):
-        program_path = os.path.join(directory, program_folder)
-        if os.path.isdir(program_path):
-            program_data = []
-            for json_file in os.listdir(program_path):
-                if json_file.endswith('.json'):
-                    file_path = os.path.join(program_path, json_file)
-                    try:
-                        with open(file_path, 'r') as f:
-                            json_data = json.load(f)
-                            program_data.append(json_data)
-                    except json.JSONDecodeError as e:
-                        print(f"Skipping {file_path}: Invalid JSON ({e})")
-                    except Exception as e:
-                        print(f"Skipping {file_path}: Error ({e})")
-            if program_data:
-                data.append(program_data)
-                program_names.append(program_folder)
-            else:
-                print(f"Warning: No valid JSON files loaded from {program_folder}")
-    
-    if not data:
-        raise ValueError("No valid data loaded from Output_Programs folder")
-    return data, program_names
+def get_execution_time(file_path):
+    try:
+        with open(file_path, 'rb') as f:
+            raw_content = f.read()
+            content = raw_content.decode('utf-8', errors='replace').replace('\0', '')
+            data = json.loads(content)
+        schedules = data["scheduling_data"]
+        for item in schedules:
+            if isinstance(item, dict) and item.get('name') == 'total_execution_time_ms':
+                execution_time = item.get('value')
+                if execution_time is not None:
+                    return float(execution_time)
+        print(f"Warning: 'total_execution_time_ms' not found in 'Schedules' of {file_path}")
+        return schedules[-1]["value"]
+    except Exception as e:
+        print(f"Error processing {file_path}: {str(e)}")
+        return None
 
-# Step 2: Enhanced Feature Extraction with Better Execution Time Detection
-def extract_features(json_data, debug=False):
-    features = []
+def extract_optimized_features(file_path):
+    try:
+        with open(file_path, 'r') as f:
+            data = json.load(f)
+        
+        execution_time = get_execution_time(file_path)
+        if execution_time is None:
+            return None
+        
+        nodes = data["programming_details"]["Nodes"]
+        edges = data["programming_details"]["Edges"]
+        scheduling = data["scheduling_data"]
+        
+        node_dict = {node["Name"]: node["Details"] for node in nodes}
+        sched_dict = {item["Name"]: item["Details"]["scheduling_feature"] for item in scheduling if "Name" in item and "Details" in item}
+        
+        features = {'execution_time': execution_time}
+        
+        op_counts = {}
+        for node_name, details in node_dict.items():
+            op_hist = details.get("Op histogram", [])
+            for entry in op_hist:
+                parts = entry.split(':')
+                if len(parts) == 2:
+                    op_name = parts[0].strip().lower()
+                    op_count = int(parts[1].strip().split()[0])
+                    op_counts[f'op_{op_name}'] = op_counts.get(f'op_{op_name}', 0) + op_count
+        features.update(op_counts)
+        
+        features['nodes_count'] = len(nodes)
+        features['edges_count'] = len(edges)
+        features['avg_inputs'] = np.mean([len([e for e in edges if e["To"] == n["Name"]]) for n in nodes]) if nodes else 0
+        features['reductions_count'] = sum(1 for e in edges if ".update(" in e["To"])
+        
+        loop_features = {
+            'parallel_count': 0, 'tile_count': 0, 'total_tile_factor': 0,
+            'vectorize_count': 0, 'total_vector_size': 0, 'unroll_count': 0, 'total_unroll_factor': 0
+        }
+        for node_name in node_dict:
+            sched = sched_dict.get(node_name, {})
+            for _ in range(2):
+                if sched.get("inner_parallelism", 1.0) > 1.0:
+                    loop_features['parallel_count'] += 1
+                tile_factor = sched.get("unrolled_loop_extent", 1.0)
+                if tile_factor > 1.0:
+                    loop_features['tile_count'] += 1
+                    loop_features['total_tile_factor'] += tile_factor
+                vector_size = sched.get("vector_size", 1.0)
+                if vector_size > 1.0:
+                    loop_features['vectorize_count'] += 1
+                    loop_features['total_vector_size'] += vector_size
+                if tile_factor > 1.0:
+                    loop_features['unroll_count'] += 1
+                    loop_features['total_unroll_factor'] += tile_factor
+        features.update(loop_features)
+        
+        features['total_bytes_at_production'] = sum(sched.get('bytes_at_production', 0) for sched in sched_dict.values())
+        features['total_vectors'] = sum(sched.get('num_vectors', 0) for sched in sched_dict.values())
+        features['total_parallelism'] = sum(sched.get('inner_parallelism', 0) * sched.get('outer_parallelism', 1) for sched in sched_dict.values())
+        
+        return features
     
-    # Extract from Edges
-    edges = json_data.get('programming_details', {}).get('Edges', [])
-    num_edges = len(edges)
-    footprint_sizes = [len(edge.get('Details', {}).get('Footprint', [])) for edge in edges if 'Details' in edge]
-    jacobian_sizes = [len(edge.get('Details', {}).get('Load Jacobians', [])) for edge in edges if 'Details' in edge]
-    
-    features.extend([
-        num_edges,
-        np.mean(footprint_sizes) if footprint_sizes else 0,
-        np.mean(jacobian_sizes) if jacobian_sizes else 0
-    ])
-    
-    # Extract from Nodes
-    nodes = json_data.get('programming_details', {}).get('Nodes', [])
-    num_nodes = len(nodes)
-    
-    # More robust memory_patterns extraction
-    memory_patterns = []
-    for node in nodes:
-        if 'Details' in node and 'Memory access patterns' in node['Details']:
-            patterns = node['Details']['Memory access patterns']
-            if patterns and isinstance(patterns, list) and patterns[0]:
-                try:
-                    # Try different pattern formats
-                    pattern = patterns[0]
-                    if isinstance(pattern, str):
-                        # Format: "pattern 1 2 3 4"
-                        values = pattern.split()[1:]
-                        memory_patterns.append(sum(map(int, values)))
-                    elif isinstance(pattern, dict) and 'pattern' in pattern:
-                        # Format: {"pattern": "1 2 3 4"}
-                        values = pattern['pattern'].split()
-                        memory_patterns.append(sum(map(int, values)))
-                except (ValueError, IndexError, KeyError):
-                    continue
-    
-    # More robust op_histogram extraction
-    op_histogram = []
-    for node in nodes:
-        if 'Details' in node and 'Op histogram' in node['Details']:
-            ops = node['Details']['Op histogram']
-            if ops and isinstance(ops, list):
-                try:
-                    # Try different op formats
-                    for op in ops:
-                        if isinstance(op, str) and len(op.split()) > 0:
-                            # Format: "op_name 123"
-                            op_histogram.append(int(op.split()[-1]))
-                        elif isinstance(op, dict) and 'count' in op:
-                            # Format: {"op": "op_name", "count": 123}
-                            op_histogram.append(int(op['count']))
-                except (ValueError, IndexError, KeyError):
-                    continue
-    
-    features.extend([
-        num_nodes,
-        np.mean(memory_patterns) if memory_patterns else 0,
-        np.mean(op_histogram) if op_histogram else 0
-    ])
-    
-    # Add fallback features
-    # If we have too few features, extend with zeros
-    while len(features) < 6:  # Assuming we need at least 6 features
-        features.append(0)
-    
-    # ENHANCED EXECUTION TIME EXTRACTION
-    # Try multiple possible locations for execution time
-    execution_time = None
-    
-    # Debug full structure
-    if debug:
-        print(f"JSON structure keys: {json_data.keys()}")
-        if 'schedule_feature' in json_data:
-            print(f"schedule_feature type: {type(json_data['schedule_feature'])}")
-            print(f"schedule_feature content: {json_data['schedule_feature']}")
-    
-    # Method 1: Try the original structure (list of dicts in schedule_feature)
-    if 'schedule_feature' in json_data and isinstance(json_data['schedule_feature'], list):
-        for item in json_data['schedule_feature']:
-            if isinstance(item, dict):
-                if item.get('name') == 'total_execution_time_ms':
-                    execution_time = float(item.get('value', 0))
-                    if debug:
-                        print(f"Found execution time in schedule_feature: {execution_time}")
-                    break
-    
-    # Method 2: Check if schedule_feature is a dict
-    if execution_time is None and 'schedule_feature' in json_data and isinstance(json_data['schedule_feature'], dict):
-        if 'total_execution_time_ms' in json_data['schedule_feature']:
-            execution_time = float(json_data['schedule_feature']['total_execution_time_ms'])
-            if debug:
-                print(f"Found execution time in schedule_feature dict: {execution_time}")
-    
-    # Method 3: Look for execution_time directly
-    if execution_time is None:
-        # Try different key names that might contain execution time
-        for key in ['total_execution_time_ms', 'execution_time_ms', 'execution_time', 'runtime_ms', 'runtime']:
-            if key in json_data:
-                execution_time = float(json_data[key])
-                if debug:
-                    print(f"Found execution time at key '{key}': {execution_time}")
-                break
-    
-    # Method 4: Look in performance_metrics or similar fields
-    if execution_time is None:
-        for metrics_key in ['performance_metrics', 'metrics', 'details', 'Details', 'stats', 'timing']:
-            if metrics_key in json_data and isinstance(json_data[metrics_key], dict):
-                for time_key in ['total_execution_time_ms', 'execution_time_ms', 'time_ms', 'runtime_ms']:
-                    if time_key in json_data[metrics_key]:
-                        execution_time = float(json_data[metrics_key][time_key])
-                        if debug:
-                            print(f"Found execution time in {metrics_key}.{time_key}: {execution_time}")
-                        break
-            if execution_time is not None:
-                break
-    
-    # Method 5: Look in nested programming_details
-    if execution_time is None and 'programming_details' in json_data:
-        details = json_data['programming_details']
-        if isinstance(details, dict):
-            for time_key in ['total_execution_time_ms', 'execution_time_ms', 'time_ms', 'runtime_ms']:
-                if time_key in details:
-                    execution_time = float(details[time_key])
-                    if debug:
-                        print(f"Found execution time in programming_details.{time_key}: {execution_time}")
-                    break
-    
-    # Fallback: If no execution time is found, generate synthetic data for demonstration
-    # In a real application, you would instead return None and skip this data point
-    if execution_time is None:
-        # For debug builds or if asked to use synthetic data, generate a value
-        use_synthetic = os.environ.get('USE_SYNTHETIC_DATA', 'False').lower() in ('true', '1', 't')
-        if debug or use_synthetic:
-            # Generate synthetic execution time based on features
-            # More edges, nodes, etc. would generally mean longer execution time
-            synthetic_time = (num_edges * 0.5 + num_nodes * 0.3) * (1 + np.random.random() * 0.5)
-            execution_time = max(0.1, synthetic_time)  # Ensure positive value
-            print(f"Using synthetic execution time: {execution_time:.2f} ms")
-        else:
-            if debug:
-                print("Warning: No execution time found in JSON")
-            return np.array(features, dtype=float), None
-    
-    return np.array(features, dtype=float), execution_time
+    except Exception as e:
+        print(f"Error extracting features from {file_path}: {str(e)}")
+        return None
 
-# Step 3: Prepare Data for LSTM with Better Error Handling
-def prepare_lstm_data(data):
-    X, y = [], []
-    feature_dim = None
+def process_main_directory(main_dir, train_ratio=0.9):
+    train_features = []
+    test_features = []
+    test_file_names = []
     
-    # First pass to determine feature dimension
-    for program_data in data:
-        for schedule in program_data:
-            features, _ = extract_features(schedule)
-            if feature_dim is None:
-                feature_dim = len(features)
-            elif len(features) > feature_dim:
-                feature_dim = len(features)
+    subdirs = sorted([d for d in os.listdir(main_dir) if os.path.isdir(os.path.join(main_dir, d))])
     
-    if feature_dim is None:
-        raise ValueError("Could not determine feature dimension from data")
+    if not subdirs:
+        raise ValueError(f"No subdirectories found in {main_dir}")
     
-    print(f"Using feature dimension: {feature_dim}")
-    
-    # Second pass to extract features and targets
-    for i, program_data in enumerate(data):
-        program_X, program_y = [], []
-        schedules_with_time = 0
+    for subdir in subdirs:
+        subdir_path = os.path.join(main_dir, subdir)
+        all_features = []
+        all_file_names = []
         
-        for j, schedule in enumerate(program_data):
-            # Enable debug for the first schedule of each program
-            debug_this = (j == 0)
-            features, exec_time = extract_features(schedule, debug=debug_this)
-            
-            if exec_time is not None:
-                schedules_with_time += 1
-                # Ensure consistent feature dimension
-                if len(features) < feature_dim:
-                    features = np.pad(features, (0, feature_dim - len(features)), 'constant')
-                elif len(features) > feature_dim:
-                    features = features[:feature_dim]
-                
-                program_X.append(features)
-                program_y.append(exec_time)
+        for filename in sorted(os.listdir(subdir_path)):
+            if filename.endswith('.json'):
+                file_path = os.path.join(subdir_path, filename)
+                features = extract_optimized_features(file_path)
+                if features is not None:
+                    all_features.append(features)
+                    all_file_names.append(filename)
         
-        if schedules_with_time > 0:
-            X.append(program_X)
-            y.append(program_y)
-            print(f"Program {i}: Added {schedules_with_time} schedules with execution times")
-        else:
-            print(f"Warning: No valid schedules with execution time in program {i}")
-    
-    if not X or not y:
-        # If no real data, create synthetic data for demonstration
-        print("WARNING: No valid sequences with execution times. Creating synthetic data for demonstration.")
+        if len(all_features) != 32:
+            print(f"Warning: Expected 32 files in {subdir_path}, found {len(all_features)}")
+            continue
         
-        # Generate synthetic data
-        n_programs = 10
-        max_schedules = 20
-        X = []
-        y = []
-        
-        for i in range(n_programs):
-            n_schedules = np.random.randint(5, max_schedules)
-            program_X = np.random.rand(n_schedules, feature_dim)
-            # Create synthetic target values correlated with features
-            base_time = np.random.uniform(10, 100)
-            program_y = base_time + np.sum(program_X, axis=1) * np.random.uniform(5, 10)
-            
-            X.append(program_X)
-            y.append(program_y)
-            print(f"Generated synthetic program {i} with {n_schedules} schedules")
-        
-        print("IMPORTANT: Using synthetic data for demonstration. Results will not be meaningful.")
+        # Fixed split: first 30 for training, last 2 for testing
+        train_features.extend(all_features[:30])
+        test_features.extend(all_features[30:])
+        test_file_names.extend([os.path.join(subdir, fname) for fname in all_file_names[30:]])
+        print(f"Processed {len(all_features)} files from {subdir}: 30 for training, 2 for testing")
     
-    # Convert to numpy arrays
-    X = np.array(X, dtype=object)  # Allow ragged arrays temporarily
-    y = np.array(y, dtype=object)
-    
-    # Pad sequences to the same length (max num_schedules)
-    max_seq_len = max(len(seq) for seq in X)
-    X_padded = np.zeros((len(X), max_seq_len, feature_dim))
-    y_padded = np.zeros((len(y), max_seq_len))
-    
-    for i in range(len(X)):
-        seq_len = len(X[i])
-        X_padded[i, :seq_len, :] = X[i]
-        y_padded[i, :seq_len] = y[i]
-    
-    # Debug target values
-    print(f"Target values range: min={y_padded.min()}, max={y_padded.max()}, mean={y_padded.mean()}")
-    
-    # Normalize features
-    scaler_X = MinMaxScaler()
-    X_reshaped = X_padded.reshape(-1, X_padded.shape[-1])
-    X_normalized = scaler_X.fit_transform(X_reshaped).reshape(X_padded.shape)
-    
-    # Normalize target
-    scaler_y = MinMaxScaler()
-    y_reshaped = y_padded.reshape(-1, 1)
-    y_normalized = scaler_y.fit_transform(y_reshaped).reshape(y_padded.shape)
-    
-    return X_normalized, y_normalized, scaler_X, scaler_y
+    return train_features, test_features, test_file_names
 
-# Step 4: Custom Dataset for PyTorch
-class HalideDataset(Dataset):
-    def __init__(self, X, y):
-        self.X = torch.tensor(X, dtype=torch.float32)
-        self.y = torch.tensor(y, dtype=torch.float32)
+def prepare_data_for_model(train_features, test_features):
+    all_features_df = pd.DataFrame(train_features + test_features)
+    if len(all_features_df) <= 5:
+        raise ValueError("Not enough data samples to train the model")
     
-    def __len__(self):
-        return len(self.X)
+    X = all_features_df.drop('execution_time', axis=1)
+    y = all_features_df['execution_time']
+    X = X.fillna(0)
     
-    def __getitem__(self, idx):
-        return self.X[idx], self.y[idx]
+    scaler_X = StandardScaler()
+    scaler_y = StandardScaler()
+    
+    train_size = len(train_features)
+    X_train = X.iloc[:train_size]
+    y_train = y.iloc[:train_size].values.reshape(-1, 1)
+    X_test = X.iloc[train_size:]
+    y_test = y.iloc[train_size:].values.reshape(-1, 1)
+    
+    orig_y_train = y_train.copy()  # Unscaled targets
+    orig_y_test = y_test.copy()
+    
+    X_train_scaled = scaler_X.fit_transform(X_train)
+    y_train_scaled = scaler_y.fit_transform(y_train)
+    X_test_scaled = scaler_X.transform(X_test)
+    y_test_scaled = scaler_y.transform(y_test)
+    
+    # For LSTM/CNN-LSTM, add sequence dimension; for Ensemble, keep flat
+    X_train_tensor = torch.FloatTensor(X_train_scaled).unsqueeze(1)  # [batch, 1, features]
+    y_train_tensor = torch.FloatTensor(y_train_scaled)
+    X_test_tensor = torch.FloatTensor(X_test_scaled).unsqueeze(1)  # [batch, 1, features]
+    y_test_tensor = torch.FloatTensor(y_test_scaled)
+    
+    return X_train_tensor, y_train_tensor, X_test_tensor, y_test_tensor, scaler_y, X_train_scaled.shape[1], X.columns.tolist(), orig_y_train, orig_y_test
 
-# Step 5: Define LSTM Model in PyTorch
-class LSTMModel(nn.Module):
-    def __init__(self, input_size, hidden_size1=128, hidden_size2=64):
-        super(LSTMModel, self).__init__()
+def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=16):
+    train_dataset = TensorDataset(X_train, y_train)
+    test_dataset = TensorDataset(X_test, y_test)
+    
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    
+    return train_loader, test_loader
+
+# Model Definitions
+class EnhancedLSTMModel(nn.Module):
+    def __init__(self, input_size, hidden_size1=128, hidden_size2=64, output_size=1):
+        super(EnhancedLSTMModel, self).__init__()
         self.lstm1 = nn.LSTM(input_size, hidden_size1, batch_first=True)
-        self.dropout1 = nn.Dropout(0.2)
+        self.dropout1 = nn.Dropout(0.3)
         self.lstm2 = nn.LSTM(hidden_size1, hidden_size2, batch_first=True)
-        self.dropout2 = nn.Dropout(0.2)
-        self.fc1 = nn.Linear(hidden_size2, 32)
-        self.relu = nn.ReLU()
-        self.fc2 = nn.Linear(32, 1)
+        self.dropout2 = nn.Dropout(0.3)
+        self.fc = nn.Linear(hidden_size2, output_size)
     
     def forward(self, x):
         out, _ = self.lstm1(x)
         out = self.dropout1(out)
         out, _ = self.lstm2(out)
-        out = self.dropout2(out[:, -1, :])  # Take the last timestep
-        out = self.fc1(out)
+        out = self.dropout2(out)
+        out = self.fc(out[:, -1, :])  # Last timestep
+        return out
+
+class CNNLSTMModel(nn.Module):
+    def __init__(self, input_size, hidden_size=128, output_size=1):
+        super(CNNLSTMModel, self).__init__()
+        self.conv1 = nn.Conv1d(input_size, 64, kernel_size=1)  # 1D conv over features
+        self.bn1 = nn.BatchNorm1d(64)
+        self.relu = nn.ReLU()
+        self.lstm = nn.LSTM(64, hidden_size, batch_first=True)
+        self.dropout = nn.Dropout(0.3)
+        self.fc = nn.Linear(hidden_size, output_size)
+    
+    def forward(self, x):
+        # x: [batch, seq_len=1, input_size]
+        out = x.transpose(1, 2)  # [batch, input_size, seq_len=1]
+        out = self.conv1(out)    # [batch, 64, 1]
+        out = self.bn1(out)
         out = self.relu(out)
+        out = out.transpose(1, 2)  # [batch, 1, 64]
+        out, _ = self.lstm(out)
+        out = self.dropout(out)
+        out = self.fc(out[:, -1, :])
+        return out
+
+class EnsembleModel(nn.Module):
+    def __init__(self, input_size, hidden_size=128, output_size=1):
+        super(EnsembleModel, self).__init__()
+        # LSTM branch
+        self.lstm = nn.LSTM(input_size, hidden_size, batch_first=True)
+        self.lstm_dropout = nn.Dropout(0.3)
+        
+        # CNN branch
+        self.conv1 = nn.Conv1d(input_size, 64, kernel_size=1)
+        self.conv_bn1 = nn.BatchNorm1d(64)
+        self.conv_relu = nn.ReLU()
+        self.conv_fc = nn.Linear(64, hidden_size)
+        
+        # Combined
+        self.fc1 = nn.Linear(hidden_size * 2, 64)
+        self.fc_dropout = nn.Dropout(0.3)
+        self.fc2 = nn.Linear(64, output_size)
+    
+    def forward(self, x):
+        # LSTM branch
+        lstm_out, _ = self.lstm(x)
+        lstm_out = self.lstm_dropout(lstm_out[:, -1, :])  # [batch, hidden_size]
+        
+        # CNN branch
+        cnn_out = x.transpose(1, 2)  # [batch, input_size, 1]
+        cnn_out = self.conv1(cnn_out)  # [batch, 64, 1]
+        cnn_out = self.conv_bn1(cnn_out)
+        cnn_out = self.conv_relu(cnn_out)
+        cnn_out = cnn_out.squeeze(2)  # [batch, 64]
+        cnn_out = self.conv_fc(cnn_out)  # [batch, hidden_size]
+        
+        # Combine
+        combined = torch.cat((lstm_out, cnn_out), dim=1)  # [batch, hidden_size * 2]
+        out = self.fc1(combined)
+        out = self.fc_dropout(out)
         out = self.fc2(out)
         return out
 
-# Step 6: Training and Evaluation
-def train_model(model, train_loader, val_loader, epochs=50, device='cuda' if torch.cuda.is_available() else 'cpu'):
-    model = model.to(device)
-    criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
+def train_model(model, train_loader, test_loader, criterion, optimizer, scheduler, num_epochs=200, patience=20):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    model.to(device)
     
-    # Early stopping parameters
     best_val_loss = float('inf')
-    patience = 10
-    counter = 0
+    epochs_no_improve = 0
+    best_model_state = None
+    train_losses = []
+    val_losses = []
     
-    for epoch in range(epochs):
+    for epoch in range(num_epochs):
         model.train()
-        train_loss = 0
-        for X_batch, y_batch in train_loader:
-            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+        running_loss = 0.0
+        for inputs, targets in train_loader:
+            inputs, targets = inputs.to(device), targets.to(device)
             optimizer.zero_grad()
-            outputs = model(X_batch)
-            loss = criterion(outputs, y_batch[:, -1].unsqueeze(1))  # Predict last timestep
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
             loss.backward()
             optimizer.step()
-            train_loss += loss.item()
+            running_loss += loss.item() * inputs.size(0)
+        
+        train_loss = running_loss / len(train_loader.dataset)
+        train_losses.append(train_loss)
         
         model.eval()
-        val_loss = 0
+        val_loss = 0.0
         with torch.no_grad():
-            for X_batch, y_batch in val_loader:
-                X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-                outputs = model(X_batch)
-                val_loss += criterion(outputs, y_batch[:, -1].unsqueeze(1)).item()
+            for inputs, targets in test_loader:
+                inputs, targets = inputs.to(device), targets.to(device)
+                outputs = model(inputs)
+                loss = criterion(outputs, targets)
+                val_loss += loss.item() * inputs.size(0)
         
-        avg_train_loss = train_loss/len(train_loader)
-        avg_val_loss = val_loss/len(val_loader)
-        print(f"Epoch {epoch+1}/{epochs}, Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}")
+        val_loss /= len(test_loader.dataset)
+        val_losses.append(val_loss)
+        print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
         
-        # Early stopping check
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-            counter = 0
-            # Save best model
-            torch.save(model.state_dict(), 'best_lstm_model.pt')
+        scheduler.step(val_loss)
+        
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            epochs_no_improve = 0
+            best_model_state = model.state_dict().copy()
         else:
-            counter += 1
-            if counter >= patience:
-                print(f"Early stopping at epoch {epoch+1}")
-                break
+            epochs_no_improve += 1
+        
+        if epochs_no_improve >= patience:
+            print(f'Early stopping after {epoch+1} epochs')
+            model.load_state_dict(best_model_state)
+            break
     
-    # Load best model
-    model.load_state_dict(torch.load('best_lstm_model.pt'))
-    return model
+    if best_model_state is not None and epochs_no_improve > 0:
+        model.load_state_dict(best_model_state)
+    
+    return train_losses, val_losses
 
-def evaluate_model(model, test_loader, scaler_y, device='cuda' if torch.cuda.is_available() else 'cpu'):
+def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, orig_y_test):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model.to(device)
     model.eval()
-    predictions, actuals = [], []
+    
+    X_test = X_test.to(device)
     with torch.no_grad():
-        for X_batch, y_batch in test_loader:
-            X_batch = X_batch.to(device)
-            outputs = model(X_batch)
-            predictions.append(outputs.cpu().numpy())
-            actuals.append(y_batch[:, -1].numpy())  # Last timestep
+        y_pred_scaled = model(X_test)
     
-    y_pred = np.concatenate(predictions)
-    y_test = np.concatenate(actuals)
+    y_pred_scaled = y_pred_scaled.cpu().numpy()
+    y_test = y_test.cpu().numpy()
     
-    # Reshape and denormalize
-    y_pred_rescaled = scaler_y.inverse_transform(y_pred.reshape(-1, 1)).flatten()
-    y_test_rescaled = scaler_y.inverse_transform(y_test.reshape(-1, 1)).flatten()
+    y_test_actual = y_scaler.inverse_transform(y_test)
+    y_pred_actual = y_scaler.inverse_transform(y_pred_scaled)
     
-    # Calculate metrics
-    mse = np.mean((y_test_rescaled - y_pred_rescaled) ** 2)
-    rmse = np.sqrt(mse)
-    mae = np.mean(np.abs(y_test_rescaled - y_pred_rescaled))
-    mape = np.mean(np.abs((y_test_rescaled - y_pred_rescaled) / (y_test_rescaled + 1e-8))) * 100
+    print("\nPredicted vs Actual Execution Times for Test Files:")
+    for i, file_name in enumerate(file_names_test):
+        print(f"File: {file_name}")
+        print(f"  Actual Execution Time: {y_test_actual[i][0]:.2f} ms")
+        print(f"  Predicted Execution Time: {y_pred_actual[i][0]:.2f} ms")
     
-    print(f"Test MSE: {mse:.6f}")
-    print(f"Test RMSE: {rmse:.6f}")
-    print(f"Test MAE: {mae:.6f}")
-    print(f"Test MAPE: {mape:.2f}%")
-    
-    return y_test_rescaled, y_pred_rescaled
+    return y_test_actual, y_pred_actual
 
-# Main Execution
-def predict_halide_speedup(data_dir, use_synthetic=False):
-    if use_synthetic:
-        os.environ['USE_SYNTHETIC_DATA'] = 'True'
+def main(main_dir, model_type='ensemble', train_ratio=0.9):
+    print(f"Processing main directory: {main_dir}")
+    train_features, test_features, test_file_names = process_main_directory(main_dir, train_ratio)
     
-    # Load and prepare data
-    data, program_names = load_json_files(data_dir)
-    print(f"Loaded data from {len(program_names)} programs")
+    print(f"Total training samples: {len(train_features)}")
+    print(f"Total test samples: {len(test_features)}")
     
-    # Print first few programs to debug
-    print(f"Program names: {program_names[:5]}")
+    if len(train_features) == 0 or len(test_features) == 0:
+        print("Error: No valid training or test data found")
+        return None, None, None
     
-    # Try to prepare data
-    try:
-        X, y, scaler_X, scaler_y = prepare_lstm_data(data)
-        print(f"X shape: {X.shape}, y shape: {y.shape}")
-    except Exception as e:
-        print(f"Error preparing data: {e}")
-        print("Trying with synthetic data...")
-        os.environ['USE_SYNTHETIC_DATA'] = 'True'
-        X, y, scaler_X, scaler_y = prepare_lstm_data(data)
-        print(f"X shape with synthetic data: {X.shape}, y shape: {y.shape}")
+    # Prepare data for model
+    data = prepare_data_for_model(train_features, test_features)
+    X_train, y_train, X_test, y_test, y_scaler, input_size, feature_names, orig_y_train, orig_y_test = data
     
-    # Split data
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-    X_train, X_val, y_train, y_val = train_test_split(X_train, y_train, test_size=0.25, random_state=42)  # 60% train, 20% val, 20% test
+    # Create data loaders
+    train_loader, test_loader = create_data_loaders(X_train, y_train, X_test, y_test, batch_size=16)
     
-    # Create datasets and loaders
-    train_dataset = HalideDataset(X_train, y_train)
-    val_dataset = HalideDataset(X_val, y_val)
-    test_dataset = HalideDataset(X_test, y_test)
+    # Select model type
+    if model_type == 'lstm':
+        model = EnhancedLSTMModel(input_size=input_size, hidden_size1=128, hidden_size2=64)
+    elif model_type == 'cnn_lstm':
+        model = CNNLSTMModel(input_size=input_size, hidden_size=128)
+    elif model_type == 'ensemble':
+        model = EnsembleModel(input_size=input_size, hidden_size=128)
+    else:
+        raise ValueError(f"Unknown model type: {model_type}")
     
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
+    # Define loss function, optimizer, and scheduler
+    criterion = nn.MSELoss()
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10, verbose=True)
     
-    # Initialize model
-    input_size = X.shape[2]  # feature_dim
-    model = LSTMModel(input_size)
+    # Train the model
+    print(f"Training {model_type} model...")
+    train_losses, val_losses = train_model(
+        model, train_loader, test_loader, criterion, optimizer, scheduler, num_epochs=200, patience=20
+    )
     
-    # Train model
-    model = train_model(model, train_loader, val_loader, epochs=50)
+    # Evaluate the model
+    print("\nEvaluating the model...")
+    y_test_actual, y_pred_actual = evaluate_model(
+        model, X_test, y_test, y_scaler, test_file_names, orig_y_test
+    )
     
-    # Evaluate model
-    y_test_rescaled, y_pred_rescaled = evaluate_model(model, test_loader, scaler_y)
-    
-    # Print example predictions
-    for i in range(min(5, len(y_test_rescaled))):
-        print(f"Example {i+1}: True Time: {y_test_rescaled[i]:.2f} ms, Predicted Time: {y_pred_rescaled[i]:.2f} ms")
-    
-    # Save model
-    torch.save({
-        'model_state_dict': model.state_dict(),
-        'scaler_X': scaler_X,
-        'scaler_y': scaler_y,
-        'feature_dim': input_size
-    }, 'lstm_execution_time_predictor.pt')
-    
-    print("Model saved as 'lstm_execution_time_predictor.pt'")
-    
-    return model, scaler_X, scaler_y
+    return model, y_test_actual, y_pred_actual
 
+# Run the main function
 if __name__ == "__main__":
-    # Try with real data first, fall back to synthetic if needed
-    predict_halide_speedup(data_dir="Output_Programs", use_synthetic=False)
+    main_dir = "Output_Programs"  # Replace with your actual path if different
+    model, y_test_actual, y_pred_actual = main(main_dir, model_type='ensemble')
+    if model is not None:
+        print("\nModel training and prediction completed!")
