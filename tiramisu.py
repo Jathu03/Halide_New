@@ -35,6 +35,14 @@ def extract_features_from_file(file_path):
         iterators = prog_annot.get("iterators", {})
         computations = prog_annot.get("computations", {})
         
+        # Calculate avg_loop_range only for numeric bounds
+        loop_ranges = []
+        for it in iterators.values():
+            lower = it.get("lower_bound")
+            upper = it.get("upper_bound")
+            if isinstance(lower, (int, float)) and isinstance(upper, (int, float)):
+                loop_ranges.append(upper - lower)
+        
         base_features = {
             'memory_size': prog_annot.get("memory_size", 0),
             'iterator_count': len(iterators),
@@ -44,12 +52,7 @@ def extract_features_from_file(file_path):
             'computation_count': len(computations),
             'reduction_count': sum(1 for comp in computations.values() if comp.get("comp_is_reduction", False)),
             'access_count': sum(len(comp.get("accesses", [])) for comp in computations.values()),
-            'avg_loop_range': np.mean([
-                (eval(it["upper_bound"]) - eval(str(it["lower_bound"]))) 
-                if isinstance(it["upper_bound"], str) and isinstance(it["lower_bound"], str) 
-                else (it["upper_bound"] - it["lower_bound"]) 
-                for it in iterators.values() if isinstance(it.get("upper_bound"), (int, str)) and isinstance(it.get("lower_bound"), (int, str))
-            ]) if iterators else 0
+            'avg_loop_range': float(np.mean(loop_ranges)) if loop_ranges else 0
         }
         base_features['avg_access_per_comp'] = base_features['access_count'] / max(base_features['computation_count'], 1)
         
@@ -181,7 +184,7 @@ class EnhancedLSTMModel(nn.Module):
         
     def forward(self, x):
         lstm_out, _ = self.lstm(x)
-        lstm_out = self.dropout(lstm_out[:, -1, :])  # Take the last time step
+        lstm_out = self.dropout(lstm_out[:, -1, :])
         fc_out = self.fc1(lstm_out)
         fc_out = self.bn1(fc_out)
         fc_out = self.leaky_relu(fc_out)
@@ -189,8 +192,7 @@ class EnhancedLSTMModel(nn.Module):
         return output
 
 def custom_loss(y_pred, y_true):
-    # Custom loss on log scale to handle scale differences
-    y_pred_safe = torch.clamp(y_pred, min=-10)  # Avoid extreme negatives
+    y_pred_safe = torch.clamp(y_pred, min=-10)
     return torch.mean(torch.square(torch.log1p(torch.exp(y_pred_safe)) - torch.log1p(torch.exp(y_true))))
 
 def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=16):
