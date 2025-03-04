@@ -134,7 +134,11 @@ def clean_and_transform_features(train_features, test_features):
     all_features_df = all_features_df.drop(columns=constant_columns)
     print(f"Dropped {len(constant_columns)} constant columns")
     
+    # Log transform execution time and features with wide ranges
     all_features_df['execution_time_log'] = np.log1p(all_features_df['execution_time'])
+    for col in ['memory_size', 'access_count', 'avg_exec_time', 'max_exec_time', 'exec_time_std']:
+        if col in all_features_df.columns and all_features_df[col].max() > 0:
+            all_features_df[f'{col}_log'] = np.log1p(all_features_df[col])
     
     numeric_cols = all_features_df.select_dtypes(include=['number']).columns
     all_features_df = all_features_df[numeric_cols]
@@ -145,7 +149,7 @@ def clean_and_transform_features(train_features, test_features):
     
     return train_df, test_df
 
-def prepare_data_for_transformer(train_features, test_features):
+def prepare_data_for_fnn(train_features, test_features):
     train_df, test_df = clean_and_transform_features(train_features, test_features)
     
     y_train = train_df['execution_time_log'].values.reshape(-1, 1)
@@ -161,62 +165,41 @@ def prepare_data_for_transformer(train_features, test_features):
     X_test_scaled = scaler_X.transform(X_test_df)
     y_test_scaled = scaler_y.transform(y_test)
     
-    # Reshape for Transformer: [batch, seq_len, features] where seq_len=1 for tabular data
-    X_train_tensor = torch.FloatTensor(X_train_scaled).unsqueeze(1)
+    X_train_tensor = torch.FloatTensor(X_train_scaled)
     y_train_tensor = torch.FloatTensor(y_train_scaled)
-    X_test_tensor = torch.FloatTensor(X_test_scaled).unsqueeze(1)
+    X_test_tensor = torch.FloatTensor(X_test_scaled)
     y_test_tensor = torch.FloatTensor(y_test_scaled)
     
     print(f"Input feature dimension: {X_train_scaled.shape[1]}")
     
     return X_train_tensor, y_train_tensor, X_test_tensor, y_test_tensor, scaler_y, X_train_scaled.shape[1]
 
-class TransformerModel(nn.Module):
-    def __init__(self, input_size, d_model=128, n_heads=4, n_layers=2, dropout=0.3):
-        super(TransformerModel, self).__init__()
+class FNNModel(nn.Module):
+    def __init__(self, input_size, hidden_sizes=[256, 128, 64], dropout=0.3):
+        super(FNNModel, self).__init__()
         
-        self.input_proj = nn.Linear(input_size, d_model)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=n_heads,
-            dim_feedforward=512,
-            dropout=dropout,
-            batch_first=True
-        )
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        layers = []
+        in_features = input_size
+        for hidden_size in hidden_sizes:
+            layers.append(nn.Linear(in_features, hidden_size))
+            layers.append(nn.BatchNorm1d(hidden_size))
+            layers.append(nn.LeakyReLU(0.1))
+            layers.append(nn.Dropout(dropout))
+            in_features = hidden_size
         
-        self.fc1 = nn.Linear(d_model, 64)
-        self.bn1 = nn.BatchNorm1d(64)
-        self.fc2 = nn.Linear(64, 32)
-        self.bn2 = nn.BatchNorm1d(32)
-        self.output_layer = nn.Linear(32, 1)
-        
-        self.leaky_relu = nn.LeakyReLU(0.1)
-        self.dropout = nn.Dropout(dropout)
+        self.features = nn.Sequential(*layers)
+        self.output_layer = nn.Linear(hidden_sizes[-1], 1)
         
     def forward(self, x):
-        # x: [batch, seq_len=1, input_size]
-        x = self.input_proj(x)  # [batch, seq_len=1, d_model]
-        x = self.transformer_encoder(x)  # [batch, seq_len=1, d_model]
-        x = x.squeeze(1)  # [batch, d_model]
-        
-        x = self.fc1(x)
-        x = self.bn1(x)
-        x = self.leaky_relu(x)
-        x = self.dropout(x)
-        
-        x = self.fc2(x)
-        x = self.bn2(x)
-        x = self.leaky_relu(x)
-        x = self.dropout(x)
-        
+        x = self.features(x)
         output = self.output_layer(x)
-        return torch.nn.functional.softplus(output)  # Ensure positive outputs
+        return output  # Raw output, positivity handled in evaluation
 
 def custom_loss(y_pred, y_true):
-    # Safe MSLE with clamping to prevent NaN
-    y_pred_safe = torch.clamp(y_pred, min=0)
-    return torch.mean(torch.square(torch.log1p(y_pred_safe) - torch.log1p(y_true)))
+    # Combined MSE and relative error loss
+    mse_loss = torch.mean(torch.square(y_pred - y_true))
+    rel_loss = torch.mean(torch.square(torch.log1p(torch.clamp(torch.exp(y_pred), min=1e-8)) - torch.log1p(torch.clamp(torch.exp(y_true), min=1e-8))))
+    return mse_loss + 0.5 * rel_loss  # Balance absolute and relative errors
 
 def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=32):
     train_dataset = TensorDataset(X_train, y_train)
@@ -319,7 +302,7 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test):
     y_test_transformed = y_scaler.inverse_transform(y_test)
     y_pred_transformed = y_scaler.inverse_transform(y_pred_scaled)
     y_test_actual = np.expm1(y_test_transformed)
-    y_pred_actual = np.expm1(np.clip(y_pred_transformed, 0, None))
+    y_pred_actual = np.expm1(np.clip(y_pred_transformed, -10, None))  # Ensure reasonable range post-transformation
     
     print("\nEvaluation Results:")
     for i, file_name in enumerate(file_names_test):
@@ -356,22 +339,20 @@ def main(main_dir):
         print("Error: Insufficient training data for robust model training")
         return None
     
-    X_train, y_train, X_test, y_test, y_scaler, input_size = prepare_data_for_transformer(train_features, test_features)
+    X_train, y_train, X_test, y_test, y_scaler, input_size = prepare_data_for_fnn(train_features, test_features)
     
     train_loader, test_loader = create_data_loaders(X_train, y_train, X_test, y_test, batch_size=32)
     
-    model = TransformerModel(
+    model = FNNModel(
         input_size=input_size,
-        d_model=128,
-        n_heads=4,
-        n_layers=2,
+        hidden_sizes=[256, 128, 64],
         dropout=0.3
     )
     
     criterion = custom_loss
-    optimizer = optim.AdamW(model.parameters(), lr=0.0005, weight_decay=1e-4)  # Lower initial LR
+    optimizer = optim.AdamW(model.parameters(), lr=0.0005, weight_decay=1e-4)
     
-    print("Building and training Transformer model...")
+    print("Building and training Feedforward Neural Network model...")
     train_losses, val_losses = train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=250, patience=30)
     
     if train_losses is None or val_losses is None:
@@ -388,6 +369,6 @@ if __name__ == "__main__":
     result = main(main_dir)
     if result is not None:
         model, y_scaler, y_test_actual, y_pred_actual = result
-        print("\nTransformer model training and prediction completed!")
+        print("\nFNN model training and prediction completed!")
     else:
         print("\nModel training failed!")
