@@ -1,0 +1,3072 @@
+{
+    "function779447": {
+        "filename": "./function779447_explored_schedules.json",
+        "node_name": "lanka10",
+        "parameters": {
+            "beam_size": 2,
+            "max_depth": 4
+        },
+        "program_annotation": {
+            "memory_size": 0.126953125,
+            "iterators": {
+                "i0": {
+                    "lower_bound": 0,
+                    "upper_bound": 64,
+                    "parent_iterator": null,
+                    "child_iterators": [
+                        "i1"
+                    ],
+                    "computations_list": []
+                },
+                "i1": {
+                    "lower_bound": 1,
+                    "upper_bound": 129,
+                    "parent_iterator": "i0",
+                    "child_iterators": [],
+                    "computations_list": [
+                        "comp00",
+                        "comp01"
+                    ]
+                }
+            },
+            "computations": {
+                "comp00": {
+                    "absolute_order": 1,
+                    "iterators": [
+                        "i0",
+                        "i1"
+                    ],
+                    "comp_is_reduction": true,
+                    "number_of_additions": 1,
+                    "number_of_subtraction": 0,
+                    "number_of_multiplication": 0,
+                    "number_of_division": 0,
+                    "write_access_relation": "{ comp00[i0, i1] -> buf00[i0] }",
+                    "write_buffer_id": 0,
+                    "data_type": "float64",
+                    "data_type_size": 0,
+                    "accesses": [
+                        {
+                            "access_is_reduction": true,
+                            "buffer_id": 0,
+                            "access_matrix": [
+                                [
+                                    1,
+                                    0,
+                                    0
+                                ]
+                            ]
+                        },
+                        {
+                            "access_is_reduction": false,
+                            "buffer_id": 1,
+                            "access_matrix": [
+                                [
+                                    1,
+                                    0,
+                                    0
+                                ],
+                                [
+                                    0,
+                                    1,
+                                    0
+                                ]
+                            ]
+                        }
+                    ],
+                    "expression_representation": {
+                        "expr_type": "add",
+                        "children": [
+                            {
+                                "expr_type": "access",
+                                "children": []
+                            },
+                            {
+                                "expr_type": "access",
+                                "children": []
+                            }
+                        ]
+                    }
+                },
+                "comp01": {
+                    "absolute_order": 2,
+                    "iterators": [
+                        "i0",
+                        "i1"
+                    ],
+                    "comp_is_reduction": false,
+                    "number_of_additions": 2,
+                    "number_of_subtraction": 2,
+                    "number_of_multiplication": 0,
+                    "number_of_division": 0,
+                    "write_access_relation": "{ comp01[i0, i1] -> buf02[i0' = i0, i1' = i1] }",
+                    "write_buffer_id": 2,
+                    "data_type": "float64",
+                    "data_type_size": 0,
+                    "accesses": [
+                        {
+                            "access_is_reduction": false,
+                            "buffer_id": 0,
+                            "access_matrix": [
+                                [
+                                    1,
+                                    0,
+                                    0
+                                ]
+                            ]
+                        },
+                        {
+                            "access_is_reduction": true,
+                            "buffer_id": 2,
+                            "access_matrix": [
+                                [
+                                    1,
+                                    0,
+                                    0
+                                ],
+                                [
+                                    0,
+                                    1,
+                                    0
+                                ]
+                            ]
+                        },
+                        {
+                            "access_is_reduction": true,
+                            "buffer_id": 2,
+                            "access_matrix": [
+                                [
+                                    1,
+                                    0,
+                                    0
+                                ],
+                                [
+                                    0,
+                                    1,
+                                    -1
+                                ]
+                            ]
+                        },
+                        {
+                            "access_is_reduction": true,
+                            "buffer_id": 2,
+                            "access_matrix": [
+                                [
+                                    1,
+                                    0,
+                                    0
+                                ],
+                                [
+                                    0,
+                                    1,
+                                    1
+                                ]
+                            ]
+                        }
+                    ],
+                    "expression_representation": {
+                        "expr_type": "add",
+                        "children": [
+                            {
+                                "expr_type": "add",
+                                "children": [
+                                    {
+                                        "expr_type": "sub",
+                                        "children": [
+                                            {
+                                                "expr_type": "sub",
+                                                "children": [
+                                                    {
+                                                        "expr_type": "value",
+                                                        "children": []
+                                                    },
+                                                    {
+                                                        "expr_type": "access",
+                                                        "children": []
+                                                    }
+                                                ]
+                                            },
+                                            {
+                                                "expr_type": "access",
+                                                "children": []
+                                            }
+                                        ]
+                                    },
+                                    {
+                                        "expr_type": "access",
+                                        "children": []
+                                    }
+                                ]
+                            },
+                            {
+                                "expr_type": "access",
+                                "children": []
+                            }
+                        ]
+                    }
+                }
+            }
+        },
+        "initial_execution_time": 0.020093,
+        "schedules_list": [
+            {
+                "comp00": {
+                    "shiftings": null,
+                    "tiling": {},
+                    "unrolling_factor": null,
+                    "parallelized_dim": null,
+                    "transformations_list": []
+                },
+                "comp01": {
+                    "shiftings": null,
+                    "tiling": {},
+                    "unrolling_factor": null,
+                    "parallelized_dim": null,
+                    "transformations_list": []
+                },
+                "fusions": null,
+                "sched_str": "{comp00}:{comp01}:",
+                "tree_structure": {
+                    "roots": [
+                        {
+                            "loop_name": "i0",
+                            "computations_list": [],
+                            "child_list": [
+                                {
+                                    "loop_name": "i1",
+                                    "computations_list": [
+                                        "comp00",
+                                        "comp01"
+                                    ],
+                                    "child_list": []
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "execution_times": [
+                    0.022243,
+                    0.020296,
+                    0.02022,
+                    0.020247,
+                    0.020145,
+                    0.020158,
+                    0.020118,
+                    0.020127,
+                    0.02012,
+                    0.020101,
+                    0.020112,
+                    0.020093,
+                    0.020106,
+                    0.020125,
+                    0.020118,
+                    0.020128,
+                    0.020124,
+                    0.020118,
+                    0.020116,
+                    0.02012,
+                    0.020114,
+                    0.020185,
+                    0.020136,
+                    0.020104,
+                    0.020111,
+                    0.020115,
+                    0.02011,
+                    0.020131,
+                    0.020115,
+                    0.020118
+                ],
+                "legality_check": true,
+                "exploration_method": 1
+            },
+            {
+                "comp00": {
+                    "shiftings": null,
+                    "tiling": {},
+                    "unrolling_factor": null,
+                    "parallelized_dim": null,
+                    "transformations_list": [
+                        [
+                            1,
+                            0,
+                            1,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0
+                        ]
+                    ]
+                },
+                "comp01": {
+                    "shiftings": null,
+                    "tiling": {},
+                    "unrolling_factor": null,
+                    "parallelized_dim": null,
+                    "transformations_list": [
+                        [
+                            1,
+                            0,
+                            1,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0
+                        ]
+                    ]
+                },
+                "fusions": null,
+                "sched_str": "{comp00}:I(L0,L1){comp01}:I(L0,L1)",
+                "tree_structure": {
+                    "roots": [
+                        {
+                            "loop_name": "i0",
+                            "computations_list": [],
+                            "child_list": [
+                                {
+                                    "loop_name": "i1",
+                                    "computations_list": [
+                                        "comp00",
+                                        "comp01"
+                                    ],
+                                    "child_list": []
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "execution_times": [
+                    0.053553,
+                    0.024546,
+                    0.023366,
+                    0.023903,
+                    0.023466,
+                    0.023353,
+                    0.023057,
+                    0.023032,
+                    0.022967,
+                    0.022983,
+                    0.023138,
+                    0.023015,
+                    0.022988,
+                    0.023012,
+                    0.023096,
+                    0.022938,
+                    0.023033,
+                    0.02314,
+                    0.023018,
+                    0.023211,
+                    0.02318,
+                    0.023201,
+                    0.023244,
+                    0.022978,
+                    0.023131,
+                    0.022921,
+                    0.023158,
+                    0.022966,
+                    0.023054,
+                    0.023061
+                ],
+                "legality_check": true,
+                "exploration_method": 1
+            },
+            {
+                "comp00": {
+                    "shiftings": null,
+                    "tiling": {},
+                    "unrolling_factor": null,
+                    "parallelized_dim": null,
+                    "transformations_list": [
+                        [
+                            2,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0
+                        ]
+                    ]
+                },
+                "comp01": {
+                    "shiftings": null,
+                    "tiling": {},
+                    "unrolling_factor": null,
+                    "parallelized_dim": null,
+                    "transformations_list": [
+                        [
+                            2,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0
+                        ]
+                    ]
+                },
+                "fusions": null,
+                "sched_str": "{comp00}:R(L0){comp01}:R(L0)",
+                "tree_structure": {
+                    "roots": [
+                        {
+                            "loop_name": "i0",
+                            "computations_list": [],
+                            "child_list": [
+                                {
+                                    "loop_name": "i1",
+                                    "computations_list": [
+                                        "comp00",
+                                        "comp01"
+                                    ],
+                                    "child_list": []
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "execution_times": [
+                    0.024626,
+                    0.018364,
+                    0.017869,
+                    0.018038,
+                    0.017697,
+                    0.017652,
+                    0.017619,
+                    0.017611,
+                    0.017594,
+                    0.017616,
+                    0.017608,
+                    0.017655,
+                    0.017587,
+                    0.017625,
+                    0.017584,
+                    0.017605,
+                    0.01763,
+                    0.017628,
+                    0.01762,
+                    0.017603,
+                    0.017577,
+                    0.017632,
+                    0.017638,
+                    0.017623,
+                    0.01761,
+                    0.017613,
+                    0.017632,
+                    0.017649,
+                    0.017605,
+                    0.017642
+                ],
+                "legality_check": true,
+                "exploration_method": 1
+            },
+            {
+                "comp00": {
+                    "shiftings": null,
+                    "tiling": {},
+                    "unrolling_factor": null,
+                    "parallelized_dim": null,
+                    "transformations_list": [
+                        [
+                            3,
+                            0,
+                            0,
+                            0,
+                            0,
+                            1,
+                            0,
+                            1,
+                            1,
+                            0,
+                            1,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0
+                        ]
+                    ]
+                },
+                "comp01": {
+                    "shiftings": null,
+                    "tiling": {},
+                    "unrolling_factor": null,
+                    "parallelized_dim": null,
+                    "transformations_list": [
+                        [
+                            3,
+                            0,
+                            0,
+                            0,
+                            0,
+                            1,
+                            0,
+                            1,
+                            1,
+                            0,
+                            1,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0
+                        ]
+                    ]
+                },
+                "fusions": null,
+                "sched_str": "{comp00}:S(L0,L1,1,1){comp01}:S(L0,L1,1,1)",
+                "tree_structure": {
+                    "roots": [
+                        {
+                            "loop_name": "i0",
+                            "computations_list": [],
+                            "child_list": [
+                                {
+                                    "loop_name": "i1",
+                                    "computations_list": [
+                                        "comp00",
+                                        "comp01"
+                                    ],
+                                    "child_list": []
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "execution_times": [
+                    0.048104,
+                    0.041271,
+                    0.039839,
+                    0.039804,
+                    0.039044,
+                    0.038992,
+                    0.038717,
+                    0.03852,
+                    0.038644,
+                    0.039184,
+                    0.038885,
+                    0.038655,
+                    0.038499,
+                    0.038611,
+                    0.038593,
+                    0.038486,
+                    0.038533,
+                    0.038608,
+                    0.038694,
+                    0.038551,
+                    0.038656,
+                    0.038633,
+                    0.038951,
+                    0.038535,
+                    0.038876,
+                    0.038726,
+                    0.038563,
+                    0.038858,
+                    0.03863,
+                    0.038936
+                ],
+                "legality_check": true,
+                "exploration_method": 1
+            },
+            {
+                "comp00": {
+                    "shiftings": null,
+                    "tiling": {},
+                    "unrolling_factor": null,
+                    "parallelized_dim": null,
+                    "transformations_list": [
+                        [
+                            3,
+                            0,
+                            0,
+                            0,
+                            0,
+                            1,
+                            0,
+                            1,
+                            2,
+                            0,
+                            1,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0
+                        ]
+                    ]
+                },
+                "comp01": {
+                    "shiftings": null,
+                    "tiling": {},
+                    "unrolling_factor": null,
+                    "parallelized_dim": null,
+                    "transformations_list": [
+                        [
+                            3,
+                            0,
+                            0,
+                            0,
+                            0,
+                            1,
+                            0,
+                            1,
+                            2,
+                            0,
+                            1,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0
+                        ]
+                    ]
+                },
+                "fusions": null,
+                "sched_str": "{comp00}:S(L0,L1,1,2){comp01}:S(L0,L1,1,2)",
+                "tree_structure": {
+                    "roots": [
+                        {
+                            "loop_name": "i0",
+                            "computations_list": [],
+                            "child_list": [
+                                {
+                                    "loop_name": "i1",
+                                    "computations_list": [
+                                        "comp00",
+                                        "comp01"
+                                    ],
+                                    "child_list": []
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "execution_times": [
+                    0.052625,
+                    0.035992,
+                    0.034409,
+                    0.033968,
+                    0.033123,
+                    0.032537,
+                    0.032256,
+                    0.032222,
+                    0.032264,
+                    0.032077,
+                    0.03182,
+                    0.031971,
+                    0.031923,
+                    0.031889,
+                    0.03185,
+                    0.032168,
+                    0.032323,
+                    0.032152,
+                    0.032044,
+                    0.032051,
+                    0.032161,
+                    0.031966,
+                    0.031972,
+                    0.031953,
+                    0.032095,
+                    0.031753,
+                    0.032152,
+                    0.032283,
+                    0.032045,
+                    0.032295
+                ],
+                "legality_check": true,
+                "exploration_method": 1
+            },
+            {
+                "comp00": {
+                    "shiftings": null,
+                    "tiling": {},
+                    "unrolling_factor": null,
+                    "parallelized_dim": null,
+                    "transformations_list": [
+                        [
+                            3,
+                            0,
+                            0,
+                            0,
+                            0,
+                            1,
+                            0,
+                            1,
+                            3,
+                            0,
+                            1,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0
+                        ]
+                    ]
+                },
+                "comp01": {
+                    "shiftings": null,
+                    "tiling": {},
+                    "unrolling_factor": null,
+                    "parallelized_dim": null,
+                    "transformations_list": [
+                        [
+                            3,
+                            0,
+                            0,
+                            0,
+                            0,
+                            1,
+                            0,
+                            1,
+                            3,
+                            0,
+                            1,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0
+                        ]
+                    ]
+                },
+                "fusions": null,
+                "sched_str": "{comp00}:S(L0,L1,1,3){comp01}:S(L0,L1,1,3)",
+                "tree_structure": {
+                    "roots": [
+                        {
+                            "loop_name": "i0",
+                            "computations_list": [],
+                            "child_list": [
+                                {
+                                    "loop_name": "i1",
+                                    "computations_list": [
+                                        "comp00",
+                                        "comp01"
+                                    ],
+                                    "child_list": []
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "execution_times": [
+                    0.049561,
+                    0.037929,
+                    0.037289,
+                    0.037299,
+                    0.036651,
+                    0.036141,
+                    0.035904,
+                    0.035738,
+                    0.035896,
+                    0.035863,
+                    0.035658,
+                    0.03588,
+                    0.035794,
+                    0.03577,
+                    0.035717,
+                    0.035789,
+                    0.035917,
+                    0.035892,
+                    0.062933,
+                    0.038068,
+                    0.037091,
+                    0.036729,
+                    0.036864,
+                    0.036733,
+                    0.036767,
+                    0.050788,
+                    0.034845,
+                    0.034944,
+                    0.034783,
+                    0.034763
+                ],
+                "legality_check": true,
+                "exploration_method": 1
+            },
+            {
+                "comp00": {
+                    "shiftings": null,
+                    "tiling": {},
+                    "unrolling_factor": null,
+                    "parallelized_dim": null,
+                    "transformations_list": [
+                        [
+                            2,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0
+                        ],
+                        [
+                            1,
+                            0,
+                            1,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0
+                        ]
+                    ]
+                },
+                "comp01": {
+                    "shiftings": null,
+                    "tiling": {},
+                    "unrolling_factor": null,
+                    "parallelized_dim": null,
+                    "transformations_list": [
+                        [
+                            2,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0
+                        ],
+                        [
+                            1,
+                            0,
+                            1,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0
+                        ]
+                    ]
+                },
+                "fusions": null,
+                "sched_str": "{comp00}:R(L0)I(L0,L1){comp01}:R(L0)I(L0,L1)",
+                "tree_structure": {
+                    "roots": [
+                        {
+                            "loop_name": "i0",
+                            "computations_list": [],
+                            "child_list": [
+                                {
+                                    "loop_name": "i1",
+                                    "computations_list": [
+                                        "comp00",
+                                        "comp01"
+                                    ],
+                                    "child_list": []
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "execution_times": [
+                    0.044144,
+                    0.016801,
+                    0.016057,
+                    0.016162,
+                    0.015662,
+                    0.015613,
+                    0.01551,
+                    0.015489,
+                    0.015496,
+                    0.015503,
+                    0.015459,
+                    0.015472,
+                    0.015477,
+                    0.015394,
+                    0.015629,
+                    0.015452,
+                    0.015468,
+                    0.015466,
+                    0.015428,
+                    0.015434,
+                    0.015514,
+                    0.015399,
+                    0.015483,
+                    0.015459,
+                    0.015462,
+                    0.015507,
+                    0.015446,
+                    0.015449,
+                    0.015461,
+                    0.015534
+                ],
+                "legality_check": true,
+                "exploration_method": 1
+            },
+            {
+                "comp00": {
+                    "shiftings": null,
+                    "tiling": {},
+                    "unrolling_factor": null,
+                    "parallelized_dim": null,
+                    "transformations_list": [
+                        [
+                            2,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0
+                        ],
+                        [
+                            3,
+                            0,
+                            0,
+                            0,
+                            0,
+                            1,
+                            0,
+                            1,
+                            1,
+                            0,
+                            1,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0
+                        ]
+                    ]
+                },
+                "comp01": {
+                    "shiftings": null,
+                    "tiling": {},
+                    "unrolling_factor": null,
+                    "parallelized_dim": null,
+                    "transformations_list": [
+                        [
+                            2,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0
+                        ],
+                        [
+                            3,
+                            0,
+                            0,
+                            0,
+                            0,
+                            1,
+                            0,
+                            1,
+                            1,
+                            0,
+                            1,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0
+                        ]
+                    ]
+                },
+                "fusions": null,
+                "sched_str": "{comp00}:R(L0)S(L0,L1,1,1){comp01}:R(L0)S(L0,L1,1,1)",
+                "tree_structure": {
+                    "roots": [
+                        {
+                            "loop_name": "i0",
+                            "computations_list": [],
+                            "child_list": [
+                                {
+                                    "loop_name": "i1",
+                                    "computations_list": [
+                                        "comp00",
+                                        "comp01"
+                                    ],
+                                    "child_list": []
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "execution_times": [
+                    0.049002,
+                    0.029338,
+                    0.027871,
+                    0.028008,
+                    0.027031,
+                    0.026636,
+                    0.026238,
+                    0.026611,
+                    0.026321,
+                    0.026205,
+                    0.026142,
+                    0.02614,
+                    0.026558,
+                    0.026218,
+                    0.026284,
+                    0.026154,
+                    0.026199,
+                    0.026244,
+                    0.02614,
+                    0.026367,
+                    0.026179,
+                    0.026198,
+                    0.026334,
+                    0.026166,
+                    0.02639,
+                    0.025931,
+                    0.026173,
+                    0.026088,
+                    0.026081,
+                    0.026289
+                ],
+                "legality_check": true,
+                "exploration_method": 1
+            },
+            {
+                "comp00": {
+                    "shiftings": null,
+                    "tiling": {},
+                    "unrolling_factor": null,
+                    "parallelized_dim": null,
+                    "transformations_list": [
+                        [
+                            2,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0
+                        ],
+                        [
+                            3,
+                            0,
+                            0,
+                            0,
+                            0,
+                            1,
+                            0,
+                            1,
+                            2,
+                            0,
+                            1,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0
+                        ]
+                    ]
+                },
+                "comp01": {
+                    "shiftings": null,
+                    "tiling": {},
+                    "unrolling_factor": null,
+                    "parallelized_dim": null,
+                    "transformations_list": [
+                        [
+                            2,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0
+                        ],
+                        [
+                            3,
+                            0,
+                            0,
+                            0,
+                            0,
+                            1,
+                            0,
+                            1,
+                            2,
+                            0,
+                            1,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0
+                        ]
+                    ]
+                },
+                "fusions": null,
+                "sched_str": "{comp00}:R(L0)S(L0,L1,1,2){comp01}:R(L0)S(L0,L1,1,2)",
+                "tree_structure": {
+                    "roots": [
+                        {
+                            "loop_name": "i0",
+                            "computations_list": [],
+                            "child_list": [
+                                {
+                                    "loop_name": "i1",
+                                    "computations_list": [
+                                        "comp00",
+                                        "comp01"
+                                    ],
+                                    "child_list": []
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "execution_times": [
+                    0.101317,
+                    0.043626,
+                    0.028935,
+                    0.029374,
+                    0.028836,
+                    0.02835,
+                    0.027755,
+                    0.027575,
+                    0.027706,
+                    0.027567,
+                    0.027851,
+                    0.027868,
+                    0.027373,
+                    0.027501,
+                    0.027935,
+                    0.027883,
+                    0.027885,
+                    0.027714,
+                    0.027988,
+                    0.027939,
+                    0.028112,
+                    0.027784,
+                    0.027659,
+                    0.027936,
+                    0.027968,
+                    0.027554,
+                    0.027374,
+                    0.027412,
+                    0.027314,
+                    0.027609
+                ],
+                "legality_check": true,
+                "exploration_method": 1
+            },
+            {
+                "comp00": {
+                    "shiftings": null,
+                    "tiling": {},
+                    "unrolling_factor": null,
+                    "parallelized_dim": null,
+                    "transformations_list": [
+                        [
+                            2,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0
+                        ],
+                        [
+                            3,
+                            0,
+                            0,
+                            0,
+                            0,
+                            1,
+                            0,
+                            1,
+                            3,
+                            0,
+                            1,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0
+                        ]
+                    ]
+                },
+                "comp01": {
+                    "shiftings": null,
+                    "tiling": {},
+                    "unrolling_factor": null,
+                    "parallelized_dim": null,
+                    "transformations_list": [
+                        [
+                            2,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0
+                        ],
+                        [
+                            3,
+                            0,
+                            0,
+                            0,
+                            0,
+                            1,
+                            0,
+                            1,
+                            3,
+                            0,
+                            1,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0
+                        ]
+                    ]
+                },
+                "fusions": null,
+                "sched_str": "{comp00}:R(L0)S(L0,L1,1,3){comp01}:R(L0)S(L0,L1,1,3)",
+                "tree_structure": {
+                    "roots": [
+                        {
+                            "loop_name": "i0",
+                            "computations_list": [],
+                            "child_list": [
+                                {
+                                    "loop_name": "i1",
+                                    "computations_list": [
+                                        "comp00",
+                                        "comp01"
+                                    ],
+                                    "child_list": []
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "execution_times": [
+                    0.039,
+                    0.031353,
+                    0.030248,
+                    0.030299,
+                    0.029727,
+                    0.02956,
+                    0.029508,
+                    0.029422,
+                    0.029339,
+                    0.029486,
+                    0.029334,
+                    0.029323,
+                    0.029287,
+                    0.02933,
+                    0.029329,
+                    0.029398,
+                    0.029397,
+                    0.029384,
+                    0.029417,
+                    0.029268,
+                    0.029407,
+                    0.029384,
+                    0.02935,
+                    0.029533,
+                    0.029482,
+                    0.029367,
+                    0.029474,
+                    0.029335,
+                    0.029476,
+                    0.029439
+                ],
+                "legality_check": true,
+                "exploration_method": 1
+            },
+            {
+                "comp00": {
+                    "shiftings": null,
+                    "tiling": {},
+                    "unrolling_factor": null,
+                    "parallelized_dim": "i1",
+                    "transformations_list": [
+                        [
+                            2,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0
+                        ],
+                        [
+                            1,
+                            0,
+                            1,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0
+                        ]
+                    ]
+                },
+                "comp01": {
+                    "shiftings": null,
+                    "tiling": {},
+                    "unrolling_factor": null,
+                    "parallelized_dim": "i1",
+                    "transformations_list": [
+                        [
+                            2,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0
+                        ],
+                        [
+                            1,
+                            0,
+                            1,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0
+                        ]
+                    ]
+                },
+                "fusions": null,
+                "sched_str": "{comp00}:R(L0)I(L0,L1)P(L1){comp01}:R(L0)I(L0,L1)P(L1)",
+                "tree_structure": {
+                    "roots": [
+                        {
+                            "loop_name": "i0",
+                            "computations_list": [],
+                            "child_list": [
+                                {
+                                    "loop_name": "i1",
+                                    "computations_list": [
+                                        "comp00",
+                                        "comp01"
+                                    ],
+                                    "child_list": []
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "execution_times": [
+                    20.093
+                ],
+                "legality_check": true,
+                "exploration_method": 1
+            },
+            {
+                "comp00": {
+                    "shiftings": null,
+                    "tiling": {},
+                    "unrolling_factor": null,
+                    "parallelized_dim": "i0",
+                    "transformations_list": [
+                        [
+                            2,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0
+                        ]
+                    ]
+                },
+                "comp01": {
+                    "shiftings": null,
+                    "tiling": {},
+                    "unrolling_factor": null,
+                    "parallelized_dim": "i0",
+                    "transformations_list": [
+                        [
+                            2,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0
+                        ]
+                    ]
+                },
+                "fusions": null,
+                "sched_str": "{comp00}:R(L0)P(L0){comp01}:R(L0)P(L0)",
+                "tree_structure": {
+                    "roots": [
+                        {
+                            "loop_name": "i0",
+                            "computations_list": [],
+                            "child_list": [
+                                {
+                                    "loop_name": "i1",
+                                    "computations_list": [
+                                        "comp00",
+                                        "comp01"
+                                    ],
+                                    "child_list": []
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "execution_times": [
+                    1.21557,
+                    0.221766,
+                    0.202244,
+                    0.21424,
+                    0.189699,
+                    0.171742,
+                    0.201425,
+                    0.208649,
+                    0.194265,
+                    0.205123,
+                    0.188758,
+                    0.188915,
+                    0.201347,
+                    0.198507,
+                    0.200428,
+                    0.189059,
+                    0.190603,
+                    0.180202,
+                    0.182795,
+                    0.183831,
+                    0.194463,
+                    0.175972,
+                    0.19242,
+                    0.198065,
+                    0.200958,
+                    0.204822,
+                    0.215707,
+                    0.192491,
+                    0.196651,
+                    0.196267
+                ],
+                "legality_check": true,
+                "exploration_method": 1
+            },
+            {
+                "comp00": {
+                    "shiftings": null,
+                    "tiling": {},
+                    "unrolling_factor": 4,
+                    "parallelized_dim": null,
+                    "transformations_list": [
+                        [
+                            2,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0
+                        ]
+                    ]
+                },
+                "comp01": {
+                    "shiftings": null,
+                    "tiling": {},
+                    "unrolling_factor": 4,
+                    "parallelized_dim": null,
+                    "transformations_list": [
+                        [
+                            2,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0
+                        ]
+                    ]
+                },
+                "fusions": null,
+                "sched_str": "{comp00}:R(L0)U(L1,4){comp01}:R(L0)U(L1,4)",
+                "tree_structure": {
+                    "roots": [
+                        {
+                            "loop_name": "i0",
+                            "computations_list": [],
+                            "child_list": [
+                                {
+                                    "loop_name": "i1",
+                                    "computations_list": [
+                                        "comp00",
+                                        "comp01"
+                                    ],
+                                    "child_list": []
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "execution_times": [
+                    0.021661,
+                    0.032936,
+                    0.017814,
+                    0.017809,
+                    0.017719,
+                    0.01763,
+                    0.017672,
+                    0.017585,
+                    0.017657,
+                    0.017572,
+                    0.01765,
+                    0.017588,
+                    0.017621,
+                    0.017631,
+                    0.017648,
+                    0.017647,
+                    0.017617,
+                    0.017626,
+                    0.01763,
+                    0.017583,
+                    0.017663,
+                    0.017627,
+                    0.01764,
+                    0.017586,
+                    0.017596,
+                    0.017602,
+                    0.017608,
+                    0.017586,
+                    0.017643,
+                    0.017607
+                ],
+                "legality_check": true,
+                "exploration_method": 1
+            },
+            {
+                "comp00": {
+                    "shiftings": null,
+                    "tiling": {},
+                    "unrolling_factor": 8,
+                    "parallelized_dim": null,
+                    "transformations_list": [
+                        [
+                            2,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0
+                        ]
+                    ]
+                },
+                "comp01": {
+                    "shiftings": null,
+                    "tiling": {},
+                    "unrolling_factor": 8,
+                    "parallelized_dim": null,
+                    "transformations_list": [
+                        [
+                            2,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0
+                        ]
+                    ]
+                },
+                "fusions": null,
+                "sched_str": "{comp00}:R(L0)U(L1,8){comp01}:R(L0)U(L1,8)",
+                "tree_structure": {
+                    "roots": [
+                        {
+                            "loop_name": "i0",
+                            "computations_list": [],
+                            "child_list": [
+                                {
+                                    "loop_name": "i1",
+                                    "computations_list": [
+                                        "comp00",
+                                        "comp01"
+                                    ],
+                                    "child_list": []
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "execution_times": [
+                    0.021016,
+                    0.017306,
+                    0.031447,
+                    0.016446,
+                    0.016361,
+                    0.016244,
+                    0.016233,
+                    0.016244,
+                    0.016248,
+                    0.016222,
+                    0.016196,
+                    0.016187,
+                    0.016237,
+                    0.016201,
+                    0.016202,
+                    0.0162,
+                    0.016203,
+                    0.01621,
+                    0.016195,
+                    0.016209,
+                    0.016181,
+                    0.016202,
+                    0.016193,
+                    0.016211,
+                    0.016212,
+                    0.016176,
+                    0.016197,
+                    0.01621,
+                    0.016189,
+                    0.016182
+                ],
+                "legality_check": true,
+                "exploration_method": 1
+            },
+            {
+                "comp00": {
+                    "shiftings": null,
+                    "tiling": {},
+                    "unrolling_factor": 16,
+                    "parallelized_dim": null,
+                    "transformations_list": [
+                        [
+                            2,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0
+                        ]
+                    ]
+                },
+                "comp01": {
+                    "shiftings": null,
+                    "tiling": {},
+                    "unrolling_factor": 16,
+                    "parallelized_dim": null,
+                    "transformations_list": [
+                        [
+                            2,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0
+                        ]
+                    ]
+                },
+                "fusions": null,
+                "sched_str": "{comp00}:R(L0)U(L1,16){comp01}:R(L0)U(L1,16)",
+                "tree_structure": {
+                    "roots": [
+                        {
+                            "loop_name": "i0",
+                            "computations_list": [],
+                            "child_list": [
+                                {
+                                    "loop_name": "i1",
+                                    "computations_list": [
+                                        "comp00",
+                                        "comp01"
+                                    ],
+                                    "child_list": []
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "execution_times": [
+                    0.021251,
+                    0.035275,
+                    0.017862,
+                    0.017316,
+                    0.017107,
+                    0.016979,
+                    0.016977,
+                    0.016977,
+                    0.016911,
+                    0.016909,
+                    0.016951,
+                    0.017009,
+                    0.016951,
+                    0.016957,
+                    0.016958,
+                    0.016917,
+                    0.016966,
+                    0.016913,
+                    0.016953,
+                    0.016938,
+                    0.016911,
+                    0.016926,
+                    0.016928,
+                    0.016905,
+                    0.016913,
+                    0.016923,
+                    0.016928,
+                    0.016942,
+                    0.016926,
+                    0.016915
+                ],
+                "legality_check": true,
+                "exploration_method": 1
+            },
+            {
+                "comp00": {
+                    "shiftings": null,
+                    "tiling": {},
+                    "unrolling_factor": 4,
+                    "parallelized_dim": "i0",
+                    "transformations_list": [
+                        [
+                            2,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0
+                        ]
+                    ]
+                },
+                "comp01": {
+                    "shiftings": null,
+                    "tiling": {},
+                    "unrolling_factor": 4,
+                    "parallelized_dim": "i0",
+                    "transformations_list": [
+                        [
+                            2,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0
+                        ]
+                    ]
+                },
+                "fusions": null,
+                "sched_str": "{comp00}:R(L0)P(L0)U(L1,4){comp01}:R(L0)P(L0)U(L1,4)",
+                "tree_structure": {
+                    "roots": [
+                        {
+                            "loop_name": "i0",
+                            "computations_list": [],
+                            "child_list": [
+                                {
+                                    "loop_name": "i1",
+                                    "computations_list": [
+                                        "comp00",
+                                        "comp01"
+                                    ],
+                                    "child_list": []
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "execution_times": [
+                    1.1166,
+                    0.17228,
+                    0.186362,
+                    0.185529,
+                    0.167611,
+                    0.169927,
+                    0.172852,
+                    0.185185,
+                    0.171222,
+                    0.172748,
+                    0.154175,
+                    0.167228,
+                    0.153605,
+                    0.159912,
+                    0.180814,
+                    0.1577,
+                    0.16491,
+                    0.166878,
+                    0.18341,
+                    0.174923,
+                    0.169194,
+                    0.158106,
+                    0.158542,
+                    0.160584,
+                    0.16481,
+                    0.1742,
+                    0.165913,
+                    0.163495,
+                    0.160917,
+                    0.170225
+                ],
+                "legality_check": true,
+                "exploration_method": 1
+            },
+            {
+                "comp00": {
+                    "shiftings": null,
+                    "tiling": {},
+                    "unrolling_factor": 8,
+                    "parallelized_dim": "i0",
+                    "transformations_list": [
+                        [
+                            2,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0
+                        ]
+                    ]
+                },
+                "comp01": {
+                    "shiftings": null,
+                    "tiling": {},
+                    "unrolling_factor": 8,
+                    "parallelized_dim": "i0",
+                    "transformations_list": [
+                        [
+                            2,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0
+                        ]
+                    ]
+                },
+                "fusions": null,
+                "sched_str": "{comp00}:R(L0)P(L0)U(L1,8){comp01}:R(L0)P(L0)U(L1,8)",
+                "tree_structure": {
+                    "roots": [
+                        {
+                            "loop_name": "i0",
+                            "computations_list": [],
+                            "child_list": [
+                                {
+                                    "loop_name": "i1",
+                                    "computations_list": [
+                                        "comp00",
+                                        "comp01"
+                                    ],
+                                    "child_list": []
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "execution_times": [
+                    1.21783,
+                    0.187253,
+                    0.172205,
+                    0.164096,
+                    0.15389,
+                    0.171295,
+                    0.165361,
+                    0.153356,
+                    0.212423,
+                    0.154997,
+                    0.167262,
+                    0.161387,
+                    0.163673,
+                    0.151865,
+                    0.165188,
+                    0.152686,
+                    0.152426,
+                    0.157471,
+                    0.153876,
+                    0.151315,
+                    0.168404,
+                    0.164745,
+                    0.163248,
+                    0.150206,
+                    0.158274,
+                    0.163014,
+                    0.184357,
+                    0.181669,
+                    0.182408,
+                    0.184063
+                ],
+                "legality_check": true,
+                "exploration_method": 1
+            },
+            {
+                "comp00": {
+                    "shiftings": null,
+                    "tiling": {},
+                    "unrolling_factor": 16,
+                    "parallelized_dim": "i0",
+                    "transformations_list": [
+                        [
+                            2,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0
+                        ]
+                    ]
+                },
+                "comp01": {
+                    "shiftings": null,
+                    "tiling": {},
+                    "unrolling_factor": 16,
+                    "parallelized_dim": "i0",
+                    "transformations_list": [
+                        [
+                            2,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0
+                        ]
+                    ]
+                },
+                "fusions": null,
+                "sched_str": "{comp00}:R(L0)P(L0)U(L1,16){comp01}:R(L0)P(L0)U(L1,16)",
+                "tree_structure": {
+                    "roots": [
+                        {
+                            "loop_name": "i0",
+                            "computations_list": [],
+                            "child_list": [
+                                {
+                                    "loop_name": "i1",
+                                    "computations_list": [
+                                        "comp00",
+                                        "comp01"
+                                    ],
+                                    "child_list": []
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "execution_times": [
+                    1.31378,
+                    0.202918,
+                    0.192566,
+                    0.181713,
+                    0.171408,
+                    0.167852,
+                    0.173497,
+                    0.181483,
+                    0.18725,
+                    0.228152,
+                    0.193862,
+                    0.184908,
+                    0.187471,
+                    0.188063,
+                    0.184656,
+                    0.19359,
+                    0.19101,
+                    0.178012,
+                    0.189709,
+                    0.188205,
+                    0.204533,
+                    0.190942,
+                    0.18602,
+                    0.172981,
+                    0.205477,
+                    0.192931,
+                    0.209646,
+                    0.189133,
+                    0.203802,
+                    0.22774
+                ],
+                "legality_check": true,
+                "exploration_method": 1
+            },
+            {
+                "comp00": {
+                    "shiftings": null,
+                    "tiling": {},
+                    "unrolling_factor": null,
+                    "parallelized_dim": "i0",
+                    "transformations_list": []
+                },
+                "comp01": {
+                    "shiftings": null,
+                    "tiling": {},
+                    "unrolling_factor": null,
+                    "parallelized_dim": "i0",
+                    "transformations_list": []
+                },
+                "fusions": null,
+                "sched_str": "{comp00}:P(L0){comp01}:P(L0)",
+                "tree_structure": {
+                    "roots": [
+                        {
+                            "loop_name": "i0",
+                            "computations_list": [],
+                            "child_list": [
+                                {
+                                    "loop_name": "i1",
+                                    "computations_list": [
+                                        "comp00",
+                                        "comp01"
+                                    ],
+                                    "child_list": []
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "execution_times": [
+                    1.2064,
+                    0.200514,
+                    0.171064,
+                    0.162061,
+                    0.17178,
+                    0.160256,
+                    0.180682,
+                    0.180946,
+                    0.160992,
+                    0.159769,
+                    0.178994,
+                    0.165461,
+                    0.163905,
+                    0.161204,
+                    0.157105,
+                    0.166967,
+                    0.155097,
+                    0.158781,
+                    0.18935,
+                    0.164713,
+                    0.15775,
+                    0.155831,
+                    0.161278,
+                    0.167871,
+                    0.198855,
+                    0.177777,
+                    0.182683,
+                    0.185908,
+                    0.183105,
+                    0.192842
+                ],
+                "legality_check": true,
+                "exploration_method": 1
+            },
+            {
+                "comp00": {
+                    "shiftings": null,
+                    "tiling": {},
+                    "unrolling_factor": 4,
+                    "parallelized_dim": null,
+                    "transformations_list": []
+                },
+                "comp01": {
+                    "shiftings": null,
+                    "tiling": {},
+                    "unrolling_factor": 4,
+                    "parallelized_dim": null,
+                    "transformations_list": []
+                },
+                "fusions": null,
+                "sched_str": "{comp00}:U(L1,4){comp01}:U(L1,4)",
+                "tree_structure": {
+                    "roots": [
+                        {
+                            "loop_name": "i0",
+                            "computations_list": [],
+                            "child_list": [
+                                {
+                                    "loop_name": "i1",
+                                    "computations_list": [
+                                        "comp00",
+                                        "comp01"
+                                    ],
+                                    "child_list": []
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "execution_times": [
+                    0.028596,
+                    0.031006,
+                    0.016737,
+                    0.016873,
+                    0.016702,
+                    0.016681,
+                    0.016726,
+                    0.016682,
+                    0.016678,
+                    0.016687,
+                    0.016741,
+                    0.01672,
+                    0.01671,
+                    0.016728,
+                    0.016685,
+                    0.016734,
+                    0.016754,
+                    0.016743,
+                    0.016744,
+                    0.016691,
+                    0.016721,
+                    0.016705,
+                    0.016727,
+                    0.016741,
+                    0.016678,
+                    0.016729,
+                    0.016687,
+                    0.01669,
+                    0.016691,
+                    0.016737
+                ],
+                "legality_check": true,
+                "exploration_method": 1
+            },
+            {
+                "comp00": {
+                    "shiftings": null,
+                    "tiling": {},
+                    "unrolling_factor": 8,
+                    "parallelized_dim": null,
+                    "transformations_list": []
+                },
+                "comp01": {
+                    "shiftings": null,
+                    "tiling": {},
+                    "unrolling_factor": 8,
+                    "parallelized_dim": null,
+                    "transformations_list": []
+                },
+                "fusions": null,
+                "sched_str": "{comp00}:U(L1,8){comp01}:U(L1,8)",
+                "tree_structure": {
+                    "roots": [
+                        {
+                            "loop_name": "i0",
+                            "computations_list": [],
+                            "child_list": [
+                                {
+                                    "loop_name": "i1",
+                                    "computations_list": [
+                                        "comp00",
+                                        "comp01"
+                                    ],
+                                    "child_list": []
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "execution_times": [
+                    0.038452,
+                    0.03038,
+                    0.016069,
+                    0.016181,
+                    0.016112,
+                    0.016045,
+                    0.016008,
+                    0.016027,
+                    0.015996,
+                    0.015991,
+                    0.015995,
+                    0.016015,
+                    0.01602,
+                    0.016028,
+                    0.016018,
+                    0.016035,
+                    0.016006,
+                    0.016009,
+                    0.015992,
+                    0.015987,
+                    0.01599,
+                    0.015983,
+                    0.016014,
+                    0.015985,
+                    0.016012,
+                    0.016001,
+                    0.015974,
+                    0.015969,
+                    0.015999,
+                    0.015971
+                ],
+                "legality_check": true,
+                "exploration_method": 1
+            },
+            {
+                "comp00": {
+                    "shiftings": null,
+                    "tiling": {},
+                    "unrolling_factor": 16,
+                    "parallelized_dim": null,
+                    "transformations_list": []
+                },
+                "comp01": {
+                    "shiftings": null,
+                    "tiling": {},
+                    "unrolling_factor": 16,
+                    "parallelized_dim": null,
+                    "transformations_list": []
+                },
+                "fusions": null,
+                "sched_str": "{comp00}:U(L1,16){comp01}:U(L1,16)",
+                "tree_structure": {
+                    "roots": [
+                        {
+                            "loop_name": "i0",
+                            "computations_list": [],
+                            "child_list": [
+                                {
+                                    "loop_name": "i1",
+                                    "computations_list": [
+                                        "comp00",
+                                        "comp01"
+                                    ],
+                                    "child_list": []
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "execution_times": [
+                    0.019841,
+                    0.017263,
+                    0.01719,
+                    0.017208,
+                    0.017118,
+                    0.017156,
+                    0.01714,
+                    0.040135,
+                    0.016586,
+                    0.03103,
+                    0.016038,
+                    0.016022,
+                    0.016012,
+                    0.016026,
+                    0.016018,
+                    0.016034,
+                    0.016023,
+                    0.016014,
+                    0.016016,
+                    0.016025,
+                    0.016015,
+                    0.016007,
+                    0.01602,
+                    0.016024,
+                    0.016026,
+                    0.016021,
+                    0.016017,
+                    0.016018,
+                    0.016017,
+                    0.01602
+                ],
+                "legality_check": true,
+                "exploration_method": 1
+            },
+            {
+                "comp00": {
+                    "shiftings": null,
+                    "tiling": {},
+                    "unrolling_factor": 4,
+                    "parallelized_dim": "i0",
+                    "transformations_list": []
+                },
+                "comp01": {
+                    "shiftings": null,
+                    "tiling": {},
+                    "unrolling_factor": 4,
+                    "parallelized_dim": "i0",
+                    "transformations_list": []
+                },
+                "fusions": null,
+                "sched_str": "{comp00}:P(L0)U(L1,4){comp01}:P(L0)U(L1,4)",
+                "tree_structure": {
+                    "roots": [
+                        {
+                            "loop_name": "i0",
+                            "computations_list": [],
+                            "child_list": [
+                                {
+                                    "loop_name": "i1",
+                                    "computations_list": [
+                                        "comp00",
+                                        "comp01"
+                                    ],
+                                    "child_list": []
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "execution_times": [
+                    1.68823,
+                    0.195134,
+                    0.192396,
+                    0.193867,
+                    0.203949,
+                    0.181085,
+                    0.189371,
+                    0.206034,
+                    0.220384,
+                    0.204156,
+                    0.184734,
+                    0.196059,
+                    0.182726,
+                    0.192723,
+                    0.184526,
+                    0.186443,
+                    0.196236,
+                    0.201579,
+                    0.197161,
+                    0.16998,
+                    0.188741,
+                    0.187136,
+                    0.189137,
+                    0.210284,
+                    0.201981,
+                    0.180555,
+                    0.192853,
+                    0.208122,
+                    0.189779,
+                    0.198509
+                ],
+                "legality_check": true,
+                "exploration_method": 1
+            },
+            {
+                "comp00": {
+                    "shiftings": null,
+                    "tiling": {},
+                    "unrolling_factor": 8,
+                    "parallelized_dim": "i0",
+                    "transformations_list": []
+                },
+                "comp01": {
+                    "shiftings": null,
+                    "tiling": {},
+                    "unrolling_factor": 8,
+                    "parallelized_dim": "i0",
+                    "transformations_list": []
+                },
+                "fusions": null,
+                "sched_str": "{comp00}:P(L0)U(L1,8){comp01}:P(L0)U(L1,8)",
+                "tree_structure": {
+                    "roots": [
+                        {
+                            "loop_name": "i0",
+                            "computations_list": [],
+                            "child_list": [
+                                {
+                                    "loop_name": "i1",
+                                    "computations_list": [
+                                        "comp00",
+                                        "comp01"
+                                    ],
+                                    "child_list": []
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "execution_times": [
+                    1.36174,
+                    0.184726,
+                    0.178533,
+                    0.165689,
+                    0.168463,
+                    0.163579,
+                    0.16326,
+                    0.162813,
+                    0.159811,
+                    0.143155,
+                    0.163993,
+                    0.162503,
+                    0.160065,
+                    0.141459,
+                    0.161856,
+                    0.17304,
+                    0.156183,
+                    0.156246,
+                    0.178056,
+                    0.191451,
+                    0.188753,
+                    0.182948,
+                    0.185158,
+                    0.186407,
+                    0.199744,
+                    0.191843,
+                    0.171294,
+                    0.178628,
+                    0.199031,
+                    0.188258
+                ],
+                "legality_check": true,
+                "exploration_method": 1
+            },
+            {
+                "comp00": {
+                    "shiftings": null,
+                    "tiling": {},
+                    "unrolling_factor": 16,
+                    "parallelized_dim": "i0",
+                    "transformations_list": []
+                },
+                "comp01": {
+                    "shiftings": null,
+                    "tiling": {},
+                    "unrolling_factor": 16,
+                    "parallelized_dim": "i0",
+                    "transformations_list": []
+                },
+                "fusions": null,
+                "sched_str": "{comp00}:P(L0)U(L1,16){comp01}:P(L0)U(L1,16)",
+                "tree_structure": {
+                    "roots": [
+                        {
+                            "loop_name": "i0",
+                            "computations_list": [],
+                            "child_list": [
+                                {
+                                    "loop_name": "i1",
+                                    "computations_list": [
+                                        "comp00",
+                                        "comp01"
+                                    ],
+                                    "child_list": []
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "execution_times": [
+                    1.35867,
+                    0.218098,
+                    0.193117,
+                    0.216064,
+                    0.19642,
+                    0.196054,
+                    0.195116,
+                    0.204036,
+                    0.186518,
+                    0.213278,
+                    0.203625,
+                    0.193963,
+                    0.18865,
+                    0.188268,
+                    0.186272,
+                    0.19664,
+                    0.189635,
+                    0.199562,
+                    0.19983,
+                    0.187174,
+                    0.180151,
+                    0.205727,
+                    0.189666,
+                    0.206086,
+                    0.183894,
+                    0.202457,
+                    0.209807,
+                    0.206157,
+                    0.180451,
+                    0.192291
+                ],
+                "legality_check": true,
+                "exploration_method": 1
+            }
+        ],
+        "exploration_trace": {
+            "id": 0,
+            "schedule": "",
+            "depth": 1,
+            "evaluation": 0.020093,
+            "children": [
+                {
+                    "id": 0,
+                    "schedule": "",
+                    "depth": 1,
+                    "evaluation": 0.020093,
+                    "children": [
+                        {
+                            "id": 1,
+                            "schedule": "M({C0},0,1,1,0)M({C1},0,1,1,0)",
+                            "depth": 1,
+                            "evaluation": 0.022921,
+                            "children": []
+                        },
+                        {
+                            "id": 2,
+                            "schedule": "M({C0},-1,0,0,1)M({C1},-1,0,0,1)",
+                            "depth": 1,
+                            "evaluation": 0.017577,
+                            "children": [
+                                {
+                                    "id": 6,
+                                    "schedule": "M({C0},0,1,-1,0)M({C1},0,1,-1,0)",
+                                    "depth": 2,
+                                    "evaluation": 0.015394,
+                                    "children": [
+                                        {
+                                            "id": 6,
+                                            "schedule": "M({C0},0,1,-1,0)M({C1},0,1,-1,0)",
+                                            "depth": 3,
+                                            "evaluation": 0.015394,
+                                            "children": [
+                                                {
+                                                    "id": 10,
+                                                    "schedule": "M({C0},0,1,-1,0)M({C1},0,1,-1,0)P({C0,C1},L1)",
+                                                    "depth": 4,
+                                                    "evaluation": 20.093,
+                                                    "children": [
+                                                        {
+                                                            "id": 10,
+                                                            "schedule": "M({C0},0,1,-1,0)M({C1},0,1,-1,0)P({C0,C1},L1)",
+                                                            "depth": 5,
+                                                            "evaluation": 20.093,
+                                                            "children": []
+                                                        }
+                                                    ]
+                                                },
+                                                {
+                                                    "id": 6,
+                                                    "schedule": "M({C0},0,1,-1,0)M({C1},0,1,-1,0)",
+                                                    "depth": 4,
+                                                    "evaluation": 0.015394,
+                                                    "children": [
+                                                        {
+                                                            "id": 6,
+                                                            "schedule": "M({C0},0,1,-1,0)M({C1},0,1,-1,0)",
+                                                            "depth": 5,
+                                                            "evaluation": 0.015394,
+                                                            "children": []
+                                                        }
+                                                    ]
+                                                }
+                                            ]
+                                        }
+                                    ]
+                                },
+                                {
+                                    "id": 7,
+                                    "schedule": "M({C0},-1,1,0,1)M({C1},-1,1,0,1)",
+                                    "depth": 2,
+                                    "evaluation": 0.025931,
+                                    "children": []
+                                },
+                                {
+                                    "id": 8,
+                                    "schedule": "M({C0},-1,2,0,1)M({C1},-1,2,0,1)",
+                                    "depth": 2,
+                                    "evaluation": 0.027314,
+                                    "children": []
+                                },
+                                {
+                                    "id": 9,
+                                    "schedule": "M({C0},-1,3,0,1)M({C1},-1,3,0,1)",
+                                    "depth": 2,
+                                    "evaluation": 0.029268,
+                                    "children": []
+                                },
+                                {
+                                    "id": 2,
+                                    "schedule": "M({C0},-1,0,0,1)M({C1},-1,0,0,1)",
+                                    "depth": 2,
+                                    "evaluation": 0.017577,
+                                    "children": [
+                                        {
+                                            "id": 11,
+                                            "schedule": "M({C0},-1,0,0,1)M({C1},-1,0,0,1)P({C0,C1},L0)",
+                                            "depth": 3,
+                                            "evaluation": 0.171742,
+                                            "children": [
+                                                {
+                                                    "id": 11,
+                                                    "schedule": "M({C0},-1,0,0,1)M({C1},-1,0,0,1)P({C0,C1},L0)",
+                                                    "depth": 4,
+                                                    "evaluation": 0.171742,
+                                                    "children": [
+                                                        {
+                                                            "id": 15,
+                                                            "schedule": "M({C0},-1,0,0,1)M({C1},-1,0,0,1)P({C0,C1},L0)U({C0,C1},L1,4)",
+                                                            "depth": 5,
+                                                            "evaluation": 0.153605,
+                                                            "children": []
+                                                        },
+                                                        {
+                                                            "id": 16,
+                                                            "schedule": "M({C0},-1,0,0,1)M({C1},-1,0,0,1)P({C0,C1},L0)U({C0,C1},L1,8)",
+                                                            "depth": 5,
+                                                            "evaluation": 0.150206,
+                                                            "children": []
+                                                        },
+                                                        {
+                                                            "id": 17,
+                                                            "schedule": "M({C0},-1,0,0,1)M({C1},-1,0,0,1)P({C0,C1},L0)U({C0,C1},L1,16)",
+                                                            "depth": 5,
+                                                            "evaluation": 0.167852,
+                                                            "children": []
+                                                        },
+                                                        {
+                                                            "id": 11,
+                                                            "schedule": "M({C0},-1,0,0,1)M({C1},-1,0,0,1)P({C0,C1},L0)",
+                                                            "depth": 5,
+                                                            "evaluation": 0.171742,
+                                                            "children": []
+                                                        }
+                                                    ]
+                                                }
+                                            ]
+                                        },
+                                        {
+                                            "id": 2,
+                                            "schedule": "M({C0},-1,0,0,1)M({C1},-1,0,0,1)",
+                                            "depth": 3,
+                                            "evaluation": 0.017577,
+                                            "children": [
+                                                {
+                                                    "id": 2,
+                                                    "schedule": "M({C0},-1,0,0,1)M({C1},-1,0,0,1)",
+                                                    "depth": 4,
+                                                    "evaluation": 0.017577,
+                                                    "children": [
+                                                        {
+                                                            "id": 12,
+                                                            "schedule": "M({C0},-1,0,0,1)M({C1},-1,0,0,1)U({C0,C1},L1,4)",
+                                                            "depth": 5,
+                                                            "evaluation": 0.017572,
+                                                            "children": []
+                                                        },
+                                                        {
+                                                            "id": 13,
+                                                            "schedule": "M({C0},-1,0,0,1)M({C1},-1,0,0,1)U({C0,C1},L1,8)",
+                                                            "depth": 5,
+                                                            "evaluation": 0.016176,
+                                                            "children": []
+                                                        },
+                                                        {
+                                                            "id": 14,
+                                                            "schedule": "M({C0},-1,0,0,1)M({C1},-1,0,0,1)U({C0,C1},L1,16)",
+                                                            "depth": 5,
+                                                            "evaluation": 0.016905,
+                                                            "children": []
+                                                        },
+                                                        {
+                                                            "id": 2,
+                                                            "schedule": "M({C0},-1,0,0,1)M({C1},-1,0,0,1)",
+                                                            "depth": 5,
+                                                            "evaluation": 0.017577,
+                                                            "children": []
+                                                        }
+                                                    ]
+                                                }
+                                            ]
+                                        }
+                                    ]
+                                }
+                            ]
+                        },
+                        {
+                            "id": 3,
+                            "schedule": "M({C0},1,1,0,1)M({C1},1,1,0,1)",
+                            "depth": 1,
+                            "evaluation": 0.038486,
+                            "children": []
+                        },
+                        {
+                            "id": 4,
+                            "schedule": "M({C0},1,2,0,1)M({C1},1,2,0,1)",
+                            "depth": 1,
+                            "evaluation": 0.031753,
+                            "children": []
+                        },
+                        {
+                            "id": 5,
+                            "schedule": "M({C0},1,3,0,1)M({C1},1,3,0,1)",
+                            "depth": 1,
+                            "evaluation": 0.034763,
+                            "children": []
+                        },
+                        {
+                            "id": 0,
+                            "schedule": "M({C0},1,0,0,1)M({C1},1,0,0,1)",
+                            "depth": 1,
+                            "evaluation": 0.020093,
+                            "children": [
+                                {
+                                    "id": 18,
+                                    "schedule": "M({C0},1,0,0,1)M({C1},1,0,0,1)P({C0,C1},L0)",
+                                    "depth": 2,
+                                    "evaluation": 0.155097,
+                                    "children": [
+                                        {
+                                            "id": 18,
+                                            "schedule": "M({C0},1,0,0,1)M({C1},1,0,0,1)P({C0,C1},L0)",
+                                            "depth": 3,
+                                            "evaluation": 0.155097,
+                                            "children": [
+                                                {
+                                                    "id": 22,
+                                                    "schedule": "M({C0},1,0,0,1)M({C1},1,0,0,1)P({C0,C1},L0)U({C0,C1},L1,4)",
+                                                    "depth": 4,
+                                                    "evaluation": 0.16998,
+                                                    "children": []
+                                                },
+                                                {
+                                                    "id": 23,
+                                                    "schedule": "M({C0},1,0,0,1)M({C1},1,0,0,1)P({C0,C1},L0)U({C0,C1},L1,8)",
+                                                    "depth": 4,
+                                                    "evaluation": 0.141459,
+                                                    "children": []
+                                                },
+                                                {
+                                                    "id": 24,
+                                                    "schedule": "M({C0},1,0,0,1)M({C1},1,0,0,1)P({C0,C1},L0)U({C0,C1},L1,16)",
+                                                    "depth": 4,
+                                                    "evaluation": 0.180151,
+                                                    "children": []
+                                                },
+                                                {
+                                                    "id": 18,
+                                                    "schedule": "M({C0},1,0,0,1)M({C1},1,0,0,1)P({C0,C1},L0)",
+                                                    "depth": 4,
+                                                    "evaluation": 0.155097,
+                                                    "children": []
+                                                }
+                                            ]
+                                        }
+                                    ]
+                                },
+                                {
+                                    "id": 0,
+                                    "schedule": "M({C0},1,0,0,1)M({C1},1,0,0,1)",
+                                    "depth": 2,
+                                    "evaluation": 0.020093,
+                                    "children": [
+                                        {
+                                            "id": 0,
+                                            "schedule": "M({C0},1,0,0,1)M({C1},1,0,0,1)",
+                                            "depth": 3,
+                                            "evaluation": 0.020093,
+                                            "children": [
+                                                {
+                                                    "id": 19,
+                                                    "schedule": "M({C0},1,0,0,1)M({C1},1,0,0,1)U({C0,C1},L1,4)",
+                                                    "depth": 4,
+                                                    "evaluation": 0.016678,
+                                                    "children": []
+                                                },
+                                                {
+                                                    "id": 20,
+                                                    "schedule": "M({C0},1,0,0,1)M({C1},1,0,0,1)U({C0,C1},L1,8)",
+                                                    "depth": 4,
+                                                    "evaluation": 0.015969,
+                                                    "children": []
+                                                },
+                                                {
+                                                    "id": 21,
+                                                    "schedule": "M({C0},1,0,0,1)M({C1},1,0,0,1)U({C0,C1},L1,16)",
+                                                    "depth": 4,
+                                                    "evaluation": 0.016007,
+                                                    "children": []
+                                                },
+                                                {
+                                                    "id": 0,
+                                                    "schedule": "M({C0},1,0,0,1)M({C1},1,0,0,1)",
+                                                    "depth": 4,
+                                                    "evaluation": 0.020093,
+                                                    "children": []
+                                                }
+                                            ]
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        }
+    }
+}
