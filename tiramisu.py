@@ -355,6 +355,6 @@ def main(main_dir):
     return model, y_scaler, y_test_actual, y_pred_actual
 
 if __name__ == "__main__":
-    main_dir = "Output_Programs"  # Adjust this to your directory path
+    main_dir = "Tiramisu"  # Adjust this to your directory path
     model, y_scaler, y_test_actual, y_pred_actual = main(main_dir)
     print("\nModel training and prediction completed!")
