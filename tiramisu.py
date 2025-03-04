@@ -9,119 +9,104 @@ import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
-def get_execution_time(file_path):
-    try:
-        with open(file_path, 'r') as f:
-            data = json.load(f)
-        for func_id, func_data in data.items():
-            if "initial_execution_time" in func_data:
-                return float(func_data["initial_execution_time"])
-            if "schedules_list" in func_data:
-                schedules = func_data["schedules_list"]
-                if schedules and "execution_times" in schedules[0]:
-                    exec_times = schedules[0]["execution_times"]
-                    return float(np.mean(exec_times))
-        print(f"Warning: No execution time found in {file_path}")
-        return None
-    except Exception as e:
-        print(f"Error processing {file_path}: {str(e)}")
-        return None
+def get_execution_time(schedule_data):
+    """Extract execution time from a schedule."""
+    if "execution_times" in schedule_data:
+        exec_times = schedule_data["execution_times"]
+        return float(np.mean(exec_times))  # Use mean of execution times
+    print(f"Warning: No execution times found in schedule")
+    return None
 
-def extract_features_from_file(file_path):
-    with open(file_path, 'r') as f:
-        data = json.load(f)
-    
-    execution_time = get_execution_time(file_path)
+def extract_features_from_schedule(schedule_data, program_details):
+    """Extract features from a single schedule and its program details."""
+    execution_time = get_execution_time(schedule_data)
     if execution_time is None:
         return None
     
     features = {'execution_time': execution_time}
     
-    for func_id, func_data in data.items():
-        if "program_annotation" in func_data:
-            prog_annot = func_data["program_annotation"]
-            features['memory_size'] = prog_annot.get("memory_size", 0)
-            iterators = prog_annot.get("iterators", {})
-            features['iterator_count'] = len(iterators)
-            features['max_depth_iterators'] = max(
-                (len(it.get("child_iterators", [])) for it in iterators.values()), default=0
-            )
-            computations = prog_annot.get("computations", {})
-            features['computation_count'] = len(computations)
-            features['reduction_count'] = sum(
-                1 for comp in computations.values() if comp.get("comp_is_reduction", False)
-            )
-            features['access_count'] = sum(
-                len(comp.get("accesses", [])) for comp in computations.values()
-            )
-            features['avg_access_per_comp'] = features['access_count'] / max(features['computation_count'], 1)
-        
-        if "schedules_list" in func_data:
-            schedules = func_data["schedules_list"]
-            features['schedule_count'] = len(schedules)
-            all_exec_times = []
-            tiling_factors = []
-            for sched in schedules:
-                if "execution_times" in sched:
-                    all_exec_times.extend(sched["execution_times"])
-                for comp in sched.values():
-                    if isinstance(comp, dict) and "tiling" in comp and comp["tiling"]:
-                        tiling_factors.extend(comp["tiling"].get("tiling_factors", []))
-            if all_exec_times:
-                features['avg_exec_time'] = float(np.mean(all_exec_times))
-                features['min_exec_time'] = float(np.min(all_exec_times))
-                features['max_exec_time'] = float(np.max(all_exec_times))
-                features['exec_time_std'] = float(np.std(all_exec_times))
-            features['tiling_count'] = sum(
-                1 for sched in schedules for comp in sched.values() 
-                if isinstance(comp, dict) and comp.get("tiling", {})
-            )
-            features['transformation_count'] = sum(
-                sum(len(comp.get("transformations_list", [])) for comp in sched.values() if isinstance(comp, dict))
-                for sched in schedules
-            )
-            features['avg_tiling_factor'] = float(np.mean(tiling_factors)) if tiling_factors else 0
-        
-        if "exploration_trace" in func_data:
-            trace = func_data["exploration_trace"]
-            def count_nodes(trace_node):
-                count = 1
-                for child in trace_node.get("children", []):
-                    count += count_nodes(child)
-                return count
-            features['exploration_node_count'] = count_nodes(trace)
+    # Program-level features from program_details
+    prog_annot = program_details.get("program_annotation", {})
+    features['memory_size'] = prog_annot.get("memory_size", 0)
+    iterators = prog_annot.get("iterators", {})
+    features['iterator_count'] = len(iterators)
+    features['max_depth_iterators'] = max(
+        (len(it.get("child_iterators", [])) for it in iterators.values()), default=0
+    )
+    computations = prog_annot.get("computations", {})
+    features['computation_count'] = len(computations)
+    features['reduction_count'] = sum(
+        1 for comp in computations.values() if comp.get("comp_is_reduction", False)
+    )
+    features['access_count'] = sum(
+        len(comp.get("accesses", [])) for comp in computations.values()
+    )
+    features['avg_access_per_comp'] = features['access_count'] / max(features['computation_count'], 1)
+    
+    # Schedule-level features
+    tiling_factors = []
+    for comp_key, comp_data in schedule_data.items():
+        if isinstance(comp_data, dict):  # Check if it's a computation entry
+            if "tiling" in comp_data and comp_data["tiling"]:
+                tiling_factors.extend(comp_data["tiling"].get("tiling_factors", []))
+            features[f'{comp_key}_transformation_count'] = len(comp_data.get("transformations_list", []))
+            features[f'{comp_key}_tiling'] = 1 if comp_data.get("tiling", {}) else 0
+    
+    features['tiling_count'] = sum(1 for comp in schedule_data.values() if isinstance(comp, dict) and comp.get("tiling", {}))
+    features['total_transformation_count'] = sum(
+        len(comp.get("transformations_list", [])) for comp in schedule_data.values() if isinstance(comp, dict)
+    )
+    features['avg_tiling_factor'] = float(np.mean(tiling_factors)) if tiling_factors else 0
     
     return features
 
-def process_directory(directory_path):
+def process_converted_directory(directory_path):
+    """Process all subfolders in the converted directory, extracting features from schedules."""
     all_features = []
-    file_names = []
+    file_names = []  # Store function_id and schedule index for tracking
     
-    json_files = sorted([f for f in os.listdir(directory_path) if f.endswith('.json')])
-    
-    if len(json_files) < 11:
-        print(f"Error: Expected at least 11 files, found {len(json_files)} in {directory_path}")
-        return None, None, None
-    
-    for filename in json_files:
-        file_path = os.path.join(directory_path, filename)
-        features = extract_features_from_file(file_path)
-        if features is not None:
-            all_features.append(features)
-            file_names.append(filename)
+    # Iterate through subfolders (function directories)
+    for subfolder in os.listdir(directory_path):
+        subfolder_path = os.path.join(directory_path, subfolder)
+        if not os.path.isdir(subfolder_path):
+            continue
+        
+        json_file = os.path.join(subfolder_path, f"{subfolder}_details.json")
+        if not os.path.exists(json_file):
+            print(f"Warning: No details file found in {subfolder_path}")
+            continue
+        
+        try:
+            with open(json_file, 'r') as f:
+                data = json.load(f)
+            
+            program_details = data.get("program_details", {})
+            schedules = data.get("schedules", [])
+            
+            # Process each schedule as a separate data point
+            for idx, schedule in enumerate(schedules):
+                features = extract_features_from_schedule(schedule, program_details)
+                if features is not None:
+                    all_features.append(features)
+                    file_names.append(f"{subfolder}_schedule_{idx}")
+        
+        except json.JSONDecodeError as e:
+            print(f"Error decoding JSON in {json_file}: {str(e)}")
+        except Exception as e:
+            print(f"Error processing {json_file}: {str(e)}")
     
     if len(all_features) < 11:
-        print(f"Error: Only {len(all_features)} valid files found in {directory_path}")
+        print(f"Error: Only {len(all_features)} valid schedules found in {directory_path}")
         return None, None, None
     
-    total_files = len(all_features)
-    train_size = total_files - 10
+    total_schedules = len(all_features)
+    train_size = total_schedules - 10
     train_features = all_features[:train_size]
     test_features = all_features[train_size:]
     train_file_names = file_names[:train_size]
     test_file_names = file_names[train_size:]
     
-    print(f"Processed {directory_path}: {len(train_features)} training files, {len(test_features)} test files")
+    print(f"Processed {directory_path}: {len(train_features)} training schedules, {len(test_features)} test schedules")
     
     return train_features, test_features, test_file_names
 
@@ -193,7 +178,6 @@ class EnhancedLSTMModel(nn.Module):
         self.output_layer = nn.Linear(64, output_size)
         
         self.leaky_relu = nn.LeakyReLU(0.1)
-        
         self.residual_adapter = nn.Linear(128, 64)
         
     def attention_net(self, lstm_output):
@@ -224,11 +208,10 @@ class EnhancedLSTMModel(nn.Module):
         fc_out = fc_out + residual
         
         output = self.output_layer(fc_out)
-        return torch.nn.functional.softplus(output)  # Ensure positive outputs
+        return torch.nn.functional.softplus(output)
 
 def custom_loss(y_pred, y_true):
-    # Modified MSLE to handle negative predictions safely
-    y_pred_safe = torch.clamp(y_pred, min=0)  # Ensure non-negative before log
+    y_pred_safe = torch.clamp(y_pred, min=0)
     return torch.mean(torch.square(torch.log1p(y_pred_safe) - torch.log1p(y_true)))
 
 def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=32):
@@ -261,7 +244,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
             optimizer.zero_grad()
             outputs = model(inputs)
             loss = criterion(outputs, targets)
-            if torch.isnan(loss):  # Debug NaN loss
+            if torch.isnan(loss):
                 print(f"NaN loss detected at epoch {epoch+1}")
                 return None, None
             loss.backward()
@@ -336,7 +319,7 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test):
     
     print("\nEvaluation Results:")
     for i, file_name in enumerate(file_names_test):
-        print(f"File: {file_name}")
+        print(f"Schedule: {file_name}")
         print(f"  Actual execution time: {y_test_actual[i][0]:.6f} seconds")
         print(f"  Predicted execution time: {y_pred_actual[i][0]:.6f} seconds")
         print(f"  Error percentage: {abs(y_test_actual[i][0] - y_pred_actual[i][0]) / y_test_actual[i][0] * 100:.2f}%")
@@ -356,7 +339,7 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test):
 
 def main(main_dir):
     print(f"Processing directory: {main_dir}")
-    train_features, test_features, test_file_names = process_directory(main_dir)
+    train_features, test_features, test_file_names = process_converted_directory(main_dir)
     
     if train_features is None or test_features is None:
         print("Error: Insufficient data to proceed")
@@ -375,7 +358,7 @@ def main(main_dir):
     
     model = EnhancedLSTMModel(
         input_size=input_size,
-        hidden_sizes=[256, 128, 64],  # Reduced capacity to prevent instability
+        hidden_sizes=[256, 128, 64],
         output_size=1,
         dropout_rate=0.3
     )
@@ -396,7 +379,7 @@ def main(main_dir):
     return model, y_scaler, y_test_actual, y_pred_actual
 
 if __name__ == "__main__":
-    main_dir = "Tiramisu"
+    main_dir = "converted"  # Changed to process the converted folder
     result = main(main_dir)
     if result is not None:
         model, y_scaler, y_test_actual, y_pred_actual = result
