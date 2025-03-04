@@ -134,7 +134,6 @@ def clean_and_transform_features(train_features, test_features):
     all_features_df = all_features_df.drop(columns=constant_columns)
     print(f"Dropped {len(constant_columns)} constant columns")
     
-    # Log transform execution time
     all_features_df['execution_time_log'] = np.log1p(all_features_df['execution_time'])
     
     numeric_cols = all_features_df.select_dtypes(include=['number']).columns
@@ -172,7 +171,7 @@ def prepare_data_for_lstm(train_features, test_features):
     return X_train_tensor, y_train_tensor, X_test_tensor, y_test_tensor, scaler_y, X_train_scaled.shape[1]
 
 class EnhancedLSTMModel(nn.Module):
-    def __init__(self, input_size, hidden_sizes=[512, 256, 128], output_size=1, dropout_rate=0.5):
+    def __init__(self, input_size, hidden_sizes=[256, 128, 64], output_size=1, dropout_rate=0.3):
         super(EnhancedLSTMModel, self).__init__()
         
         self.lstm_layers = nn.ModuleList()
@@ -187,17 +186,15 @@ class EnhancedLSTMModel(nn.Module):
         
         self.attention = nn.Linear(hidden_sizes[-1] * 2, 1)
         
-        self.fc1 = nn.Linear(hidden_sizes[-1] * 2, 256)
-        self.bn1 = nn.BatchNorm1d(256)
-        self.fc2 = nn.Linear(256, 128)
-        self.bn2 = nn.BatchNorm1d(128)
-        self.fc3 = nn.Linear(128, 64)
-        self.bn3 = nn.BatchNorm1d(64)
+        self.fc1 = nn.Linear(hidden_sizes[-1] * 2, 128)
+        self.bn1 = nn.BatchNorm1d(128)
+        self.fc2 = nn.Linear(128, 64)
+        self.bn2 = nn.BatchNorm1d(64)
         self.output_layer = nn.Linear(64, output_size)
         
         self.leaky_relu = nn.LeakyReLU(0.1)
         
-        self.residual_adapter = nn.Linear(256, 64)
+        self.residual_adapter = nn.Linear(128, 64)
         
     def attention_net(self, lstm_output):
         attn_weights = self.attention(lstm_output).squeeze(2)
@@ -224,18 +221,15 @@ class EnhancedLSTMModel(nn.Module):
         fc_out = self.bn2(fc_out)
         fc_out = self.leaky_relu(fc_out)
         
-        fc_out = self.fc3(fc_out)
-        fc_out = self.bn3(fc_out)
-        fc_out = self.leaky_relu(fc_out)
-        
         fc_out = fc_out + residual
         
         output = self.output_layer(fc_out)
-        return output
+        return torch.nn.functional.softplus(output)  # Ensure positive outputs
 
 def custom_loss(y_pred, y_true):
-    # Mean squared logarithmic error (MSLE) to handle scale differences
-    return torch.mean(torch.square(torch.log1p(y_pred) - torch.log1p(y_true)))
+    # Modified MSLE to handle negative predictions safely
+    y_pred_safe = torch.clamp(y_pred, min=0)  # Ensure non-negative before log
+    return torch.mean(torch.square(torch.log1p(y_pred_safe) - torch.log1p(y_true)))
 
 def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=32):
     train_dataset = TensorDataset(X_train, y_train)
@@ -266,14 +260,19 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
             inputs, targets = inputs.to(device), targets.to(device)
             optimizer.zero_grad()
             outputs = model(inputs)
-            outputs = torch.clamp(outputs, min=-10, max=10)  # Prevent extreme predictions
             loss = criterion(outputs, targets)
+            if torch.isnan(loss):  # Debug NaN loss
+                print(f"NaN loss detected at epoch {epoch+1}")
+                return None, None
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             running_loss += loss.item() * inputs.size(0)
         
         train_loss = running_loss / len(train_loader.dataset)
+        if np.isnan(train_loss):
+            print(f"NaN training loss at epoch {epoch+1}")
+            return None, None
         train_losses.append(train_loss)
         
         model.eval()
@@ -282,18 +281,23 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
             for inputs, targets in test_loader:
                 inputs, targets = inputs.to(device), targets.to(device)
                 outputs = model(inputs)
-                outputs = torch.clamp(outputs, min=-10, max=10)
                 loss = criterion(outputs, targets)
+                if torch.isnan(loss):
+                    print(f"NaN validation loss at epoch {epoch+1}")
+                    return None, None
                 val_loss += loss.item() * inputs.size(0)
         
         val_loss /= len(test_loader.dataset)
+        if np.isnan(val_loss):
+            print(f"NaN validation loss at epoch {epoch+1}")
+            return None, None
         val_losses.append(val_loss)
         
         scheduler.step(val_loss)
         
         print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}, LR: {optimizer.param_groups[0]["lr"]:.6f}')
         
-        if val_loss < best_val_loss:
+        if val_loss < best_val_loss and not np.isnan(val_loss):
             best_val_loss = val_loss
             epochs_no_improve = 0
             best_model_state = model.state_dict().copy()
@@ -302,11 +306,14 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
         
         if epochs_no_improve >= patience:
             print(f'Early stopping after {epoch+1} epochs')
-            model.load_state_dict(best_model_state)
+            if best_model_state is not None:
+                model.load_state_dict(best_model_state)
+            else:
+                print("No valid model state saved due to NaN losses")
             break
     
-    if best_model_state is not None and epochs_no_improve > 0:
-        model.load_state_dict(best_model_state)
+    if best_model_state is None:
+        print("Training failed: No valid model state saved due to persistent NaN losses")
     
     return train_losses, val_losses
 
@@ -325,7 +332,7 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test):
     y_test_transformed = y_scaler.inverse_transform(y_test)
     y_pred_transformed = y_scaler.inverse_transform(y_pred_scaled)
     y_test_actual = np.expm1(y_test_transformed)
-    y_pred_actual = np.expm1(np.clip(y_pred_transformed, 0, None))  # Ensure non-negative predictions
+    y_pred_actual = np.expm1(np.clip(y_pred_transformed, 0, None))
     
     print("\nEvaluation Results:")
     for i, file_name in enumerate(file_names_test):
@@ -368,16 +375,20 @@ def main(main_dir):
     
     model = EnhancedLSTMModel(
         input_size=input_size,
-        hidden_sizes=[512, 256, 128],
+        hidden_sizes=[256, 128, 64],  # Reduced capacity to prevent instability
         output_size=1,
-        dropout_rate=0.5
+        dropout_rate=0.3
     )
     
-    criterion = custom_loss  # Use MSLE for scale-sensitive loss
+    criterion = custom_loss
     optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-4)
     
     print("Building and training Enhanced LSTM model...")
     train_losses, val_losses = train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=250, patience=30)
+    
+    if train_losses is None or val_losses is None:
+        print("Training failed due to NaN losses")
+        return None
     
     print("\nEvaluating model:")
     y_test_actual, y_pred_actual = evaluate_model(model, X_test, y_test, y_scaler, test_file_names)
@@ -386,5 +397,9 @@ def main(main_dir):
 
 if __name__ == "__main__":
     main_dir = "Tiramisu"
-    model, y_scaler, y_test_actual, y_pred_actual = main(main_dir)
-    print("\nEnhanced model training and prediction completed!")
+    result = main(main_dir)
+    if result is not None:
+        model, y_scaler, y_test_actual, y_pred_actual = result
+        print("\nEnhanced model training and prediction completed!")
+    else:
+        print("\nModel training failed!")
