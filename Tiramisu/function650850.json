@@ -1,0 +1,1883 @@
+{
+    "function650850": {
+        "filename": "./function650850_explored_schedules.json",
+        "node_name": "lanka05",
+        "parameters": {
+            "beam_size": 2,
+            "max_depth": 6
+        },
+        "program_annotation": {
+            "memory_size": 3.0,
+            "iterators": {
+                "i0": {
+                    "lower_bound": 0,
+                    "upper_bound": 64,
+                    "parent_iterator": null,
+                    "child_iterators": [
+                        "i1"
+                    ],
+                    "computations_list": []
+                },
+                "i1": {
+                    "lower_bound": 0,
+                    "upper_bound": 96,
+                    "parent_iterator": "i0",
+                    "child_iterators": [
+                        "i2"
+                    ],
+                    "computations_list": []
+                },
+                "i2": {
+                    "lower_bound": 0,
+                    "upper_bound": 32,
+                    "parent_iterator": "i1",
+                    "child_iterators": [],
+                    "computations_list": [
+                        "comp00"
+                    ]
+                }
+            },
+            "computations": {
+                "comp00": {
+                    "absolute_order": 1,
+                    "iterators": [
+                        "i0",
+                        "i1",
+                        "i2"
+                    ],
+                    "comp_is_reduction": false,
+                    "number_of_additions": 0,
+                    "number_of_subtraction": 0,
+                    "number_of_multiplication": 1,
+                    "number_of_division": 1,
+                    "write_access_relation": "{ comp00[i0, i1, i2] -> buf00[i0' = i0, i1' = i1, i2' = i2] }",
+                    "write_buffer_id": 0,
+                    "data_type": "float64",
+                    "data_type_size": 0,
+                    "accesses": [
+                        {
+                            "access_is_reduction": true,
+                            "buffer_id": 0,
+                            "access_matrix": [
+                                [
+                                    1,
+                                    0,
+                                    0,
+                                    0
+                                ],
+                                [
+                                    0,
+                                    1,
+                                    0,
+                                    0
+                                ],
+                                [
+                                    0,
+                                    0,
+                                    1,
+                                    0
+                                ]
+                            ]
+                        },
+                        {
+                            "access_is_reduction": true,
+                            "buffer_id": 0,
+                            "access_matrix": [
+                                [
+                                    1,
+                                    0,
+                                    0,
+                                    0
+                                ],
+                                [
+                                    0,
+                                    1,
+                                    0,
+                                    0
+                                ],
+                                [
+                                    0,
+                                    0,
+                                    1,
+                                    0
+                                ]
+                            ]
+                        },
+                        {
+                            "access_is_reduction": false,
+                            "buffer_id": 1,
+                            "access_matrix": [
+                                [
+                                    1,
+                                    0,
+                                    0,
+                                    0
+                                ],
+                                [
+                                    0,
+                                    1,
+                                    0,
+                                    0
+                                ],
+                                [
+                                    0,
+                                    0,
+                                    1,
+                                    0
+                                ]
+                            ]
+                        }
+                    ],
+                    "expression_representation": {
+                        "expr_type": "div",
+                        "children": [
+                            {
+                                "expr_type": "mul",
+                                "children": [
+                                    {
+                                        "expr_type": "access",
+                                        "children": []
+                                    },
+                                    {
+                                        "expr_type": "access",
+                                        "children": []
+                                    }
+                                ]
+                            },
+                            {
+                                "expr_type": "access",
+                                "children": []
+                            }
+                        ]
+                    }
+                }
+            }
+        },
+        "initial_execution_time": 0.254737,
+        "schedules_list": [
+            {
+                "comp00": {
+                    "tiling": {},
+                    "unrolling_factor": null,
+                    "parallelized_dim": null,
+                    "shiftings": null,
+                    "transformations_list": []
+                },
+                "unfuse_iterators": [],
+                "tree_structure": {
+                    "roots": [
+                        {
+                            "loop_name": "i0",
+                            "computations_list": [],
+                            "child_list": [
+                                {
+                                    "loop_name": "i1",
+                                    "computations_list": [],
+                                    "child_list": [
+                                        {
+                                            "loop_name": "i2",
+                                            "computations_list": [
+                                                "comp00"
+                                            ],
+                                            "child_list": []
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "execution_times": [
+                    0.508104,
+                    0.492409,
+                    0.492331,
+                    0.492548,
+                    0.492448,
+                    0.492589,
+                    0.492509,
+                    0.499179,
+                    0.49236,
+                    0.492336,
+                    0.492343,
+                    0.493822,
+                    0.282698,
+                    0.282384,
+                    0.282198,
+                    0.282425,
+                    0.282155,
+                    0.282365,
+                    0.289512,
+                    0.298564,
+                    0.268097,
+                    0.255191,
+                    0.281791,
+                    0.254789,
+                    0.254978,
+                    0.254872,
+                    0.280393,
+                    0.254737,
+                    0.254847,
+                    0.255038
+                ],
+                "legality_check": true,
+                "exploration_method": 1,
+                "sched_str": "{comp00}:"
+            },
+            {
+                "comp00": {
+                    "tiling": {},
+                    "unrolling_factor": null,
+                    "parallelized_dim": null,
+                    "shiftings": null,
+                    "transformations_list": [
+                        [
+                            1,
+                            0,
+                            1,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0
+                        ]
+                    ]
+                },
+                "unfuse_iterators": [],
+                "tree_structure": {
+                    "roots": [
+                        {
+                            "loop_name": "i0",
+                            "computations_list": [],
+                            "child_list": [
+                                {
+                                    "loop_name": "i1",
+                                    "computations_list": [],
+                                    "child_list": [
+                                        {
+                                            "loop_name": "i2",
+                                            "computations_list": [
+                                                "comp00"
+                                            ],
+                                            "child_list": []
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "execution_times": [
+                    0.87901,
+                    0.689622,
+                    0.60166,
+                    0.601413,
+                    0.601564,
+                    0.60167,
+                    0.601578,
+                    0.629513,
+                    0.608,
+                    0.601679,
+                    0.601593,
+                    0.601554,
+                    0.346707,
+                    0.346677,
+                    0.346716,
+                    0.346842,
+                    0.354292,
+                    0.346869,
+                    0.346649,
+                    0.346695,
+                    0.346703,
+                    0.346797,
+                    0.346664,
+                    0.34666,
+                    0.346608,
+                    0.346557,
+                    0.346629,
+                    0.367438,
+                    0.332356,
+                    0.332244
+                ],
+                "legality_check": true,
+                "exploration_method": 1,
+                "sched_str": "{comp00}:I(L0,L1)"
+            },
+            {
+                "comp00": {
+                    "tiling": {},
+                    "unrolling_factor": null,
+                    "parallelized_dim": null,
+                    "shiftings": null,
+                    "transformations_list": [
+                        [
+                            1,
+                            0,
+                            2,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0
+                        ]
+                    ]
+                },
+                "unfuse_iterators": [],
+                "tree_structure": {
+                    "roots": [
+                        {
+                            "loop_name": "i0",
+                            "computations_list": [],
+                            "child_list": [
+                                {
+                                    "loop_name": "i1",
+                                    "computations_list": [],
+                                    "child_list": [
+                                        {
+                                            "loop_name": "i2",
+                                            "computations_list": [
+                                                "comp00"
+                                            ],
+                                            "child_list": []
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "execution_times": [
+                    2.27221,
+                    2.21598,
+                    3.12242,
+                    3.13628,
+                    2.40788,
+                    1.89754,
+                    1.96619,
+                    1.89656,
+                    1.96318,
+                    1.89177,
+                    1.97991,
+                    1.89415,
+                    1.98128,
+                    1.90091,
+                    1.90293,
+                    1.89818,
+                    1.97332,
+                    1.89212,
+                    1.90586,
+                    1.89766,
+                    1.897,
+                    1.89602,
+                    1.89549,
+                    1.9071,
+                    1.89643,
+                    1.89747,
+                    1.89199,
+                    1.91645,
+                    1.89407,
+                    1.8978
+                ],
+                "legality_check": true,
+                "exploration_method": 1,
+                "sched_str": "{comp00}:I(L0,L2)"
+            },
+            {
+                "comp00": {
+                    "tiling": {},
+                    "unrolling_factor": null,
+                    "parallelized_dim": null,
+                    "shiftings": null,
+                    "transformations_list": [
+                        [
+                            1,
+                            1,
+                            2,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0
+                        ]
+                    ]
+                },
+                "unfuse_iterators": [],
+                "tree_structure": {
+                    "roots": [
+                        {
+                            "loop_name": "i0",
+                            "computations_list": [],
+                            "child_list": [
+                                {
+                                    "loop_name": "i1",
+                                    "computations_list": [],
+                                    "child_list": [
+                                        {
+                                            "loop_name": "i2",
+                                            "computations_list": [
+                                                "comp00"
+                                            ],
+                                            "child_list": []
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "execution_times": [
+                    1.27386,
+                    1.28323,
+                    1.62931,
+                    1.62878,
+                    1.2751,
+                    1.15448,
+                    1.1545,
+                    1.16626,
+                    1.1545,
+                    1.15491,
+                    1.15432,
+                    1.1611,
+                    0.77685,
+                    0.777158,
+                    0.776654,
+                    0.822688,
+                    0.776041,
+                    0.776136,
+                    0.777581,
+                    0.77662,
+                    0.786222,
+                    0.777179,
+                    0.777083,
+                    0.77608,
+                    0.77728,
+                    0.784851,
+                    0.775926,
+                    0.77756,
+                    0.776543,
+                    0.77684
+                ],
+                "legality_check": true,
+                "exploration_method": 1,
+                "sched_str": "{comp00}:I(L1,L2)"
+            },
+            {
+                "comp00": {
+                    "tiling": {},
+                    "unrolling_factor": null,
+                    "parallelized_dim": "i0",
+                    "shiftings": null,
+                    "transformations_list": [
+                        [
+                            1,
+                            1,
+                            2,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0
+                        ]
+                    ]
+                },
+                "unfuse_iterators": [],
+                "tree_structure": {
+                    "roots": [
+                        {
+                            "loop_name": "i0",
+                            "computations_list": [],
+                            "child_list": [
+                                {
+                                    "loop_name": "i1",
+                                    "computations_list": [],
+                                    "child_list": [
+                                        {
+                                            "loop_name": "i2",
+                                            "computations_list": [
+                                                "comp00"
+                                            ],
+                                            "child_list": []
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "execution_times": [
+                    1.71582,
+                    0.236141,
+                    0.275609,
+                    0.263275,
+                    0.296433,
+                    0.2206,
+                    0.25556,
+                    0.231197,
+                    0.248623,
+                    0.244658,
+                    0.242731,
+                    0.246598,
+                    0.284996,
+                    0.237673,
+                    0.247642,
+                    0.243439,
+                    0.250083,
+                    0.260222,
+                    0.233297,
+                    0.246722,
+                    0.243496,
+                    0.232491,
+                    0.231004,
+                    0.264134,
+                    0.239195,
+                    0.220958,
+                    0.29807,
+                    0.230799,
+                    0.221325,
+                    0.219954
+                ],
+                "legality_check": true,
+                "exploration_method": 1,
+                "sched_str": "{comp00}:I(L1,L2)P(L0)"
+            },
+            {
+                "comp00": {
+                    "tiling": {},
+                    "unrolling_factor": null,
+                    "parallelized_dim": "i2",
+                    "shiftings": null,
+                    "transformations_list": [
+                        [
+                            1,
+                            1,
+                            2,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0
+                        ]
+                    ]
+                },
+                "unfuse_iterators": [],
+                "tree_structure": {
+                    "roots": [
+                        {
+                            "loop_name": "i0",
+                            "computations_list": [],
+                            "child_list": [
+                                {
+                                    "loop_name": "i1",
+                                    "computations_list": [],
+                                    "child_list": [
+                                        {
+                                            "loop_name": "i2",
+                                            "computations_list": [
+                                                "comp00"
+                                            ],
+                                            "child_list": []
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "execution_times": [
+                    11.0673,
+                    9.22959,
+                    8.72803,
+                    8.66071,
+                    8.40664,
+                    8.66448,
+                    8.84707,
+                    8.63015,
+                    8.67926,
+                    8.78257,
+                    8.68028,
+                    8.63445,
+                    8.74366,
+                    8.68823,
+                    8.60846,
+                    8.64883,
+                    8.61554,
+                    8.6454,
+                    8.83637,
+                    8.73445,
+                    8.72534,
+                    8.55251,
+                    8.62048,
+                    8.79476,
+                    8.54262,
+                    8.60964,
+                    8.53517,
+                    8.59295,
+                    8.5654,
+                    8.36029
+                ],
+                "legality_check": true,
+                "exploration_method": 1,
+                "sched_str": "{comp00}:I(L1,L2)P(L2)"
+            },
+            {
+                "comp00": {
+                    "tiling": {},
+                    "unrolling_factor": 4,
+                    "parallelized_dim": null,
+                    "shiftings": null,
+                    "transformations_list": [
+                        [
+                            1,
+                            1,
+                            2,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0
+                        ]
+                    ]
+                },
+                "unfuse_iterators": [],
+                "tree_structure": {
+                    "roots": [
+                        {
+                            "loop_name": "i0",
+                            "computations_list": [],
+                            "child_list": [
+                                {
+                                    "loop_name": "i1",
+                                    "computations_list": [],
+                                    "child_list": [
+                                        {
+                                            "loop_name": "i2",
+                                            "computations_list": [
+                                                "comp00"
+                                            ],
+                                            "child_list": []
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "execution_times": [
+                    1.25183,
+                    1.15173,
+                    1.16421,
+                    1.15241,
+                    1.15238,
+                    1.16756,
+                    1.15252,
+                    1.15217,
+                    1.15268,
+                    1.16081,
+                    1.1516,
+                    1.15316,
+                    0.775021,
+                    0.767876,
+                    0.768901,
+                    0.767133,
+                    0.768035,
+                    0.767934,
+                    0.767728,
+                    0.768361,
+                    0.76732,
+                    0.767614,
+                    0.767896,
+                    0.775696,
+                    0.767328,
+                    0.768025,
+                    0.768315,
+                    0.767073,
+                    0.774491,
+                    0.767177
+                ],
+                "legality_check": true,
+                "exploration_method": 1,
+                "sched_str": "{comp00}:I(L1,L2)U(L2,4)"
+            },
+            {
+                "comp00": {
+                    "tiling": {},
+                    "unrolling_factor": 8,
+                    "parallelized_dim": null,
+                    "shiftings": null,
+                    "transformations_list": [
+                        [
+                            1,
+                            1,
+                            2,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0
+                        ]
+                    ]
+                },
+                "unfuse_iterators": [],
+                "tree_structure": {
+                    "roots": [
+                        {
+                            "loop_name": "i0",
+                            "computations_list": [],
+                            "child_list": [
+                                {
+                                    "loop_name": "i1",
+                                    "computations_list": [],
+                                    "child_list": [
+                                        {
+                                            "loop_name": "i2",
+                                            "computations_list": [
+                                                "comp00"
+                                            ],
+                                            "child_list": []
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "execution_times": [
+                    1.50405,
+                    1.62881,
+                    1.66309,
+                    2.08943,
+                    1.93817,
+                    1.15432,
+                    1.15414,
+                    1.15406,
+                    1.16055,
+                    1.15425,
+                    1.1543,
+                    1.16009,
+                    0.778353,
+                    0.779117,
+                    0.778724,
+                    0.77903,
+                    0.815579,
+                    0.777515,
+                    0.779487,
+                    0.779551,
+                    0.778354,
+                    0.785981,
+                    0.779126,
+                    0.778796,
+                    0.779228,
+                    0.779291,
+                    0.783416,
+                    0.778588,
+                    0.779629,
+                    0.777755
+                ],
+                "legality_check": true,
+                "exploration_method": 1,
+                "sched_str": "{comp00}:I(L1,L2)U(L2,8)"
+            },
+            {
+                "comp00": {
+                    "tiling": {},
+                    "unrolling_factor": 16,
+                    "parallelized_dim": null,
+                    "shiftings": null,
+                    "transformations_list": [
+                        [
+                            1,
+                            1,
+                            2,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0
+                        ]
+                    ]
+                },
+                "unfuse_iterators": [],
+                "tree_structure": {
+                    "roots": [
+                        {
+                            "loop_name": "i0",
+                            "computations_list": [],
+                            "child_list": [
+                                {
+                                    "loop_name": "i1",
+                                    "computations_list": [],
+                                    "child_list": [
+                                        {
+                                            "loop_name": "i2",
+                                            "computations_list": [
+                                                "comp00"
+                                            ],
+                                            "child_list": []
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "execution_times": [
+                    1.73983,
+                    1.62967,
+                    1.64244,
+                    1.62893,
+                    1.62953,
+                    2.0793,
+                    2.07537,
+                    1.15378,
+                    1.15359,
+                    1.18677,
+                    1.16557,
+                    1.15382,
+                    0.777522,
+                    0.776628,
+                    0.793792,
+                    0.776764,
+                    0.77718,
+                    0.776319,
+                    0.776623,
+                    0.782542,
+                    0.777851,
+                    0.776908,
+                    0.776633,
+                    0.776076,
+                    0.784891,
+                    0.77688,
+                    0.776781,
+                    0.77614,
+                    0.776718,
+                    0.791638
+                ],
+                "legality_check": true,
+                "exploration_method": 1,
+                "sched_str": "{comp00}:I(L1,L2)U(L2,16)"
+            },
+            {
+                "comp00": {
+                    "tiling": {},
+                    "unrolling_factor": null,
+                    "parallelized_dim": "i0",
+                    "shiftings": null,
+                    "transformations_list": []
+                },
+                "unfuse_iterators": [],
+                "tree_structure": {
+                    "roots": [
+                        {
+                            "loop_name": "i0",
+                            "computations_list": [],
+                            "child_list": [
+                                {
+                                    "loop_name": "i1",
+                                    "computations_list": [],
+                                    "child_list": [
+                                        {
+                                            "loop_name": "i2",
+                                            "computations_list": [
+                                                "comp00"
+                                            ],
+                                            "child_list": []
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "execution_times": [
+                    2.07599,
+                    0.254981,
+                    0.211432,
+                    0.209841,
+                    0.204305,
+                    0.206643,
+                    0.207491,
+                    0.23738,
+                    0.248267,
+                    0.259974,
+                    0.229723,
+                    0.231201,
+                    0.24901,
+                    0.243761,
+                    0.21215,
+                    0.246498,
+                    0.242485,
+                    0.239299,
+                    0.271795,
+                    0.21241,
+                    0.266126,
+                    0.250503,
+                    0.221738,
+                    0.248678,
+                    0.230008,
+                    0.226686,
+                    0.218259,
+                    0.223712,
+                    0.200852,
+                    0.241188
+                ],
+                "legality_check": true,
+                "exploration_method": 1,
+                "sched_str": "{comp00}:P(L0)"
+            },
+            {
+                "comp00": {
+                    "tiling": {},
+                    "unrolling_factor": null,
+                    "parallelized_dim": "i1",
+                    "shiftings": null,
+                    "transformations_list": []
+                },
+                "unfuse_iterators": [],
+                "tree_structure": {
+                    "roots": [
+                        {
+                            "loop_name": "i0",
+                            "computations_list": [],
+                            "child_list": [
+                                {
+                                    "loop_name": "i1",
+                                    "computations_list": [],
+                                    "child_list": [
+                                        {
+                                            "loop_name": "i2",
+                                            "computations_list": [
+                                                "comp00"
+                                            ],
+                                            "child_list": []
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "execution_times": [
+                    18.447701,
+                    13.8972,
+                    14.1947,
+                    14.1346,
+                    14.1418,
+                    13.8949,
+                    13.3598,
+                    13.5737,
+                    13.3579,
+                    13.3475,
+                    13.7274,
+                    13.386,
+                    13.1594,
+                    13.256,
+                    13.2419,
+                    13.1555,
+                    13.0888,
+                    13.2876,
+                    12.974,
+                    13.216,
+                    13.1607,
+                    13.0927,
+                    12.9452,
+                    13.0598,
+                    13.1891,
+                    13.1055,
+                    13.1421,
+                    13.0129,
+                    12.8878,
+                    13.1274
+                ],
+                "legality_check": true,
+                "exploration_method": 1,
+                "sched_str": "{comp00}:P(L1)"
+            },
+            {
+                "comp00": {
+                    "tiling": {},
+                    "unrolling_factor": null,
+                    "parallelized_dim": "i2",
+                    "shiftings": null,
+                    "transformations_list": []
+                },
+                "unfuse_iterators": [],
+                "tree_structure": {
+                    "roots": [
+                        {
+                            "loop_name": "i0",
+                            "computations_list": [],
+                            "child_list": [
+                                {
+                                    "loop_name": "i1",
+                                    "computations_list": [],
+                                    "child_list": [
+                                        {
+                                            "loop_name": "i2",
+                                            "computations_list": [
+                                                "comp00"
+                                            ],
+                                            "child_list": []
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "execution_times": [
+                    254.737
+                ],
+                "legality_check": true,
+                "exploration_method": 1,
+                "sched_str": "{comp00}:P(L2)"
+            },
+            {
+                "comp00": {
+                    "tiling": {
+                        "tiling_depth": 2,
+                        "tiling_dims": [
+                            "i0",
+                            "i1"
+                        ],
+                        "tiling_factors": [
+                            32,
+                            32
+                        ]
+                    },
+                    "unrolling_factor": null,
+                    "parallelized_dim": null,
+                    "shiftings": null,
+                    "transformations_list": []
+                },
+                "unfuse_iterators": [],
+                "tree_structure": {
+                    "roots": [
+                        {
+                            "loop_name": "i0",
+                            "computations_list": [],
+                            "child_list": [
+                                {
+                                    "loop_name": "i1",
+                                    "computations_list": [],
+                                    "child_list": [
+                                        {
+                                            "loop_name": "i2",
+                                            "computations_list": [
+                                                "comp00"
+                                            ],
+                                            "child_list": []
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "execution_times": [
+                    0.586217,
+                    0.574497,
+                    0.574491,
+                    0.58583,
+                    0.574703,
+                    0.574513,
+                    0.574656,
+                    0.574484,
+                    0.574439,
+                    0.57457,
+                    0.649844,
+                    0.812007,
+                    0.466312,
+                    0.466406,
+                    0.46761,
+                    0.467328,
+                    0.466508,
+                    0.467452,
+                    0.370662,
+                    0.330765,
+                    0.330467,
+                    0.330306,
+                    0.331004,
+                    0.33126,
+                    0.330377,
+                    0.330587,
+                    0.330226,
+                    0.330869,
+                    0.331002,
+                    0.347089
+                ],
+                "legality_check": true,
+                "exploration_method": 1,
+                "sched_str": "{comp00}:T2(L0,L1,32,32)"
+            },
+            {
+                "comp00": {
+                    "tiling": {
+                        "tiling_depth": 2,
+                        "tiling_dims": [
+                            "i0",
+                            "i1"
+                        ],
+                        "tiling_factors": [
+                            32,
+                            64
+                        ]
+                    },
+                    "unrolling_factor": null,
+                    "parallelized_dim": null,
+                    "shiftings": null,
+                    "transformations_list": []
+                },
+                "unfuse_iterators": [],
+                "tree_structure": {
+                    "roots": [
+                        {
+                            "loop_name": "i0",
+                            "computations_list": [],
+                            "child_list": [
+                                {
+                                    "loop_name": "i1",
+                                    "computations_list": [],
+                                    "child_list": [
+                                        {
+                                            "loop_name": "i2",
+                                            "computations_list": [
+                                                "comp00"
+                                            ],
+                                            "child_list": []
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "execution_times": [
+                    0.587366,
+                    0.575494,
+                    0.575493,
+                    0.575602,
+                    0.575596,
+                    0.711232,
+                    0.727098,
+                    0.726885,
+                    0.727081,
+                    0.727068,
+                    0.724516,
+                    0.575117,
+                    0.330621,
+                    0.330814,
+                    0.330527,
+                    0.330616,
+                    0.331004,
+                    0.330715,
+                    0.330714,
+                    0.330709,
+                    0.330753,
+                    0.338156,
+                    0.331026,
+                    0.330746,
+                    0.331143,
+                    0.330908,
+                    0.330681,
+                    0.330981,
+                    0.331083,
+                    0.331101
+                ],
+                "legality_check": true,
+                "exploration_method": 1,
+                "sched_str": "{comp00}:T2(L0,L1,32,64)"
+            },
+            {
+                "comp00": {
+                    "tiling": {},
+                    "unrolling_factor": 4,
+                    "parallelized_dim": null,
+                    "shiftings": null,
+                    "transformations_list": []
+                },
+                "unfuse_iterators": [],
+                "tree_structure": {
+                    "roots": [
+                        {
+                            "loop_name": "i0",
+                            "computations_list": [],
+                            "child_list": [
+                                {
+                                    "loop_name": "i1",
+                                    "computations_list": [],
+                                    "child_list": [
+                                        {
+                                            "loop_name": "i2",
+                                            "computations_list": [
+                                                "comp00"
+                                            ],
+                                            "child_list": []
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "execution_times": [
+                    0.506789,
+                    0.494433,
+                    0.493906,
+                    0.49392,
+                    0.49407,
+                    0.494206,
+                    0.504265,
+                    0.617719,
+                    0.692098,
+                    0.691614,
+                    0.692317,
+                    0.690018,
+                    0.396964,
+                    0.34153,
+                    0.277477,
+                    0.264912,
+                    0.27772,
+                    0.264557,
+                    0.277526,
+                    0.278738,
+                    0.276676,
+                    0.279129,
+                    0.276862,
+                    0.264331,
+                    0.276584,
+                    0.278559,
+                    0.298675,
+                    0.29675,
+                    0.270367,
+                    0.256133
+                ],
+                "legality_check": true,
+                "exploration_method": 1,
+                "sched_str": "{comp00}:U(L2,4)"
+            },
+            {
+                "comp00": {
+                    "tiling": {},
+                    "unrolling_factor": 8,
+                    "parallelized_dim": null,
+                    "shiftings": null,
+                    "transformations_list": []
+                },
+                "unfuse_iterators": [],
+                "tree_structure": {
+                    "roots": [
+                        {
+                            "loop_name": "i0",
+                            "computations_list": [],
+                            "child_list": [
+                                {
+                                    "loop_name": "i1",
+                                    "computations_list": [],
+                                    "child_list": [
+                                        {
+                                            "loop_name": "i2",
+                                            "computations_list": [
+                                                "comp00"
+                                            ],
+                                            "child_list": []
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "execution_times": [
+                    0.577714,
+                    0.57425,
+                    0.574277,
+                    0.574192,
+                    0.574347,
+                    0.604192,
+                    0.626657,
+                    0.626593,
+                    0.626605,
+                    0.626556,
+                    0.626575,
+                    0.626454,
+                    0.371819,
+                    0.336146,
+                    0.334973,
+                    0.336096,
+                    0.335794,
+                    0.334819,
+                    0.336126,
+                    0.336574,
+                    0.33452,
+                    0.336121,
+                    0.334766,
+                    0.343234,
+                    0.336128,
+                    0.334868,
+                    0.33606,
+                    0.336471,
+                    0.336333,
+                    0.334654
+                ],
+                "legality_check": true,
+                "exploration_method": 1,
+                "sched_str": "{comp00}:U(L2,8)"
+            },
+            {
+                "comp00": {
+                    "tiling": {},
+                    "unrolling_factor": 16,
+                    "parallelized_dim": null,
+                    "shiftings": null,
+                    "transformations_list": []
+                },
+                "unfuse_iterators": [],
+                "tree_structure": {
+                    "roots": [
+                        {
+                            "loop_name": "i0",
+                            "computations_list": [],
+                            "child_list": [
+                                {
+                                    "loop_name": "i1",
+                                    "computations_list": [],
+                                    "child_list": [
+                                        {
+                                            "loop_name": "i2",
+                                            "computations_list": [
+                                                "comp00"
+                                            ],
+                                            "child_list": []
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "execution_times": [
+                    0.588457,
+                    0.575663,
+                    0.574611,
+                    0.574424,
+                    0.574539,
+                    0.574471,
+                    0.584506,
+                    0.574773,
+                    0.574672,
+                    0.574589,
+                    0.574473,
+                    0.575189,
+                    0.330406,
+                    0.345776,
+                    0.330556,
+                    0.329621,
+                    0.330471,
+                    0.329421,
+                    0.3307,
+                    0.329456,
+                    0.330255,
+                    0.329353,
+                    0.330331,
+                    0.329678,
+                    0.329714,
+                    0.338491,
+                    0.329841,
+                    0.329468,
+                    0.329547,
+                    0.330351
+                ],
+                "legality_check": true,
+                "exploration_method": 1,
+                "sched_str": "{comp00}:U(L2,16)"
+            },
+            {
+                "comp00": {
+                    "tiling": {
+                        "tiling_depth": 2,
+                        "tiling_dims": [
+                            "i0",
+                            "i1"
+                        ],
+                        "tiling_factors": [
+                            32,
+                            32
+                        ]
+                    },
+                    "unrolling_factor": 4,
+                    "parallelized_dim": null,
+                    "shiftings": null,
+                    "transformations_list": []
+                },
+                "unfuse_iterators": [],
+                "tree_structure": {
+                    "roots": [
+                        {
+                            "loop_name": "i0",
+                            "computations_list": [],
+                            "child_list": [
+                                {
+                                    "loop_name": "i1",
+                                    "computations_list": [],
+                                    "child_list": [
+                                        {
+                                            "loop_name": "i2",
+                                            "computations_list": [
+                                                "comp00"
+                                            ],
+                                            "child_list": []
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "execution_times": [
+                    0.589225,
+                    0.574611,
+                    0.574166,
+                    0.583717,
+                    0.574397,
+                    0.574334,
+                    0.57432,
+                    0.574304,
+                    0.574341,
+                    0.582615,
+                    0.574377,
+                    0.574659,
+                    0.330644,
+                    0.330522,
+                    0.330581,
+                    0.330467,
+                    0.330387,
+                    0.330511,
+                    0.330593,
+                    0.330399,
+                    0.337513,
+                    0.33044,
+                    0.331171,
+                    0.330473,
+                    0.330271,
+                    0.330279,
+                    0.330396,
+                    0.330389,
+                    0.330263,
+                    0.33049
+                ],
+                "legality_check": true,
+                "exploration_method": 1,
+                "sched_str": "{comp00}:T2(L0,L1,32,32)U(L4,4)"
+            },
+            {
+                "comp00": {
+                    "tiling": {
+                        "tiling_depth": 2,
+                        "tiling_dims": [
+                            "i0",
+                            "i1"
+                        ],
+                        "tiling_factors": [
+                            32,
+                            32
+                        ]
+                    },
+                    "unrolling_factor": 8,
+                    "parallelized_dim": null,
+                    "shiftings": null,
+                    "transformations_list": []
+                },
+                "unfuse_iterators": [],
+                "tree_structure": {
+                    "roots": [
+                        {
+                            "loop_name": "i0",
+                            "computations_list": [],
+                            "child_list": [
+                                {
+                                    "loop_name": "i1",
+                                    "computations_list": [],
+                                    "child_list": [
+                                        {
+                                            "loop_name": "i2",
+                                            "computations_list": [
+                                                "comp00"
+                                            ],
+                                            "child_list": []
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "execution_times": [
+                    0.580679,
+                    0.574839,
+                    0.574859,
+                    0.574829,
+                    0.574965,
+                    0.585967,
+                    0.574908,
+                    0.574924,
+                    0.574932,
+                    0.574899,
+                    0.574901,
+                    0.57478,
+                    0.345473,
+                    0.337541,
+                    0.336502,
+                    0.337059,
+                    0.337553,
+                    0.336447,
+                    0.336663,
+                    0.337306,
+                    0.337077,
+                    0.337604,
+                    0.336866,
+                    0.345184,
+                    0.336984,
+                    0.337417,
+                    0.336689,
+                    0.337635,
+                    0.337508,
+                    0.337457
+                ],
+                "legality_check": true,
+                "exploration_method": 1,
+                "sched_str": "{comp00}:T2(L0,L1,32,32)U(L4,8)"
+            },
+            {
+                "comp00": {
+                    "tiling": {
+                        "tiling_depth": 2,
+                        "tiling_dims": [
+                            "i0",
+                            "i1"
+                        ],
+                        "tiling_factors": [
+                            32,
+                            32
+                        ]
+                    },
+                    "unrolling_factor": 16,
+                    "parallelized_dim": null,
+                    "shiftings": null,
+                    "transformations_list": []
+                },
+                "unfuse_iterators": [],
+                "tree_structure": {
+                    "roots": [
+                        {
+                            "loop_name": "i0",
+                            "computations_list": [],
+                            "child_list": [
+                                {
+                                    "loop_name": "i1",
+                                    "computations_list": [],
+                                    "child_list": [
+                                        {
+                                            "loop_name": "i2",
+                                            "computations_list": [
+                                                "comp00"
+                                            ],
+                                            "child_list": []
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    ]
+                },
+                "execution_times": [
+                    0.50015,
+                    0.475657,
+                    0.475355,
+                    0.475354,
+                    0.475465,
+                    0.475398,
+                    0.475351,
+                    0.553979,
+                    0.626665,
+                    0.626624,
+                    0.626641,
+                    0.626924,
+                    0.360844,
+                    0.360658,
+                    0.360762,
+                    0.341824,
+                    0.288332,
+                    0.268554,
+                    0.255901,
+                    0.281428,
+                    0.255916,
+                    0.256068,
+                    0.25606,
+                    0.25601,
+                    0.255963,
+                    0.280855,
+                    0.256051,
+                    0.256118,
+                    0.282072,
+                    0.283917
+                ],
+                "legality_check": true,
+                "exploration_method": 1,
+                "sched_str": "{comp00}:T2(L0,L1,32,32)U(L4,16)"
+            }
+        ],
+        "exploration_trace": {
+            "id": 0,
+            "schedule": "",
+            "depth": 1,
+            "evaluation": 0.254737,
+            "children": [
+                {
+                    "id": 1,
+                    "schedule": "I(L0,L1)",
+                    "depth": 1,
+                    "evaluation": 0.332244,
+                    "children": []
+                },
+                {
+                    "id": 2,
+                    "schedule": "I(L0,L2)",
+                    "depth": 1,
+                    "evaluation": 1.89177,
+                    "children": []
+                },
+                {
+                    "id": 3,
+                    "schedule": "I(L1,L2)",
+                    "depth": 1,
+                    "evaluation": 0.775926,
+                    "children": [
+                        {
+                            "id": 4,
+                            "schedule": "I(L1,L2)P(L0)",
+                            "depth": 2,
+                            "evaluation": 0.219954,
+                            "children": []
+                        },
+                        {
+                            "id": 5,
+                            "schedule": "I(L1,L2)P(L1)",
+                            "depth": 2,
+                            "evaluation": 8.36029,
+                            "children": []
+                        },
+                        {
+                            "id": 6,
+                            "schedule": "I(L1,L2)P(L2)",
+                            "depth": 2,
+                            "evaluation": 254.737,
+                            "children": []
+                        },
+                        {
+                            "id": 3,
+                            "schedule": "I(L1,L2)",
+                            "depth": 2,
+                            "evaluation": 0.775926,
+                            "children": [
+                                {
+                                    "id": 7,
+                                    "schedule": "I(L1,L2)U(L2,4)",
+                                    "depth": 3,
+                                    "evaluation": 0.767073,
+                                    "children": []
+                                },
+                                {
+                                    "id": 8,
+                                    "schedule": "I(L1,L2)U(L2,8)",
+                                    "depth": 3,
+                                    "evaluation": 0.777515,
+                                    "children": []
+                                },
+                                {
+                                    "id": 9,
+                                    "schedule": "I(L1,L2)U(L2,16)",
+                                    "depth": 3,
+                                    "evaluation": 0.776076,
+                                    "children": []
+                                }
+                            ]
+                        }
+                    ]
+                },
+                {
+                    "id": 0,
+                    "schedule": "",
+                    "depth": 1,
+                    "evaluation": 0.254737,
+                    "children": [
+                        {
+                            "id": 10,
+                            "schedule": "P(L0)",
+                            "depth": 2,
+                            "evaluation": 0.200852,
+                            "children": []
+                        },
+                        {
+                            "id": 11,
+                            "schedule": "P(L1)",
+                            "depth": 2,
+                            "evaluation": 12.8878,
+                            "children": []
+                        },
+                        {
+                            "id": 12,
+                            "schedule": "P(L2)",
+                            "depth": 2,
+                            "evaluation": 254.737,
+                            "children": [
+                                {
+                                    "id": 12,
+                                    "schedule": "P(L2)",
+                                    "depth": 3,
+                                    "evaluation": 254.737,
+                                    "children": []
+                                }
+                            ]
+                        },
+                        {
+                            "id": 0,
+                            "schedule": "",
+                            "depth": 2,
+                            "evaluation": 0.254737,
+                            "children": [
+                                {
+                                    "id": 13,
+                                    "schedule": "T2(L0,L1,32,32)",
+                                    "depth": 3,
+                                    "evaluation": 0.330226,
+                                    "children": [
+                                        {
+                                            "id": 18,
+                                            "schedule": "T2(L0,L1,32,32)U(L4,4)",
+                                            "depth": 4,
+                                            "evaluation": 0.330263,
+                                            "children": []
+                                        },
+                                        {
+                                            "id": 19,
+                                            "schedule": "T2(L0,L1,32,32)U(L4,8)",
+                                            "depth": 4,
+                                            "evaluation": 0.336447,
+                                            "children": []
+                                        },
+                                        {
+                                            "id": 20,
+                                            "schedule": "T2(L0,L1,32,32)U(L4,16)",
+                                            "depth": 4,
+                                            "evaluation": 0.255901,
+                                            "children": []
+                                        }
+                                    ]
+                                },
+                                {
+                                    "id": 14,
+                                    "schedule": "T2(L0,L1,32,64)",
+                                    "depth": 3,
+                                    "evaluation": 0.330527,
+                                    "children": []
+                                },
+                                {
+                                    "id": 0,
+                                    "schedule": "",
+                                    "depth": 3,
+                                    "evaluation": 0.254737,
+                                    "children": [
+                                        {
+                                            "id": 15,
+                                            "schedule": "U(L2,4)",
+                                            "depth": 4,
+                                            "evaluation": 0.256133,
+                                            "children": []
+                                        },
+                                        {
+                                            "id": 16,
+                                            "schedule": "U(L2,8)",
+                                            "depth": 4,
+                                            "evaluation": 0.33452,
+                                            "children": []
+                                        },
+                                        {
+                                            "id": 17,
+                                            "schedule": "U(L2,16)",
+                                            "depth": 4,
+                                            "evaluation": 0.329353,
+                                            "children": []
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        }
+    }
+}
