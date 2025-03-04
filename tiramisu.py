@@ -113,15 +113,18 @@ def extract_features_from_file(file_path):
     return features
 
 def process_directory(directory_path):
-    """Process all JSON files in a directory and split into train and test sets."""
+    """Process all JSON files in the directory and split into train and test sets."""
     all_features = []
     file_names = []
     
+    # Get all JSON files in the directory
     json_files = sorted([f for f in os.listdir(directory_path) if f.endswith('.json')])
     
-    if len(json_files) < 32:
-        print(f"Warning: Expected at least 32 files, found {len(json_files)} in {directory_path}")
+    if len(json_files) < 5:  # Minimum threshold to ensure enough data for training
+        print(f"Error: Expected at least 5 files, found {len(json_files)} in {directory_path}")
+        return None, None, None
     
+    # Process each file and extract features
     for filename in json_files:
         file_path = os.path.join(directory_path, filename)
         features = extract_features_from_file(file_path)
@@ -129,42 +132,21 @@ def process_directory(directory_path):
             all_features.append(features)
             file_names.append(filename)
     
-    if len(all_features) < 32:
-        print(f"Warning: Only {len(all_features)} valid files found in {directory_path}")
+    if len(all_features) < 5:
+        print(f"Error: Only {len(all_features)} valid files found in {directory_path}")
         return None, None, None
     
-    train_features = all_features[:30]
-    test_features = all_features[30:32]
-    test_file_names = file_names[30:32]
+    # Split into training (80%) and testing (20%)
+    total_files = len(all_features)
+    train_size = int(0.8 * total_files)
+    train_features = all_features[:train_size]
+    test_features = all_features[train_size:]
+    train_file_names = file_names[:train_size]
+    test_file_names = file_names[train_size:]
+    
+    print(f"Processed {directory_path}: {len(train_features)} training files, {len(test_features)} test files")
     
     return train_features, test_features, test_file_names
-
-def process_main_directory(main_dir):
-    """Process all subdirectories, splitting each into train/test sets."""
-    all_train_features = []
-    all_test_features = []
-    all_test_file_names = []
-    
-    subdirs = sorted([d for d in os.listdir(main_dir) if os.path.isdir(os.path.join(main_dir, d))])
-    
-    if len(subdirs) < 1:
-        raise ValueError(f"Expected at least 1 subdirectory in {main_dir}, found {len(subdirs)}")
-    
-    for subdir in subdirs:
-        subdir_path = os.path.join(main_dir, subdir)
-        train_features, test_features, test_file_names = process_directory(subdir_path)
-        
-        if train_features is None or test_features is None:
-            print(f"Skipping {subdir} due to insufficient data")
-            continue
-        
-        all_train_features.extend(train_features)
-        all_test_features.extend(test_features)
-        all_test_file_names.extend([os.path.join(subdir, fname) for fname in test_file_names])
-        
-        print(f"Processed subdir {subdir}: {len(train_features)} training files, {len(test_features)} test files")
-    
-    return all_train_features, all_test_features, all_test_file_names
 
 def prepare_data_for_lstm(train_features, test_features):
     """Prepare training and testing data for the LSTM model."""
@@ -298,24 +280,11 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test):
     y_test_actual = y_scaler.inverse_transform(y_test)
     y_pred_actual = y_scaler.inverse_transform(y_pred_scaled)
     
-    results_by_subfolder = {}
-    for i, file_path in enumerate(file_names_test):
-        subfolder = file_path.split('/')[0]
-        if subfolder not in results_by_subfolder:
-            results_by_subfolder[subfolder] = []
-        
-        results_by_subfolder[subfolder].append({
-            'file': file_path,
-            'actual': y_test_actual[i][0],
-            'predicted': y_pred_actual[i][0]
-        })
-    
-    for subfolder, results in results_by_subfolder.items():
-        print(f"\nResults for {subfolder}:")
-        for result in results:
-            print(f"File: {result['file']}")
-            print(f"  Actual execution time: {result['actual']:.6f} seconds")
-            print(f"  Predicted execution time: {result['predicted']:.6f} seconds")
+    print("\nEvaluation Results:")
+    for i, file_name in enumerate(file_names_test):
+        print(f"File: {file_name}")
+        print(f"  Actual execution time: {y_test_actual[i][0]:.6f} seconds")
+        print(f"  Predicted execution time: {y_pred_actual[i][0]:.6f} seconds")
     
     mse = np.mean((y_test_actual - y_pred_actual) ** 2)
     rmse = np.sqrt(mse)
@@ -329,11 +298,15 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test):
     return y_test_actual, y_pred_actual
 
 def main(main_dir):
-    print(f"Processing main directory: {main_dir}")
-    train_features, test_features, test_file_names = process_main_directory(main_dir)
+    print(f"Processing directory: {main_dir}")
+    train_features, test_features, test_file_names = process_directory(main_dir)
     
-    print(f"Total training samples: {len(train_features)} (30 files from each program)")
-    print(f"Total test samples: {len(test_features)} (2 files from each program)")
+    if train_features is None or test_features is None:
+        print("Error: Insufficient data to proceed")
+        return None
+    
+    print(f"Total training samples: {len(train_features)}")
+    print(f"Total test samples: {len(test_features)}")
     
     if len(train_features) == 0 or len(test_features) == 0:
         print("Error: No valid training or test data found")
@@ -355,6 +328,6 @@ def main(main_dir):
     return model, y_scaler, y_test_actual, y_pred_actual
 
 if __name__ == "__main__":
-    main_dir = "Tiramisu"  # Adjust this to your directory path
+    main_dir = "Tiramisu"  # Directory containing all JSON files with no subfolders
     model, y_scaler, y_test_actual, y_pred_actual = main(main_dir)
     print("\nModel training and prediction completed!")
