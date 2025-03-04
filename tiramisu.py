@@ -120,8 +120,8 @@ def process_directory(directory_path):
     # Get all JSON files in the directory
     json_files = sorted([f for f in os.listdir(directory_path) if f.endswith('.json')])
     
-    if len(json_files) < 5:  # Minimum threshold to ensure enough data for training
-        print(f"Error: Expected at least 5 files, found {len(json_files)} in {directory_path}")
+    if len(json_files) < 11:  # Minimum threshold: 10 for test + at least 1 for train
+        print(f"Error: Expected at least 11 files, found {len(json_files)} in {directory_path}")
         return None, None, None
     
     # Process each file and extract features
@@ -132,13 +132,13 @@ def process_directory(directory_path):
             all_features.append(features)
             file_names.append(filename)
     
-    if len(all_features) < 5:
+    if len(all_features) < 11:
         print(f"Error: Only {len(all_features)} valid files found in {directory_path}")
         return None, None, None
     
-    # Split into training (80%) and testing (20%)
+    # Split into training (all except last 10) and testing (last 10)
     total_files = len(all_features)
-    train_size = int(0.8 * total_files)
+    train_size = total_files - 10  # Use all but the last 10 for training
     train_features = all_features[:train_size]
     test_features = all_features[train_size:]
     train_file_names = file_names[:train_size]
@@ -208,7 +208,7 @@ def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=32):
     
     return train_loader, test_loader
 
-def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=100, patience=10):
+def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=250, patience=10):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     model.to(device)
@@ -320,7 +320,7 @@ def main(main_dir):
     optimizer = optim.Adam(model.parameters(), lr=0.001)
     
     print("Building and training LSTM model...")
-    train_losses, val_losses = train_model(model, train_loader, test_loader, criterion, optimizer)
+    train_losses, val_losses = train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=250)
     
     print("\nEvaluating model:")
     y_test_actual, y_pred_actual = evaluate_model(model, X_test, y_test, y_scaler, test_file_names)
