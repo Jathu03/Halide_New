@@ -2,11 +2,12 @@ import os
 import json
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 def get_execution_time(file_path):
     try:
@@ -110,6 +111,13 @@ def extract_features_from_file(file_path):
         'scheduling_count': len(scheduling_features)
     }
     
+    # Add node to edge ratio feature
+    if len(nodes_features) > 0 and len(edges_features) > 0:
+        features['node_edge_ratio'] = len(nodes_features) / len(edges_features)
+    else:
+        features['node_edge_ratio'] = 0
+    
+    # Parse op counts with improved handling
     op_counts = {}
     for node in nodes_features:
         for key, value in node.items():
@@ -117,6 +125,7 @@ def extract_features_from_file(file_path):
                 op_counts[key] = op_counts.get(key, 0) + value
     features.update(op_counts)
     
+    # Extract more detailed scheduling metrics
     if scheduling_features:
         important_metrics = [
             'bytes_at_production', 'bytes_at_realization', 'bytes_at_root', 'bytes_at_task',
@@ -128,6 +137,7 @@ def extract_features_from_file(file_path):
                 if metric in scheduling_features[0]:
                     features[f'sched_{metric}'] = scheduling_features[0][metric]
         
+        # Calculate aggregated metrics
         total_bytes_at_production = sum(sf.get('bytes_at_production', 0) for sf in scheduling_features if isinstance(sf, dict))
         total_vectors = sum(sf.get('num_vectors', 0) for sf in scheduling_features if isinstance(sf, dict))
         total_parallelism = sum(sf.get('inner_parallelism', 0) * sf.get('outer_parallelism', 1) for sf in scheduling_features if isinstance(sf, dict))
@@ -135,6 +145,20 @@ def extract_features_from_file(file_path):
         features['total_bytes_at_production'] = total_bytes_at_production
         features['total_vectors'] = total_vectors
         features['total_parallelism'] = total_parallelism
+        
+        # Add derived features
+        if total_vectors > 0:
+            features['bytes_per_vector'] = total_bytes_at_production / total_vectors if total_vectors > 0 else 0
+        
+        # Add memory pressure indicator
+        if 'working_set' in scheduling_features[0] and 'bytes_at_production' in scheduling_features[0]:
+            features['memory_pressure'] = scheduling_features[0]['working_set'] / scheduling_features[0]['bytes_at_production'] if scheduling_features[0]['bytes_at_production'] > 0 else 0
+    
+    # Add node complexity indicators
+    if len(nodes_features) > 0:
+        op_types = sum(1 for k in op_counts.keys())
+        features['avg_ops_per_node'] = sum(op_counts.values()) / len(nodes_features)
+        features['op_diversity'] = op_types / len(nodes_features) if len(nodes_features) > 0 else 0
     
     return features
 
@@ -198,55 +222,157 @@ def process_main_directory(main_dir):
     
     return all_train_features, all_test_features, all_test_file_names
 
-def prepare_data_for_lstm(train_features, test_features):
-    """Prepare the training and testing data for the LSTM model."""
+def clean_and_transform_features(train_features, test_features):
+    """Clean, transform, and augment features for improved model performance"""
     all_features_df = pd.DataFrame(train_features + test_features)
-    if len(all_features_df) <= 5:
-        raise ValueError("Not enough data samples to train the model")
     
-    X = all_features_df.drop('execution_time', axis=1)
-    y = all_features_df['execution_time']
-    X = X.fillna(0)
+    # Handle missing values
+    all_features_df = all_features_df.fillna(0)
     
+    # Drop columns with constant values
+    constant_columns = [col for col in all_features_df.columns 
+                       if col != 'execution_time' and all_features_df[col].nunique() == 1]
+    all_features_df = all_features_df.drop(columns=constant_columns)
+    print(f"Dropped {len(constant_columns)} constant columns")
+    
+    # Log transform the target variable to handle skewness
+    if 'execution_time' in all_features_df.columns:
+        all_features_df['execution_time_log'] = np.log1p(all_features_df['execution_time'])
+    
+    # Create ratio features for potentially important metrics
+    if 'total_vectors' in all_features_df.columns and all_features_df['total_vectors'].max() > 0:
+        all_features_df['bytes_per_vector'] = all_features_df['total_bytes_at_production'] / (all_features_df['total_vectors'] + 1e-8)
+    
+    # Feature selection - keep only numeric columns
+    numeric_cols = all_features_df.select_dtypes(include=['number']).columns
+    all_features_df = all_features_df[numeric_cols]
+    
+    # Split back into train and test
+    train_size = len(train_features)
+    train_df = all_features_df.iloc[:train_size]
+    test_df = all_features_df.iloc[train_size:]
+    
+    return train_df, test_df
+
+def prepare_data_for_model(train_features, test_features):
+    """Prepare the training and testing data for the model."""
+    # Clean and transform features
+    train_df, test_df = clean_and_transform_features(train_features, test_features)
+    
+    # Use log-transformed target if available
+    if 'execution_time_log' in train_df.columns:
+        y_train = train_df['execution_time_log'].values.reshape(-1, 1)
+        y_test = test_df['execution_time_log'].values.reshape(-1, 1)
+        train_df = train_df.drop(['execution_time', 'execution_time_log'], axis=1)
+        test_df = test_df.drop(['execution_time', 'execution_time_log'], axis=1)
+    else:
+        y_train = train_df['execution_time'].values.reshape(-1, 1)
+        y_test = test_df['execution_time'].values.reshape(-1, 1)
+        train_df = train_df.drop('execution_time', axis=1)
+        test_df = test_df.drop('execution_time', axis=1)
+    
+    # Normalize features
     scaler_X = StandardScaler()
     scaler_y = StandardScaler()
     
-    train_size = len(train_features)
-    X_train = X.iloc[:train_size]
-    y_train = y.iloc[:train_size].values.reshape(-1, 1)
-    X_test = X.iloc[train_size:]
-    y_test = y.iloc[train_size:].values.reshape(-1, 1)
-    
-    X_train_scaled = scaler_X.fit_transform(X_train)
+    X_train_scaled = scaler_X.fit_transform(train_df)
     y_train_scaled = scaler_y.fit_transform(y_train)
-    X_test_scaled = scaler_X.transform(X_test)
+    X_test_scaled = scaler_X.transform(test_df)
     y_test_scaled = scaler_y.transform(y_test)
     
+    # Create tensors
     X_train_tensor = torch.FloatTensor(X_train_scaled).unsqueeze(1)
     y_train_tensor = torch.FloatTensor(y_train_scaled)
     X_test_tensor = torch.FloatTensor(X_test_scaled).unsqueeze(1)
     y_test_tensor = torch.FloatTensor(y_test_scaled)
     
-    return X_train_tensor, y_train_tensor, X_test_tensor, y_test_tensor, scaler_y, X_train_scaled.shape[1]
+    print(f"Input feature dimension: {X_train_scaled.shape[1]}")
+    
+    return (X_train_tensor, y_train_tensor, X_test_tensor, y_test_tensor, 
+            scaler_y, X_train_scaled.shape[1], 'execution_time_log' in train_df.columns)
 
-class LSTMModel(nn.Module):
-    def __init__(self, input_size, hidden_size1=64, hidden_size2=32, output_size=1):
-        super(LSTMModel, self).__init__()
-        self.lstm1 = nn.LSTM(input_size, hidden_size1, batch_first=True)
-        self.dropout1 = nn.Dropout(0.2)
-        self.lstm2 = nn.LSTM(hidden_size1, hidden_size2, batch_first=True)
-        self.dropout2 = nn.Dropout(0.2)
-        self.fc1 = nn.Linear(hidden_size2, 16)
+class EnhancedLSTMModel(nn.Module):
+    def __init__(self, input_size, hidden_sizes=[128, 64, 32], output_size=1, dropout_rate=0.3):
+        super(EnhancedLSTMModel, self).__init__()
+        
+        # LSTM layers with increasing complexity
+        self.lstm_layers = nn.ModuleList()
+        self.dropout_layers = nn.ModuleList()
+        
+        # First LSTM layer
+        self.lstm_layers.append(nn.LSTM(input_size, hidden_sizes[0], batch_first=True))
+        self.dropout_layers.append(nn.Dropout(dropout_rate))
+        
+        # Additional LSTM layers
+        for i in range(1, len(hidden_sizes)):
+            self.lstm_layers.append(nn.LSTM(hidden_sizes[i-1], hidden_sizes[i], batch_first=True))
+            self.dropout_layers.append(nn.Dropout(dropout_rate))
+        
+        # Attention mechanism
+        self.attention = nn.Linear(hidden_sizes[-1], 1)
+        
+        # Fully connected layers with batch normalization
+        self.fc_layers = nn.ModuleList()
+        self.bn_layers = nn.ModuleList()
+        
+        # First FC layer after LSTM
+        self.fc_layers.append(nn.Linear(hidden_sizes[-1], hidden_sizes[-1] // 2))
+        self.bn_layers.append(nn.BatchNorm1d(hidden_sizes[-1] // 2))
+        
+        # Second FC layer
+        self.fc_layers.append(nn.Linear(hidden_sizes[-1] // 2, hidden_sizes[-1] // 4))
+        self.bn_layers.append(nn.BatchNorm1d(hidden_sizes[-1] // 4))
+        
+        # Output layer
+        self.output_layer = nn.Linear(hidden_sizes[-1] // 4, output_size)
+        
+        # Activation functions
         self.relu = nn.ReLU()
-        self.fc2 = nn.Linear(16, output_size)
+        self.leaky_relu = nn.LeakyReLU(0.1)
+        
+        # Residual connections
+        self.has_residual = (hidden_sizes[-1] // 4 == hidden_sizes[-1] // 2)
+        if not self.has_residual:
+            self.residual_adapter = nn.Linear(hidden_sizes[-1] // 2, hidden_sizes[-1] // 4)
+        
+    def attention_net(self, lstm_output):
+        attn_weights = self.attention(lstm_output).squeeze(2)
+        soft_attn_weights = torch.softmax(attn_weights, 1)
+        context = torch.bmm(soft_attn_weights.unsqueeze(1), lstm_output).squeeze(1)
+        return context
         
     def forward(self, x):
-        lstm_out1, _ = self.lstm1(x)
-        lstm_out1 = self.dropout1(lstm_out1)
-        lstm_out2, _ = self.lstm2(lstm_out1)
-        lstm_out2 = self.dropout2(lstm_out2[:, -1, :])
-        fc1_out = self.relu(self.fc1(lstm_out2))
-        output = self.fc2(fc1_out)
+        # Process through LSTM layers
+        lstm_out = x
+        for i, (lstm, dropout) in enumerate(zip(self.lstm_layers, self.dropout_layers)):
+            lstm_out, _ = lstm(lstm_out)
+            if i < len(self.lstm_layers) - 1:  # Apply dropout except for the last layer
+                lstm_out = dropout(lstm_out)
+        
+        # Apply attention
+        attn_output = self.attention_net(lstm_out)
+        
+        # First FC layer
+        fc_out = self.fc_layers[0](attn_output)
+        fc_out = self.bn_layers[0](fc_out)
+        fc_out = self.leaky_relu(fc_out)
+        
+        # Save for residual connection
+        residual = fc_out
+        if not self.has_residual:
+            residual = self.residual_adapter(residual)
+        
+        # Second FC layer
+        fc_out = self.fc_layers[1](fc_out)
+        fc_out = self.bn_layers[1](fc_out)
+        fc_out = self.leaky_relu(fc_out)
+        
+        # Add residual connection
+        fc_out = fc_out + residual
+        
+        # Output layer
+        output = self.output_layer(fc_out)
+        
         return output
 
 def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=32):
@@ -258,10 +384,13 @@ def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=32):
     
     return train_loader, test_loader
 
-def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=100, patience=10):
+def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=150, patience=20):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     model.to(device)
+    
+    # Learning rate scheduler
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
     
     best_val_loss = float('inf')
     epochs_no_improve = 0
@@ -270,6 +399,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
     val_losses = []
     
     for epoch in range(num_epochs):
+        # Training phase
         model.train()
         running_loss = 0.0
         for inputs, targets in train_loader:
@@ -278,12 +408,17 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
             outputs = model(inputs)
             loss = criterion(outputs, targets)
             loss.backward()
+            
+            # Gradient clipping to prevent exploding gradients
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
             optimizer.step()
             running_loss += loss.item() * inputs.size(0)
         
         train_loss = running_loss / len(train_loader.dataset)
         train_losses.append(train_loss)
         
+        # Validation phase
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
@@ -296,8 +431,12 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
         val_loss /= len(test_loader.dataset)
         val_losses.append(val_loss)
         
+        # Update learning rate
+        scheduler.step(val_loss)
+        
         print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
         
+        # Early stopping check
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             epochs_no_improve = 0
@@ -315,7 +454,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
     
     return train_losses, val_losses
 
-def evaluate_model(model, X_test, y_test, y_scaler, file_names_test):
+def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_transformed=False):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.to(device)
     model.eval()
@@ -327,8 +466,17 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test):
     y_pred_scaled = y_pred_scaled.cpu().numpy()
     y_test = y_test.cpu().numpy()
     
-    y_test_actual = y_scaler.inverse_transform(y_test)
-    y_pred_actual = y_scaler.inverse_transform(y_pred_scaled)
+    # Inverse transform the predictions
+    y_test_transformed = y_scaler.inverse_transform(y_test)
+    y_pred_transformed = y_scaler.inverse_transform(y_pred_scaled)
+    
+    # If log-transformed, convert back to original scale
+    if is_log_transformed:
+        y_test_actual = np.expm1(y_test_transformed)
+        y_pred_actual = np.expm1(y_pred_transformed)
+    else:
+        y_test_actual = y_test_transformed
+        y_pred_actual = y_pred_transformed
     
     # Group results by subfolder
     results_by_subfolder = {}
@@ -340,7 +488,8 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test):
         results_by_subfolder[subfolder].append({
             'file': file_path,
             'actual': y_test_actual[i][0],
-            'predicted': y_pred_actual[i][0]
+            'predicted': y_pred_actual[i][0],
+            'error_percentage': abs(y_test_actual[i][0] - y_pred_actual[i][0]) / y_test_actual[i][0] * 100 if y_test_actual[i][0] > 0 else 0
         })
     
     # Print results for each subfolder
@@ -350,16 +499,19 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test):
             print(f"File: {result['file']}")
             print(f"  Actual execution time: {result['actual']:.2f} ms")
             print(f"  Predicted execution time: {result['predicted']:.2f} ms")
+            print(f"  Error percentage: {result['error_percentage']:.2f}%")
     
     # Calculate overall metrics
     mse = np.mean((y_test_actual - y_pred_actual) ** 2)
     rmse = np.sqrt(mse)
     mae = np.mean(np.abs(y_test_actual - y_pred_actual))
+    mape = np.mean(np.abs((y_test_actual - y_pred_actual) / (y_test_actual + 1e-8))) * 100
     
     print("\nOverall Model Performance:")
     print(f"MSE: {mse:.2f}")
     print(f"RMSE: {rmse:.2f}")
     print(f"MAE: {mae:.2f}")
+    print(f"MAPE: {mape:.2f}%")
     
     return y_test_actual, y_pred_actual
 
@@ -374,18 +526,39 @@ def main(main_dir):
         print("Error: No valid training or test data found")
         return None
     
-    X_train, y_train, X_test, y_test, y_scaler, input_size = prepare_data_for_lstm(train_features, test_features)
+    # Prepare data for model
+    X_train, y_train, X_test, y_test, y_scaler, input_size, is_log_transformed = prepare_data_for_model(train_features, test_features)
     
-    train_loader, test_loader = create_data_loaders(X_train, y_train, X_test, y_test, batch_size=32)
-    model = LSTMModel(input_size=input_size)
-    criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    # Create data loaders
+    train_loader, test_loader = create_data_loaders(X_train, y_train, X_test, y_test, batch_size=16)
     
-    print("Building and training LSTM model...")
-    train_losses, val_losses = train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=100, patience=10)
+    # Initialize enhanced model
+    model = EnhancedLSTMModel(
+        input_size=input_size,
+        hidden_sizes=[128, 64, 32],  # Deeper architecture
+        output_size=1,
+        dropout_rate=0.3
+    )
     
+    # Define loss function and optimizer
+    criterion = nn.HuberLoss(delta=1.0)  # More robust to outliers than MSE
+    optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-5)  # Better optimizer with weight decay
+    
+    # Build and train model
+    print("Building and training Enhanced LSTM model...")
+    train_losses, val_losses = train_model(
+        model, 
+        train_loader, 
+        test_loader, 
+        criterion, 
+        optimizer, 
+        num_epochs=150,  # More epochs 
+        patience=20      # More patience for early stopping
+    )
+    
+    # Evaluate model
     print("\nEvaluating model:")
-    y_test_actual, y_pred_actual = evaluate_model(model, X_test, y_test, y_scaler, test_file_names)
+    y_test_actual, y_pred_actual = evaluate_model(model, X_test, y_test, y_scaler, test_file_names, is_log_transformed)
     
     return model, y_scaler, y_test_actual, y_pred_actual
 
@@ -396,4 +569,4 @@ if __name__ == "__main__":
     # Run the main function to train and test
     model, y_scaler, y_test_actual, y_pred_actual = main(main_dir)
     
-    print("\nModel training and prediction completed!")
+    print("\nEnhanced model training and prediction completed!")
