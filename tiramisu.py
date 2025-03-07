@@ -74,13 +74,18 @@ def extract_features_from_file(file_path):
                     if "tiling" in comp_data and comp_data["tiling"]:
                         tiling_factors.extend(comp_data["tiling"].get("tiling_factors", []))
                     if "unrolling_factor" in comp_data:
-                        unroll_factors.append(comp_data["unrolling_factor"])
+                        unroll_factor = comp_data["unrolling_factor"]
+                        # Handle case where unrolling_factor might be None
+                        if unroll_factor is not None and isinstance(unroll_factor, (int, float)):
+                            unroll_factors.append(unroll_factor)
                     if "parallelized_dim" in comp_data:
                         parallel_factors.append(1)
                     
                     features[f'{comp_key}_transformation_count'] = len(comp_data.get("transformations_list", []))
                     features[f'{comp_key}_tiling'] = 1 if comp_data.get("tiling", {}) else 0
-                    features[f'{comp_key}_unrolled'] = 1 if comp_data.get("unrolling_factor", 0) > 0 else 0
+                    # Modified line to handle None case
+                    unroll_val = comp_data.get("unrolling_factor")
+                    features[f'{comp_key}_unrolled'] = 1 if (unroll_val is not None and isinstance(unroll_val, (int, float)) and unroll_val > 0) else 0
                     features[f'{comp_key}_parallelized'] = 1 if comp_data.get("parallelized_dim", "") else 0
             
             features['tiling_count'] = sum(1 for comp in schedule.values() if isinstance(comp, dict) and comp.get("tiling", {}))
