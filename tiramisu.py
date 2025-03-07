@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
 from torch.optim.lr_scheduler import ReduceLROnPlateau
+import random
 
 def get_execution_time(schedule_data):
     if "execution_times" in schedule_data:
@@ -35,7 +36,6 @@ def extract_features_from_file(file_path):
         iterators = prog_annot.get("iterators", {})
         computations = prog_annot.get("computations", {})
         
-        # Calculate avg_loop_range only for numeric bounds
         loop_ranges = []
         for it in iterators.values():
             lower = it.get("lower_bound")
@@ -46,13 +46,13 @@ def extract_features_from_file(file_path):
         base_features = {
             'memory_size': prog_annot.get("memory_size", 0),
             'iterator_count': len(iterators),
-            'max_depth_iterators': max(
-                (len(it.get("child_iterators", [])) for it in iterators.values()), default=0
-            ),
+            'max_depth_iterators': max((len(it.get("child_iterators", [])) for it in iterators.values()), default=0),
             'computation_count': len(computations),
             'reduction_count': sum(1 for comp in computations.values() if comp.get("comp_is_reduction", False)),
             'access_count': sum(len(comp.get("accesses", [])) for comp in computations.values()),
-            'avg_loop_range': float(np.mean(loop_ranges)) if loop_ranges else 0
+            'avg_loop_range': float(np.mean(loop_ranges)) if loop_ranges else 0,
+            'memory_per_computation': prog_annot.get("memory_size", 0) / max(len(computations), 1),
+            'loop_range_std': float(np.std(loop_ranges)) if loop_ranges else 0
         }
         base_features['avg_access_per_comp'] = base_features['access_count'] / max(base_features['computation_count'], 1)
         
@@ -66,18 +66,31 @@ def extract_features_from_file(file_path):
             features['execution_time'] = execution_time
             
             tiling_factors = []
+            unroll_factors = []
+            parallel_factors = []
+            
             for comp_key, comp_data in schedule.items():
                 if isinstance(comp_data, dict):
                     if "tiling" in comp_data and comp_data["tiling"]:
                         tiling_factors.extend(comp_data["tiling"].get("tiling_factors", []))
+                    if "unrolling_factor" in comp_data:
+                        unroll_factors.append(comp_data["unrolling_factor"])
+                    if "parallelized_dim" in comp_data:
+                        parallel_factors.append(1)
+                    
                     features[f'{comp_key}_transformation_count'] = len(comp_data.get("transformations_list", []))
                     features[f'{comp_key}_tiling'] = 1 if comp_data.get("tiling", {}) else 0
+                    features[f'{comp_key}_unrolled'] = 1 if comp_data.get("unrolling_factor", 0) > 0 else 0
+                    features[f'{comp_key}_parallelized'] = 1 if comp_data.get("parallelized_dim", "") else 0
             
             features['tiling_count'] = sum(1 for comp in schedule.values() if isinstance(comp, dict) and comp.get("tiling", {}))
+            features['unroll_count'] = len(unroll_factors)
+            features['parallel_count'] = len(parallel_factors)
             features['total_transformation_count'] = sum(
                 len(comp.get("transformations_list", [])) for comp in schedule.values() if isinstance(comp, dict)
             )
             features['avg_tiling_factor'] = float(np.mean(tiling_factors)) if tiling_factors else 0
+            features['avg_unroll_factor'] = float(np.mean(unroll_factors)) if unroll_factors else 0
             features['tiling_depth'] = max(
                 (comp["tiling"]["tiling_depth"] for comp in schedule.values() 
                  if isinstance(comp, dict) and comp.get("tiling", {}).get("tiling_depth")), default=0
@@ -90,6 +103,13 @@ def extract_features_from_file(file_path):
                     (1 + max((len(child.get("child_list", [])) for child in root.get("child_list", [])), default=0) 
                      for root in roots), default=0
                 )
+                features['avg_children_per_root'] = np.mean(
+                    [len(root.get("child_list", [])) for root in roots]
+                ) if roots else 0
+            
+            # Interaction features
+            features['comp_depth_interaction'] = features['computation_count'] * features['max_tree_depth']
+            features['tiling_parallel_interaction'] = features['tiling_count'] * features['parallel_count']
             
             all_features.append(features)
     
@@ -101,10 +121,6 @@ def process_directory(directory_path):
     
     json_files = sorted([f for f in os.listdir(directory_path) if f.endswith('.json')])
     
-    if len(json_files) < 2:
-        print(f"Error: Expected at least 2 files in {directory_path}, found {len(json_files)}")
-        return None, None, None
-    
     for filename in json_files:
         file_path = os.path.join(directory_path, filename)
         features_list = extract_features_from_file(file_path)
@@ -112,15 +128,19 @@ def process_directory(directory_path):
             all_features.extend(features_list)
             file_names.extend([f"{filename}_schedule_{i}" for i in range(len(features_list))])
     
-    if len(all_features) < 11:
+    if len(all_features) < 60:  # Need at least 60 samples for 50 train + 10 test
         print(f"Error: Only {len(all_features)} valid schedules found in {directory_path}")
         return None, None, None
     
-    train_size = len(all_features) - 10
-    train_features = all_features[:train_size]
-    test_features = all_features[train_size:]
-    train_file_names = file_names[:train_size]
-    test_file_names = file_names[train_size:]
+    # Random split
+    combined = list(zip(all_features, file_names))
+    random.shuffle(combined)
+    all_features, file_names = zip(*combined)
+    
+    train_features = list(all_features[:-10])
+    test_features = list(all_features[-10:])
+    train_file_names = list(file_names[:-10])
+    test_file_names = list(file_names[-10:])
     
     print(f"Processed {directory_path}: {len(train_features)} training schedules, {len(test_features)} test schedules")
     
@@ -136,6 +156,11 @@ def clean_and_transform_features(train_features, test_features):
     print(f"Dropped {len(constant_columns)} constant columns")
     
     all_features_df['execution_time_log'] = np.log1p(all_features_df['execution_time'])
+    
+    # Additional feature transformations
+    for col in all_features_df.columns:
+        if col not in ['execution_time', 'execution_time_log'] and all_features_df[col].max() > 0:
+            all_features_df[f'{col}_log'] = np.log1p(all_features_df[col])
     
     numeric_cols = all_features_df.select_dtypes(include=['number']).columns
     all_features_df = all_features_df[numeric_cols]
@@ -172,30 +197,38 @@ def prepare_data_for_model(train_features, test_features):
     return X_train_tensor, y_train_tensor, X_test_tensor, y_test_tensor, scaler_y, X_train_scaled.shape[1]
 
 class EnhancedLSTMModel(nn.Module):
-    def __init__(self, input_size, hidden_sizes=[64, 32], output_size=1, dropout_rate=0.2):
+    def __init__(self, input_size, hidden_sizes=[128, 64, 32], output_size=1, dropout_rate=0.3):
         super(EnhancedLSTMModel, self).__init__()
         
-        self.lstm = nn.LSTM(input_size, hidden_sizes[0], batch_first=True, num_layers=1)
+        self.lstm1 = nn.LSTM(input_size, hidden_sizes[0], batch_first=True, bidirectional=True)
+        self.lstm2 = nn.LSTM(hidden_sizes[0]*2, hidden_sizes[1], batch_first=True)
+        self.attention = nn.Linear(hidden_sizes[1], 1)
         self.dropout = nn.Dropout(dropout_rate)
-        self.fc1 = nn.Linear(hidden_sizes[0], hidden_sizes[1])
-        self.bn1 = nn.BatchNorm1d(hidden_sizes[1])
-        self.fc2 = nn.Linear(hidden_sizes[1], output_size)
+        self.fc1 = nn.Linear(hidden_sizes[1], hidden_sizes[2])
+        self.bn1 = nn.BatchNorm1d(hidden_sizes[2])
+        self.fc2 = nn.Linear(hidden_sizes[2], output_size)
         self.leaky_relu = nn.LeakyReLU(0.1)
         
+    def attention_net(self, lstm_output):
+        attn_weights = torch.softmax(self.attention(lstm_output), dim=1)
+        context = torch.bmm(attn_weights.transpose(1, 2), lstm_output).squeeze(1)
+        return context
+    
     def forward(self, x):
-        lstm_out, _ = self.lstm(x)
-        lstm_out = self.dropout(lstm_out[:, -1, :])
-        fc_out = self.fc1(lstm_out)
-        fc_out = self.bn1(fc_out)
-        fc_out = self.leaky_relu(fc_out)
-        output = self.fc2(fc_out)
-        return output
+        lstm_out, _ = self.lstm1(x)
+        lstm_out, _ = self.lstm2(lstm_out)
+        attn_out = self.attention_net(lstm_out)
+        out = self.dropout(attn_out)
+        out = self.fc1(out)
+        out = self.bn1(out)
+        out = self.leaky_relu(out)
+        out = self.fc2(out)
+        return out
 
 def custom_loss(y_pred, y_true):
-    y_pred_safe = torch.clamp(y_pred, min=-10)
-    return torch.mean(torch.square(torch.log1p(torch.exp(y_pred_safe)) - torch.log1p(torch.exp(y_true))))
+    return nn.MSELoss()(y_pred, y_true) + 0.1 * nn.L1Loss()(y_pred, y_true)
 
-def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=16):
+def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=32):
     train_dataset = TensorDataset(X_train, y_train)
     test_dataset = TensorDataset(X_test, y_test)
     
@@ -204,12 +237,12 @@ def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=16):
     
     return train_loader, test_loader
 
-def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=200, patience=30):
+def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=300, patience=50):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     model.to(device)
     
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.3, patience=10, verbose=True, min_lr=1e-6)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=15, verbose=True, min_lr=1e-6)
     
     best_val_loss = float('inf')
     epochs_no_improve = 0
@@ -229,7 +262,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
                 print(f"NaN loss at epoch {epoch+1}")
                 return None, None
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
             optimizer.step()
             running_loss += loss.item() * inputs.size(0)
         
@@ -307,6 +340,8 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test):
     return y_test_actual, y_pred_actual
 
 def main(main_dir):
+    random.seed(42)  # For reproducibility
+    
     print(f"Processing directory: {main_dir}")
     train_features, test_features, test_file_names = process_directory(main_dir)
     
@@ -323,20 +358,20 @@ def main(main_dir):
     
     X_train, y_train, X_test, y_test, y_scaler, input_size = prepare_data_for_model(train_features, test_features)
     
-    train_loader, test_loader = create_data_loaders(X_train, y_train, X_test, y_test, batch_size=16)
+    train_loader, test_loader = create_data_loaders(X_train, y_train, X_test, y_test, batch_size=32)
     
     model = EnhancedLSTMModel(
         input_size=input_size,
-        hidden_sizes=[64, 32],
+        hidden_sizes=[128, 64, 32],
         output_size=1,
-        dropout_rate=0.2
+        dropout_rate=0.3
     )
     
     criterion = custom_loss
-    optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-4)
+    optimizer = optim.AdamW(model.parameters(), lr=0.0005, weight_decay=1e-5)
     
     print("Building and training Enhanced LSTM model...")
-    train_losses, val_losses = train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=200, patience=30)
+    train_losses, val_losses = train_model(model, train_loader, test_loader, criterion, optimizer)
     
     if train_losses is None or val_losses is None:
         print("Training failed due to NaN losses")
