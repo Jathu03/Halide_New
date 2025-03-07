@@ -52,18 +52,20 @@ def extract_features_from_file(file_path):
             'access_count': sum(len(comp.get("accesses", [])) for comp in computations.values()),
             'avg_loop_range': float(np.mean(loop_ranges)) if loop_ranges else 0,
             'memory_per_computation': prog_annot.get("memory_size", 0) / max(len(computations), 1),
-            'loop_range_std': float(np.std(loop_ranges)) if loop_ranges else 0
+            'loop_range_std': float(np.std(loop_ranges)) if loop_ranges else 0,
+            'access_per_iterator': sum(len(comp.get("accesses", [])) for comp in computations.values()) / max(len(iterators), 1)
         }
         base_features['avg_access_per_comp'] = base_features['access_count'] / max(base_features['computation_count'], 1)
         
         schedules = func_data["schedules_list"]
         for idx, schedule in enumerate(schedules):
             execution_time = get_execution_time(schedule)
-            if execution_time is None:
+            if execution_time is None or execution_time <= 0:
                 continue
             
             features = base_features.copy()
             features['execution_time'] = execution_time
+            features['log_execution_time'] = np.log1p(execution_time)  # Add log-transformed target
             
             tiling_factors = []
             unroll_factors = []
@@ -82,7 +84,6 @@ def extract_features_from_file(file_path):
                     
                     features[f'{comp_key}_transformation_count'] = len(comp_data.get("transformations_list", []))
                     features[f'{comp_key}_tiling'] = 1 if comp_data.get("tiling", {}) else 0
-                    # Corrected handling of unrolling_factor
                     unroll_val = comp_data.get("unrolling_factor")
                     features[f'{comp_key}_unrolled'] = 1 if (unroll_val is not None and isinstance(unroll_val, (int, float)) and unroll_val > 0) else 0
                     features[f'{comp_key}_parallelized'] = 1 if comp_data.get("parallelized_dim", "") else 0
@@ -111,9 +112,11 @@ def extract_features_from_file(file_path):
                     [len(root.get("child_list", [])) for root in roots]
                 ) if roots else 0
             
-            # Interaction features
+            # Additional features
             features['comp_depth_interaction'] = features['computation_count'] * features['max_tree_depth']
             features['tiling_parallel_interaction'] = features['tiling_count'] * features['parallel_count']
+            features['memory_per_access'] = features['memory_size'] / max(features['access_count'], 1)
+            features['transformations_per_comp'] = features['total_transformation_count'] / max(features['computation_count'], 1)
             
             all_features.append(features)
     
@@ -132,11 +135,10 @@ def process_directory(directory_path):
             all_features.extend(features_list)
             file_names.extend([f"{filename}_schedule_{i}" for i in range(len(features_list))])
     
-    if len(all_features) < 60:  # Need at least 60 samples for 50 train + 10 test
+    if len(all_features) < 60:
         print(f"Error: Only {len(all_features)} valid schedules found in {directory_path}")
         return None, None, None
     
-    # Random split
     combined = list(zip(all_features, file_names))
     random.shuffle(combined)
     all_features, file_names = zip(*combined)
@@ -155,15 +157,13 @@ def clean_and_transform_features(train_features, test_features):
     all_features_df = all_features_df.fillna(0)
     
     constant_columns = [col for col in all_features_df.columns 
-                        if col != 'execution_time' and all_features_df[col].nunique() == 1]
+                        if col not in ['execution_time', 'log_execution_time'] and all_features_df[col].nunique() == 1]
     all_features_df = all_features_df.drop(columns=constant_columns)
     print(f"Dropped {len(constant_columns)} constant columns")
     
-    all_features_df['execution_time_log'] = np.log1p(all_features_df['execution_time'])
-    
-    # Additional feature transformations
+    # Log transform all positive features
     for col in all_features_df.columns:
-        if col not in ['execution_time', 'execution_time_log'] and all_features_df[col].max() > 0:
+        if col not in ['execution_time', 'log_execution_time'] and all_features_df[col].min() >= 0 and all_features_df[col].max() > 0:
             all_features_df[f'{col}_log'] = np.log1p(all_features_df[col])
     
     numeric_cols = all_features_df.select_dtypes(include=['number']).columns
@@ -178,10 +178,10 @@ def clean_and_transform_features(train_features, test_features):
 def prepare_data_for_model(train_features, test_features):
     train_df, test_df = clean_and_transform_features(train_features, test_features)
     
-    y_train = train_df['execution_time_log'].values.reshape(-1, 1)
-    y_test = test_df['execution_time_log'].values.reshape(-1, 1)
-    X_train_df = train_df.drop(['execution_time', 'execution_time_log'], axis=1)
-    X_test_df = test_df.drop(['execution_time', 'execution_time_log'], axis=1)
+    y_train = train_df['log_execution_time'].values.reshape(-1, 1)
+    y_test = test_df['log_execution_time'].values.reshape(-1, 1)
+    X_train_df = train_df.drop(['execution_time', 'log_execution_time'], axis=1)
+    X_test_df = test_df.drop(['execution_time', 'log_execution_time'], axis=1)
     
     scaler_X = StandardScaler()
     scaler_y = StandardScaler()
@@ -201,16 +201,17 @@ def prepare_data_for_model(train_features, test_features):
     return X_train_tensor, y_train_tensor, X_test_tensor, y_test_tensor, scaler_y, X_train_scaled.shape[1]
 
 class EnhancedLSTMModel(nn.Module):
-    def __init__(self, input_size, hidden_sizes=[128, 64, 32], output_size=1, dropout_rate=0.3):
+    def __init__(self, input_size, hidden_sizes=[256, 128, 64], output_size=1, dropout_rate=0.4):
         super(EnhancedLSTMModel, self).__init__()
         
         self.lstm1 = nn.LSTM(input_size, hidden_sizes[0], batch_first=True, bidirectional=True)
-        self.lstm2 = nn.LSTM(hidden_sizes[0]*2, hidden_sizes[1], batch_first=True)
-        self.attention = nn.Linear(hidden_sizes[1], 1)
+        self.lstm2 = nn.LSTM(hidden_sizes[0]*2, hidden_sizes[1], batch_first=True, bidirectional=True)
+        self.lstm3 = nn.LSTM(hidden_sizes[1]*2, hidden_sizes[2], batch_first=True)
+        self.attention = nn.Linear(hidden_sizes[2], 1)
         self.dropout = nn.Dropout(dropout_rate)
-        self.fc1 = nn.Linear(hidden_sizes[1], hidden_sizes[2])
-        self.bn1 = nn.BatchNorm1d(hidden_sizes[2])
-        self.fc2 = nn.Linear(hidden_sizes[2], output_size)
+        self.fc1 = nn.Linear(hidden_sizes[2], hidden_sizes[2]//2)
+        self.bn1 = nn.BatchNorm1d(hidden_sizes[2]//2)
+        self.fc2 = nn.Linear(hidden_sizes[2]//2, output_size)
         self.leaky_relu = nn.LeakyReLU(0.1)
         
     def attention_net(self, lstm_output):
@@ -221,6 +222,7 @@ class EnhancedLSTMModel(nn.Module):
     def forward(self, x):
         lstm_out, _ = self.lstm1(x)
         lstm_out, _ = self.lstm2(lstm_out)
+        lstm_out, _ = self.lstm3(lstm_out)
         attn_out = self.attention_net(lstm_out)
         out = self.dropout(attn_out)
         out = self.fc1(out)
@@ -230,9 +232,12 @@ class EnhancedLSTMModel(nn.Module):
         return out
 
 def custom_loss(y_pred, y_true):
-    return nn.MSELoss()(y_pred, y_true) + 0.1 * nn.L1Loss()(y_pred, y_true)
+    # Relative error loss with small epsilon to avoid division by zero
+    epsilon = 1e-8
+    rel_error = torch.abs((y_pred - y_true) / (y_true.abs() + epsilon))
+    return torch.mean(rel_error) + 0.5 * nn.MSELoss()(y_pred, y_true)
 
-def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=32):
+def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=64):
     train_dataset = TensorDataset(X_train, y_train)
     test_dataset = TensorDataset(X_test, y_test)
     
@@ -241,12 +246,12 @@ def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=32):
     
     return train_loader, test_loader
 
-def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=300, patience=50):
+def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=500, patience=100):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     model.to(device)
     
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=15, verbose=True, min_lr=1e-6)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.3, patience=20, verbose=True, min_lr=1e-7)
     
     best_val_loss = float('inf')
     epochs_no_improve = 0
@@ -344,7 +349,7 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test):
     return y_test_actual, y_pred_actual
 
 def main(main_dir):
-    random.seed(42)  # For reproducibility
+    random.seed(42)
     
     print(f"Processing directory: {main_dir}")
     train_features, test_features, test_file_names = process_directory(main_dir)
@@ -362,17 +367,17 @@ def main(main_dir):
     
     X_train, y_train, X_test, y_test, y_scaler, input_size = prepare_data_for_model(train_features, test_features)
     
-    train_loader, test_loader = create_data_loaders(X_train, y_train, X_test, y_test, batch_size=32)
+    train_loader, test_loader = create_data_loaders(X_train, y_train, X_test, y_test, batch_size=64)
     
     model = EnhancedLSTMModel(
         input_size=input_size,
-        hidden_sizes=[128, 64, 32],
+        hidden_sizes=[256, 128, 64],
         output_size=1,
-        dropout_rate=0.3
+        dropout_rate=0.4
     )
     
     criterion = custom_loss
-    optimizer = optim.AdamW(model.parameters(), lr=0.0005, weight_decay=1e-5)
+    optimizer = optim.AdamW(model.parameters(), lr=0.0001, weight_decay=1e-4)
     
     print("Building and training Enhanced LSTM model...")
     train_losses, val_losses = train_model(model, train_loader, test_loader, criterion, optimizer)
