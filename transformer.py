@@ -568,28 +568,37 @@ def ensemble_predictions(models, X_test_tensor, X_test_flat, weights=None):
             model.to(device)
             with torch.no_grad():
                 preds = model(X_test_tensor.to(device)).cpu().numpy()
+                preds = preds.squeeze()  # Ensure predictions are 1D
         elif isinstance(model, MLPModel):
             model.eval()
             model.to(device)
             with torch.no_grad():
                 preds = model(X_test_flat.to(device)).cpu().numpy()
+                preds = preds.squeeze()  # Ensure predictions are 1D
         else:
             preds = model.predict(X_test_flat.numpy())
+            preds = preds.squeeze()  # Ensure predictions are 1D
         all_preds.append(preds)
+    
+    # Ensure all predictions have the same shape
+    if not all(pred.shape == all_preds[0].shape for pred in all_preds):
+        raise ValueError("All model predictions must have the same shape for ensemble averaging.")
     
     if weights is None:
         weights = [1/len(models)] * len(models)
     
     weights = np.array(weights) / sum(weights)
     
+    # Stack predictions into a 2D array for averaging
+    all_preds = np.stack(all_preds, axis=0)
     ensemble_preds = np.average(all_preds, axis=0, weights=weights)
     
     return ensemble_preds
 
 def evaluate_model(predictions, y_test, y_scaler, file_names_test, y_test_actual, model_name="Model"):
     if predictions.ndim > 1:
-        predictions = predictions.squeeze()
-    y_test_scaled = y_test.squeeze()
+        predictions = predictions.squeeze()  # Ensure predictions are 1D
+    y_test_scaled = y_test.squeeze()  # Ensure y_test is 1D
     
     y_pred_transformed = y_scaler.inverse_transform(predictions.reshape(-1, 1))
     y_test_transformed = y_scaler.inverse_transform(y_test_scaled.reshape(-1, 1))
