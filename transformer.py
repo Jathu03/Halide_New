@@ -327,31 +327,31 @@ def prepare_data_for_model(train_features, test_features):
     X_test_scaled = scaler_X.transform(X_test_df)
     y_test_scaled = scaler_y.transform(y_test)
     
-    X_train_tensor = torch.FloatTensor(X_train_scaled).unsqueeze(1)
+    X_train_tensor = torch.FloatTensor(X_train_scaled)
     y_train_tensor = torch.FloatTensor(y_train_scaled)
-    X_test_tensor = torch.FloatTensor(X_test_scaled).unsqueeze(1)
+    X_test_tensor = torch.FloatTensor(X_test_scaled)
     y_test_tensor = torch.FloatTensor(y_test_scaled)
-    
-    X_train_flat = torch.FloatTensor(X_train_scaled)
-    X_test_flat = torch.FloatTensor(X_test_scaled)
     
     print(f"Input feature dimension: {X_train_scaled.shape[1]}")
     
     return (X_train_tensor, y_train_tensor, X_test_tensor, y_test_tensor, 
-            X_train_flat, X_test_flat, scaler_y, X_train_scaled.shape[1],
+            X_train_tensor, X_test_tensor, scaler_y, X_train_scaled.shape[1],
             y_train_actual, y_test_actual, train_meta_df, test_meta_df, list(X_train_df.columns))
 
 class HybridAttentionModel(nn.Module):
     def __init__(self, input_size, hidden_sizes=[128, 64, 32], output_size=1, dropout_rate=0.3):
         super(HybridAttentionModel, self).__init__()
         
+        # LSTM layer for sequential analysis
         self.lstm = nn.LSTM(input_size, hidden_sizes[0], batch_first=True, bidirectional=True)
         self.lstm_attention = nn.Linear(hidden_sizes[0] * 2, 1)
         
+        # CNN layers for feature extraction
         self.conv1 = nn.Conv1d(1, 32, kernel_size=3, padding=1)
         self.conv2 = nn.Conv1d(32, 64, kernel_size=3, padding=1)
         self.max_pool = nn.AdaptiveMaxPool1d(1)
         
+        # Fully connected layers
         combined_size = hidden_sizes[0] * 2 + 64
         self.fc1 = nn.Linear(combined_size, hidden_sizes[1])
         self.bn1 = nn.BatchNorm1d(hidden_sizes[1])
@@ -365,20 +365,34 @@ class HybridAttentionModel(nn.Module):
     
     def forward(self, x):
         batch_size = x.size(0)
-        seq_len = x.size(1)
         
-        lstm_out, _ = self.lstm(x)
+        # Reshape input for LSTM if needed
+        if x.dim() == 2:
+            # Add sequence dimension
+            x_lstm = x.unsqueeze(1)
+        else:
+            x_lstm = x
+        
+        # LSTM processing
+        lstm_out, _ = self.lstm(x_lstm)
         attention_weights = torch.softmax(self.lstm_attention(lstm_out), dim=1)
         lstm_attn_out = torch.sum(attention_weights * lstm_out, dim=1)
         
-        x_cnn = x.view(batch_size, 1, -1)
+        # CNN processing - ensure correct input shape
+        if x.dim() == 2:
+            x_cnn = x.unsqueeze(1)  # Add channel dimension [batch, 1, features]
+        else:
+            x_cnn = x.view(batch_size, 1, -1)  # Flatten sequence dimension
+        
         cnn_out = self.leaky_relu(self.conv1(x_cnn))
         cnn_out = self.leaky_relu(self.conv2(cnn_out))
         cnn_out = self.max_pool(cnn_out).squeeze(2)
         
+        # Combine outputs
         combined = torch.cat((lstm_attn_out, cnn_out), dim=1)
         combined = self.dropout(combined)
         
+        # Fully connected layers
         fc_out = self.silu(self.bn1(self.fc1(combined)))
         fc_out = self.dropout(fc_out)
         fc_out = self.silu(self.bn2(self.fc2(fc_out)))
@@ -556,9 +570,13 @@ def ensemble_predictions(models, X_test, weights=None):
                     X_test_device = X_test.to(device)
                     preds = model(X_test_device).cpu().numpy()
                 else:
-                    raise ValueError("X_test must be a tensor for PyTorch models")
+                    X_test_tensor = torch.FloatTensor(X_test).to(device)
+                    preds = model(X_test_tensor).cpu().numpy()
         else:
-            preds = model.predict(X_test)
+            if isinstance(X_test, torch.Tensor):
+                preds = model.predict(X_test.cpu().numpy())
+            else:
+                preds = model.predict(X_test)
         all_preds.append(preds)
     
     if weights is None:
@@ -566,9 +584,17 @@ def ensemble_predictions(models, X_test, weights=None):
     
     weights = np.array(weights) / sum(weights)
     
-    ensemble_preds = np.average(all_preds, axis=0, weights=weights)
+    # Make sure predictions have consistent shapes
+    reshaped_preds = []
+    for pred in all_preds:
+        if pred.ndim > 1:
+            reshaped_preds.append(pred.reshape(-1))
+        else:
+            reshaped_preds.append(pred)
     
-    return ensemble_preds
+    ensemble_preds = np.average(np.column_stack(reshaped_preds), axis=1, weights=weights)
+    
+    return ensemble_preds.reshape(-1, 1)
 
 def evaluate_model(predictions, y_test, y_scaler, file_names_test, y_test_actual, model_name="Model"):
     if predictions.ndim > 1:
@@ -581,157 +607,244 @@ def evaluate_model(predictions, y_test, y_scaler, file_names_test, y_test_actual
     y_pred_actual = np.expm1(np.clip(y_pred_transformed, 0, None))
     y_test_actual_pred = np.expm1(y_test_transformed)
     
-    y_test_actual = y_test_actual.reshape(-1)
+    y_test_actual = y_test_actual.reshape(-1, 1)
     
-    print(f"\n{model_name} Evaluation Results:")
-    for i, file_name in enumerate(file_names_test):
-        print(f"Schedule: {file_name}")
-        print(f"  Actual execution time: {y_test_actual[i]:.6f} seconds")
-        print(f"  Predicted execution time: {y_pred_actual[i][0]:.6f} seconds")
-        print(f"  Error percentage: {abs(y_test_actual[i] - y_pred_actual[i][0]) / y_test_actual[i] * 100:.2f}%")
-    
+    # Calculate error metrics
     mse = mean_squared_error(y_test_actual, y_pred_actual)
-    rmse = np.sqrt(mse)
     mae = mean_absolute_error(y_test_actual, y_pred_actual)
-    mape = np.mean(np.abs((y_test_actual - y_pred_actual.flatten()) / (y_test_actual + 1e-8))) * 100
+    r2 = r2_score(y_test_actual.ravel(), y_pred_actual.ravel())
     
-    print(f"\n{model_name} Overall Performance:")
-    print(f"MSE: {mse:.6f}")
-    print(f"RMSE: {rmse:.6f}")
-    print(f"MAE: {mae:.6f}")
-    print(f"MAPE: {mape:.2f}%")
+    # Calculate relative error metrics
+    relative_errors = np.abs(y_pred_actual - y_test_actual) / (y_test_actual + 1e-10)
+    mean_relative_error = np.mean(relative_errors)
+    median_relative_error = np.median(relative_errors)
     
-    return y_test_actual, y_pred_actual.flatten()
-
-def plot_results(y_test_actual, y_pred_actual, model_name):
-    plt.figure(figsize=(10, 6))
-    plt.scatter(y_test_actual, y_pred_actual, alpha=0.5)
-    plt.plot([min(y_test_actual), max(y_test_actual)], 
-             [min(y_test_actual), max(y_test_actual)], 
-             'r--', lw=2)
-    plt.xlabel('Actual Execution Time (seconds)')
-    plt.ylabel('Predicted Execution Time (seconds)')
-    plt.title(f'{model_name}: Actual vs Predicted Execution Times')
-    plt.xscale('log')
-    plt.yscale('log')
-    plt.grid(True, which="both", ls="-", alpha=0.2)
-    plt.savefig(f'{model_name.lower().replace(" ", "_")}_results.png')
-    plt.close()
-
-def main(main_dir):
-    random.seed(42)
-    torch.manual_seed(42)
-    np.random.seed(42)
+    print(f"\n{model_name} Results:")
+    print(f"MSE: {mse:.4f}, MAE: {mae:.4f}, R²: {r2:.4f}")
+    print(f"Mean Relative Error: {mean_relative_error:.4f}, Median Relative Error: {median_relative_error:.4f}")
     
-    print(f"Processing directory: {main_dir}")
-    train_features, test_features, test_file_names, function_metadata = process_directory(main_dir)
+    # Detailed prediction analysis
+    results = []
+    for i in range(len(file_names_test)):
+        result = {
+            'file_name': file_names_test[i],
+            'actual': float(y_test_actual[i]),
+            'predicted': float(y_pred_actual[i]),
+            'error': float(y_pred_actual[i] - y_test_actual[i]),
+            'relative_error': float((y_pred_actual[i] - y_test_actual[i]) / (y_test_actual[i] + 1e-10)),
+            'absolute_error': float(abs(y_pred_actual[i] - y_test_actual[i])),
+            'percent_error': float(abs(y_pred_actual[i] - y_test_actual[i]) / (y_test_actual[i] + 1e-10) * 100)
+        }
+        results.append(result)
     
-    if train_features is None or test_features is None:
-        print("Error: Insufficient data to proceed")
-        return None
+    # Sort results by relative error
+    sorted_results = sorted(results, key=lambda x: x['relative_error'], reverse=True)
     
-    print(f"Total training samples: {len(train_features)}")
-    print(f"Total test samples: {len(test_features)}")
-    
-    if len(train_features) < 50 or len(test_features) == 0:
-        print("Error: Insufficient training data for robust model training")
-        return None
-    
-    (X_train_tensor, y_train_tensor, X_test_tensor, y_test_tensor,
-     X_train_flat, X_test_flat, y_scaler, input_size,
-     y_train_actual, y_test_actual, train_meta_df, test_meta_df, feature_names) = prepare_data_for_model(train_features, test_features)
-    
-    train_loader_hybrid, test_loader_hybrid = create_data_loaders(X_train_tensor, y_train_tensor, X_test_tensor, y_test_tensor)
-    train_loader_mlp, test_loader_mlp = create_data_loaders(X_train_flat, y_train_tensor, X_test_flat, y_test_tensor)
-    
-    hybrid_model = HybridAttentionModel(input_size=input_size)
-    mlp_model = MLPModel(input_size=input_size)
-    
-    hybrid_optimizer = optim.AdamW(hybrid_model.parameters(), lr=0.001, weight_decay=1e-4)
-    mlp_optimizer = optim.AdamW(mlp_model.parameters(), lr=0.001, weight_decay=1e-4)
-    criterion = custom_loss
-    
-    hybrid_train_losses, hybrid_val_losses = train_model(
-        hybrid_model, train_loader_hybrid, test_loader_hybrid, criterion, hybrid_optimizer,
-        model_name="Hybrid Attention Model"
-    )
-    
-    mlp_train_losses, mlp_val_losses = train_model(
-        mlp_model, train_loader_mlp, test_loader_mlp, criterion, mlp_optimizer,
-        model_name="MLP Model"
-    )
-    
-    rf_model, rf_preds_scaled = train_random_forest(
-        X_train_flat, y_train_tensor, X_test_flat, y_test_tensor, feature_names
-    )
-    
-    # Get device and ensure predictions are made on the correct device
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    # Hybrid model predictions
-    hybrid_model.eval()
-    hybrid_model.to(device)
-    with torch.no_grad():
-        hybrid_preds_scaled = hybrid_model(X_test_tensor.to(device)).detach().cpu().numpy()
-    
-    # MLP model predictions
-    mlp_model.eval()
-    mlp_model.to(device)
-    with torch.no_grad():
-        mlp_preds_scaled = mlp_model(X_test_flat.to(device)).detach().cpu().numpy()
-    
-    ensemble_preds_scaled = ensemble_predictions(
-        [hybrid_model, mlp_model, rf_model],
-        X_test_flat,
-        weights=[0.4, 0.3, 0.3]
-    )
-    
-    hybrid_y_test_actual, hybrid_y_pred_actual = evaluate_model(
-        hybrid_preds_scaled, y_test_tensor.numpy(), y_scaler, test_file_names, y_test_actual,
-        "Hybrid Attention Model"
-    )
-    
-    mlp_y_test_actual, mlp_y_pred_actual = evaluate_model(
-        mlp_preds_scaled, y_test_tensor.numpy(), y_scaler, test_file_names, y_test_actual,
-        "MLP Model"
-    )
-    
-    rf_y_test_actual, rf_y_pred_actual = evaluate_model(
-        rf_preds_scaled, y_test_tensor.numpy(), y_scaler, test_file_names, y_test_actual,
-        "Random Forest Model"
-    )
-    
-    ensemble_y_test_actual, ensemble_y_pred_actual = evaluate_model(
-        ensemble_preds_scaled, y_test_tensor.numpy(), y_scaler, test_file_names, y_test_actual,
-        "Ensemble Model"
-    )
-    
-    plot_results(hybrid_y_test_actual, hybrid_y_pred_actual, "Hybrid Attention Model")
-    plot_results(mlp_y_test_actual, mlp_y_pred_actual, "MLP Model")
-    plot_results(rf_y_test_actual, rf_y_pred_actual, "Random Forest Model")
-    plot_results(ensemble_y_test_actual, ensemble_y_pred_actual, "Ensemble Model")
+    print("\nTop 5 worst predictions (by relative error):")
+    for i in range(min(5, len(sorted_results))):
+        r = sorted_results[i]
+        print(f"{r['file_name']}: Actual={r['actual']:.4f}, Pred={r['predicted']:.4f}, Error={r['error']:.4f} ({r['percent_error']:.2f}%)")
     
     return {
-        'hybrid_model': hybrid_model,
-        'mlp_model': mlp_model,
-        'rf_model': rf_model,
-        'y_scaler': y_scaler,
-        'results': {
-            'hybrid': (hybrid_y_test_actual, hybrid_y_pred_actual),
-            'mlp': (mlp_y_test_actual, mlp_y_pred_actual),
-            'rf': (rf_y_test_actual, rf_y_pred_actual),
-            'ensemble': (ensemble_y_test_actual, ensemble_y_pred_actual)
-        }
+        'mse': mse,
+        'mae': mae,
+        'r2': r2,
+        'mean_relative_error': mean_relative_error,
+        'median_relative_error': median_relative_error,
+        'predictions': y_pred_actual,
+        'actuals': y_test_actual,
+        'detailed_results': results
     }
 
+def plot_results(train_losses, val_losses, y_actual, y_pred, results, save_path=None):
+    plt.figure(figsize=(16, 12))
+    
+    # Plot training curve
+    plt.subplot(2, 2, 1)
+    plt.plot(train_losses, label='Training Loss')
+    plt.plot(val_losses, label='Validation Loss')
+    plt.title('Training and Validation Loss')
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid(True)
+    
+    # Plot actual vs predicted values
+    plt.subplot(2, 2, 2)
+    plt.scatter(y_actual, y_pred, alpha=0.5)
+    min_val = min(np.min(y_actual), np.min(y_pred))
+    max_val = max(np.max(y_actual), np.max(y_pred))
+    plt.plot([min_val, max_val], [min_val, max_val], 'r--')
+    plt.title('Actual vs Predicted Execution Time')
+    plt.xlabel('Actual Execution Time')
+    plt.ylabel('Predicted Execution Time')
+    plt.grid(True)
+    
+    # Plot error distribution
+    errors = y_pred.flatten() - y_actual.flatten()
+    plt.subplot(2, 2, 3)
+    plt.hist(errors, bins=30, alpha=0.7)
+    plt.axvline(x=0, color='r', linestyle='--')
+    plt.title('Error Distribution')
+    plt.xlabel('Prediction Error')
+    plt.ylabel('Frequency')
+    plt.grid(True)
+    
+    # Plot relative error distribution
+    rel_errors = np.abs(errors) / (y_actual.flatten() + 1e-10) * 100
+    plt.subplot(2, 2, 4)
+    plt.hist(rel_errors, bins=30, alpha=0.7)
+    plt.title('Relative Error Distribution')
+    plt.xlabel('Relative Error (%)')
+    plt.ylabel('Frequency')
+    plt.grid(True)
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path)
+    
+    plt.show()
+
+def save_model_results(models, results, feature_names, directory="model_results"):
+    os.makedirs(directory, exist_ok=True)
+    
+    # Save metrics
+    with open(os.path.join(directory, "metrics.json"), 'w') as f:
+        json.dump({
+            'mse': results['mse'],
+            'mae': results['mae'],
+            'r2': results['r2'],
+            'mean_relative_error': results['mean_relative_error'],
+            'median_relative_error': results['median_relative_error']
+        }, f, indent=4)
+    
+    # Save detailed prediction results
+    with open(os.path.join(directory, "predictions.json"), 'w') as f:
+        json.dump(results['detailed_results'], f, indent=4)
+    
+    # Save feature importance if RF model is available
+    for model in models:
+        if hasattr(model, 'feature_importances_'):
+            feature_imp = dict(zip(feature_names, model.feature_importances_))
+            sorted_features = {k: v for k, v in sorted(feature_imp.items(), key=lambda item: item[1], reverse=True)}
+            
+            with open(os.path.join(directory, "feature_importance.json"), 'w') as f:
+                json.dump(sorted_features, f, indent=4)
+    
+    # Save models if they are PyTorch models
+    for i, model in enumerate(models):
+        if isinstance(model, nn.Module):
+            torch.save(model.state_dict(), os.path.join(directory, f"model_{i}.pt"))
+    
+    print(f"Results saved to {directory}")
+
+def set_seed(seed=42):
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+def main(data_dir, output_dir="output", test_size=15):
+    set_seed(42)
+    
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Process data
+    train_features, test_features, test_file_names, function_metadata = process_directory(data_dir, test_size)
+    
+    if train_features is None:
+        print("Error processing data. Exiting.")
+        return
+    
+    # Prepare data for modeling
+    (X_train_tensor, y_train_tensor, X_test_tensor, y_test_tensor,
+     X_train, X_test, y_scaler, input_dim, y_train_actual, y_test_actual,
+     train_meta_df, test_meta_df, feature_names) = prepare_data_for_model(train_features, test_features)
+    
+    print(f"Training set size: {len(X_train)}")
+    print(f"Test set size: {len(X_test)}")
+    
+    # Create data loaders
+    train_loader, test_loader = create_data_loaders(X_train_tensor, y_train_tensor, X_test_tensor, y_test_tensor)
+    
+    # Define models
+    models = []
+    
+    # MLP model
+    mlp_model = MLPModel(
+        input_size=input_dim,
+        hidden_sizes=[256, 128, 64, 32],
+        output_size=1,
+        dropout_rate=0.3
+    )
+    optimizer_mlp = optim.Adam(mlp_model.parameters(), lr=0.001, weight_decay=1e-5)
+    
+    # Hybrid model
+    hybrid_model = HybridAttentionModel(
+        input_size=input_dim,
+        hidden_sizes=[128, 64, 32],
+        output_size=1,
+        dropout_rate=0.3
+    )
+    optimizer_hybrid = optim.Adam(hybrid_model.parameters(), lr=0.001, weight_decay=1e-5)
+    
+    # Define loss function
+    criterion = custom_loss
+    
+    # Train models
+    mlp_train_losses, mlp_val_losses = train_model(
+        mlp_model, train_loader, test_loader, criterion, optimizer_mlp,
+        num_epochs=300, patience=40, model_name="MLP"
+    )
+    
+    hybrid_train_losses, hybrid_val_losses = train_model(
+        hybrid_model, train_loader, test_loader, criterion, optimizer_hybrid,
+        num_epochs=300, patience=40, model_name="Hybrid"
+    )
+    
+    # Train Random Forest model
+    rf_model, rf_preds = train_random_forest(X_train, y_train_tensor, X_test, y_test_tensor, feature_names)
+    
+    # Add models to ensemble
+    models.append(mlp_model)
+    models.append(hybrid_model)
+    models.append(rf_model)
+    
+    # Make ensemble predictions
+    ensemble_weights = [0.3, 0.3, 0.4]  # Weights for MLP, Hybrid, RF
+    ensemble_preds = ensemble_predictions(models, X_test_tensor, weights=ensemble_weights)
+    
+    # Evaluate final model
+    results = evaluate_model(
+        ensemble_preds, y_test_tensor, y_scaler, test_file_names, 
+        y_test_actual, model_name="Ensemble"
+    )
+    
+    # Plot results
+    plot_results(
+        mlp_train_losses, mlp_val_losses, 
+        results['actuals'], results['predictions'], 
+        results, save_path=os.path.join(output_dir, "results_plot.png")
+    )
+    
+    # Save results
+    save_model_results(models, results, feature_names, directory=output_dir)
+    
+    return models, results
+
 if __name__ == "__main__":
-    main_dir = "Tiramisu"
-    result = main(main_dir)
-    if result is not None:
-        print("\nModel training and evaluation completed!")
-        torch.save(result['hybrid_model'].state_dict(), 'hybrid_model.pth')
-        torch.save(result['mlp_model'].state_dict(), 'mlp_model.pth')
-        import joblib
-        joblib.dump(result['rf_model'], 'rf_model.pkl')
-    else:
-        print("\nModel training failed!")
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Train execution time prediction models")
+    parser.add_argument("--data_dir", type=str, required=True, help="Directory containing JSON data files")
+    parser.add_argument("--output_dir", type=str, default="output", help="Directory to save outputs")
+    parser.add_argument("--test_size", type=int, default=15, help="Number of samples to use for testing")
+    
+    args = parser.parse_args()
+    
+    main(args.data_dir, args.output_dir, args.test_size)
