@@ -12,7 +12,7 @@ import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-import random  # Added missing import
+import random
 
 def get_execution_time(schedule_data):
     if "execution_times" in schedule_data:
@@ -34,7 +34,6 @@ def extract_advanced_features(iterators, computations):
     """Extract more advanced features from program structure"""
     features = {}
     
-    # Iterator complexity metrics
     if iterators:
         max_depth = 0
         iterator_nesting = {}
@@ -51,16 +50,12 @@ def extract_advanced_features(iterators, computations):
         features['max_iterator_nesting'] = max_depth
         features['avg_iterator_nesting'] = sum(iterator_nesting.values()) / len(iterator_nesting)
     
-    # Computation complexity metrics
     if computations:
         access_patterns = []
         reduction_depths = []
         for comp_id, comp in computations.items():
-            # Analyze access patterns
             accesses = comp.get("accesses", [])
             access_patterns.extend([len(access.get("access_pattern", [])) for access in accesses])
-            
-            # Analyze reductions
             if comp.get("comp_is_reduction", False):
                 parent_it = comp.get("iterator_name")
                 depth = 0
@@ -80,7 +75,6 @@ def extract_schedule_features(schedule):
     """Extract detailed features specific to a schedule"""
     features = {}
     
-    # Transformation type counts
     transformation_types = {}
     for comp_key, comp_data in schedule.items():
         if isinstance(comp_data, dict) and "transformations_list" in comp_data:
@@ -92,23 +86,19 @@ def extract_schedule_features(schedule):
     for t_type, count in transformation_types.items():
         features[f'transform_{t_type}_count'] = count
     
-    # Tiling analysis
     if any(isinstance(comp, dict) and comp.get("tiling") for comp in schedule.values()):
         tiling_factors = []
         for comp_key, comp_data in schedule.items():
             if isinstance(comp_data, dict) and "tiling" in comp_data and comp_data["tiling"]:
                 factors = comp_data["tiling"].get("tiling_factors", [])
                 tiling_factors.extend(factors)
-                
-                # Add individual tiling factors as features
-                for i, factor in enumerate(factors[:3]):  # Limit to first 3 factors
+                for i, factor in enumerate(factors[:3]):
                     features[f'{comp_key}_tiling_factor_{i}'] = factor
         
         features['min_tiling_factor'] = min(tiling_factors) if tiling_factors else 0
         features['max_tiling_factor'] = max(tiling_factors) if tiling_factors else 0
         features['tiling_factor_product'] = np.prod(tiling_factors) if tiling_factors else 0
     
-    # Tree structure analysis
     if "tree_structure" in schedule and "roots" in schedule["tree_structure"]:
         roots = schedule["tree_structure"]["roots"]
         tree_depths = []
@@ -155,7 +145,6 @@ def extract_features_from_file(file_path):
         iterators = prog_annot.get("iterators", {})
         computations = prog_annot.get("computations", {})
         
-        # Basic features
         loop_ranges = []
         max_loop_range = 0
         for it in iterators.values():
@@ -180,16 +169,11 @@ def extract_features_from_file(file_path):
             'loop_range_product': float(np.prod(loop_ranges)) if loop_ranges else 0
         }
         
-        # Add advanced program features
         advanced_features = extract_advanced_features(iterators, computations)
         base_features.update(advanced_features)
         
-        if base_features['computation_count'] > 0:
-            base_features['avg_access_per_comp'] = base_features['access_count'] / base_features['computation_count']
-        else:
-            base_features['avg_access_per_comp'] = 0
+        base_features['avg_access_per_comp'] = base_features['access_count'] / base_features['computation_count'] if base_features['computation_count'] > 0 else 0
         
-        # Extract function-level metadata for later use
         function_metadata[func_id] = {
             'memory_size': base_features['memory_size'],
             'iterator_count': base_features['iterator_count'],
@@ -207,11 +191,9 @@ def extract_features_from_file(file_path):
             features['schedule_id'] = idx
             features['func_id'] = func_id
             
-            # Add schedule-specific features
             schedule_features = extract_schedule_features(schedule)
             features.update(schedule_features)
             
-            # Basic schedule metrics
             tiling_factors = []
             total_transformations = 0
             for comp_key, comp_data in schedule.items():
@@ -231,7 +213,6 @@ def extract_features_from_file(file_path):
                  if isinstance(comp, dict) and comp.get("tiling", {}).get("tiling_depth")), default=0
             )
             
-            # Additional metadata
             features['file_path'] = file_path
             features['file_name'] = os.path.basename(file_path)
             
@@ -262,27 +243,22 @@ def process_directory(directory_path, test_size=10, random_split=True):
         print(f"Error: Only {len(all_features)} valid schedules found in {directory_path}")
         return None, None, None, None
     
-    # Create a DataFrame for easier manipulation
     features_df = pd.DataFrame(all_features)
     
     if random_split:
-        # Random split preserving function groups
         unique_funcs = features_df['func_id'].unique()
         train_funcs, test_funcs = train_test_split(unique_funcs, test_size=min(0.2, test_size/len(features_df)))
         
         test_features_df = features_df[features_df['func_id'].isin(test_funcs)]
         train_features_df = features_df[~features_df['func_id'].isin(test_funcs)]
         
-        # Ensure we have exactly test_size samples in test set
         if len(test_features_df) > test_size:
             test_features_df = test_features_df.sample(test_size, random_state=42)
         elif len(test_features_df) < test_size and len(train_features_df) > 0:
-            # Add some samples from train to test to reach test_size
             additional_samples = train_features_df.sample(min(test_size - len(test_features_df), len(train_features_df)), random_state=42)
             test_features_df = pd.concat([test_features_df, additional_samples])
             train_features_df = train_features_df.drop(additional_samples.index)
     else:
-        # Use the last test_size samples as test data
         train_features_df = features_df.iloc[:-test_size]
         test_features_df = features_df.iloc[-test_size:]
     
@@ -298,34 +274,27 @@ def clean_and_transform_features(train_features, test_features):
     all_features_df = pd.DataFrame(train_features + test_features)
     all_features_df = all_features_df.fillna(0)
     
-    # Convert all feature names to strings to avoid issues with numeric column names
     all_features_df.columns = [str(col) for col in all_features_df.columns]
     
-    # Drop non-numeric and metadata columns before finding constant columns
     meta_columns = ['func_id', 'schedule_id', 'file_path', 'file_name']
     numeric_features_df = all_features_df.drop(columns=[col for col in meta_columns if col in all_features_df.columns])
     
-    # Find columns with very low variance or constant values
     constant_columns = [col for col in numeric_features_df.columns 
                         if col != 'execution_time' and numeric_features_df[col].nunique() <= 1]
     all_features_df = all_features_df.drop(columns=constant_columns)
     print(f"Dropped {len(constant_columns)} constant columns")
     
-    # Create additional engineered features
     all_features_df['execution_time_log'] = np.log1p(all_features_df['execution_time'])
     
-    # Create interaction features
     if 'memory_size' in all_features_df.columns and 'computation_count' in all_features_df.columns:
         all_features_df['memory_per_computation'] = all_features_df['memory_size'] / (all_features_df['computation_count'] + 1e-6)
     
     if 'total_transformation_count' in all_features_df.columns and 'computation_count' in all_features_df.columns:
         all_features_df['transformations_per_comp'] = all_features_df['total_transformation_count'] / (all_features_df['computation_count'] + 1e-6)
     
-    # Keep only numeric columns for modeling
     numeric_cols = all_features_df.select_dtypes(include=['number']).columns
     model_features_df = all_features_df[numeric_cols]
     
-    # Split back into train and test
     train_size = len(train_features)
     train_df = model_features_df.iloc[:train_size]
     test_df = model_features_df.iloc[train_size:]
@@ -335,26 +304,21 @@ def clean_and_transform_features(train_features, test_features):
 def prepare_data_for_model(train_features, test_features):
     train_df, test_df, train_meta_df, test_meta_df = clean_and_transform_features(train_features, test_features)
     
-    # Store actual execution times
     y_train_actual = train_df['execution_time'].values
     y_test_actual = test_df['execution_time'].values
     
-    # Use log-transformed target for training
     y_train = train_df['execution_time_log'].values.reshape(-1, 1)
     y_test = test_df['execution_time_log'].values.reshape(-1, 1)
     
-    # Drop target variables from features
     X_train_df = train_df.drop(['execution_time', 'execution_time_log'], axis=1, errors='ignore')
     X_test_df = test_df.drop(['execution_time', 'execution_time_log'], axis=1, errors='ignore')
     
-    # Make sure train and test have the same columns
     common_cols = set(X_train_df.columns).intersection(set(X_test_df.columns))
     X_train_df = X_train_df[list(common_cols)]
     X_test_df = X_test_df[list(common_cols)]
     
     print(f"Using {len(common_cols)} features for modeling")
     
-    # Use RobustScaler to handle outliers better
     scaler_X = RobustScaler()
     scaler_y = PowerTransformer(method='yeo-johnson')
     
@@ -363,13 +327,11 @@ def prepare_data_for_model(train_features, test_features):
     X_test_scaled = scaler_X.transform(X_test_df)
     y_test_scaled = scaler_y.transform(y_test)
     
-    # Create tensors for PyTorch
     X_train_tensor = torch.FloatTensor(X_train_scaled).unsqueeze(1)
     y_train_tensor = torch.FloatTensor(y_train_scaled)
     X_test_tensor = torch.FloatTensor(X_test_scaled).unsqueeze(1)
     y_test_tensor = torch.FloatTensor(y_test_scaled)
     
-    # Also prepare non-sequence format for alternative models
     X_train_flat = torch.FloatTensor(X_train_scaled)
     X_test_flat = torch.FloatTensor(X_test_scaled)
     
@@ -383,16 +345,13 @@ class HybridAttentionModel(nn.Module):
     def __init__(self, input_size, hidden_sizes=[128, 64, 32], output_size=1, dropout_rate=0.3):
         super(HybridAttentionModel, self).__init__()
         
-        # LSTM branch
         self.lstm = nn.LSTM(input_size, hidden_sizes[0], batch_first=True, bidirectional=True)
         self.lstm_attention = nn.Linear(hidden_sizes[0] * 2, 1)
         
-        # CNN branch
         self.conv1 = nn.Conv1d(1, 32, kernel_size=3, padding=1)
         self.conv2 = nn.Conv1d(32, 64, kernel_size=3, padding=1)
         self.max_pool = nn.AdaptiveMaxPool1d(1)
         
-        # Fully connected layers
         combined_size = hidden_sizes[0] * 2 + 64
         self.fc1 = nn.Linear(combined_size, hidden_sizes[1])
         self.bn1 = nn.BatchNorm1d(hidden_sizes[1])
@@ -400,7 +359,6 @@ class HybridAttentionModel(nn.Module):
         self.bn2 = nn.BatchNorm1d(hidden_sizes[2])
         self.fc3 = nn.Linear(hidden_sizes[2], output_size)
         
-        # Other layers
         self.dropout = nn.Dropout(dropout_rate)
         self.leaky_relu = nn.LeakyReLU(0.2)
         self.silu = nn.SiLU()
@@ -409,22 +367,18 @@ class HybridAttentionModel(nn.Module):
         batch_size = x.size(0)
         seq_len = x.size(1)
         
-        # LSTM branch with attention
         lstm_out, _ = self.lstm(x)
         attention_weights = torch.softmax(self.lstm_attention(lstm_out), dim=1)
         lstm_attn_out = torch.sum(attention_weights * lstm_out, dim=1)
         
-        # CNN branch
         x_cnn = x.view(batch_size, 1, -1)
         cnn_out = self.leaky_relu(self.conv1(x_cnn))
         cnn_out = self.leaky_relu(self.conv2(cnn_out))
         cnn_out = self.max_pool(cnn_out).squeeze(2)
         
-        # Combine branches
         combined = torch.cat((lstm_attn_out, cnn_out), dim=1)
         combined = self.dropout(combined)
         
-        # Fully connected layers
         fc_out = self.silu(self.bn1(self.fc1(combined)))
         fc_out = self.dropout(fc_out)
         fc_out = self.silu(self.bn2(self.fc2(fc_out)))
@@ -449,7 +403,6 @@ class MLPModel(nn.Module):
         self.output_layer = nn.Linear(layer_sizes[-1], output_size)
     
     def forward(self, x):
-        # If input is 3D (batch_size, seq_len, features), flatten it
         if x.dim() == 3:
             x = x.view(x.size(0), -1)
         
@@ -459,7 +412,6 @@ class MLPModel(nn.Module):
         return self.output_layer(x)
 
 def custom_loss(y_pred, y_true, alpha=0.85):
-    # Combine MSE and Huber loss
     mse_loss = torch.mean(torch.square(y_pred - y_true))
     huber_loss = torch.nn.functional.smooth_l1_loss(y_pred, y_true)
     return alpha * mse_loss + (1 - alpha) * huber_loss
@@ -525,7 +477,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
         if (epoch + 1) % 10 == 0:
             print(f'Epoch {epoch+1}/{num_epochs}, {model_name} - Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}, LR: {optimizer.param_groups[0]["lr"]:.6f}')
         
-        if val_loss < best_val_loss * 0.995 and not np.isnan(val_loss):  # 0.5% improvement threshold
+        if val_loss < best_val_loss * 0.995 and not np.isnan(val_loss):
             best_val_loss = val_loss
             epochs_no_improve = 0
             best_model_state = model.state_dict().copy()
@@ -538,7 +490,6 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
                 model.load_state_dict(best_model_state)
             break
         
-        # Learning rate annealing - reduce learning rate at later epochs
         if epoch > num_epochs * 0.7 and optimizer.param_groups[0]['lr'] > 1e-5:
             for param_group in optimizer.param_groups:
                 param_group['lr'] *= 0.95
@@ -548,7 +499,6 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
     return train_losses, val_losses
 
 def train_random_forest(X_train, y_train, X_test, y_test, feature_names):
-    # Convert to numpy for sklearn model
     if isinstance(X_train, torch.Tensor):
         X_train = X_train.numpy()
     if isinstance(y_train, torch.Tensor):
@@ -558,7 +508,6 @@ def train_random_forest(X_train, y_train, X_test, y_test, feature_names):
     if isinstance(y_test, torch.Tensor):
         y_test = y_test.numpy()
     
-    # Ensure correct shape
     if y_train.ndim > 1:
         y_train = y_train.squeeze()
     if y_test.ndim > 1:
@@ -576,7 +525,6 @@ def train_random_forest(X_train, y_train, X_test, y_test, feature_names):
     
     rf_model.fit(X_train, y_train)
     
-    # Feature importance analysis
     feature_importances = rf_model.feature_importances_
     feature_importance_dict = dict(zip(feature_names, feature_importances))
     sorted_features = sorted(feature_importance_dict.items(), key=lambda x: x[1], reverse=True)
@@ -585,10 +533,8 @@ def train_random_forest(X_train, y_train, X_test, y_test, feature_names):
     for feature, importance in sorted_features[:10]:
         print(f"{feature}: {importance:.4f}")
     
-    # Predict on test set
     y_pred = rf_model.predict(X_test)
     
-    # Calculate error metrics
     mse = mean_squared_error(y_test, y_pred)
     mae = mean_absolute_error(y_test, y_pred)
     r2 = r2_score(y_test, y_pred)
@@ -598,7 +544,6 @@ def train_random_forest(X_train, y_train, X_test, y_test, feature_names):
     return rf_model, y_pred
 
 def ensemble_predictions(models, X_test, weights=None):
-    """Ensemble predictions from multiple models with optional weighting"""
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     all_preds = []
     
@@ -612,25 +557,20 @@ def ensemble_predictions(models, X_test, weights=None):
                     preds = model(X_test_device).cpu().numpy()
                 else:
                     raise ValueError("X_test must be a tensor for PyTorch models")
-        else:  # Assume sklearn model
+        else:
             preds = model.predict(X_test)
         all_preds.append(preds)
     
-    # Apply weights if provided
     if weights is None:
         weights = [1/len(models)] * len(models)
     
-    # Ensure weights sum to 1
     weights = np.array(weights) / sum(weights)
     
-    # Compute weighted average
     ensemble_preds = np.average(all_preds, axis=0, weights=weights)
     
     return ensemble_preds
 
 def evaluate_model(predictions, y_test, y_scaler, file_names_test, y_test_actual, model_name="Model"):
-    """Evaluate predictions and print results"""
-    # Convert predictions back to original scale
     if predictions.ndim > 1:
         predictions = predictions.squeeze()
     y_test_scaled = y_test.squeeze()
@@ -641,7 +581,6 @@ def evaluate_model(predictions, y_test, y_scaler, file_names_test, y_test_actual
     y_pred_actual = np.expm1(np.clip(y_pred_transformed, 0, None))
     y_test_actual_pred = np.expm1(y_test_transformed)
     
-    # Use actual execution times from original data for comparison
     y_test_actual = y_test_actual.reshape(-1)
     
     print(f"\n{model_name} Evaluation Results:")
@@ -665,7 +604,6 @@ def evaluate_model(predictions, y_test, y_scaler, file_names_test, y_test_actual
     return y_test_actual, y_pred_actual.flatten()
 
 def plot_results(y_test_actual, y_pred_actual, model_name):
-    """Plot actual vs predicted values"""
     plt.figure(figsize=(10, 6))
     plt.scatter(y_test_actual, y_pred_actual, alpha=0.5)
     plt.plot([min(y_test_actual), max(y_test_actual)], 
@@ -703,20 +641,16 @@ def main(main_dir):
      X_train_flat, X_test_flat, y_scaler, input_size,
      y_train_actual, y_test_actual, train_meta_df, test_meta_df, feature_names) = prepare_data_for_model(train_features, test_features)
     
-    # Create data loaders
     train_loader_hybrid, test_loader_hybrid = create_data_loaders(X_train_tensor, y_train_tensor, X_test_tensor, y_test_tensor)
     train_loader_mlp, test_loader_mlp = create_data_loaders(X_train_flat, y_train_tensor, X_test_flat, y_test_tensor)
     
-    # Initialize models
     hybrid_model = HybridAttentionModel(input_size=input_size)
     mlp_model = MLPModel(input_size=input_size)
     
-    # Define optimizers and criterion
     hybrid_optimizer = optim.AdamW(hybrid_model.parameters(), lr=0.001, weight_decay=1e-4)
     mlp_optimizer = optim.AdamW(mlp_model.parameters(), lr=0.001, weight_decay=1e-4)
     criterion = custom_loss
     
-    # Train models
     hybrid_train_losses, hybrid_val_losses = train_model(
         hybrid_model, train_loader_hybrid, test_loader_hybrid, criterion, hybrid_optimizer,
         model_name="Hybrid Attention Model"
@@ -727,23 +661,31 @@ def main(main_dir):
         model_name="MLP Model"
     )
     
-    # Train Random Forest
     rf_model, rf_preds_scaled = train_random_forest(
         X_train_flat, y_train_tensor, X_test_flat, y_test_tensor, feature_names
     )
     
-    # Get individual predictions
-    hybrid_preds_scaled = hybrid_model(X_test_tensor).detach().cpu().numpy()
-    mlp_preds_scaled = mlp_model(X_test_flat).detach().cpu().numpy()
+    # Get device and ensure predictions are made on the correct device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    # Ensemble predictions (equal weights for simplicity)
+    # Hybrid model predictions
+    hybrid_model.eval()
+    hybrid_model.to(device)
+    with torch.no_grad():
+        hybrid_preds_scaled = hybrid_model(X_test_tensor.to(device)).detach().cpu().numpy()
+    
+    # MLP model predictions
+    mlp_model.eval()
+    mlp_model.to(device)
+    with torch.no_grad():
+        mlp_preds_scaled = mlp_model(X_test_flat.to(device)).detach().cpu().numpy()
+    
     ensemble_preds_scaled = ensemble_predictions(
         [hybrid_model, mlp_model, rf_model],
-        X_test_flat,  # Use flat format as RF requires it
-        weights=[0.4, 0.3, 0.3]  # Weight hybrid higher as it's more complex
+        X_test_flat,
+        weights=[0.4, 0.3, 0.3]
     )
     
-    # Evaluate all models
     hybrid_y_test_actual, hybrid_y_pred_actual = evaluate_model(
         hybrid_preds_scaled, y_test_tensor.numpy(), y_scaler, test_file_names, y_test_actual,
         "Hybrid Attention Model"
@@ -764,7 +706,6 @@ def main(main_dir):
         "Ensemble Model"
     )
     
-    # Plot results
     plot_results(hybrid_y_test_actual, hybrid_y_pred_actual, "Hybrid Attention Model")
     plot_results(mlp_y_test_actual, mlp_y_pred_actual, "MLP Model")
     plot_results(rf_y_test_actual, rf_y_pred_actual, "Random Forest Model")
@@ -788,7 +729,6 @@ if __name__ == "__main__":
     result = main(main_dir)
     if result is not None:
         print("\nModel training and evaluation completed!")
-        # Optionally save models
         torch.save(result['hybrid_model'].state_dict(), 'hybrid_model.pth')
         torch.save(result['mlp_model'].state_dict(), 'mlp_model.pth')
         import joblib
