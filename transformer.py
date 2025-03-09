@@ -13,7 +13,7 @@ import random
 def get_execution_time(schedule_data):
     if "execution_times" in schedule_data:
         exec_times = schedule_data["execution_times"]
-        filtered_times = [t for t in exec_times if t > 0]  # Filter out invalid times
+        filtered_times = [t for t in exec_times if t > 0]
         return float(np.median(filtered_times)) if filtered_times else None
     print("Warning: No valid execution times found in schedule")
     return None
@@ -88,7 +88,6 @@ def extract_features_from_file(file_path):
                         parallel_factors.append(1)
                     comp_features.append(comp_dict)
             
-            # Aggregate computation-level features into sequence
             features['seq_tiling'] = [cf['tiling'] for cf in comp_features]
             features['seq_unroll'] = [cf['unroll'] for cf in comp_features]
             features['seq_parallel'] = [cf['parallel'] for cf in comp_features]
@@ -115,7 +114,6 @@ def extract_features_from_file(file_path):
                      for root in roots), default=0
                 )
             
-            # Additional features
             features['memory_access_ratio'] = features['memory_size'] * features['access_count']
             features['comp_transform_interaction'] = features['computation_count'] * features['total_transformation_count']
             features['tiling_parallel_product'] = features['tiling_count'] * features['parallel_count']
@@ -160,14 +158,12 @@ def clean_and_transform_features(train_features, test_features):
     all_features_df = pd.DataFrame(train_features + test_features)
     all_features_df = all_features_df.fillna(0)
     
-    # Drop constant columns
     constant_columns = [col for col in all_features_df.columns 
                         if col not in ['execution_time', 'log_execution_time', 'seq_tiling', 'seq_unroll', 'seq_parallel', 'seq_transform_count']
                         and all_features_df[col].nunique() == 1]
     all_features_df = all_features_df.drop(columns=constant_columns)
     print(f"Dropped {len(constant_columns)} constant columns")
     
-    # Log-transform positive scalar features
     for col in all_features_df.columns:
         if col not in ['execution_time', 'log_execution_time', 'seq_tiling', 'seq_unroll', 'seq_parallel', 'seq_transform_count']:
             if all_features_df[col].min() >= 0 and all_features_df[col].max() > 0:
@@ -210,9 +206,13 @@ def prepare_data_for_model(train_features, test_features):
     X_train_scalar = scaler_X.fit_transform(train_df[scalar_cols])
     X_test_scalar = scaler_X.transform(test_df[scalar_cols])
     
+    # Broadcast scalar features to match sequence length
+    X_train_scalar_expanded = np.tile(X_train_scalar[:, np.newaxis, :], (1, max_seq_len, 1))
+    X_test_scalar_expanded = np.tile(X_test_scalar[:, np.newaxis, :], (1, max_seq_len, 1))
+    
     # Combine sequence and scalar features
-    X_train = np.concatenate([X_train_seq, X_train_scalar[:, :, np.newaxis]], axis=2)
-    X_test = np.concatenate([X_test_seq, X_test_scalar[:, :, np.newaxis]], axis=2)
+    X_train = np.concatenate([X_train_seq, X_train_scalar_expanded], axis=2)
+    X_test = np.concatenate([X_test_seq, X_test_scalar_expanded], axis=2)
     
     y_train = train_df['log_execution_time'].values.reshape(-1, 1)
     y_test = test_df['log_execution_time'].values.reshape(-1, 1)
