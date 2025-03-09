@@ -3,13 +3,14 @@ import json
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
+from sklearn.feature_selection import VarianceThreshold
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.optim.lr_scheduler import ReduceLROnPlateau, LambdaLR
 import random
-import matplotlib.pyplot as plt  # Added for plotting
+import matplotlib.pyplot as plt
 
 def get_execution_time(schedule_data):
     if "execution_times" in schedule_data:
@@ -156,17 +157,22 @@ def clean_and_transform_features(train_features, test_features):
     all_features_df = pd.DataFrame(train_features + test_features)
     all_features_df = all_features_df.fillna(0)
     
+    # Remove constant columns
     constant_columns = [col for col in all_features_df.columns 
                         if col not in ['execution_time', 'log_execution_time'] and all_features_df[col].nunique() == 1]
     all_features_df = all_features_df.drop(columns=constant_columns)
     print(f"Dropped {len(constant_columns)} constant columns")
     
+    # Log transform positive features
     for col in all_features_df.columns:
         if col not in ['execution_time', 'log_execution_time'] and all_features_df[col].min() >= 0 and all_features_df[col].max() > 0:
             all_features_df[f'{col}_log'] = np.log1p(all_features_df[col])
     
+    # Remove low-variance features
     numeric_cols = all_features_df.select_dtypes(include=['number']).columns
-    all_features_df = all_features_df[numeric_cols]
+    vt = VarianceThreshold(threshold=0.01)
+    all_features_df[numeric_cols] = vt.fit_transform(all_features_df[numeric_cols])
+    all_features_df = all_features_df.loc[:, ~all_features_df.columns.duplicated()]
     
     train_size = len(train_features)
     train_df = all_features_df.iloc[:train_size]
@@ -200,12 +206,12 @@ def prepare_data_for_model(train_features, test_features):
     return X_train_tensor, y_train_tensor, X_test_tensor, y_test_tensor, scaler_y, X_train_scaled.shape[1]
 
 class EnhancedLSTMModel(nn.Module):
-    def __init__(self, input_size, hidden_sizes=[256, 128, 64], output_size=1, dropout_rate=0.4):
+    def __init__(self, input_size, hidden_sizes=[512, 256, 128], output_size=1, dropout_rate=0.5):
         super(EnhancedLSTMModel, self).__init__()
         
-        self.lstm1 = nn.LSTM(input_size, hidden_sizes[0], batch_first=True, bidirectional=True)
-        self.lstm2 = nn.LSTM(hidden_sizes[0]*2, hidden_sizes[1], batch_first=True, bidirectional=True)
-        self.lstm3 = nn.LSTM(hidden_sizes[1]*2, hidden_sizes[2], batch_first=True)
+        self.lstm1 = nn.LSTM(input_size, hidden_sizes[0], batch_first=True, bidirectional=True, dropout=0.2)
+        self.lstm2 = nn.LSTM(hidden_sizes[0]*2, hidden_sizes[1], batch_first=True, bidirectional=True, dropout=0.2)
+        self.lstm3 = nn.LSTM(hidden_sizes[1]*2, hidden_sizes[2], batch_first=True, dropout=0.2)
         self.attention = nn.Linear(hidden_sizes[2], 1)
         self.dropout = nn.Dropout(dropout_rate)
         self.fc1 = nn.Linear(hidden_sizes[2], hidden_sizes[2]//2)
@@ -249,14 +255,22 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
     print(f"Using device: {device}")
     model.to(device)
     
+    # Learning rate warmup scheduler
+    def lr_lambda(current_step):
+        warmup_steps = 10
+        if current_step < warmup_steps:
+            return current_step / warmup_steps
+        return 1.0
+    
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.3, patience=20, verbose=True, min_lr=1e-7)
+    warmup_scheduler = LambdaLR(optimizer, lr_lambda)
     
     best_val_loss = float('inf')
     epochs_no_improve = 0
     best_model_state = None
     train_losses = []
     val_losses = []
-    learning_rates = []  # Track learning rate over epochs
+    learning_rates = []
     
     for epoch in range(num_epochs):
         model.train()
@@ -274,6 +288,9 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
             optimizer.step()
             running_loss += loss.item() * inputs.size(0)
         
+        if epoch < 10:  # Warmup for first 10 epochs
+            warmup_scheduler.step()
+        
         train_loss = running_loss / len(train_loader.dataset)
         train_losses.append(train_loss)
         
@@ -289,7 +306,6 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
         val_loss /= len(test_loader.dataset)
         val_losses.append(val_loss)
         
-        # Record current learning rate
         current_lr = optimizer.param_groups[0]['lr']
         learning_rates.append(current_lr)
         
@@ -313,7 +329,6 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
     if best_model_state is not None:
         model.load_state_dict(best_model_state)
     
-    # Save training metrics to JSON
     metrics = {
         'train_losses': train_losses,
         'val_losses': val_losses,
@@ -326,10 +341,9 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
     return train_losses, val_losses, learning_rates
 
 def plot_metrics(train_losses, val_losses, learning_rates):
-    """Generate and save plots for training metrics."""
     epochs = range(1, len(train_losses) + 1)
     
-    # Plot 1: Training and Validation Loss
+    # Loss Plot
     plt.figure(figsize=(10, 6))
     plt.plot(epochs, train_losses, label='Training Loss', color='blue')
     plt.plot(epochs, val_losses, label='Validation Loss', color='orange')
@@ -342,13 +356,13 @@ def plot_metrics(train_losses, val_losses, learning_rates):
     plt.close()
     print("Loss plot saved as 'loss_plot.png'")
     
-    # Plot 2: Learning Rate
+    # Learning Rate Plot
     plt.figure(figsize=(10, 6))
     plt.plot(epochs, learning_rates, label='Learning Rate', color='green')
     plt.xlabel('Epoch')
     plt.ylabel('Learning Rate')
     plt.title('Learning Rate Over Epochs')
-    plt.yscale('log')  # Log scale for better visibility of LR changes
+    plt.yscale('log')
     plt.legend()
     plt.grid(True)
     plt.savefig('lr_plot.png')
@@ -390,10 +404,18 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test):
     print(f"MAE: {mae:.6f}")
     print(f"MAPE: {mape:.2f}%")
     
+    # Additional diagnostics
+    residuals = y_test_actual - y_pred_actual
+    print(f"\nDiagnostics:")
+    print(f"Mean Residual: {np.mean(residuals):.6f}")
+    print(f"Std of Residuals: {np.std(residuals):.6f}")
+    
     return y_test_actual, y_pred_actual
 
 def main(main_dir):
     random.seed(42)
+    torch.manual_seed(42)
+    np.random.seed(42)
     
     print(f"Processing directory: {main_dir}")
     train_features, test_features, test_file_names = process_directory(main_dir)
@@ -415,13 +437,13 @@ def main(main_dir):
     
     model = EnhancedLSTMModel(
         input_size=input_size,
-        hidden_sizes=[256, 128, 64],
+        hidden_sizes=[512, 256, 128],
         output_size=1,
-        dropout_rate=0.4
+        dropout_rate=0.5
     )
     
     criterion = custom_loss
-    optimizer = optim.AdamW(model.parameters(), lr=0.0001, weight_decay=1e-4)
+    optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-4)
     
     print("Building and training Enhanced LSTM model...")
     train_losses, val_losses, learning_rates = train_model(model, train_loader, test_loader, criterion, optimizer)
@@ -430,7 +452,6 @@ def main(main_dir):
         print("Training failed due to NaN losses")
         return None
     
-    # Generate and save plots
     plot_metrics(train_losses, val_losses, learning_rates)
     
     print("\nEvaluating model:")
