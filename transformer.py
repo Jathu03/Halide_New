@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader, SubsetRandomSampler
-from torch.optim.lr_scheduler import ReduceLROnPlateau, CyclicLR
+from torch.optim.lr_scheduler import CyclicLR
 import random
 import matplotlib.pyplot as plt
 from sklearn.model_selection import KFold
@@ -54,7 +54,6 @@ def extract_features_from_file(file_path):
             except (ValueError, TypeError):
                 continue
         
-        # Avoid division by zero by using max(1, denominator)
         base_features = {
             'memory_size': prog_annot.get("memory_size", 0),
             'iterator_count': len(iterators),
@@ -129,7 +128,6 @@ def extract_features_from_file(file_path):
             features['tiling_parallel_interaction'] = features['tiling_count'] * features['parallel_count']
             features['memory_per_access'] = features['memory_size'] / max(features['access_count'], 1)
             features['transformations_per_comp'] = features['total_transformation_count'] / max(features['computation_count'], 1)
-            # Handle potential inf in execution_time_norm
             exec_times = [f['execution_time'] for f in all_features if f['execution_time'] > 0]
             mean_exec = np.mean(exec_times) if exec_times else 0
             std_exec = np.std(exec_times) if exec_times else 1
@@ -173,33 +171,27 @@ def clean_and_transform_features(train_features, test_features):
     all_features_df = pd.DataFrame(train_features + test_features)
     all_features_df = all_features_df.fillna(0)
     
-    # Remove constant columns
     constant_columns = [col for col in all_features_df.columns 
                         if col not in ['execution_time', 'log_execution_time'] and all_features_df[col].nunique() == 1]
     all_features_df = all_features_df.drop(columns=constant_columns)
     print(f"Dropped {len(constant_columns)} constant columns")
     
-    # Log transform positive features, avoiding inf
     for col in all_features_df.columns:
         if col not in ['execution_time', 'log_execution_time'] and all_features_df[col].min() >= 0 and all_features_df[col].max() > 0:
             all_features_df[f'{col}_log'] = np.log1p(all_features_df[col].replace([np.inf, -np.inf], 0))
     
-    # Replace inf and -inf with large finite numbers
     numeric_cols = all_features_df.select_dtypes(include=['number']).columns
     all_features_df[numeric_cols] = all_features_df[numeric_cols].replace([np.inf, -np.inf], np.finfo(np.float64).max)
     
-    # Handle outliers with RobustScaler
     scaler = RobustScaler()
     all_features_df[numeric_cols] = scaler.fit_transform(all_features_df[numeric_cols])
     
-    # Remove low-variance features
     vt = VarianceThreshold(threshold=0.01)
     transformed_data = vt.fit_transform(all_features_df[numeric_cols])
     selected_feature_indices = vt.get_support(indices=True)
     selected_numeric_cols = numeric_cols[selected_feature_indices]
     all_features_df = pd.DataFrame(transformed_data, columns=selected_numeric_cols, index=all_features_df.index)
     
-    # Ensure no duplicate columns
     all_features_df = all_features_df.loc[:, ~all_features_df.columns.duplicated()]
     
     train_size = len(train_features)
@@ -237,11 +229,12 @@ class EnhancedLSTMModel(nn.Module):
     def __init__(self, input_size, hidden_sizes=[512, 256, 128], output_size=1, dropout_rate=0.5):
         super(EnhancedLSTMModel, self).__init__()
         
-        self.lstm1 = nn.LSTM(input_size, hidden_sizes[0], batch_first=True, bidirectional=True, dropout=0.2)
+        # Increased num_layers to 2 to allow dropout
+        self.lstm1 = nn.LSTM(input_size, hidden_sizes[0], num_layers=2, batch_first=True, bidirectional=True, dropout=0.2)
         self.ln1 = nn.LayerNorm(hidden_sizes[0] * 2)
-        self.lstm2 = nn.LSTM(hidden_sizes[0]*2, hidden_sizes[1], batch_first=True, bidirectional=True, dropout=0.2)
+        self.lstm2 = nn.LSTM(hidden_sizes[0]*2, hidden_sizes[1], num_layers=2, batch_first=True, bidirectional=True, dropout=0.2)
         self.ln2 = nn.LayerNorm(hidden_sizes[1] * 2)
-        self.lstm3 = nn.LSTM(hidden_sizes[1]*2, hidden_sizes[2], batch_first=True, dropout=0.2)
+        self.lstm3 = nn.LSTM(hidden_sizes[1]*2, hidden_sizes[2], num_layers=2, batch_first=True, dropout=0.2)
         self.ln3 = nn.LayerNorm(hidden_sizes[2])
         self.attention = nn.Linear(hidden_sizes[2], 1)
         self.dropout = nn.Dropout(dropout_rate)
@@ -299,7 +292,8 @@ def train_model(model, train_loader, val_loader, test_loader, criterion, optimiz
     print(f"Using device: {device}")
     model.to(device)
     
-    scheduler = CyclicLR(optimizer, base_lr=0.0001, max_lr=0.001, step_size_up=10, mode='triangular')
+    # Set cycle_momentum=False to work with AdamW
+    scheduler = CyclicLR(optimizer, base_lr=0.0001, max_lr=0.001, step_size_up=10, mode='triangular', cycle_momentum=False)
     
     best_val_loss = float('inf')
     epochs_no_improve = 0
@@ -381,7 +375,6 @@ def plot_metrics(train_losses, val_losses, learning_rates, y_test_actual, y_pred
     val_losses_smooth = np.convolve(val_losses, np.ones(window_size)/window_size, mode='valid')
     epochs_smooth = epochs[:len(train_losses_smooth)]
     
-    # Loss Plot
     plt.figure(figsize=(12, 7))
     plt.plot(epochs_smooth, train_losses_smooth, label='Training Loss (Smoothed)', color='blue', linewidth=2)
     plt.plot(epochs_smooth, val_losses_smooth, label='Validation Loss (Smoothed)', color='orange', linewidth=2)
@@ -397,7 +390,6 @@ def plot_metrics(train_losses, val_losses, learning_rates, y_test_actual, y_pred
     plt.close()
     print("Loss plot saved as 'loss_plot.png'")
     
-    # Learning Rate Plot
     plt.figure(figsize=(12, 7))
     plt.plot(epochs, learning_rates, label='Learning Rate', color='green', linewidth=2)
     plt.xlabel('Epoch')
@@ -410,7 +402,6 @@ def plot_metrics(train_losses, val_losses, learning_rates, y_test_actual, y_pred
     plt.close()
     print("Learning rate plot saved as 'lr_plot.png'")
     
-    # Residual Plot
     if y_test_actual is not None and y_pred_actual is not None:
         residuals = y_test_actual - y_pred_actual
         plt.figure(figsize=(12, 7))
