@@ -171,7 +171,16 @@ def clean_and_transform_features(train_features, test_features):
     # Remove low-variance features
     numeric_cols = all_features_df.select_dtypes(include=['number']).columns
     vt = VarianceThreshold(threshold=0.01)
-    all_features_df[numeric_cols] = vt.fit_transform(all_features_df[numeric_cols])
+    transformed_data = vt.fit_transform(all_features_df[numeric_cols])
+    
+    # Update numeric_cols to reflect the selected features
+    selected_feature_indices = vt.get_support(indices=True)
+    selected_numeric_cols = numeric_cols[selected_feature_indices]
+    
+    # Create a new DataFrame with transformed data
+    all_features_df = pd.DataFrame(transformed_data, columns=selected_numeric_cols, index=all_features_df.index)
+    
+    # Ensure no duplicate columns
     all_features_df = all_features_df.loc[:, ~all_features_df.columns.duplicated()]
     
     train_size = len(train_features)
@@ -255,7 +264,6 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
     print(f"Using device: {device}")
     model.to(device)
     
-    # Learning rate warmup scheduler
     def lr_lambda(current_step):
         warmup_steps = 10
         if current_step < warmup_steps:
@@ -288,7 +296,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
             optimizer.step()
             running_loss += loss.item() * inputs.size(0)
         
-        if epoch < 10:  # Warmup for first 10 epochs
+        if epoch < 10:
             warmup_scheduler.step()
         
         train_loss = running_loss / len(train_loader.dataset)
@@ -404,7 +412,6 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test):
     print(f"MAE: {mae:.6f}")
     print(f"MAPE: {mape:.2f}%")
     
-    # Additional diagnostics
     residuals = y_test_actual - y_pred_actual
     print(f"\nDiagnostics:")
     print(f"Mean Residual: {np.mean(residuals):.6f}")
