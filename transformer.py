@@ -40,11 +40,20 @@ def extract_features_from_file(file_path):
         computations = prog_annot.get("computations", {})
         
         loop_ranges = []
+        valid_skew_values = []
         for it in iterators.values():
             lower = it.get("lower_bound")
             upper = it.get("upper_bound")
-            if isinstance(lower, (int, float)) and isinstance(upper, (int, float)):
-                loop_ranges.append(upper - lower)
+            # Convert to float if possible, skip if conversion fails
+            try:
+                lower = float(lower) if lower is not None and str(lower).replace('.', '').replace('-', '').isdigit() else 0.0
+                upper = float(upper) if upper is not None and str(upper).replace('.', '').replace('-', '').isdigit() else 0.0
+                if isinstance(lower, (int, float)) and isinstance(upper, (int, float)):
+                    range_val = upper - lower
+                    loop_ranges.append(range_val)
+                    valid_skew_values.append(range_val ** 3)
+            except (ValueError, TypeError):
+                continue
         
         base_features = {
             'memory_size': prog_annot.get("memory_size", 0),
@@ -57,9 +66,7 @@ def extract_features_from_file(file_path):
             'memory_per_computation': prog_annot.get("memory_size", 0) / max(len(computations), 1),
             'loop_range_std': float(np.std(loop_ranges)) if loop_ranges else 0,
             'access_per_iterator': sum(len(comp.get("accesses", [])) for comp in computations.values()) / max(len(iterators), 1),
-            'loop_range_skew': float(np.mean([(upper - lower) ** 3 for it in iterators.values() 
-                                            if isinstance(it.get("lower_bound"), (int, float)) and isinstance(it.get("upper_bound"), (int, float))]) 
-                                   if loop_ranges else 0)  # New feature: skewness
+            'loop_range_skew': float(np.mean(valid_skew_values)) if valid_skew_values else 0  # Use valid_skew_values
         }
         base_features['avg_access_per_comp'] = base_features['access_count'] / max(base_features['computation_count'], 1)
         
@@ -122,7 +129,7 @@ def extract_features_from_file(file_path):
             features['tiling_parallel_interaction'] = features['tiling_count'] * features['parallel_count']
             features['memory_per_access'] = features['memory_size'] / max(features['access_count'], 1)
             features['transformations_per_comp'] = features['total_transformation_count'] / max(features['computation_count'], 1)
-            features['execution_time_norm'] = (execution_time - np.mean([f['execution_time'] for f in all_features])) / np.std([f['execution_time'] for f in all_features]) if all_features else 0  # New feature
+            features['execution_time_norm'] = (execution_time - np.mean([f['execution_time'] for f in all_features])) / np.std([f['execution_time'] for f in all_features]) if all_features else 0
             
             all_features.append(features)
     
@@ -265,7 +272,6 @@ def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=64, val_spl
     dataset = TensorDataset(X_train, y_train)
     test_dataset = TensorDataset(X_test, y_test)
     
-    # Create validation split
     n_samples = len(dataset)
     indices = list(range(n_samples))
     val_size = int(np.floor(val_split * n_samples))
@@ -286,7 +292,6 @@ def train_model(model, train_loader, val_loader, test_loader, criterion, optimiz
     print(f"Using device: {device}")
     model.to(device)
     
-    # Cyclic learning rate scheduler
     scheduler = CyclicLR(optimizer, base_lr=0.0001, max_lr=0.001, step_size_up=10, mode='triangular')
     
     best_val_loss = float('inf')
@@ -364,7 +369,6 @@ def train_model(model, train_loader, val_loader, test_loader, criterion, optimiz
 def plot_metrics(train_losses, val_losses, learning_rates, y_test_actual, y_pred_actual):
     epochs = range(1, len(train_losses) + 1)
     
-    # Smoothed losses for better visualization
     window_size = 5
     train_losses_smooth = np.convolve(train_losses, np.ones(window_size)/window_size, mode='valid')
     val_losses_smooth = np.convolve(val_losses, np.ones(window_size)/window_size, mode='valid')
@@ -400,17 +404,18 @@ def plot_metrics(train_losses, val_losses, learning_rates, y_test_actual, y_pred
     print("Learning rate plot saved as 'lr_plot.png'")
     
     # Residual Plot
-    residuals = y_test_actual - y_pred_actual
-    plt.figure(figsize=(12, 7))
-    plt.scatter(range(len(residuals)), residuals, color='purple', alpha=0.5)
-    plt.axhline(y=0, color='red', linestyle='--')
-    plt.xlabel('Test Sample Index')
-    plt.ylabel('Residual (Actual - Predicted)')
-    plt.title('Residual Plot for Prediction Errors')
-    plt.grid(True)
-    plt.savefig('residual_plot.png')
-    plt.close()
-    print("Residual plot saved as 'residual_plot.png'")
+    if y_test_actual is not None and y_pred_actual is not None:
+        residuals = y_test_actual - y_pred_actual
+        plt.figure(figsize=(12, 7))
+        plt.scatter(range(len(residuals)), residuals, color='purple', alpha=0.5)
+        plt.axhline(y=0, color='red', linestyle='--')
+        plt.xlabel('Test Sample Index')
+        plt.ylabel('Residual (Actual - Predicted)')
+        plt.title('Residual Plot for Prediction Errors')
+        plt.grid(True)
+        plt.savefig('residual_plot.png')
+        plt.close()
+        print("Residual plot saved as 'residual_plot.png'")
 
 def evaluate_model(model, X_test, y_test, y_scaler, file_names_test):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -501,7 +506,6 @@ def main(main_dir):
     
     X_train, y_train, X_test, y_test, y_scaler, input_size = prepare_data_for_model(train_features, test_features)
     
-    # Perform k-fold cross-validation
     print("\nPerforming 5-fold cross-validation...")
     k_fold_cross_validate(EnhancedLSTMModel, X_train, y_train)
     
@@ -519,7 +523,7 @@ def main(main_dir):
         print("Training failed due to NaN losses")
         return None
     
-    plot_metrics(train_losses, val_losses, learning_rates, None, None)  # Update with actual y_test_actual, y_pred_actual later
+    plot_metrics(train_losses, val_losses, learning_rates, None, None)
     
     print("\nEvaluating model:")
     y_test_actual, y_pred_actual = evaluate_model(model, X_test, y_test, y_scaler, test_file_names)
