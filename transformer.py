@@ -461,7 +461,7 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test):
     
     return y_test_actual, y_pred_actual
 
-def k_fold_cross_validate(model_class, X_train, y_train, k=5, batch_size=64, num_epochs=500, patience=100):
+def k_fold_cross_validate(model_class, X_train, y_train, k=3, batch_size=64, num_epochs=500, patience=100):
     kfold = KFold(n_splits=k, shuffle=True, random_state=42)
     fold_losses = []
     
@@ -507,7 +507,7 @@ def main(main_dir):
     print("\nPerforming 5-fold cross-validation...")
     k_fold_cross_validate(EnhancedLSTMModel, X_train, y_train)
     
-    train_loader, val_loader, test_loader = create_data_loaders(X_train, y_train, X_test, y_test, batch_size=64, val_split=0.1)
+    train_loader, val_loader, test_loader = create_data_loaders(X_train, y_train, X_test, y_test, batch_size=64, val_split=0.25)
     
     model = EnhancedLSTMModel(input_size=input_size, hidden_sizes=[512, 256, 128], output_size=1, dropout_rate=0.5)
     
