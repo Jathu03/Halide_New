@@ -9,6 +9,7 @@ import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 import random
+import matplotlib.pyplot as plt  # Added for plotting
 
 def get_execution_time(schedule_data):
     if "execution_times" in schedule_data:
@@ -65,7 +66,7 @@ def extract_features_from_file(file_path):
             
             features = base_features.copy()
             features['execution_time'] = execution_time
-            features['log_execution_time'] = np.log1p(execution_time)  # Add log-transformed target
+            features['log_execution_time'] = np.log1p(execution_time)
             
             tiling_factors = []
             unroll_factors = []
@@ -112,7 +113,6 @@ def extract_features_from_file(file_path):
                     [len(root.get("child_list", [])) for root in roots]
                 ) if roots else 0
             
-            # Additional features
             features['comp_depth_interaction'] = features['computation_count'] * features['max_tree_depth']
             features['tiling_parallel_interaction'] = features['tiling_count'] * features['parallel_count']
             features['memory_per_access'] = features['memory_size'] / max(features['access_count'], 1)
@@ -161,7 +161,6 @@ def clean_and_transform_features(train_features, test_features):
     all_features_df = all_features_df.drop(columns=constant_columns)
     print(f"Dropped {len(constant_columns)} constant columns")
     
-    # Log transform all positive features
     for col in all_features_df.columns:
         if col not in ['execution_time', 'log_execution_time'] and all_features_df[col].min() >= 0 and all_features_df[col].max() > 0:
             all_features_df[f'{col}_log'] = np.log1p(all_features_df[col])
@@ -232,7 +231,6 @@ class EnhancedLSTMModel(nn.Module):
         return out
 
 def custom_loss(y_pred, y_true):
-    # Relative error loss with small epsilon to avoid division by zero
     epsilon = 1e-8
     rel_error = torch.abs((y_pred - y_true) / (y_true.abs() + epsilon))
     return torch.mean(rel_error) + 0.5 * nn.MSELoss()(y_pred, y_true)
@@ -258,6 +256,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
     best_model_state = None
     train_losses = []
     val_losses = []
+    learning_rates = []  # Track learning rate over epochs
     
     for epoch in range(num_epochs):
         model.train()
@@ -269,7 +268,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
             loss = criterion(outputs, targets)
             if torch.isnan(loss):
                 print(f"NaN loss at epoch {epoch+1}")
-                return None, None
+                return None, None, None
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
             optimizer.step()
@@ -290,9 +289,13 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
         val_loss /= len(test_loader.dataset)
         val_losses.append(val_loss)
         
+        # Record current learning rate
+        current_lr = optimizer.param_groups[0]['lr']
+        learning_rates.append(current_lr)
+        
         scheduler.step(val_loss)
         
-        print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}, LR: {optimizer.param_groups[0]["lr"]:.6f}')
+        print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}, LR: {current_lr:.6f}')
         
         if val_loss < best_val_loss and not np.isnan(val_loss):
             best_val_loss = val_loss
@@ -309,7 +312,48 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
     
     if best_model_state is not None:
         model.load_state_dict(best_model_state)
-    return train_losses, val_losses
+    
+    # Save training metrics to JSON
+    metrics = {
+        'train_losses': train_losses,
+        'val_losses': val_losses,
+        'learning_rates': learning_rates
+    }
+    with open('training_metrics.json', 'w') as f:
+        json.dump(metrics, f)
+    print("Training metrics saved to 'training_metrics.json'")
+    
+    return train_losses, val_losses, learning_rates
+
+def plot_metrics(train_losses, val_losses, learning_rates):
+    """Generate and save plots for training metrics."""
+    epochs = range(1, len(train_losses) + 1)
+    
+    # Plot 1: Training and Validation Loss
+    plt.figure(figsize=(10, 6))
+    plt.plot(epochs, train_losses, label='Training Loss', color='blue')
+    plt.plot(epochs, val_losses, label='Validation Loss', color='orange')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('Training and Validation Loss Over Epochs')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig('loss_plot.png')
+    plt.close()
+    print("Loss plot saved as 'loss_plot.png'")
+    
+    # Plot 2: Learning Rate
+    plt.figure(figsize=(10, 6))
+    plt.plot(epochs, learning_rates, label='Learning Rate', color='green')
+    plt.xlabel('Epoch')
+    plt.ylabel('Learning Rate')
+    plt.title('Learning Rate Over Epochs')
+    plt.yscale('log')  # Log scale for better visibility of LR changes
+    plt.legend()
+    plt.grid(True)
+    plt.savefig('lr_plot.png')
+    plt.close()
+    print("Learning rate plot saved as 'lr_plot.png'")
 
 def evaluate_model(model, X_test, y_test, y_scaler, file_names_test):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -380,11 +424,14 @@ def main(main_dir):
     optimizer = optim.AdamW(model.parameters(), lr=0.0001, weight_decay=1e-4)
     
     print("Building and training Enhanced LSTM model...")
-    train_losses, val_losses = train_model(model, train_loader, test_loader, criterion, optimizer)
+    train_losses, val_losses, learning_rates = train_model(model, train_loader, test_loader, criterion, optimizer)
     
-    if train_losses is None or val_losses is None:
+    if train_losses is None or val_losses is None or learning_rates is None:
         print("Training failed due to NaN losses")
         return None
+    
+    # Generate and save plots
+    plot_metrics(train_losses, val_losses, learning_rates)
     
     print("\nEvaluating model:")
     y_test_actual, y_pred_actual = evaluate_model(model, X_test, y_test, y_scaler, test_file_names)
