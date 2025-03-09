@@ -44,7 +44,6 @@ def extract_features_from_file(file_path):
         for it in iterators.values():
             lower = it.get("lower_bound")
             upper = it.get("upper_bound")
-            # Convert to float if possible, skip if conversion fails
             try:
                 lower = float(lower) if lower is not None and str(lower).replace('.', '').replace('-', '').isdigit() else 0.0
                 upper = float(upper) if upper is not None and str(upper).replace('.', '').replace('-', '').isdigit() else 0.0
@@ -55,6 +54,7 @@ def extract_features_from_file(file_path):
             except (ValueError, TypeError):
                 continue
         
+        # Avoid division by zero by using max(1, denominator)
         base_features = {
             'memory_size': prog_annot.get("memory_size", 0),
             'iterator_count': len(iterators),
@@ -66,7 +66,7 @@ def extract_features_from_file(file_path):
             'memory_per_computation': prog_annot.get("memory_size", 0) / max(len(computations), 1),
             'loop_range_std': float(np.std(loop_ranges)) if loop_ranges else 0,
             'access_per_iterator': sum(len(comp.get("accesses", [])) for comp in computations.values()) / max(len(iterators), 1),
-            'loop_range_skew': float(np.mean(valid_skew_values)) if valid_skew_values else 0  # Use valid_skew_values
+            'loop_range_skew': float(np.mean(valid_skew_values)) if valid_skew_values else 0
         }
         base_features['avg_access_per_comp'] = base_features['access_count'] / max(base_features['computation_count'], 1)
         
@@ -129,7 +129,11 @@ def extract_features_from_file(file_path):
             features['tiling_parallel_interaction'] = features['tiling_count'] * features['parallel_count']
             features['memory_per_access'] = features['memory_size'] / max(features['access_count'], 1)
             features['transformations_per_comp'] = features['total_transformation_count'] / max(features['computation_count'], 1)
-            features['execution_time_norm'] = (execution_time - np.mean([f['execution_time'] for f in all_features])) / np.std([f['execution_time'] for f in all_features]) if all_features else 0
+            # Handle potential inf in execution_time_norm
+            exec_times = [f['execution_time'] for f in all_features if f['execution_time'] > 0]
+            mean_exec = np.mean(exec_times) if exec_times else 0
+            std_exec = np.std(exec_times) if exec_times else 1
+            features['execution_time_norm'] = (execution_time - mean_exec) / max(std_exec, 1e-8) if std_exec > 0 else 0
             
             all_features.append(features)
     
@@ -175,13 +179,16 @@ def clean_and_transform_features(train_features, test_features):
     all_features_df = all_features_df.drop(columns=constant_columns)
     print(f"Dropped {len(constant_columns)} constant columns")
     
-    # Log transform positive features
+    # Log transform positive features, avoiding inf
     for col in all_features_df.columns:
         if col not in ['execution_time', 'log_execution_time'] and all_features_df[col].min() >= 0 and all_features_df[col].max() > 0:
-            all_features_df[f'{col}_log'] = np.log1p(all_features_df[col])
+            all_features_df[f'{col}_log'] = np.log1p(all_features_df[col].replace([np.inf, -np.inf], 0))
+    
+    # Replace inf and -inf with large finite numbers
+    numeric_cols = all_features_df.select_dtypes(include=['number']).columns
+    all_features_df[numeric_cols] = all_features_df[numeric_cols].replace([np.inf, -np.inf], np.finfo(np.float64).max)
     
     # Handle outliers with RobustScaler
-    numeric_cols = all_features_df.select_dtypes(include=['number']).columns
     scaler = RobustScaler()
     all_features_df[numeric_cols] = scaler.fit_transform(all_features_df[numeric_cols])
     
