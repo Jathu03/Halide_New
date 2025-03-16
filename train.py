@@ -5,7 +5,7 @@ from sklearn.preprocessing import StandardScaler
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import TensorDataset, DataLoader
+from torch.utils.data import Dataset, DataLoader
 from torch.optim.lr_scheduler import ReduceLROnPlateau, LambdaLR
 import random
 import matplotlib.pyplot as plt
@@ -53,56 +53,55 @@ def extract_features_from_file(file_path):
             features['execution_time'] = execution_time
             features['log_execution_time'] = np.log1p(execution_time)
             
-            # Template: 5 slots [outer_loop, middle_loop, inner_loop, comp1, comp2]
-            template = np.zeros((5, 6))  # [loop_range, tile_factor, unroll_factor, parallel_flag, n_comps, n_accesses]
+            # Tree representation: list of nodes with features and child indices
+            tree_nodes = []
+            node_to_idx = {}
             
-            # Populate loop levels from tree_structure
+            def traverse_tree(node, depth, parent_idx=None):
+                # Node features: [loop_range, tile_factor, unroll_factor, parallel_flag, n_comps, n_accesses, depth]
+                node_features = [0] * 7
+                node_idx = len(tree_nodes)
+                node_to_idx[id(node)] = node_idx
+                
+                # Loop range
+                it_id = node.get("iterator_id", "")
+                if it_id in iterators:
+                    it = iterators[it_id]
+                    loop_range = it.get("upper_bound", 0) - it.get("lower_bound", 0)
+                    node_features[0] = loop_range if isinstance(loop_range, (int, float)) else 0
+                
+                # Transformations and computations
+                comp_key = node.get("computation", "")
+                if comp_key in schedule and isinstance(schedule[comp_key], dict):
+                    comp_data = schedule[comp_key]
+                    if "tiling" in comp_data and comp_data["tiling"]:
+                        factors = comp_data["tiling"].get("tiling_factors", [])
+                        node_features[1] = factors[0] if factors else 0
+                    if "unrolling_factor" in comp_data and comp_data["unrolling_factor"]:
+                        node_features[2] = comp_data["unrolling_factor"]
+                    if "parallelized_dim" in comp_data and comp_data["parallelized_dim"]:
+                        node_features[3] = 1
+                    if comp_key in computations:
+                        comp = computations[comp_key]
+                        node_features[4] = 1  # n_comps
+                        node_features[5] = len(comp.get("accesses", []))
+                
+                node_features[6] = depth
+                
+                # Add node
+                children = [node_to_idx.get(id(child)) for child in node.get("child_list", [])]
+                tree_nodes.append({'features': node_features, 'children': children})
+                
+                # Traverse children
+                for child in node.get("child_list", []):
+                    traverse_tree(child, depth + 1, node_idx)
+            
             if "tree_structure" in schedule and "roots" in schedule["tree_structure"]:
                 roots = schedule["tree_structure"]["roots"]
-                level = 0
-                def traverse_tree(node, level, iterators, computations):
-                    nonlocal template
-                    if level < 3:  # Limit to 3 loop levels
-                        it_id = node.get("iterator_id", "")
-                        if it_id in iterators:
-                            it = iterators[it_id]
-                            loop_range = it.get("upper_bound", 0) - it.get("lower_bound", 0)
-                            template[level, 0] = loop_range if isinstance(loop_range, (int, float)) else 0
-                        
-                        # Check transformations for this level
-                        comp_key = node.get("computation", "")
-                        if comp_key in schedule and isinstance(schedule[comp_key], dict):
-                            comp_data = schedule[comp_key]
-                            if "tiling" in comp_data and comp_data["tiling"]:
-                                factors = comp_data["tiling"].get("tiling_factors", [])
-                                template[level, 1] = factors[0] if factors else 0
-                            if "unrolling_factor" in comp_data and comp_data["unrolling_factor"]:
-                                template[level, 2] = comp_data["unrolling_factor"]
-                            if "parallelized_dim" in comp_data and comp_data["parallelized_dim"]:
-                                template[level, 3] = 1
-                        
-                        for child in node.get("child_list", []):
-                            traverse_tree(child, level + 1, iterators, computations)
-                
                 for root in roots:
-                    traverse_tree(root, 0, iterators, computations)
+                    traverse_tree(root, 0)
             
-            # Populate computation slots
-            comp_keys = [k for k in schedule.keys() if k in computations]
-            for i, comp_key in enumerate(comp_keys[:2]):  # Limit to 2 computations
-                comp_data = schedule[comp_key]
-                comp = computations[comp_key]
-                template[3 + i, 4] = 1  # n_comps
-                template[3 + i, 5] = len(comp.get("accesses", []))
-                if "tiling" in comp_data and comp_data["tiling"]:
-                    factors = comp_data["tiling"].get("tiling_factors", [])
-                    template[3 + i, 1] = factors[0] if factors else 0
-                if "unrolling_factor" in comp_data and comp_data["unrolling_factor"]:
-                    template[3 + i, 2] = comp_data["unrolling_factor"]
-                if "parallelized_dim" in comp_data and comp_data["parallelized_dim"]:
-                    template[3 + i, 3] = 1
-            
-            features['template'] = template
+            features['tree_nodes'] = tree_nodes
             all_features.append(features)
     
     return all_features if all_features else None
@@ -137,72 +136,110 @@ def process_directory(directory_path):
     
     return train_features, test_features, test_file_names
 
-def prepare_data_for_model(train_features, test_features):
-    all_features = train_features + test_features
-    X_template = []
-    X_global = []
-    y = []
+class TreeDataset(Dataset):
+    def __init__(self, features, max_nodes=10):
+        self.max_nodes = max_nodes
+        self.X_nodes = []
+        self.X_children = []
+        self.y = []
+        self.global_features = []
+        
+        global_keys = ['memory_size', 'computation_count', 'access_count']
+        
+        for feat in features:
+            nodes = feat.pop("tree_nodes")
+            # Pad or truncate to max_nodes
+            node_features = np.zeros((max_nodes, 7))
+            children = np.full((max_nodes, max_nodes), -1, dtype=int)  # -1 for no child
+            for i, node in enumerate(nodes[:max_nodes]):
+                node_features[i] = node['features']
+                for j, child_idx in enumerate(node['children']):
+                    if child_idx < max_nodes:
+                        children[i, j] = child_idx
+            
+            self.X_nodes.append(node_features)
+            self.X_children.append(children)
+            self.y.append(feat["log_execution_time"])
+            self.global_features.append([feat[k] for k in global_keys])
+        
+        self.X_nodes = np.array(self.X_nodes)  # [n_samples, max_nodes, 7]
+        self.X_children = np.array(self.X_children)  # [n_samples, max_nodes, max_nodes]
+        self.y = np.array(self.y).reshape(-1, 1)
+        self.global_features = np.array(self.global_features)  # [n_samples, 3]
+        
+        # Scale global features
+        scaler_global = StandardScaler()
+        self.global_features = scaler_global.fit_transform(self.global_features)
+        
+        # Scale target
+        self.scaler_y = StandardScaler()
+        self.y = self.scaler_y.fit_transform(self.y)
     
-    global_keys = ['memory_size', 'computation_count', 'access_count']
+    def __len__(self):
+        return len(self.y)
     
-    for feat in all_features:
-        X_template.append(feat.pop("template"))  # [5, 6]
-        X_global.append([feat[k] for k in global_keys])
-        y.append(feat["log_execution_time"])
-    
-    X_template = np.array(X_template)  # [n_samples, 5, 6]
-    X_global = np.array(X_global)  # [n_samples, 3]
-    
-    # Scale global features
-    scaler_X_global = StandardScaler()
-    X_global_scaled = scaler_X_global.fit_transform(X_global)
-    
-    # Repeat global features across sequence length
-    X_global_expanded = np.repeat(X_global_scaled[:, np.newaxis, :], 5, axis=1)
-    X_combined = np.concatenate([X_template, X_global_expanded], axis=2)  # [n_samples, 5, 9]
-    
-    # Split back into train/test
-    train_size = len(train_features)
-    X_train = X_combined[:train_size]
-    X_test = X_combined[train_size:]
-    y_train = np.array(y[:train_size]).reshape(-1, 1)
-    y_test = np.array(y[train_size:]).reshape(-1, 1)
-    
-    # Scale target
-    scaler_y = StandardScaler()
-    y_train_scaled = scaler_y.fit_transform(y_train)
-    y_test_scaled = scaler_y.transform(y_test)
-    
-    print(f"Input shape: {X_train.shape}")
-    return (torch.FloatTensor(X_train), torch.FloatTensor(y_train_scaled),
-            torch.FloatTensor(X_test), torch.FloatTensor(y_test_scaled),
-            scaler_y, X_train.shape[2])
+    def __getitem__(self, idx):
+        # Combine node features with repeated global features
+        global_expanded = np.repeat(self.global_features[idx][np.newaxis, :], self.max_nodes, axis=0)
+        X_combined = np.concatenate([self.X_nodes[idx], global_expanded], axis=1)  # [max_nodes, 10]
+        return (torch.FloatTensor(X_combined),
+                torch.LongTensor(self.X_children[idx]),
+                torch.FloatTensor(self.y[idx]))
 
-class EnhancedLSTMModel(nn.Module):
-    def __init__(self, input_size, hidden_sizes=[512, 256, 128], output_size=1, dropout_rate=0.5):
-        super(EnhancedLSTMModel, self).__init__()
+class TreeLSTM(nn.Module):
+    def __init__(self, input_size, hidden_size=128, output_size=1, dropout_rate=0.5):
+        super(TreeLSTM, self).__init__()
+        self.hidden_size = hidden_size
         
-        self.lstm1 = nn.LSTM(input_size, hidden_sizes[0], batch_first=True, bidirectional=True, dropout=0.2)
-        self.lstm2 = nn.LSTM(hidden_sizes[0]*2, hidden_sizes[1], batch_first=True, bidirectional=True, dropout=0.2)
-        self.lstm3 = nn.LSTM(hidden_sizes[1]*2, hidden_sizes[2], batch_first=True, dropout=0.2)
-        self.attention = nn.Linear(hidden_sizes[2], 1)
+        # Tree-LSTM gates
+        self.W_iou = nn.Linear(input_size, 3 * hidden_size)  # Input, Output, Update gates
+        self.U_iou = nn.Linear(hidden_size, 3 * hidden_size, bias=False)
+        self.W_f = nn.Linear(input_size, hidden_size)  # Forget gate
+        self.U_f = nn.Linear(hidden_size, hidden_size, bias=False)
+        
+        # Output layers
         self.dropout = nn.Dropout(dropout_rate)
-        self.fc1 = nn.Linear(hidden_sizes[2], hidden_sizes[2]//2)
-        self.bn1 = nn.BatchNorm1d(hidden_sizes[2]//2)
-        self.fc2 = nn.Linear(hidden_sizes[2]//2, output_size)
+        self.fc1 = nn.Linear(hidden_size, hidden_size // 2)
+        self.bn1 = nn.BatchNorm1d(hidden_size // 2)
+        self.fc2 = nn.Linear(hidden_size // 2, output_size)
         self.leaky_relu = nn.LeakyReLU(0.1)
-        
-    def attention_net(self, lstm_output):
-        attn_weights = torch.softmax(self.attention(lstm_output), dim=1)
-        context = torch.bmm(attn_weights.transpose(1, 2), lstm_output).squeeze(1)
-        return context
     
-    def forward(self, x):
-        lstm_out, _ = self.lstm1(x)
-        lstm_out, _ = self.lstm2(lstm_out)
-        lstm_out, _ = self.lstm3(lstm_out)
-        attn_out = self.attention_net(lstm_out)
-        out = self.dropout(attn_out)
+    def forward(self, node_features, children):
+        batch_size, max_nodes, input_size = node_features.size()
+        h = torch.zeros(batch_size, max_nodes, self.hidden_size).to(node_features.device)
+        c = torch.zeros(batch_size, max_nodes, self.hidden_size).to(node_features.device)
+        
+        # Process nodes bottom-up
+        for node_idx in range(max_nodes - 1, -1, -1):  # Start from leaves
+            x = node_features[:, node_idx, :]
+            child_h = []
+            child_c = []
+            for child_idx in range(max_nodes):
+                if children[:, node_idx, child_idx].max() != -1:
+                    valid_child_idx = children[:, node_idx, child_idx]
+                    child_h.append(h[range(batch_size), valid_child_idx])
+                    child_c.append(c[range(batch_size), valid_child_idx])
+            
+            child_h_sum = torch.sum(torch.stack(child_h, dim=1), dim=1) if child_h else torch.zeros(batch_size, self.hidden_size).to(x.device)
+            child_c_stack = torch.stack(child_c, dim=1) if child_c else torch.zeros(batch_size, 0, self.hidden_size).to(x.device)
+            
+            # Tree-LSTM equations
+            iou = self.W_iou(x) + self.U_iou(child_h_sum)
+            i, o, u = torch.split(iou, self.hidden_size, dim=1)
+            i, o, u = torch.sigmoid(i), torch.sigmoid(o), torch.tanh(u)
+            
+            f = torch.sigmoid(self.W_f(x).unsqueeze(1) + self.U_f(child_h_sum).unsqueeze(0))
+            if child_c_stack.size(1) > 0:
+                c_tilde = torch.sum(f * child_c_stack, dim=1)
+            else:
+                c_tilde = torch.zeros(batch_size, self.hidden_size).to(x.device)
+            
+            c[:, node_idx, :] = i * u + c_tilde
+            h[:, node_idx, :] = o * torch.tanh(c[:, node_idx, :])
+        
+        # Use root node (index 0) for prediction
+        root_h = h[:, 0, :]
+        out = self.dropout(root_h)
         out = self.fc1(out)
         out = self.bn1(out)
         out = self.leaky_relu(out)
@@ -213,15 +250,6 @@ def custom_loss(y_pred, y_true):
     epsilon = 1e-8
     rel_error = torch.abs((y_pred - y_true) / (y_true.abs() + epsilon))
     return torch.mean(rel_error) + 0.5 * nn.MSELoss()(y_pred, y_true)
-
-def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=64):
-    train_dataset = TensorDataset(X_train, y_train)
-    test_dataset = TensorDataset(X_test, y_test)
-    
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-    
-    return train_loader, test_loader
 
 def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=500, patience=100):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -247,10 +275,10 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
     for epoch in range(num_epochs):
         model.train()
         running_loss = 0.0
-        for inputs, targets in train_loader:
-            inputs, targets = inputs.to(device), targets.to(device)
+        for node_features, children, targets in train_loader:
+            node_features, children, targets = node_features.to(device), children.to(device), targets.to(device)
             optimizer.zero_grad()
-            outputs = model(inputs)
+            outputs = model(node_features, children)
             loss = criterion(outputs, targets)
             if torch.isnan(loss):
                 print(f"NaN loss at epoch {epoch+1}")
@@ -258,7 +286,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
             optimizer.step()
-            running_loss += loss.item() * inputs.size(0)
+            running_loss += loss.item() * node_features.size(0)
         
         if epoch < 10:
             warmup_scheduler.step()
@@ -269,11 +297,11 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
-            for inputs, targets in test_loader:
-                inputs, targets = inputs.to(device), targets.to(device)
-                outputs = model(inputs)
+            for node_features, children, targets in test_loader:
+                node_features, children, targets = node_features.to(device), children.to(device), targets.to(device)
+                outputs = model(node_features, children)
                 loss = criterion(outputs, targets)
-                val_loss += loss.item() * inputs.size(0)
+                val_loss += loss.item() * node_features.size(0)
         
         val_loss /= len(test_loader.dataset)
         val_losses.append(val_loss)
@@ -339,20 +367,25 @@ def plot_metrics(train_losses, val_losses, learning_rates):
     plt.close()
     print("Learning rate plot saved as 'lr_plot.png'")
 
-def evaluate_model(model, X_test, y_test, y_scaler, file_names_test):
+def evaluate_model(model, test_loader, y_scaler, file_names_test):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.to(device)
     model.eval()
     
-    X_test = X_test.to(device)
+    y_pred_scaled = []
+    y_test = []
     with torch.no_grad():
-        y_pred_scaled = model(X_test)
+        for node_features, children, targets in test_loader:
+            node_features, children, targets = node_features.to(device), children.to(device), targets.to(device)
+            outputs = model(node_features, children)
+            y_pred_scaled.append(outputs.cpu().numpy())
+            y_test.append(targets.cpu().numpy())
     
-    y_pred_scaled = y_pred_scaled.cpu().numpy()
-    y_test = y_test.cpu().numpy()
+    y_pred_scaled = np.concatenate(y_pred_scaled)
+    y_test = np.concatenate(y_test)
     
-    y_test_transformed = y_scaler.inverse_transform(y_test)
-    y_pred_transformed = y_scaler.inverse_transform(y_pred_scaled)
+    y_test_transformed = y_scaler.inverse_transform(y_test.reshape(-1, 1))
+    y_pred_transformed = y_scaler.inverse_transform(y_pred_scaled.reshape(-1, 1))
     y_test_actual = np.expm1(y_test_transformed)
     y_pred_actual = np.expm1(np.clip(y_pred_transformed, 0, None))
     
@@ -400,13 +433,17 @@ def main(main_dir):
         print("Error: Insufficient training data for robust model training")
         return None
     
-    X_train, y_train, X_test, y_test, y_scaler, input_size = prepare_data_for_model(train_features, test_features)
+    # Prepare datasets
+    train_dataset = TreeDataset(train_features, max_nodes=10)
+    test_dataset = TreeDataset(test_features, max_nodes=10)
     
-    train_loader, test_loader = create_data_loaders(X_train, y_train, X_test, y_test, batch_size=64)
+    train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
     
-    model = EnhancedLSTMModel(
-        input_size=input_size,
-        hidden_sizes=[512, 256, 128],
+    # Model
+    model = TreeLSTM(
+        input_size=10,  # 7 node features + 3 global features
+        hidden_size=128,
         output_size=1,
         dropout_rate=0.5
     )
@@ -414,7 +451,7 @@ def main(main_dir):
     criterion = custom_loss
     optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-4)
     
-    print("Building and training Enhanced LSTM model...")
+    print("Building and training Tree-LSTM model...")
     train_losses, val_losses, learning_rates = train_model(model, train_loader, test_loader, criterion, optimizer)
     
     if train_losses is None or val_losses is None or learning_rates is None:
@@ -424,15 +461,15 @@ def main(main_dir):
     plot_metrics(train_losses, val_losses, learning_rates)
     
     print("\nEvaluating model:")
-    y_test_actual, y_pred_actual = evaluate_model(model, X_test, y_test, y_scaler, test_file_names)
+    y_test_actual, y_pred_actual = evaluate_model(model, test_loader, train_dataset.scaler_y, test_file_names)
     
-    return model, y_scaler, y_test_actual, y_pred_actual
+    return model, train_dataset.scaler_y, y_test_actual, y_pred_actual
 
 if __name__ == "__main__":
     main_dir = "Tiramisu"
     result = main(main_dir)
     if result is not None:
         model, y_scaler, y_test_actual, y_pred_actual = result
-        print("\nEnhanced model training and prediction completed!")
+        print("\nTree-LSTM model training and prediction completed!")
     else:
         print("\nModel training failed!")
