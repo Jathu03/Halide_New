@@ -53,57 +53,56 @@ def extract_features_from_file(file_path):
             features['execution_time'] = execution_time
             features['log_execution_time'] = np.log1p(execution_time)
             
-            # Build tree sequence from tree_structure
-            tree_seq = []
+            # Template: 5 slots [outer_loop, middle_loop, inner_loop, comp1, comp2]
+            template = np.zeros((5, 6))  # [loop_range, tile_factor, unroll_factor, parallel_flag, n_comps, n_accesses]
+            
+            # Populate loop levels from tree_structure
             if "tree_structure" in schedule and "roots" in schedule["tree_structure"]:
                 roots = schedule["tree_structure"]["roots"]
-                
-                def traverse_tree(node, depth, iterators, computations):
-                    # Features: [depth, n_children, loop_range, tile, unroll, parallel, factor, n_comps, n_reductions, n_accesses]
-                    node_features = [0] * 10
-                    
-                    # Tree features
-                    node_features[0] = depth
-                    node_features[1] = len(node.get("child_list", []))
-                    
-                    # Loop range (if tied to an iterator)
-                    iterator_id = node.get("iterator_id", "")
-                    if iterator_id in iterators:
-                        it = iterators[iterator_id]
-                        lower = it.get("lower_bound", 0)
-                        upper = it.get("upper_bound", 0)
-                        node_features[2] = upper - lower if isinstance(lower, (int, float)) and isinstance(upper, (int, float)) else 0
-                    
-                    # Transformation features (from schedule)
-                    comp_key = node.get("computation", "")
-                    if comp_key in schedule and isinstance(schedule[comp_key], dict):
-                        comp_data = schedule[comp_key]
-                        if "tiling" in comp_data and comp_data["tiling"]:
-                            node_features[3] = 1
-                            factors = comp_data["tiling"].get("tiling_factors", [])
-                            node_features[6] = factors[0] if factors else 0
-                        if "unrolling_factor" in comp_data and comp_data["unrolling_factor"]:
-                            node_features[4] = 1
-                            node_features[6] = comp_data["unrolling_factor"]
-                        if "parallelized_dim" in comp_data and comp_data["parallelized_dim"]:
-                            node_features[5] = 1
-                    
-                    # Computation features
-                    if comp_key in computations:
-                        comp = computations[comp_key]
-                        node_features[7] = 1  # Number of computations (simplified)
-                        node_features[8] = 1 if comp.get("comp_is_reduction", False) else 0
-                        node_features[9] = len(comp.get("accesses", []))
-                    
-                    tree_seq = [node_features]
-                    for child in node.get("child_list", []):
-                        tree_seq.extend(traverse_tree(child, depth + 1, iterators, computations))
-                    return tree_seq
+                level = 0
+                def traverse_tree(node, level, iterators, computations):
+                    nonlocal template
+                    if level < 3:  # Limit to 3 loop levels
+                        it_id = node.get("iterator_id", "")
+                        if it_id in iterators:
+                            it = iterators[it_id]
+                            loop_range = it.get("upper_bound", 0) - it.get("lower_bound", 0)
+                            template[level, 0] = loop_range if isinstance(loop_range, (int, float)) else 0
+                        
+                        # Check transformations for this level
+                        comp_key = node.get("computation", "")
+                        if comp_key in schedule and isinstance(schedule[comp_key], dict):
+                            comp_data = schedule[comp_key]
+                            if "tiling" in comp_data and comp_data["tiling"]:
+                                factors = comp_data["tiling"].get("tiling_factors", [])
+                                template[level, 1] = factors[0] if factors else 0
+                            if "unrolling_factor" in comp_data and comp_data["unrolling_factor"]:
+                                template[level, 2] = comp_data["unrolling_factor"]
+                            if "parallelized_dim" in comp_data and comp_data["parallelized_dim"]:
+                                template[level, 3] = 1
+                        
+                        for child in node.get("child_list", []):
+                            traverse_tree(child, level + 1, iterators, computations)
                 
                 for root in roots:
-                    tree_seq.extend(traverse_tree(root, 0, iterators, computations))
+                    traverse_tree(root, 0, iterators, computations)
             
-            features['tree_sequence'] = tree_seq
+            # Populate computation slots
+            comp_keys = [k for k in schedule.keys() if k in computations]
+            for i, comp_key in enumerate(comp_keys[:2]):  # Limit to 2 computations
+                comp_data = schedule[comp_key]
+                comp = computations[comp_key]
+                template[3 + i, 4] = 1  # n_comps
+                template[3 + i, 5] = len(comp.get("accesses", []))
+                if "tiling" in comp_data and comp_data["tiling"]:
+                    factors = comp_data["tiling"].get("tiling_factors", [])
+                    template[3 + i, 1] = factors[0] if factors else 0
+                if "unrolling_factor" in comp_data and comp_data["unrolling_factor"]:
+                    template[3 + i, 2] = comp_data["unrolling_factor"]
+                if "parallelized_dim" in comp_data and comp_data["parallelized_dim"]:
+                    template[3 + i, 3] = 1
+            
+            features['template'] = template
             all_features.append(features)
     
     return all_features if all_features else None
@@ -138,30 +137,20 @@ def process_directory(directory_path):
     
     return train_features, test_features, test_file_names
 
-def prepare_data_for_model(train_features, test_features, max_seq_len=5):
+def prepare_data_for_model(train_features, test_features):
     all_features = train_features + test_features
-    X_seq = []
+    X_template = []
     X_global = []
     y = []
     
     global_keys = ['memory_size', 'computation_count', 'access_count']
     
     for feat in all_features:
-        # Tree sequence
-        seq = feat.pop("tree_sequence")
-        padded_seq = np.zeros((max_seq_len, 10))  # [depth, n_children, loop_range, tile, unroll, parallel, factor, n_comps, n_reductions, n_accesses]
-        for i, t in enumerate(seq[:max_seq_len]):
-            padded_seq[i] = t
-        X_seq.append(padded_seq)
-        
-        # Global features
-        global_feat = [feat[k] for k in global_keys]
-        X_global.append(global_feat)
-        
-        # Target
+        X_template.append(feat.pop("template"))  # [5, 6]
+        X_global.append([feat[k] for k in global_keys])
         y.append(feat["log_execution_time"])
     
-    X_seq = np.array(X_seq)  # [n_samples, max_seq_len, 10]
+    X_template = np.array(X_template)  # [n_samples, 5, 6]
     X_global = np.array(X_global)  # [n_samples, 3]
     
     # Scale global features
@@ -169,8 +158,8 @@ def prepare_data_for_model(train_features, test_features, max_seq_len=5):
     X_global_scaled = scaler_X_global.fit_transform(X_global)
     
     # Repeat global features across sequence length
-    X_global_expanded = np.repeat(X_global_scaled[:, np.newaxis, :], max_seq_len, axis=1)
-    X_combined = np.concatenate([X_seq, X_global_expanded], axis=2)  # [n_samples, max_seq_len, 13]
+    X_global_expanded = np.repeat(X_global_scaled[:, np.newaxis, :], 5, axis=1)
+    X_combined = np.concatenate([X_template, X_global_expanded], axis=2)  # [n_samples, 5, 9]
     
     # Split back into train/test
     train_size = len(train_features)
@@ -411,7 +400,7 @@ def main(main_dir):
         print("Error: Insufficient training data for robust model training")
         return None
     
-    X_train, y_train, X_test, y_test, y_scaler, input_size = prepare_data_for_model(train_features, test_features, max_seq_len=5)
+    X_train, y_train, X_test, y_test, y_scaler, input_size = prepare_data_for_model(train_features, test_features)
     
     train_loader, test_loader = create_data_loaders(X_train, y_train, X_test, y_test, batch_size=64)
     
