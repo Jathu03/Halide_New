@@ -1,7 +1,6 @@
 import os
 import json
 import numpy as np
-import pandas as pd
 from sklearn.preprocessing import StandardScaler
 import torch
 import torch.nn as nn
@@ -37,22 +36,11 @@ def extract_features_from_file(file_path):
         iterators = prog_annot.get("iterators", {})
         computations = prog_annot.get("computations", {})
         
-        loop_ranges = []
-        for it in iterators.values():
-            lower = it.get("lower_bound")
-            upper = it.get("upper_bound")
-            if isinstance(lower, (int, float)) and isinstance(upper, (int, float)):
-                loop_ranges.append(upper - lower)
-        
-        # Base features (non-sequential, kept for context)
-        base_features = {
+        # Global context features
+        global_features = {
             'memory_size': prog_annot.get("memory_size", 0),
-            'iterator_count': len(iterators),
-            'max_depth_iterators': max((len(it.get("child_iterators", [])) for it in iterators.values()), default=0),
             'computation_count': len(computations),
-            'reduction_count': sum(1 for comp in computations.values() if comp.get("comp_is_reduction", False)),
             'access_count': sum(len(comp.get("accesses", [])) for comp in computations.values()),
-            'avg_loop_range': float(np.mean(loop_ranges)) if loop_ranges else 0,
         }
         
         schedules = func_data["schedules_list"]
@@ -61,29 +49,61 @@ def extract_features_from_file(file_path):
             if execution_time is None or execution_time <= 0:
                 continue
             
-            features = base_features.copy()
+            features = global_features.copy()
             features['execution_time'] = execution_time
             features['log_execution_time'] = np.log1p(execution_time)
             
-            # Sequential transformation features
-            transformation_seq = []
-            for comp_key, comp_data in schedule.items():
-                if isinstance(comp_data, dict) and "transformations_list" in comp_data:
-                    for transform in comp_data["transformations_list"]:
-                        transform_features = [0, 0, 0, 0]  # [tile, unroll, parallel, factor]
-                        if isinstance(transform, str):  # Assuming string format
-                            if "tile" in transform.lower():
-                                transform_features[0] = 1
-                                factors = [int(x) for x in transform.split('[')[1].split(']')[0].split(',')]
-                                transform_features[3] = factors[0]  # First tiling factor
-                            elif "unroll" in transform.lower():
-                                transform_features[1] = 1
-                                transform_features[3] = int(transform.split('[')[1].split(']')[0])
-                            elif "parallel" in transform.lower():
-                                transform_features[2] = 1
-                        transformation_seq.append(transform_features)
+            # Build tree sequence from tree_structure
+            tree_seq = []
+            if "tree_structure" in schedule and "roots" in schedule["tree_structure"]:
+                roots = schedule["tree_structure"]["roots"]
+                
+                def traverse_tree(node, depth, iterators, computations):
+                    # Features: [depth, n_children, loop_range, tile, unroll, parallel, factor, n_comps, n_reductions, n_accesses]
+                    node_features = [0] * 10
+                    
+                    # Tree features
+                    node_features[0] = depth
+                    node_features[1] = len(node.get("child_list", []))
+                    
+                    # Loop range (if tied to an iterator)
+                    iterator_id = node.get("iterator_id", "")
+                    if iterator_id in iterators:
+                        it = iterators[iterator_id]
+                        lower = it.get("lower_bound", 0)
+                        upper = it.get("upper_bound", 0)
+                        node_features[2] = upper - lower if isinstance(lower, (int, float)) and isinstance(upper, (int, float)) else 0
+                    
+                    # Transformation features (from schedule)
+                    comp_key = node.get("computation", "")
+                    if comp_key in schedule and isinstance(schedule[comp_key], dict):
+                        comp_data = schedule[comp_key]
+                        if "tiling" in comp_data and comp_data["tiling"]:
+                            node_features[3] = 1
+                            factors = comp_data["tiling"].get("tiling_factors", [])
+                            node_features[6] = factors[0] if factors else 0
+                        if "unrolling_factor" in comp_data and comp_data["unrolling_factor"]:
+                            node_features[4] = 1
+                            node_features[6] = comp_data["unrolling_factor"]
+                        if "parallelized_dim" in comp_data and comp_data["parallelized_dim"]:
+                            node_features[5] = 1
+                    
+                    # Computation features
+                    if comp_key in computations:
+                        comp = computations[comp_key]
+                        node_features[7] = 1  # Number of computations (simplified)
+                        node_features[8] = 1 if comp.get("comp_is_reduction", False) else 0
+                        node_features[9] = len(comp.get("accesses", []))
+                    
+                    tree_seq = [node_features]
+                    for child in node.get("child_list", []):
+                        tree_seq.extend(traverse_tree(child, depth + 1, iterators, computations))
+                    return tree_seq
+                
+                for root in roots:
+                    tree_seq.extend(traverse_tree(root, 0, iterators, computations))
             
-            features['transformations'] = transformation_seq
+            features['tree_sequence'] = tree_seq
             all_features.append(features)
     
     return all_features if all_features else None
@@ -118,50 +138,46 @@ def process_directory(directory_path):
     
     return train_features, test_features, test_file_names
 
-def prepare_data_for_model(train_features, test_features, max_seq_len=10):
+def prepare_data_for_model(train_features, test_features, max_seq_len=5):
     all_features = train_features + test_features
     X_seq = []
-    X_base = []
+    X_global = []
     y = []
     
-    # Define base feature keys to keep
-    base_keys = ['memory_size', 'iterator_count', 'max_depth_iterators', 
-                 'computation_count', 'reduction_count', 'access_count', 'avg_loop_range']
+    global_keys = ['memory_size', 'computation_count', 'access_count']
     
     for feat in all_features:
-        # Sequential data (transformations)
-        seq = feat.pop("transformations")
-        padded_seq = np.zeros((max_seq_len, 4))  # [tile, unroll, parallel, factor]
+        # Tree sequence
+        seq = feat.pop("tree_sequence")
+        padded_seq = np.zeros((max_seq_len, 10))  # [depth, n_children, loop_range, tile, unroll, parallel, factor, n_comps, n_reductions, n_accesses]
         for i, t in enumerate(seq[:max_seq_len]):
             padded_seq[i] = t
         X_seq.append(padded_seq)
         
-        # Base features (non-sequential)
-        base_feat = [feat[k] for k in base_keys]
-        X_base.append(base_feat)
+        # Global features
+        global_feat = [feat[k] for k in global_keys]
+        X_global.append(global_feat)
         
         # Target
         y.append(feat["log_execution_time"])
     
-    X_seq = np.array(X_seq)  # [n_samples, max_seq_len, 4]
-    X_base = np.array(X_base)  # [n_samples, n_base_features]
-    y = np.array(y).reshape(-1, 1)
+    X_seq = np.array(X_seq)  # [n_samples, max_seq_len, 10]
+    X_global = np.array(X_global)  # [n_samples, 3]
     
-    # Scale base features
-    scaler_X_base = StandardScaler()
-    X_base_scaled = scaler_X_base.fit_transform(X_base)
+    # Scale global features
+    scaler_X_global = StandardScaler()
+    X_global_scaled = scaler_X_global.fit_transform(X_global)
     
-    # Combine sequential and base features
-    # Repeat base features across sequence length for concatenation
-    X_base_scaled_expanded = np.repeat(X_base_scaled[:, np.newaxis, :], max_seq_len, axis=1)
-    X_combined = np.concatenate([X_seq, X_base_scaled_expanded], axis=2)  # [n_samples, max_seq_len, 4 + n_base_features]
+    # Repeat global features across sequence length
+    X_global_expanded = np.repeat(X_global_scaled[:, np.newaxis, :], max_seq_len, axis=1)
+    X_combined = np.concatenate([X_seq, X_global_expanded], axis=2)  # [n_samples, max_seq_len, 13]
     
     # Split back into train/test
     train_size = len(train_features)
     X_train = X_combined[:train_size]
     X_test = X_combined[train_size:]
-    y_train = y[:train_size]
-    y_test = y[train_size:]
+    y_train = np.array(y[:train_size]).reshape(-1, 1)
+    y_test = np.array(y[train_size:]).reshape(-1, 1)
     
     # Scale target
     scaler_y = StandardScaler()
@@ -395,7 +411,7 @@ def main(main_dir):
         print("Error: Insufficient training data for robust model training")
         return None
     
-    X_train, y_train, X_test, y_test, y_scaler, input_size = prepare_data_for_model(train_features, test_features, max_seq_len=10)
+    X_train, y_train, X_test, y_test, y_scaler, input_size = prepare_data_for_model(train_features, test_features, max_seq_len=5)
     
     train_loader, test_loader = create_data_loaders(X_train, y_train, X_test, y_test, batch_size=64)
     
