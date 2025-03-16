@@ -36,7 +36,6 @@ def extract_features_from_file(file_path):
         iterators = prog_annot.get("iterators", {})
         computations = prog_annot.get("computations", {})
         
-        # Global context features
         global_features = {
             'memory_size': prog_annot.get("memory_size", 0),
             'computation_count': len(computations),
@@ -53,24 +52,20 @@ def extract_features_from_file(file_path):
             features['execution_time'] = execution_time
             features['log_execution_time'] = np.log1p(execution_time)
             
-            # Tree representation: list of nodes with features and child indices
             tree_nodes = []
             node_to_idx = {}
             
             def traverse_tree(node, depth, parent_idx=None):
-                # Node features: [loop_range, tile_factor, unroll_factor, parallel_flag, n_comps, n_accesses, depth]
                 node_features = [0] * 7
                 node_idx = len(tree_nodes)
                 node_to_idx[id(node)] = node_idx
                 
-                # Loop range
                 it_id = node.get("iterator_id", "")
                 if it_id in iterators:
                     it = iterators[it_id]
                     loop_range = it.get("upper_bound", 0) - it.get("lower_bound", 0)
                     node_features[0] = loop_range if isinstance(loop_range, (int, float)) else 0
                 
-                # Transformations and computations
                 comp_key = node.get("computation", "")
                 if comp_key in schedule and isinstance(schedule[comp_key], dict):
                     comp_data = schedule[comp_key]
@@ -83,17 +78,15 @@ def extract_features_from_file(file_path):
                         node_features[3] = 1
                     if comp_key in computations:
                         comp = computations[comp_key]
-                        node_features[4] = 1  # n_comps
+                        node_features[4] = 1
                         node_features[5] = len(comp.get("accesses", []))
                 
                 node_features[6] = depth
                 
-                # Add node with valid children only
                 child_list = node.get("child_list", [])
                 children = [node_to_idx[id(child)] for child in child_list if id(child) in node_to_idx]
                 tree_nodes.append({'features': node_features, 'children': children})
                 
-                # Traverse children
                 for child in child_list:
                     traverse_tree(child, depth + 1, node_idx)
             
@@ -149,13 +142,12 @@ class TreeDataset(Dataset):
         
         for feat in features:
             nodes = feat.pop("tree_nodes")
-            # Pad or truncate to max_nodes
             node_features = np.zeros((max_nodes, 7))
-            children = np.full((max_nodes, max_nodes), -1, dtype=int)  # -1 for no child
+            children = np.full((max_nodes, max_nodes), -1, dtype=int)
             for i, node in enumerate(nodes[:max_nodes]):
                 node_features[i] = node['features']
                 for j, child_idx in enumerate(node['children']):
-                    if child_idx is not None and child_idx < max_nodes:  # Check for None and bounds
+                    if child_idx is not None and child_idx < max_nodes:
                         children[i, j] = child_idx
             
             self.X_nodes.append(node_features)
@@ -163,16 +155,14 @@ class TreeDataset(Dataset):
             self.y.append(feat["log_execution_time"])
             self.global_features.append([feat[k] for k in global_keys])
         
-        self.X_nodes = np.array(self.X_nodes)  # [n_samples, max_nodes, 7]
-        self.X_children = np.array(self.X_children)  # [n_samples, max_nodes, max_nodes]
+        self.X_nodes = np.array(self.X_nodes)
+        self.X_children = np.array(self.X_children)
         self.y = np.array(self.y).reshape(-1, 1)
-        self.global_features = np.array(self.global_features)  # [n_samples, 3]
+        self.global_features = np.array(self.global_features)
         
-        # Scale global features
         scaler_global = StandardScaler()
         self.global_features = scaler_global.fit_transform(self.global_features)
         
-        # Scale target
         self.scaler_y = StandardScaler()
         self.y = self.scaler_y.fit_transform(self.y)
     
@@ -180,9 +170,8 @@ class TreeDataset(Dataset):
         return len(self.y)
     
     def __getitem__(self, idx):
-        # Combine node features with repeated global features
         global_expanded = np.repeat(self.global_features[idx][np.newaxis, :], self.max_nodes, axis=0)
-        X_combined = np.concatenate([self.X_nodes[idx], global_expanded], axis=1)  # [max_nodes, 10]
+        X_combined = np.concatenate([self.X_nodes[idx], global_expanded], axis=1)
         return (torch.FloatTensor(X_combined),
                 torch.LongTensor(self.X_children[idx]),
                 torch.FloatTensor(self.y[idx]))
@@ -195,7 +184,7 @@ class TreeLSTM(nn.Module):
         # Tree-LSTM gates
         self.W_iou = nn.Linear(input_size, 3 * hidden_size)  # Input, Output, Update gates
         self.U_iou = nn.Linear(hidden_size, 3 * hidden_size, bias=False)
-        self.W_f = nn.Linear(input_size, hidden_size)  # Forget gate
+        self.W_f = nn.Linear(input_size, hidden_size)  # Forget gate per child
         self.U_f = nn.Linear(hidden_size, hidden_size, bias=False)
         
         # Output layers
@@ -211,34 +200,42 @@ class TreeLSTM(nn.Module):
         c = torch.zeros(batch_size, max_nodes, self.hidden_size).to(node_features.device)
         
         # Process nodes bottom-up
-        for node_idx in range(max_nodes - 1, -1, -1):  # Start from leaves
+        for node_idx in range(max_nodes - 1, -1, -1):
             x = node_features[:, node_idx, :]
             child_h = []
             child_c = []
             for child_idx in range(max_nodes):
-                if children[:, node_idx, child_idx].max() != -1:
+                if (children[:, node_idx, child_idx] != -1).any():
                     valid_child_idx = children[:, node_idx, child_idx]
-                    child_h.append(h[range(batch_size), valid_child_idx])
-                    child_c.append(c[range(batch_size), valid_child_idx])
+                    mask = (valid_child_idx != -1)
+                    valid_h = h[range(batch_size), valid_child_idx] * mask.unsqueeze(-1).float()
+                    valid_c = c[range(batch_size), valid_child_idx] * mask.unsqueeze(-1).float()
+                    child_h.append(valid_h)
+                    child_c.append(valid_c)
             
-            child_h_sum = torch.sum(torch.stack(child_h, dim=1), dim=1) if child_h else torch.zeros(batch_size, self.hidden_size).to(x.device)
-            child_c_stack = torch.stack(child_c, dim=1) if child_c else torch.zeros(batch_size, 0, self.hidden_size).to(x.device)
+            if child_h:
+                child_h = torch.stack(child_h, dim=1)  # [batch_size, n_children, hidden_size]
+                child_c = torch.stack(child_c, dim=1)
+                child_h_sum = torch.sum(child_h, dim=1)
+            else:
+                child_h_sum = torch.zeros(batch_size, self.hidden_size).to(x.device)
+                child_c = torch.zeros(batch_size, 0, self.hidden_size).to(x.device)
             
             # Tree-LSTM equations
             iou = self.W_iou(x) + self.U_iou(child_h_sum)
             i, o, u = torch.split(iou, self.hidden_size, dim=1)
             i, o, u = torch.sigmoid(i), torch.sigmoid(o), torch.tanh(u)
             
-            f = torch.sigmoid(self.W_f(x).unsqueeze(1) + self.U_f(child_h_sum).unsqueeze(0))
-            if child_c_stack.size(1) > 0:
-                c_tilde = torch.sum(f * child_c_stack, dim=1)
+            if child_c.size(1) > 0:
+                f = torch.sigmoid(self.W_f(x).unsqueeze(1) + self.U_f(child_h))  # [batch_size, n_children, hidden_size]
+                c_tilde = torch.sum(f * child_c, dim=1)
             else:
                 c_tilde = torch.zeros(batch_size, self.hidden_size).to(x.device)
             
             c[:, node_idx, :] = i * u + c_tilde
             h[:, node_idx, :] = o * torch.tanh(c[:, node_idx, :])
         
-        # Use root node (index 0) for prediction
+        # Use root node for prediction
         root_h = h[:, 0, :]
         out = self.dropout(root_h)
         out = self.fc1(out)
@@ -385,10 +382,11 @@ def evaluate_model(model, test_loader, y_scaler, file_names_test):
     y_pred_scaled = np.concatenate(y_pred_scaled)
     y_test = np.concatenate(y_test)
     
+    # Inverse transform without clipping to debug raw predictions
     y_test_transformed = y_scaler.inverse_transform(y_test.reshape(-1, 1))
     y_pred_transformed = y_scaler.inverse_transform(y_pred_scaled.reshape(-1, 1))
     y_test_actual = np.expm1(y_test_transformed)
-    y_pred_actual = np.expm1(np.clip(y_pred_transformed, 0, None))
+    y_pred_actual = np.expm1(np.maximum(y_pred_transformed, 0))  # Avoid negative values before expm1
     
     print("\nEvaluation Results:")
     for i, file_name in enumerate(file_names_test):
@@ -434,23 +432,21 @@ def main(main_dir):
         print("Error: Insufficient training data for robust model training")
         return None
     
-    # Prepare datasets
     train_dataset = TreeDataset(train_features, max_nodes=10)
     test_dataset = TreeDataset(test_features, max_nodes=10)
     
     train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
     
-    # Model
     model = TreeLSTM(
         input_size=10,  # 7 node features + 3 global features
-        hidden_size=128,
+        hidden_size=256,  # Increased for more capacity
         output_size=1,
-        dropout_rate=0.5
+        dropout_rate=0.3  # Reduced dropout for better learning
     )
     
     criterion = custom_loss
-    optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-4)
+    optimizer = optim.AdamW(model.parameters(), lr=0.0005, weight_decay=1e-4)  # Lowered LR for stability
     
     print("Building and training Tree-LSTM model...")
     train_losses, val_losses, learning_rates = train_model(model, train_loader, test_loader, criterion, optimizer)
