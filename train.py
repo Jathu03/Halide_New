@@ -88,12 +88,13 @@ def extract_features_from_file(file_path):
                 
                 node_features[6] = depth
                 
-                # Add node
-                children = [node_to_idx.get(id(child)) for child in node.get("child_list", [])]
+                # Add node with valid children only
+                child_list = node.get("child_list", [])
+                children = [node_to_idx[id(child)] for child in child_list if id(child) in node_to_idx]
                 tree_nodes.append({'features': node_features, 'children': children})
                 
                 # Traverse children
-                for child in node.get("child_list", []):
+                for child in child_list:
                     traverse_tree(child, depth + 1, node_idx)
             
             if "tree_structure" in schedule and "roots" in schedule["tree_structure"]:
@@ -154,7 +155,7 @@ class TreeDataset(Dataset):
             for i, node in enumerate(nodes[:max_nodes]):
                 node_features[i] = node['features']
                 for j, child_idx in enumerate(node['children']):
-                    if child_idx < max_nodes:
+                    if child_idx is not None and child_idx < max_nodes:  # Check for None and bounds
                         children[i, j] = child_idx
             
             self.X_nodes.append(node_features)
