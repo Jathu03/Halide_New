@@ -54,20 +54,20 @@ def preprocess_data(X, y):
 class ExecutionTimePredictor(nn.Module):
     def __init__(self, input_dim=44, hidden_dim1=128, hidden_dim2=64, dropout=0.3):
         super(ExecutionTimePredictor, self).__init__()
-        self.lstm1 = nn.LSTM(input_dim, hidden_dim1, batch_first=True, return_sequences=True)
+        self.lstm1 = nn.LSTM(input_dim, hidden_dim1, batch_first=True)  # Outputs all timesteps by default
         self.dropout1 = nn.Dropout(dropout)
         self.lstm2 = nn.LSTM(hidden_dim1, hidden_dim2, batch_first=True)
         self.dropout2 = nn.Dropout(dropout)
         self.fc1 = nn.Linear(hidden_dim2, 32)
         self.relu = nn.ReLU()
-        self.dropout3 = nn.Dropout(dropout - 0.1)  # Slightly less dropout for dense layer
+        self.dropout3 = nn.Dropout(dropout - 0.1)
         self.fc2 = nn.Linear(32, 1)
     
     def forward(self, x):
-        out, _ = self.lstm1(x)
+        out, _ = self.lstm1(x)  # out: (batch_size, seq_len, hidden_dim1)
         out = self.dropout1(out)
-        out, _ = self.lstm2(out)
-        out = self.dropout2(out[:, -1, :])  # Take the last timestep
+        out, _ = self.lstm2(out)  # out: (batch_size, seq_len, hidden_dim2)
+        out = self.dropout2(out[:, -1, :])  # Take last timestep: (batch_size, hidden_dim2)
         out = self.fc1(out)
         out = self.relu(out)
         out = self.dropout3(out)
