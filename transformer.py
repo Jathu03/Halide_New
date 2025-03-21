@@ -23,14 +23,14 @@ def embed_categorical(value, vocab_key, max_size=10):
     one_hot = np.zeros(min(max_size, vocab_sizes[vocab_key]))
     if idx >= 0:
         one_hot[idx] = 1
-    return one_hot.tolist()  # Return as list for concatenation
+    return one_hot.tolist()
 
 def normalize_numerical(values, target_length):
     values = values + [0.0] * (target_length - len(values)) if len(values) < target_length else values[:target_length]
     scaler = MinMaxScaler()
     values = np.array(values).reshape(-1, 1)
     normalized = scaler.fit_transform(values).flatten()
-    return normalized.tolist()  # Return as list
+    return normalized.tolist()
 
 def parse_number(x):
     try:
@@ -47,13 +47,13 @@ def process_halide(halide_data):
     sched_data = halide_data.get('scheduling_data', [])
 
     sequence = []
-    type_dim = 3  # Node, Edge, Schedule
+    type_dim = 4  # Node, Edge, Schedule, Execution
     specific_dim = 40  # name(10) + access(3) + ops(10) + jacobian(10) + sched(7)
-    feature_dim = type_dim + specific_dim  # 3 + 40 = 43
+    feature_dim = type_dim + specific_dim  # 4 + 40 = 44
 
     # Process nodes
     for node in nodes:
-        type_onehot = [1.0, 0.0, 0.0]
+        type_onehot = [1.0, 0.0, 0.0, 0.0]
         specific_features = []
         name = node.get('Name', 'unknown')
         details = node.get('Details', {})
@@ -76,14 +76,13 @@ def process_halide(halide_data):
             sched.get('bytes_at_task', 0)
         ]
         specific_features.extend(normalize_numerical(sched_vals, 7))  # 7
-        # Ensure exact length
         specific_features = specific_features[:specific_dim] + [0.0] * (specific_dim - len(specific_features))
         feature_vector = type_onehot + specific_features
         sequence.append(np.array(feature_vector))
 
     # Process edges
     for edge in edges:
-        type_onehot = [0.0, 1.0, 0.0]
+        type_onehot = [0.0, 1.0, 0.0, 0.0]
         specific_features = []
         from_to = f"{edge.get('From', 'unknown')}_{edge.get('To', 'unknown')}"
         specific_features.extend(embed_categorical(from_to, 'node_names'))  # 10
@@ -93,7 +92,6 @@ def process_halide(halide_data):
         jacobian = [parse_number(x) for x in jacobian_str.split()]
         specific_features.extend(normalize_numerical(jacobian, 10))  # 10
         specific_features.extend([0.0] * 7)  # Schedule placeholder
-        # Ensure exact length
         specific_features = specific_features[:specific_dim] + [0.0] * (specific_dim - len(specific_features))
         feature_vector = type_onehot + specific_features
         sequence.append(np.array(feature_vector))
@@ -103,7 +101,7 @@ def process_halide(halide_data):
     for sched in sched_data:
         name = sched.get('Name', '')
         if name and name not in node_names:
-            type_onehot = [0.0, 0.0, 1.0]
+            type_onehot = [0.0, 0.0, 1.0, 0.0]
             specific_features = []
             specific_features.extend(embed_categorical(name, 'node_names'))  # 10
             specific_features.extend([0.0] * 3)  # Access placeholder
@@ -115,10 +113,23 @@ def process_halide(halide_data):
                           'points_computed_minimum', 'unique_bytes_read_per_realization', 'bytes_at_task']
             ]
             specific_features.extend(normalize_numerical(sched_vals, 7))  # 7
-            # Ensure exact length
             specific_features = specific_features[:specific_dim] + [0.0] * (specific_dim - len(specific_features))
             feature_vector = type_onehot + specific_features
             sequence.append(np.array(feature_vector))
+
+    # Process execution time
+    exec_time = 0.0
+    for item in halide_data.get('scheduling_data', []):
+        if isinstance(item, dict) and item.get('name') == 'total_execution_time_ms':
+            exec_time = item.get('value', 0.0)
+            break
+    else:  # If not found in scheduling_data, check root level
+        if isinstance(halide_data, dict) and halide_data.get('name') == 'total_execution_time_ms':
+            exec_time = halide_data.get('value', 0.0)
+    type_onehot = [0.0, 0.0, 0.0, 1.0]
+    specific_features = [0.0] * 37 + normalize_numerical([exec_time / 1000.0], 3)  # Convert ms to seconds
+    feature_vector = type_onehot + specific_features
+    sequence.append(np.array(feature_vector))
 
     # Pad or truncate
     max_len = 50
@@ -126,7 +137,8 @@ def process_halide(halide_data):
         sequence.extend([np.zeros(feature_dim)] * (max_len - len(sequence)))
     elif len(sequence) > max_len:
         sequence = sequence[:max_len]
-    return np.array(sequence)
+    
+    return np.array(sequence), exec_time / 1000.0  # Return sequence and execution time in seconds
 
 # Process a single Tiramisu JSON file
 def process_tiramisu(tiramisu_data):
@@ -136,6 +148,7 @@ def process_tiramisu(tiramisu_data):
     schedules = prog.get('schedules_list', [])
 
     sequences = []
+    exec_times = []
     type_dim = 4  # Iterator, Computation, Execution, Fusion
     specific_dim = 40  # name(10) + bounds(2) + comp(5) + trans(20) + exec(3)
     feature_dim = type_dim + specific_dim  # 4 + 40 = 44
@@ -154,7 +167,6 @@ def process_tiramisu(tiramisu_data):
             specific_features.extend([0.0] * 5)  # Comp placeholder
             specific_features.extend([0.0] * 20)  # Trans placeholder
             specific_features.extend([0.0] * 3)  # Exec placeholder
-            # Ensure exact length
             specific_features = specific_features[:specific_dim] + [0.0] * (specific_dim - len(specific_features))
             feature_vector = type_onehot + specific_features
             sequence.append(np.array(feature_vector))
@@ -185,22 +197,21 @@ def process_tiramisu(tiramisu_data):
                     trans_features.extend([0.0] * (4 if t_type == 'parallelized_dim' else 5 if t_type in ['tiling', 'shiftings'] else 1))
             specific_features.extend(trans_features[:20])  # 20
             specific_features.extend([0.0] * 3)  # Exec placeholder
-            # Ensure exact length
             specific_features = specific_features[:specific_dim] + [0.0] * (specific_dim - len(specific_features))
             feature_vector = type_onehot + specific_features
             sequence.append(np.array(feature_vector))
 
         # Process execution time
-        exec_times = sched.get('execution_times', [0.0])
+        exec_times_raw = sched.get('execution_times', [0.0])
+        mean_exec_time = np.mean(exec_times_raw) / 1000.0  # Convert ms to seconds
         type_onehot = [0.0, 0.0, 1.0, 0.0]
         specific_features = []
         specific_features.extend([0.0] * 10)  # Name placeholder
         specific_features.extend([0.0] * 2)  # Bounds placeholder
         specific_features.extend([0.0] * 5)  # Comp placeholder
         specific_features.extend([0.0] * 20)  # Trans placeholder
-        exec_stats = [np.mean(exec_times) / 0.01, np.std(exec_times) / 0.01, len(exec_times) / 10.0]
+        exec_stats = [np.mean(exec_times_raw) / 1000.0, np.std(exec_times_raw) / 1000.0, len(exec_times_raw) / 10.0]
         specific_features.extend(normalize_numerical(exec_stats, 3))  # 3
-        # Ensure exact length
         specific_features = specific_features[:specific_dim] + [0.0] * (specific_dim - len(specific_features))
         feature_vector = type_onehot + specific_features
         sequence.append(np.array(feature_vector))
@@ -210,7 +221,6 @@ def process_tiramisu(tiramisu_data):
         if fusions:
             type_onehot = [0.0, 0.0, 0.0, 1.0]
             specific_features = []
-            # Handle nested list structure in fusions
             fusion_names = [f[0] if isinstance(f, list) else str(f) for f in fusions[:2]]
             fusion_name = '_'.join(fusion_names) if fusion_names else 'unknown'
             specific_features.extend(embed_categorical(fusion_name, 'comp_names', 10))  # 10
@@ -218,7 +228,6 @@ def process_tiramisu(tiramisu_data):
             specific_features.extend([0.0] * 5)  # Comp placeholder
             specific_features.extend([0.0] * 20)  # Trans placeholder
             specific_features.extend([0.0] * 3)  # Exec placeholder
-            # Ensure exact length
             specific_features = specific_features[:specific_dim] + [0.0] * (specific_dim - len(specific_features))
             feature_vector = type_onehot + specific_features
             sequence.append(np.array(feature_vector))
@@ -230,12 +239,14 @@ def process_tiramisu(tiramisu_data):
         elif len(sequence) > max_len:
             sequence = sequence[:max_len]
         sequences.append(np.array(sequence))
+        exec_times.append(mean_exec_time)
 
-    return sequences
+    return sequences, exec_times
 
 # Process all Halide programs
 def process_all_halide(halide_dir):
     all_sequences = []
+    all_exec_times = []
     for subfolder in os.listdir(halide_dir):
         subfolder_path = os.path.join(halide_dir, subfolder)
         if os.path.isdir(subfolder_path):
@@ -244,37 +255,41 @@ def process_all_halide(halide_dir):
                     file_path = os.path.join(subfolder_path, file)
                     with open(file_path, 'r') as f:
                         halide_data = json.load(f)
-                    sequence = process_halide(halide_data)
+                    sequence, exec_time = process_halide(halide_data)
                     all_sequences.append(sequence)
-    return all_sequences
+                    all_exec_times.append(exec_time)
+    return np.array(all_sequences), np.array(all_exec_times)
 
 # Process all Tiramisu programs
 def process_all_tiramisu(tiramisu_dir):
     all_sequences = []
+    all_exec_times = []
     for file in os.listdir(tiramisu_dir):
         if file.endswith('.json'):
             file_path = os.path.join(tiramisu_dir, file)
             with open(file_path, 'r') as f:
                 tiramisu_data = json.load(f)
-            sequences = process_tiramisu(tiramisu_data)
+            sequences, exec_times = process_tiramisu(tiramisu_data)
             all_sequences.extend(sequences)
-    return all_sequences
+            all_exec_times.extend(exec_times)
+    return np.array(all_sequences), np.array(all_exec_times)
 
 # Main execution
 halide_dir = 'synthetic_data'
 tiramisu_dir = 'Tiramisu'
 
-halide_sequences = process_all_halide(halide_dir)
-tiramisu_sequences = process_all_tiramisu(tiramisu_dir)
+# Generate dataset
+halide_sequences, halide_exec_times = process_all_halide(halide_dir)
+tiramisu_sequences, tiramisu_exec_times = process_all_tiramisu(tiramisu_dir)
 
-for i, seq in enumerate(halide_sequences):
-    np.save(f'halide_data_{i}.npy', seq)
-for i, seq in enumerate(tiramisu_sequences):
-    np.save(f'tiramisu_data_{i}.npy', seq)
+# Save sequences and execution times
+np.save('halide_sequences.npy', halide_sequences)
+np.save('halide_exec_times.npy', halide_exec_times)
+np.save('tiramisu_sequences.npy', tiramisu_sequences)
+np.save('tiramisu_exec_times.npy', tiramisu_exec_times)
 
-print("Halide Sequences Count:", len(halide_sequences))
-if halide_sequences:
-    print("Halide Sequence Shape:", halide_sequences[0].shape)
-print("Tiramisu Sequences Count:", len(tiramisu_sequences))
-if tiramisu_sequences:
-    print("Tiramisu Sequence Shape:", tiramisu_sequences[0].shape)
+# Print verification
+print("Halide Sequences Shape:", halide_sequences.shape)
+print("Halide Execution Times Shape:", halide_exec_times.shape)
+print("Tiramisu Sequences Shape:", tiramisu_sequences.shape)
+print("Tiramisu Execution Times Shape:", tiramisu_exec_times.shape)
