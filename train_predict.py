@@ -32,12 +32,13 @@ def load_and_preprocess_dataset():
     
     # Normalize input sequences
     X_scaler = StandardScaler()
-    X_reshaped = X.reshape(-1, X.shape[-1])  # (n_samples * seq_len, features)
+    X_reshaped = X.reshape(-1, X.shape[-1])
     X_scaled = X_scaler.fit_transform(X_reshaped).reshape(X.shape)
     
-    # Normalize execution times
+    # Log-transform execution times (add small epsilon to avoid log(0))
+    y_log = np.log1p(y)  # log1p(x) = log(1 + x)
     y_scaler = StandardScaler()
-    y_scaled = y_scaler.fit_transform(y.reshape(-1, 1)).flatten()
+    y_scaled = y_scaler.fit_transform(y_log.reshape(-1, 1)).flatten()
     
     # Split data
     X_train, X_temp, y_train, y_temp = train_test_split(X_scaled, y_scaled, test_size=0.3, random_state=42)
@@ -47,59 +48,42 @@ def load_and_preprocess_dataset():
     print("Validation Shape:", X_val.shape, y_val.shape)
     print("Test Shape:", X_test.shape, y_test.shape)
     
-    return X_train, X_val, X_test, y_train, y_val, y_test, X_scaler, y_scaler
+    return X_train, X_val, X_test, y_train, y_val, y_test, X_scaler, y_scaler, y
 
-# Advanced LSTM model with attention
-class AdvancedExecutionTimePredictor(nn.Module):
-    def __init__(self, input_dim=44, hidden_dim1=256, hidden_dim2=128, hidden_dim3=64, dropout=0.2):
-        super(AdvancedExecutionTimePredictor, self).__init__()
-        # Bidirectional LSTMs
-        self.lstm1 = nn.LSTM(input_dim, hidden_dim1, batch_first=True, bidirectional=True)
+# Simplified LSTM model
+class ImprovedExecutionTimePredictor(nn.Module):
+    def __init__(self, input_dim=44, hidden_dim1=128, hidden_dim2=64, dropout=0.1):
+        super(ImprovedExecutionTimePredictor, self).__init__()
+        self.lstm1 = nn.LSTM(input_dim, hidden_dim1, batch_first=True)
         self.dropout1 = nn.Dropout(dropout)
-        self.lstm2 = nn.LSTM(hidden_dim1 * 2, hidden_dim2, batch_first=True, bidirectional=True)
+        self.lstm2 = nn.LSTM(hidden_dim1, hidden_dim2, batch_first=True)
         self.dropout2 = nn.Dropout(dropout)
-        self.lstm3 = nn.LSTM(hidden_dim2 * 2, hidden_dim3, batch_first=True)
-        
-        # Attention mechanism
-        self.attention = nn.Linear(hidden_dim3, 1)
-        self.softmax = nn.Softmax(dim=1)
-        
-        # Dense layers
-        self.fc1 = nn.Linear(hidden_dim3, 64)
-        self.bn1 = nn.BatchNorm1d(64)
+        self.fc1 = nn.Linear(hidden_dim2, 32)
         self.relu = nn.ReLU()
-        self.dropout3 = nn.Dropout(dropout)
-        self.fc2 = nn.Linear(64, 32)
-        self.bn2 = nn.BatchNorm1d(32)
-        self.fc3 = nn.Linear(32, 1)
+        self.fc2 = nn.Linear(32, 1)
+        self.exp = nn.ReLU()  # Ensures non-negative output
     
     def forward(self, x):
-        # LSTM layers
-        out, _ = self.lstm1(x)  # (batch_size, seq_len, hidden_dim1 * 2)
+        out, _ = self.lstm1(x)
         out = self.dropout1(out)
-        out, _ = self.lstm2(out)  # (batch_size, seq_len, hidden_dim2 * 2)
-        out = self.dropout2(out)
-        out, _ = self.lstm3(out)  # (batch_size, seq_len, hidden_dim3)
-        
-        # Attention
-        attn_weights = self.softmax(self.attention(out))  # (batch_size, seq_len, 1)
-        out = torch.sum(out * attn_weights, dim=1)  # (batch_size, hidden_dim3)
-        
-        # Dense layers
+        out, _ = self.lstm2(out)
+        out = self.dropout2(out[:, -1, :])  # Last timestep
         out = self.fc1(out)
-        out = self.bn1(out)
         out = self.relu(out)
-        out = self.dropout3(out)
         out = self.fc2(out)
-        out = self.bn2(out)
-        out = self.relu(out)
-        out = self.fc3(out)
+        out = self.exp(out)  # Enforce non-negative predictions
         return out
 
-# Training function with early stopping and scheduler
+# Custom loss function (MSE + MAPE)
+def custom_loss(outputs, targets, alpha=0.5):
+    mse_loss = nn.MSELoss()(outputs, targets)
+    mape_loss = torch.mean(torch.abs((outputs - targets) / (targets + 1e-6)))  # Avoid division by zero
+    return alpha * mse_loss + (1 - alpha) * mape_loss
+
+# Training function
 def train_model(model, train_loader, val_loader, device, epochs=100, patience=10):
-    criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    criterion = custom_loss
+    optimizer = optim.Adam(model.parameters(), lr=0.0005)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
     
     train_losses, val_losses, train_maes, val_maes = [], [], [], []
@@ -117,7 +101,7 @@ def train_model(model, train_loader, val_loader, device, epochs=100, patience=10
             outputs = model(sequences)
             loss = criterion(outputs.squeeze(), targets)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             
             train_loss += loss.item() * sequences.size(0)
@@ -148,10 +132,8 @@ def train_model(model, train_loader, val_loader, device, epochs=100, patience=10
         print(f"Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, "
               f"Train MAE: {train_mae:.4f}, Val MAE: {val_mae:.4f}")
         
-        # Scheduler step
         scheduler.step(val_loss)
         
-        # Early stopping
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             patience_counter = 0
@@ -172,7 +154,7 @@ def plot_history(train_losses, val_losses, train_maes, val_maes):
     plt.plot(val_losses, label='Validation Loss')
     plt.title('Model Loss')
     plt.xlabel('Epoch')
-    plt.ylabel('MSE')
+    plt.ylabel('Loss')
     plt.legend()
     
     plt.subplot(1, 2, 2)
@@ -184,7 +166,7 @@ def plot_history(train_losses, val_losses, train_maes, val_maes):
     plt.legend()
     
     plt.tight_layout()
-    plt.savefig('training_history_advanced.png')
+    plt.savefig('training_history_improved.png')
     plt.close()
 
 # Main execution
@@ -193,19 +175,19 @@ def main():
     print(f"Using device: {device}")
     
     # Load and preprocess data
-    X_train, X_val, X_test, y_train, y_val, y_test, X_scaler, y_scaler = load_and_preprocess_dataset()
+    X_train, X_val, X_test, y_train, y_val, y_test, X_scaler, y_scaler, y_original = load_and_preprocess_dataset()
     
     # Create datasets and dataloaders
     train_dataset = ExecutionTimeDataset(X_train, y_train)
     val_dataset = ExecutionTimeDataset(X_val, y_val)
     test_dataset = ExecutionTimeDataset(X_test, y_test)
     
-    train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
+    train_loader = DataLoader(train_dataset, batch_size=128, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=128, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=128, shuffle=False)
     
     # Initialize model
-    model = AdvancedExecutionTimePredictor().to(device)
+    model = ImprovedExecutionTimePredictor().to(device)
     
     # Train model
     train_losses, val_losses, train_maes, val_maes = train_model(model, train_loader, val_loader, device)
@@ -234,8 +216,10 @@ def main():
     
     # Inverse transform predictions
     y_pred_scaled = np.array(y_pred_scaled)
-    y_pred = y_scaler.inverse_transform(y_pred_scaled.reshape(-1, 1)).flatten()
-    y_test_original = y_scaler.inverse_transform(y_test.reshape(-1, 1)).flatten()
+    y_pred_log = y_scaler.inverse_transform(y_pred_scaled.reshape(-1, 1)).flatten()
+    y_pred = np.expm1(y_pred_log)  # expm1(x) = exp(x) - 1, inverse of log1p
+    y_test_log = y_scaler.inverse_transform(y_test.reshape(-1, 1)).flatten()
+    y_test_original = np.expm1(y_test_log)
     
     print("\nSample Predictions (seconds):", y_pred[:5])
     print("Sample Actuals (seconds):", y_test_original[:5])
@@ -243,8 +227,8 @@ def main():
     # Plot training history
     plot_history(train_losses, val_losses, train_maes, val_maes)
     
-    # Save final model and scalers
-    torch.save(model.state_dict(), 'execution_predictor_advanced.pt')
+    # Save model and scalers
+    torch.save(model.state_dict(), 'execution_predictor_improved.pt')
     np.save('X_scaler_mean.npy', X_scaler.mean_)
     np.save('X_scaler_scale.npy', X_scaler.scale_)
     np.save('y_scaler_mean.npy', y_scaler.mean_)
