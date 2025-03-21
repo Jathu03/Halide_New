@@ -30,7 +30,6 @@ def normalize_numerical(values, target_length):
     scaler = MinMaxScaler()
     values = np.array(values).reshape(-1, 1)
     normalized = scaler.fit_transform(values).flatten()
-    # Pad or truncate to exact target_length
     if len(normalized) < target_length:
         normalized = np.pad(normalized, (0, target_length - len(normalized)), 'constant')
     return normalized[:target_length]
@@ -57,30 +56,20 @@ def process_halide(halide_data):
     # Nodes
     for node in nodes:
         type_onehot = np.array([1.0, 0.0, 0.0, 0.0])
-        # Build specific features with exact lengths
         name_embed = embed_categorical(node.get('Name', 'unknown'), 'node_names')  # 10
         details = node.get('Details', {})
         access = ' '.join(details.get('Memory access patterns', ['Pointwise: 1'])[:2]).split(':')[1].strip().split()[0]
         access_embed = embed_categorical(access, 'access_types')[:3]  # 3
-        op_hist = details.get('Op histogram', ['Add: 0'] * 10)[:10]  # Limit to 10
+        op_hist = details.get('Op histogram', ['Add: 0'] * 10)[:10]
         op_counts = [int(line.split(':')[1].strip()) for line in op_hist]
         op_norm = normalize_numerical(op_counts, 10)  # 10
         jacobian_placeholder = np.zeros(10)  # 10
         sched = next((s.get('Details', {}).get('scheduling_feature', {}) for s in sched_data if s.get('Name') == node.get('Name')), {})
         sched_keys = ['inner_parallelism', 'outer_parallelism', 'vector_size', 'unrolled_loop_extent',
                       'points_computed_minimum', 'unique_bytes_read_per_realization', 'bytes_at_task']
-        sched_vals = [sched.get(k, 0) for k in sched_keys][:7]  # Limit to 7
+        sched_vals = [sched.get(k, 0) for k in sched_keys][:7]
         sched_norm = normalize_numerical(sched_vals, 7)  # 7
-        # Concatenate with exact lengths
-        specific_features = np.concatenate([
-            name_embed,          # 10
-            access_embed,        # 3
-            op_norm,             # 10
-            jacobian_placeholder,# 10
-            sched_norm           # 7
-        ])
-        # Debugging (uncomment if needed):
-        # print(f"Node lengths: name={len(name_embed)}, access={len(access_embed)}, op={len(op_norm)}, jacobian={len(jacobian_placeholder)}, sched={len(sched_norm)}, total={len(specific_features)}")
+        specific_features = np.concatenate([name_embed, access_embed, op_norm, jacobian_placeholder, sched_norm])
         assert len(specific_features) == specific_dim, f"Specific features length mismatch: {len(specific_features)} != {specific_dim}"
         timestep = np.concatenate([type_onehot, specific_features])
         assert len(timestep) == feature_dim, f"Node timestep length mismatch: {len(timestep)} != {feature_dim}"
@@ -171,7 +160,7 @@ def process_tiramisu(tiramisu_data):
         for comp_name, comp_data in computations.items():
             type_onehot = np.array([0.0, 1.0, 0.0, 0.0])
             specific_features = embed_categorical(comp_name, 'comp_names', 10)  # 10
-            specific_features = np.concatenate([specific_features, np.zeros(2)])  # Bounds placeholder
+            specific_features = np.concatenate([specific_features, np.zeros(2)])  # Bounds placeholder, 2
             comp_features = [comp_data.get('absolute_order', 0) / 3.0, 
                              1.0 if comp_data.get('comp_is_reduction', False) else 0.0,
                              len(comp_data.get('iterators', [])) / 4.0]
@@ -181,17 +170,25 @@ def process_tiramisu(tiramisu_data):
             for t_type in vocab['transformation_types']:
                 val = trans.get(t_type)
                 if t_type == 'parallelized_dim' and val in vocab['iterator_names']:
-                    trans_features.extend(embed_categorical(val, 'iterator_names', 4))
+                    trans_features.extend(embed_categorical(val, 'iterator_names', 4))  # 4
                 elif t_type == 'unrolling_factor' and isinstance(val, (int, float)):
-                    trans_features.append(val / 10.0)
+                    trans_features.append(val / 10.0)  # 1
                 elif t_type in ['tiling', 'shiftings'] and isinstance(val, list):
                     vals = [parse_number(str(v)) for v in val[:5]]
                     vals += [0.0] * (5 - len(vals))
-                    trans_features.extend(normalize_numerical(vals, 5))
+                    trans_features.extend(normalize_numerical(vals, 5))  # 5
                 else:
                     trans_features.extend([0.0] * (4 if t_type == 'parallelized_dim' else 5 if t_type in ['tiling', 'shiftings'] else 1))
-            specific_features = np.concatenate([specific_features, np.array(trans_features[:20])])  # 20
-            specific_features = np.concatenate([specific_features, np.zeros(3)])  # Exec placeholder
+            # Pad trans_features to exactly 20
+            if len(trans_features) < 20:
+                trans_features.extend([0.0] * (20 - len(trans_features)))
+            elif len(trans_features) > 20:
+                trans_features = trans_features[:20]
+            specific_features = np.concatenate([specific_features, np.array(trans_features)])  # 20
+            specific_features = np.concatenate([specific_features, np.zeros(3)])  # Exec placeholder, 3
+            # Debugging (uncomment if needed):
+            # print(f"Tiramisu comp lengths: comp_name={len(embed_categorical(comp_name, 'comp_names', 10))}, bounds={2}, comp_features={len(normalize_numerical(comp_features, 5))}, trans={len(trans_features)}, exec={3}, total={len(specific_features)}")
+            assert len(specific_features) == specific_dim, f"Tiramisu comp specific features length mismatch: {len(specific_features)}"
             timestep = np.concatenate([type_onehot, specific_features])
             assert len(timestep) == feature_dim, f"Tiramisu computation timestep length mismatch: {len(timestep)}"
             sequence.append(timestep)
