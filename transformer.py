@@ -30,7 +30,7 @@ def normalize_numerical(values, target_length):
     scaler = MinMaxScaler()
     values = np.array(values).reshape(-1, 1)
     normalized = scaler.fit_transform(values).flatten()
-    return normalized
+    return normalized[:target_length]  # Explicitly enforce target length
 
 def parse_number(x):
     try:
@@ -54,20 +54,23 @@ def process_halide(halide_data):
     # Nodes
     for node in nodes:
         type_onehot = np.array([1.0, 0.0, 0.0, 0.0])
-        # Build specific features step-by-step
-        specific_features = embed_categorical(node.get('Name', 'unknown'), 'node_names')  # 10
+        # Build specific features explicitly
+        name_embed = embed_categorical(node.get('Name', 'unknown'), 'node_names')  # 10
         details = node.get('Details', {})
         access = ' '.join(details.get('Memory access patterns', ['Pointwise: 1'])[:2]).split(':')[1].strip().split()[0]
-        specific_features = np.concatenate([specific_features, embed_categorical(access, 'access_types')])  # +3 = 13
-        op_hist = details.get('Op histogram', ['Add: 0'] * 10)
-        op_counts = [int(line.split(':')[1].strip()) for line in op_hist[:10]]
-        specific_features = np.concatenate([specific_features, normalize_numerical(op_counts, 10)])  # +10 = 23
-        specific_features = np.concatenate([specific_features, np.zeros(10)])  # Jacobian placeholder, +10 = 33
+        access_embed = embed_categorical(access, 'access_types')  # 3
+        op_hist = details.get('Op histogram', ['Add: 0'] * 10)[:10]  # Limit to 10
+        op_counts = [int(line.split(':')[1].strip()) for line in op_hist]
+        op_norm = normalize_numerical(op_counts, 10)  # 10
+        jacobian_placeholder = np.zeros(10)  # 10
         sched = next((s.get('Details', {}).get('scheduling_feature', {}) for s in sched_data if s.get('Name') == node.get('Name')), {})
-        sched_vals = [sched.get(k, 0) for k in ['inner_parallelism', 'outer_parallelism', 'vector_size', 'unrolled_loop_extent',
-                                                'points_computed_minimum', 'unique_bytes_read_per_realization', 'bytes_at_task']]
-        specific_features = np.concatenate([specific_features, normalize_numerical(sched_vals, 7)])  # +7 = 40
-        # Ensure exact length
+        sched_keys = ['inner_parallelism', 'outer_parallelism', 'vector_size', 'unrolled_loop_extent',
+                      'points_computed_minimum', 'unique_bytes_read_per_realization', 'bytes_at_task']
+        sched_vals = [sched.get(k, 0) for k in sched_keys][:7]  # Explicitly limit to 7
+        sched_norm = normalize_numerical(sched_vals, 7)  # 7
+        specific_features = np.concatenate([name_embed, access_embed, op_norm, jacobian_placeholder, sched_norm])
+        # Uncomment for debugging:
+        # print(f"Node features: name={len(name_embed)}, access={len(access_embed)}, op={len(op_norm)}, jacobian={len(jacobian_placeholder)}, sched={len(sched_norm)}, total={len(specific_features)}")
         assert len(specific_features) == specific_dim, f"Specific features length mismatch: {len(specific_features)} != {specific_dim}"
         timestep = np.concatenate([type_onehot, specific_features])
         assert len(timestep) == feature_dim, f"Node timestep length mismatch: {len(timestep)} != {feature_dim}"
@@ -79,7 +82,7 @@ def process_halide(halide_data):
         specific_features = embed_categorical(f"{edge.get('From', 'unknown')}_{edge.get('To', 'unknown')}", 'node_names')  # 10
         specific_features = np.concatenate([specific_features, np.zeros(3)])  # Access placeholder
         specific_features = np.concatenate([specific_features, np.zeros(10)])  # Op histogram placeholder
-        jacobian = [parse_number(x) for x in ' '.join(edge.get('Details', {}).get('Load Jacobians', ['0'] * 10)).split()]
+        jacobian = [parse_number(x) for x in ' '.join(edge.get('Details', {}).get('Load Jacobians', ['0'] * 10)).split()][:10]
         specific_features = np.concatenate([specific_features, normalize_numerical(jacobian, 10)])  # 10
         specific_features = np.concatenate([specific_features, np.zeros(7)])  # Schedule placeholder
         assert len(specific_features) == specific_dim, f"Edge specific features length mismatch: {len(specific_features)}"
@@ -99,7 +102,7 @@ def process_halide(halide_data):
             specific_features = np.concatenate([specific_features, np.zeros(10)])  # Jacobian placeholder
             sched_vals = [sched.get('Details', {}).get('scheduling_feature', {}).get(k, 0) for k in 
                           ['inner_parallelism', 'outer_parallelism', 'vector_size', 'unrolled_loop_extent',
-                           'points_computed_minimum', 'unique_bytes_read_per_realization', 'bytes_at_task']]
+                           'points_computed_minimum', 'unique_bytes_read_per_realization', 'bytes_at_task']][:7]
             specific_features = np.concatenate([specific_features, normalize_numerical(sched_vals, 7)])  # 7
             assert len(specific_features) == specific_dim, f"Schedule specific features length mismatch: {len(specific_features)}"
             timestep = np.concatenate([type_onehot, specific_features])
