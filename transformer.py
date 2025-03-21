@@ -23,14 +23,17 @@ def embed_categorical(value, vocab_key, max_size=10):
     one_hot = np.zeros(max_size)
     if idx >= 0 and idx < max_size:
         one_hot[idx] = 1
-    return one_hot
+    return one_hot[:max_size]  # Ensure exact length
 
 def normalize_numerical(values, target_length):
     values = values + [0.0] * (target_length - len(values)) if len(values) < target_length else values[:target_length]
     scaler = MinMaxScaler()
     values = np.array(values).reshape(-1, 1)
     normalized = scaler.fit_transform(values).flatten()
-    return normalized[:target_length]  # Explicitly enforce target length
+    # Pad or truncate to exact target_length
+    if len(normalized) < target_length:
+        normalized = np.pad(normalized, (0, target_length - len(normalized)), 'constant')
+    return normalized[:target_length]
 
 def parse_number(x):
     try:
@@ -54,11 +57,11 @@ def process_halide(halide_data):
     # Nodes
     for node in nodes:
         type_onehot = np.array([1.0, 0.0, 0.0, 0.0])
-        # Build specific features explicitly
+        # Build specific features with exact lengths
         name_embed = embed_categorical(node.get('Name', 'unknown'), 'node_names')  # 10
         details = node.get('Details', {})
         access = ' '.join(details.get('Memory access patterns', ['Pointwise: 1'])[:2]).split(':')[1].strip().split()[0]
-        access_embed = embed_categorical(access, 'access_types')  # 3
+        access_embed = embed_categorical(access, 'access_types')[:3]  # 3
         op_hist = details.get('Op histogram', ['Add: 0'] * 10)[:10]  # Limit to 10
         op_counts = [int(line.split(':')[1].strip()) for line in op_hist]
         op_norm = normalize_numerical(op_counts, 10)  # 10
@@ -66,11 +69,18 @@ def process_halide(halide_data):
         sched = next((s.get('Details', {}).get('scheduling_feature', {}) for s in sched_data if s.get('Name') == node.get('Name')), {})
         sched_keys = ['inner_parallelism', 'outer_parallelism', 'vector_size', 'unrolled_loop_extent',
                       'points_computed_minimum', 'unique_bytes_read_per_realization', 'bytes_at_task']
-        sched_vals = [sched.get(k, 0) for k in sched_keys][:7]  # Explicitly limit to 7
+        sched_vals = [sched.get(k, 0) for k in sched_keys][:7]  # Limit to 7
         sched_norm = normalize_numerical(sched_vals, 7)  # 7
-        specific_features = np.concatenate([name_embed, access_embed, op_norm, jacobian_placeholder, sched_norm])
-        # Uncomment for debugging:
-        # print(f"Node features: name={len(name_embed)}, access={len(access_embed)}, op={len(op_norm)}, jacobian={len(jacobian_placeholder)}, sched={len(sched_norm)}, total={len(specific_features)}")
+        # Concatenate with exact lengths
+        specific_features = np.concatenate([
+            name_embed,          # 10
+            access_embed,        # 3
+            op_norm,             # 10
+            jacobian_placeholder,# 10
+            sched_norm           # 7
+        ])
+        # Debugging (uncomment if needed):
+        # print(f"Node lengths: name={len(name_embed)}, access={len(access_embed)}, op={len(op_norm)}, jacobian={len(jacobian_placeholder)}, sched={len(sched_norm)}, total={len(specific_features)}")
         assert len(specific_features) == specific_dim, f"Specific features length mismatch: {len(specific_features)} != {specific_dim}"
         timestep = np.concatenate([type_onehot, specific_features])
         assert len(timestep) == feature_dim, f"Node timestep length mismatch: {len(timestep)} != {feature_dim}"
