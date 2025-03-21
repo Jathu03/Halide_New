@@ -213,7 +213,7 @@ def process_all_tiramisu(tiramisu_dir):
     return all_sequences
 
 # Main execution
-halide_dir = 'syntheic_data'
+halide_dir = 'synthetic_data'
 tiramisu_dir = 'Tiramisu'
 
 # Generate sequences
