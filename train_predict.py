@@ -32,11 +32,11 @@ def load_and_preprocess_dataset():
     
     # Normalize input sequences
     X_scaler = StandardScaler()
-    X_reshaped = X.reshape(-1, X.shape[-1])
-    X_scaled = X_scaler.fit_transform(X_reshaped).reshape(X.shape)
+    X_reshaped = X.reshape(-1, X.shape[-1])  # (n_samples * 100, 44)
+    X_scaled = X_scaler.fit_transform(X_reshaped).reshape(X.shape)  # Back to (n_samples, 100, 44)
     
-    # Log-transform execution times (add small epsilon to avoid log(0))
-    y_log = np.log1p(y)  # log1p(x) = log(1 + x)
+    # Log-transform and normalize execution times
+    y_log = np.log1p(y)  # Handle small/zero values
     y_scaler = StandardScaler()
     y_scaled = y_scaler.fit_transform(y_log.reshape(-1, 1)).flatten()
     
@@ -50,41 +50,35 @@ def load_and_preprocess_dataset():
     
     return X_train, X_val, X_test, y_train, y_val, y_test, X_scaler, y_scaler, y
 
-# Simplified LSTM model
+# Improved LSTM model
 class ImprovedExecutionTimePredictor(nn.Module):
-    def __init__(self, input_dim=44, hidden_dim1=128, hidden_dim2=64, dropout=0.1):
+    def __init__(self, input_dim=44, hidden_dim1=256, hidden_dim2=128, dropout=0.05):
         super(ImprovedExecutionTimePredictor, self).__init__()
         self.lstm1 = nn.LSTM(input_dim, hidden_dim1, batch_first=True)
         self.dropout1 = nn.Dropout(dropout)
         self.lstm2 = nn.LSTM(hidden_dim1, hidden_dim2, batch_first=True)
         self.dropout2 = nn.Dropout(dropout)
-        self.fc1 = nn.Linear(hidden_dim2, 32)
+        self.fc1 = nn.Linear(hidden_dim2, 64)
         self.relu = nn.ReLU()
-        self.fc2 = nn.Linear(32, 1)
+        self.fc2 = nn.Linear(64, 1)
         self.exp = nn.ReLU()  # Ensures non-negative output
     
     def forward(self, x):
-        out, _ = self.lstm1(x)
+        out, _ = self.lstm1(x)  # x: (batch_size, 100, 44)
         out = self.dropout1(out)
-        out, _ = self.lstm2(out)
-        out = self.dropout2(out[:, -1, :])  # Last timestep
-        out = self.fc1(out)
+        out, _ = self.lstm2(out)  # out: (batch_size, 100, hidden_dim2)
+        out = self.dropout2(out[:, -1, :])  # Take last timestep: (batch_size, hidden_dim2)
+        out = self.fc1(out)  # (batch_size, 64)
         out = self.relu(out)
-        out = self.fc2(out)
-        out = self.exp(out)  # Enforce non-negative predictions
+        out = self.fc2(out)  # (batch_size, 1)
+        out = self.exp(out)  # Ensure non-negative
         return out
 
-# Custom loss function (MSE + MAPE)
-def custom_loss(outputs, targets, alpha=0.5):
-    mse_loss = nn.MSELoss()(outputs, targets)
-    mape_loss = torch.mean(torch.abs((outputs - targets) / (targets + 1e-6)))  # Avoid division by zero
-    return alpha * mse_loss + (1 - alpha) * mape_loss
-
 # Training function
-def train_model(model, train_loader, val_loader, device, epochs=100, patience=10):
-    criterion = custom_loss
-    optimizer = optim.Adam(model.parameters(), lr=0.0005)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
+def train_model(model, train_loader, val_loader, device, epochs=200, patience=20):
+    criterion = nn.MSELoss()
+    optimizer = optim.Adam(model.parameters(), lr=0.0001)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
     
     train_losses, val_losses, train_maes, val_maes = [], [], [], []
     best_val_loss = float('inf')
@@ -101,7 +95,6 @@ def train_model(model, train_loader, val_loader, device, epochs=100, patience=10
             outputs = model(sequences)
             loss = criterion(outputs.squeeze(), targets)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             
             train_loss += loss.item() * sequences.size(0)
@@ -169,6 +162,22 @@ def plot_history(train_losses, val_losses, train_maes, val_maes):
     plt.savefig('training_history_improved.png')
     plt.close()
 
+# Predict function for new data
+def predict(model, X, X_scaler, y_scaler, device):
+    model.eval()
+    # Reshape and scale input
+    X_reshaped = X.reshape(-1, X.shape[-1])
+    X_scaled = X_scaler.transform(X_reshaped).reshape(X.shape)
+    X_tensor = torch.tensor(X_scaled, dtype=torch.float32).to(device)
+    
+    with torch.no_grad():
+        y_pred_scaled = model(X_tensor).squeeze().cpu().numpy()
+    
+    # Inverse transform predictions
+    y_pred_log = y_scaler.inverse_transform(y_pred_scaled.reshape(-1, 1)).flatten()
+    y_pred = np.expm1(y_pred_log)  # Reverse log1p
+    return y_pred
+
 # Main execution
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -187,7 +196,7 @@ def main():
     test_loader = DataLoader(test_dataset, batch_size=128, shuffle=False)
     
     # Initialize model
-    model = ImprovedExecutionTimePredictor().to(device)
+    model = ImprovedExecutionTimePredictor(input_dim=44).to(device)
     
     # Train model
     train_losses, val_losses, train_maes, val_maes = train_model(model, train_loader, val_loader, device)
@@ -214,10 +223,10 @@ def main():
     print(f"\nTest Loss (MSE): {test_loss:.4f}")
     print(f"Test MAE: {test_mae:.4f}")
     
-    # Inverse transform predictions
+    # Inverse transform test predictions
     y_pred_scaled = np.array(y_pred_scaled)
     y_pred_log = y_scaler.inverse_transform(y_pred_scaled.reshape(-1, 1)).flatten()
-    y_pred = np.expm1(y_pred_log)  # expm1(x) = exp(x) - 1, inverse of log1p
+    y_pred = np.expm1(y_pred_log)
     y_test_log = y_scaler.inverse_transform(y_test.reshape(-1, 1)).flatten()
     y_test_original = np.expm1(y_test_log)
     
@@ -234,6 +243,14 @@ def main():
     np.save('y_scaler_mean.npy', y_scaler.mean_)
     np.save('y_scaler_scale.npy', y_scaler.scale_)
     print("\nModel and scalers saved.")
+    
+    # Example prediction on a single test sample
+    sample_idx = 0
+    sample_X = X_test[sample_idx:sample_idx+1]  # Shape: (1, 100, 44)
+    sample_pred = predict(model, sample_X, X_scaler, y_scaler, device)
+    print(f"\nExample Prediction for Test Sample {sample_idx}:")
+    print(f"Predicted Execution Time: {sample_pred[0]:.6f} seconds")
+    print(f"Actual Execution Time: {y_test_original[sample_idx]:.6f} seconds")
 
 if __name__ == "__main__":
     required_files = ['halide_sequences.npy', 'halide_exec_times.npy', 
