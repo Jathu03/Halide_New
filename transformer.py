@@ -210,7 +210,9 @@ def process_tiramisu(tiramisu_data):
         if fusions:
             type_onehot = [0.0, 0.0, 0.0, 1.0]
             specific_features = []
-            fusion_name = '_'.join(fusions[:2])
+            # Handle nested list structure in fusions
+            fusion_names = [f[0] if isinstance(f, list) else str(f) for f in fusions[:2]]
+            fusion_name = '_'.join(fusion_names) if fusion_names else 'unknown'
             specific_features.extend(embed_categorical(fusion_name, 'comp_names', 10))  # 10
             specific_features.extend([0.0] * 2)  # Bounds placeholder
             specific_features.extend([0.0] * 5)  # Comp placeholder
