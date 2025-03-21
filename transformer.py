@@ -54,7 +54,8 @@ def process_halide(halide_data):
         op_counts = [int(line.split(':')[1].strip()) for line in op_hist[:10]]
         node_features.extend(normalize_numerical(op_counts))
         # Scheduling features (length: 10)
-        sched = next((s['Details']['scheduling_feature'] for s in sched_data if s['Name'] == name), {})
+        # Safely handle missing 'Name' key in sched_data
+        sched = next((s.get('Details', {}).get('scheduling_feature', {}) for s in sched_data if 'Name' in s and s['Name'] == name), {})
         sched_vals = [
             sched.get('inner_parallelism', 0),
             sched.get('outer_parallelism', 0),
@@ -212,7 +213,7 @@ def process_all_tiramisu(tiramisu_dir):
     return all_sequences
 
 # Main execution
-halide_dir = 'synthetic_data'
+halide_dir = 'syntheic_data'
 tiramisu_dir = 'Tiramisu'
 
 # Generate sequences
