@@ -27,6 +27,15 @@ def normalize_numerical(values):
     values = np.array(values).reshape(-1, 1)
     return scaler.fit_transform(values).flatten()
 
+# Helper function to parse numbers, handling fractions and invalid strings
+def parse_number(x):
+    try:
+        if '/' in x:
+            return float(eval(x))  # Evaluate fractions like '1/16'
+        return float(x)  # Convert regular numbers
+    except (ValueError, SyntaxError, NameError):
+        return 0.0  # Return 0.0 for invalid strings like '_'
+
 # Process a single Halide JSON file
 def process_halide(halide_data):
     edges = halide_data['programming_details']['Edges']
@@ -76,9 +85,9 @@ def process_halide(halide_data):
     for edge in edges:
         type_onehot = [0.0, 1.0]  # Edge type
         edge_features = []
-        # Handle Jacobian values as floats to accommodate fractions
+        # Parse Jacobian values, handling fractions and invalid strings
         jacobian_str = ' '.join(edge['Details']['Load Jacobians'])
-        jacobian = [float(eval(x)) if '/' in x else float(x) for x in jacobian_str.split()]
+        jacobian = [parse_number(x) for x in jacobian_str.split()]
         edge_features.extend(normalize_numerical(jacobian[:9]))  # Take up to 9 values, normalize
         # Pad to specific_dim (21)
         specific_features = edge_features + [0.0] * (specific_dim - len(edge_features))  # 9 + 12 = 21
@@ -214,7 +223,7 @@ def process_all_tiramisu(tiramisu_dir):
     return all_sequences
 
 # Main execution
-halide_dir = 'synthetic_data'  # Corrected from 'syntheic_data'
+halide_dir = 'synthetic_data'
 tiramisu_dir = 'Tiramisu'
 
 # Generate sequences
