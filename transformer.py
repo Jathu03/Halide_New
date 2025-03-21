@@ -54,7 +54,6 @@ def process_halide(halide_data):
         op_counts = [int(line.split(':')[1].strip()) for line in op_hist[:10]]
         node_features.extend(normalize_numerical(op_counts))
         # Scheduling features (length: 10)
-        # Safely handle missing 'Name' key in sched_data
         sched = next((s.get('Details', {}).get('scheduling_feature', {}) for s in sched_data if 'Name' in s and s['Name'] == name), {})
         sched_vals = [
             sched.get('inner_parallelism', 0),
@@ -77,8 +76,10 @@ def process_halide(halide_data):
     for edge in edges:
         type_onehot = [0.0, 1.0]  # Edge type
         edge_features = []
-        jacobian = [int(x) for x in ' '.join(edge['Details']['Load Jacobians']).split()]
-        edge_features.extend(normalize_numerical(jacobian[:9]))  # Length: 9
+        # Handle Jacobian values as floats to accommodate fractions
+        jacobian_str = ' '.join(edge['Details']['Load Jacobians'])
+        jacobian = [float(eval(x)) if '/' in x else float(x) for x in jacobian_str.split()]
+        edge_features.extend(normalize_numerical(jacobian[:9]))  # Take up to 9 values, normalize
         # Pad to specific_dim (21)
         specific_features = edge_features + [0.0] * (specific_dim - len(edge_features))  # 9 + 12 = 21
         feature_vector = type_onehot + specific_features
@@ -213,7 +214,7 @@ def process_all_tiramisu(tiramisu_dir):
     return all_sequences
 
 # Main execution
-halide_dir = 'synthetic_data'
+halide_dir = 'synthetic_data'  # Corrected from 'syntheic_data'
 tiramisu_dir = 'Tiramisu'
 
 # Generate sequences
