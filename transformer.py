@@ -88,6 +88,9 @@ def process_halide(halide_data):
         # Parse Jacobian values, handling fractions and invalid strings
         jacobian_str = ' '.join(edge['Details']['Load Jacobians'])
         jacobian = [parse_number(x) for x in jacobian_str.split()]
+        # Handle empty or insufficient Jacobian data
+        if not jacobian:  # If jacobian is empty
+            jacobian = [0.0] * 9  # Default to 9 zeros
         edge_features.extend(normalize_numerical(jacobian[:9]))  # Take up to 9 values, normalize
         # Pad to specific_dim (21)
         specific_features = edge_features + [0.0] * (specific_dim - len(edge_features))  # 9 + 12 = 21
