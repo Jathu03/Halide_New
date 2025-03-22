@@ -8,7 +8,6 @@ import numpy as np
 
 # Custom collate function to handle variable-sized tensors
 def custom_collate_fn(batch):
-    # batch is a list of (input_dict, exec_time) tuples
     comps_list = [item[0]["comps"] for item in batch]
     loops_list = [item[0]["loops"] for item in batch]
     expr_list = [item[0]["expr"] for item in batch]
@@ -20,11 +19,12 @@ def custom_collate_fn(batch):
     comp_feature_size = comps_list[0].shape[1]
     loop_feature_size = loops_list[0].shape[1]
     expr_feature_size = expr_list[0].shape[2]  # [num_comps, MAX_EXPR_LEN, feature_size]
+    max_expr_len = expr_list[0].shape[1]  # MAX_EXPR_LEN from data creation
 
     # Pad tensors to max sizes
     padded_comps = torch.zeros(len(batch), max_comps, comp_feature_size)
     padded_loops = torch.zeros(len(batch), max_loops, loop_feature_size)
-    padded_expr = torch.zeros(len(batch), max_comps, expr_list[0].shape[1], expr_feature_size)
+    padded_expr = torch.zeros(len(batch), max_comps, max_expr_len, expr_feature_size)
 
     for i in range(len(batch)):
         comps = comps_list[i]
@@ -33,6 +33,9 @@ def custom_collate_fn(batch):
         padded_comps[i, :comps.shape[0], :] = comps
         padded_loops[i, :loops.shape[0], :] = loops
         padded_expr[i, :expr.shape[0], :, :] = expr
+
+    # Reshape expr to (batch_size, max_comps * max_expr_len, expr_feature_size) for LSTM
+    padded_expr = padded_expr.view(len(batch), max_comps * max_expr_len, expr_feature_size)
 
     return {
         "comps": padded_comps,
@@ -71,8 +74,8 @@ class TiramisuLSTM(nn.Module):
     
     def forward(self, x):
         comp_out, _ = self.comp_lstm(x["comps"])  # (batch, seq, hidden)
-        loop_out, _ = self.loop_lstm(x["loops"])
-        expr_out, _ = self.expr_lstm(x["expr"])
+        loop_out, _ = self.loop_lstm(x["loops"])  # (batch, seq, hidden)
+        expr_out, _ = self.expr_lstm(x["expr"])   # (batch, seq, hidden)
         
         # Take the last output of each LSTM
         comp_out = comp_out[:, -1, :]
@@ -108,7 +111,7 @@ def train_model():
     test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, collate_fn=custom_collate_fn)
     
     # Model setup
-    comp_input_dim = dataset[0]["comps_tensor"].shape[1]  # e.g., 704 from the error
+    comp_input_dim = dataset[0]["comps_tensor"].shape[1]  # e.g., 704
     loop_input_dim = dataset[0]["loops_tensor"].shape[1]  # e.g., 8
     expr_input_dim = dataset[0]["expr_tensor"].shape[2]   # 11 (8 expr + 3 type)
     
