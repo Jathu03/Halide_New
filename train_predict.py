@@ -8,9 +8,9 @@ import os
 # Define constants
 MAX_NUM_TRANSFORMATIONS = 4
 MAX_TAGS = 16
-MAX_COMPS = 10  # Maximum number of computations to pad to (adjust based on your data)
+MAX_COMPS = 10
 
-# Model_Recursive_LSTM_v2 class (unchanged)
+# Model_Recursive_LSTM_v2 class with correction
 class Model_Recursive_LSTM_v2(nn.Module):
     def __init__(
         self,
@@ -111,11 +111,13 @@ class Model_Recursive_LSTM_v2(nn.Module):
         
         batch_size, num_comps, __dict__ = comps_tensor_first_part.shape
         first_part = comps_tensor_first_part.to(self.device).view(batch_size * num_comps, -1)
-        vectors = comps_tensor_vectors.to(self.device)
+        vectors = comps_tensor_vectors.to(self.device)  # Shape: [batch_size, MAX_COMPS, 64]
         third_part = comps_tensor_third_part.to(self.device).view(batch_size * num_comps, -1)
         
-        vectors = self.encode_vectors(vectors)
-        _, (prog_embedding, _) = self.transformation_vectors_embed(vectors)
+        # Reshape vectors to process each transformation vector separately
+        vectors = vectors.view(batch_size * num_comps, MAX_NUM_TRANSFORMATIONS, MAX_TAGS)  # [batch_size * MAX_COMPS, 4, 16]
+        vectors = self.encode_vectors(vectors)  # Apply to each [16] vector, output [batch_size * MAX_COMPS, 4, 16]
+        _, (prog_embedding, _) = self.transformation_vectors_embed(vectors)  # LSTM over 4 vectors
         prog_embedding = prog_embedding.permute(1, 0, 2).reshape(batch_size * num_comps, -1)
         
         x = torch.cat((first_part, prog_embedding, third_part, expr_embedding), dim=1).view(batch_size, num_comps, -1)
@@ -152,7 +154,6 @@ class TiramisuDataset(Dataset):
         sample = self.data[idx]
         num_comps = sample['comps_tensor'].shape[0]
         
-        # Pad or truncate comps_tensor to MAX_COMPS
         comps_tensor = sample['comps_tensor']
         if num_comps < MAX_COMPS:
             padding = torch.zeros(MAX_COMPS - num_comps, comps_tensor.shape[1])
@@ -160,7 +161,6 @@ class TiramisuDataset(Dataset):
         elif num_comps > MAX_COMPS:
             comps_tensor = comps_tensor[:MAX_COMPS]
         
-        # Pad or truncate expr_tensor to MAX_COMPS
         expr_tensor = sample['expr_tensor']
         num_expr_comps = expr_tensor.shape[0]
         if num_expr_comps < MAX_COMPS:
@@ -179,9 +179,9 @@ class TiramisuDataset(Dataset):
         }
         tree_tensors = (
             tree,
-            comps_tensor[:, :10],  # Adjust slicing based on your features
-            comps_tensor[:, 10:74],  # Transformation vectors (64 elements)
-            comps_tensor[:, 74:],  # Remaining features
+            comps_tensor[:, :10],
+            comps_tensor[:, 10:74],
+            comps_tensor[:, 74:],
             sample['loops_tensor'],
             expr_tensor
         )
@@ -196,20 +196,17 @@ def custom_collate_fn(batch):
         tree_tensors_list.append(tree_tensors)
         targets_list.append(target)
     
-    # Stack tensors with consistent sizes
-    comps_first = torch.stack([t[1] for t in tree_tensors_list])  # [batch_size, MAX_COMPS, 10]
-    comps_vectors = torch.stack([t[2] for t in tree_tensors_list])  # [batch_size, MAX_COMPS, 64]
-    comps_third = torch.stack([t[3] for t in tree_tensors_list])  # [batch_size, MAX_COMPS, remaining]
+    comps_first = torch.stack([t[1] for t in tree_tensors_list])
+    comps_vectors = torch.stack([t[2] for t in tree_tensors_list])
+    comps_third = torch.stack([t[3] for t in tree_tensors_list])
     
-    # Pad loops_tensor to match the maximum number of loops in the batch
     max_loops = max(t[4].shape[0] for t in tree_tensors_list)
     loops_tensor = torch.stack([
         torch.cat([t[4], torch.zeros(max_loops - t[4].shape[0], t[4].shape[1])], dim=0) if t[4].shape[0] < max_loops else t[4][:max_loops]
         for t in tree_tensors_list
     ])
     
-    # expr_tensor is now padded to MAX_COMPS
-    expr_tensor = torch.stack([t[5] for t in tree_tensors_list])  # [batch_size, MAX_COMPS, 66, 11]
+    expr_tensor = torch.stack([t[5] for t in tree_tensors_list])
     
     targets = torch.tensor(targets_list, dtype=torch.float32)
     trees = [t[0] for t in tree_tensors_list]
