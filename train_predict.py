@@ -77,27 +77,31 @@ test_dataset = TiramisuDataset(X_test, y_test)
 train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
 test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
 
-# Define LSTM Model
-class LSTMModel(nn.Module):
-    def __init__(self, vocab_size, embedding_dim=100, hidden_size=128, num_layers=2, dropout=0.2):
-        super(LSTMModel, self).__init__()
+# Define Enhanced LSTM Model
+class EnhancedLSTMModel(nn.Module):
+    def __init__(self, vocab_size, embedding_dim=100, hidden_size=256, num_layers=3, dropout=0.3):
+        super(EnhancedLSTMModel, self).__init__()
         self.embedding = nn.Embedding(vocab_size, embedding_dim, padding_idx=0)
         self.lstm = nn.LSTM(embedding_dim, hidden_size, num_layers, batch_first=True, dropout=dropout)
-        self.fc = nn.Linear(hidden_size, 1)
-        self.sigmoid = nn.Sigmoid()  # Ensure output is in [0, 1] range
+        self.fc1 = nn.Linear(hidden_size, 64)
+        self.fc2 = nn.Linear(64, 1)
+        self.dropout = nn.Dropout(dropout)
+        self.relu = nn.ReLU()
     
     def forward(self, x):
-        embedded = self.embedding(x)
-        out, _ = self.lstm(embedded)
-        out = self.fc(out[:, -1, :])
-        out = self.sigmoid(out)  # Normalize output to match scaled targets
+        embedded = self.embedding(x)  # (batch_size, seq_length, embedding_dim)
+        out, _ = self.lstm(embedded)  # (batch_size, seq_length, hidden_size)
+        out = self.dropout(out[:, -1, :])  # Last time step: (batch_size, hidden_size)
+        out = self.relu(self.fc1(out))    # (batch_size, 64)
+        out = self.fc2(out)               # (batch_size, 1)
         return out
 
-# Initialize model, loss, and optimizer
+# Initialize model, loss, optimizer, and scheduler
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-model = LSTMModel(vocab_size=vocab_size).to(device)
+model = EnhancedLSTMModel(vocab_size=vocab_size, hidden_size=256, num_layers=3).to(device)
 criterion = nn.MSELoss()
 optimizer = optim.Adam(model.parameters(), lr=0.001)
+scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
 
 # Training loop
 num_epochs = 50
@@ -128,11 +132,15 @@ for epoch in range(num_epochs):
     
     test_loss /= len(test_loader.dataset)
     
-    print(f"Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.6f}, Test Loss: {test_loss:.6f}")
+    # Step the scheduler
+    scheduler.step(test_loss)
+    current_lr = optimizer.param_groups[0]['lr']
+    
+    print(f"Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.6f}, Test Loss: {test_loss:.6f}, LR: {current_lr:.6f}")
 
 # Save the model and scaler
 torch.save(model.state_dict(), 'tiramisu_lstm_model.pth')
-np.save('scaler_params.npy', [scaler.scale_, scaler.min_])  # Save scaler params for denormalization
+np.save('scaler_params.npy', [scaler.scale_, scaler.min_])
 print("Model saved to 'tiramisu_lstm_model.pth', Scaler params saved to 'scaler_params.npy'")
 
 # Example: Denormalize a prediction
