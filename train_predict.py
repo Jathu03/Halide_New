@@ -10,7 +10,6 @@ MAX_NUM_TRANSFORMATIONS = 4
 MAX_TAGS = 16
 MAX_COMPS = 10
 
-# Model_Recursive_LSTM_v2 class with correction
 class Model_Recursive_LSTM_v2(nn.Module):
     def __init__(
         self,
@@ -29,10 +28,12 @@ class Model_Recursive_LSTM_v2(nn.Module):
         self.device = device
         embedding_size = comp_embed_layer_sizes[-1]
         
-        regression_layer_sizes = [embedding_size] + comp_embed_layer_sizes[-2:]
-        concat_layer_sizes = [embedding_size * 2 + loops_tensor_size] + comp_embed_layer_sizes[-2:]
+        # Adjust input size to account for processed embeddings
+        total_embedding_size = lstm_embedding_size * (2 if bidirectional else 1) * num_layers + expr_embed_size
+        comp_embed_layer_sizes = [input_size + total_embedding_size] + comp_embed_layer_sizes
         
-        comp_embed_layer_sizes = [input_size + lstm_embedding_size * (2 if bidirectional else 1) * num_layers + expr_embed_size] + comp_embed_layer_sizes
+        regression_layer_sizes = [embedding_size] + comp_embed_layer линииsizes[-2:]
+        concat_layer_sizes = [embedding_size * 2 + loops_tensor_size] + comp_embed_layer_sizes[-2:]
         
         self.comp_embedding_layers = nn.ModuleList()
         self.comp_embedding_dropouts = nn.ModuleList()
@@ -107,20 +108,19 @@ class Model_Recursive_LSTM_v2(nn.Module):
         batch_size, num_comps, len_sequence, len_vector = functions_comps_expr_tree.shape
         x = functions_comps_expr_tree.view(batch_size * num_comps, len_sequence, len_vector)
         _, (expr_embedding, _) = self.exprs_embed(x)
-        expr_embedding = expr_embedding.permute(1, 0, 2).reshape(batch_size * num_comps, -1)
+        expr_embedding = expr_embedding.permute(1, 0, 2).reshape(batch_size * num_comps, -1)  # [320, 100]
         
         batch_size, num_comps, __dict__ = comps_tensor_first_part.shape
-        first_part = comps_tensor_first_part.to(self.device).view(batch_size * num_comps, -1)
-        vectors = comps_tensor_vectors.to(self.device)  # Shape: [batch_size, MAX_COMPS, 64]
-        third_part = comps_tensor_third_part.to(self.device).view(batch_size * num_comps, -1)
+        first_part = comps_tensor_first_part.to(self.device).view(batch_size * num_comps, -1)  # [320, 10]
+        vectors = comps_tensor_vectors.to(self.device)  # [batch_size, MAX_COMPS, 64]
+        third_part = comps_tensor_third_part.to(self.device).view(batch_size * num_comps, -1)  # [320, 630]
         
-        # Reshape vectors to process each transformation vector separately
-        vectors = vectors.view(batch_size * num_comps, MAX_NUM_TRANSFORMATIONS, MAX_TAGS)  # [batch_size * MAX_COMPS, 4, 16]
-        vectors = self.encode_vectors(vectors)  # Apply to each [16] vector, output [batch_size * MAX_COMPS, 4, 16]
-        _, (prog_embedding, _) = self.transformation_vectors_embed(vectors)  # LSTM over 4 vectors
-        prog_embedding = prog_embedding.permute(1, 0, 2).reshape(batch_size * num_comps, -1)
+        vectors = vectors.view(batch_size * num_comps, MAX_NUM_TRANSFORMATIONS, MAX_TAGS)  # [320, 4, 16]
+        vectors = self.encode_vectors(vectors)  # [320, 4, 16]
+        _, (prog_embedding, _) = self.transformation_vectors_embed(vectors)  # [1, 320, 200]
+        prog_embedding = prog_embedding.permute(1, 0, 2).reshape(batch_size * num_comps, -1)  # [320, 200]
         
-        x = torch.cat((first_part, prog_embedding, third_part, expr_embedding), dim=1).view(batch_size, num_comps, -1)
+        x = torch.cat((first_part, prog_embedding, third_part, expr_embedding), dim=1).view(batch_size, num_comps, -1)  # [32, 10, 940]
         
         for i in range(len(self.comp_embedding_layers)):
             x = self.comp_embedding_layers[i](x)
@@ -142,7 +142,6 @@ class Model_Recursive_LSTM_v2(nn.Module):
         out = self.predict(x)
         return self.LeakyReLU(out[:, 0, 0])
 
-# Dataset class
 class TiramisuDataset(Dataset):
     def __init__(self, dataset_path="tiramisu_dataset.pt"):
         self.data = torch.load(dataset_path)
@@ -187,7 +186,6 @@ class TiramisuDataset(Dataset):
         )
         return tree_tensors, sample['exec_time']
 
-# Custom collate function with padding
 def custom_collate_fn(batch):
     tree_tensors_list = []
     targets_list = []
@@ -297,7 +295,11 @@ def main():
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=custom_collate_fn)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, collate_fn=custom_collate_fn)
     
-    input_size = dataset[0][0][1].shape[-1] + dataset[0][0][2].shape[-1] + dataset[0][0][3].shape[-1]
+    # Correct input_size calculation
+    first_part_size = dataset[0][0][1].shape[-1]  # 10
+    third_part_size = dataset[0][0][3].shape[-1]  # 630 (or whatever your data shows)
+    input_size = first_part_size + third_part_size  # Exclude vectors size, add processed sizes in model
+    
     model = Model_Recursive_LSTM_v2(
         input_size=input_size,
         comp_embed_layer_sizes=[600, 350, 200, 180],
@@ -310,6 +312,11 @@ def main():
         num_layers=1,
         bidirectional=True
     )
+    
+    # Verify input size
+    expected_input_size = first_part_size + 200 + third_part_size + 100  # 940 in this case
+    print(f"Expected input size to first comp_embedding_layer: {expected_input_size}")
+    print(f"Actual first layer input size: {model.comp_embedding_layers[0].weight.shape[1]}")
     
     train_model(model, train_loader, val_loader, num_epochs, device, learning_rate)
 
