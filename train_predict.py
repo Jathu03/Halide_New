@@ -77,24 +77,30 @@ class MultiHeadAttention(nn.Module):
         scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
         attn_weights = torch.softmax(scores, dim=-1)
         context = torch.matmul(attn_weights, V).transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_size)
-        return self.fc_out(context).mean(dim=1)  # Average over sequence length
+        return self.fc_out(context)  # Return full sequence for further processing
 
-# Improved Model with Multi-Head Attention
-class TiramisuMultiHeadLSTM(nn.Module):
+# Hierarchical LSTM Model
+class TiramisuHierarchicalLSTM(nn.Module):
     def __init__(self, comp_input_dim, loop_input_dim, expr_input_dim, hidden_size=256, num_layers=2):
-        super(TiramisuMultiHeadLSTM, self).__init__()
+        super(TiramisuHierarchicalLSTM, self).__init__()
+        self.hidden_size = hidden_size
+        
+        # Embeddings for computations, loops, and expressions
         self.comp_lstm = nn.LSTM(comp_input_dim, hidden_size, num_layers, batch_first=True, bidirectional=True)
         self.loop_lstm = nn.LSTM(loop_input_dim, hidden_size, num_layers, batch_first=True, bidirectional=True)
         self.expr_lstm = nn.LSTM(expr_input_dim, hidden_size, num_layers, batch_first=True)
         
-        self.comp_attention = MultiHeadAttention(hidden_size * 2)  # *2 for bidirectional
-        self.loop_attention = MultiHeadAttention(hidden_size * 2)  # *2 for bidirectional
+        # Attention layers
+        self.comp_attention = MultiHeadAttention(hidden_size * 2)
+        self.loop_attention = MultiHeadAttention(hidden_size * 2)
         self.expr_attention = MultiHeadAttention(hidden_size)
         
-        # Corrected normalization size: 512 (comp) + 512 (loop) + 256 (expr) = 1280
-        self.norm = nn.LayerNorm(hidden_size * 5)  # *5 = 2*hidden_size (comp) + 2*hidden_size (loop) + hidden_size (expr)
+        # Final aggregation LSTM to combine components hierarchically
+        self.agg_lstm = nn.LSTM(hidden_size * 2, hidden_size, num_layers=1, batch_first=True)
+        
+        # Output layers
         self.fc = nn.Sequential(
-            nn.Linear(hidden_size * 5, 512),
+            nn.Linear(hidden_size, 512),
             nn.ELU(),
             nn.Dropout(0.3),
             nn.Linear(512, 128),
@@ -105,25 +111,38 @@ class TiramisuMultiHeadLSTM(nn.Module):
         )
     
     def forward(self, x):
+        batch_size = x["comps"].size(0)
+        
         # Comps embedding
         comp_out, _ = self.comp_lstm(x["comps"])  # [batch, max_comps, hidden*2]
-        comp_context = self.comp_attention(comp_out)  # [batch, hidden*2]
+        comp_seq = self.comp_attention(comp_out)  # [batch, max_comps, hidden*2]
         
         # Loops embedding
         loop_out, _ = self.loop_lstm(x["loops"])  # [batch, max_loops, hidden*2]
-        loop_context = self.loop_attention(loop_out)  # [batch, hidden*2]
+        loop_seq = self.loop_attention(loop_out)  # [batch, max_loops, hidden*2]
         
         # Expr embedding (process per computation)
-        batch_size, num_comps, expr_len, _ = x["expr"].size()
+        num_comps, expr_len = x["expr"].size(1), x["expr"].size(2)
         expr_input = x["expr"].view(batch_size * num_comps, expr_len, -1)  # [batch*num_comps, expr_len, input_size]
         expr_out, _ = self.expr_lstm(expr_input)  # [batch*num_comps, expr_len, hidden]
         expr_out = expr_out.view(batch_size, num_comps, expr_len, -1)  # [batch, num_comps, expr_len, hidden]
-        expr_context = self.expr_attention(expr_out.reshape(batch_size, num_comps * expr_len, -1))  # [batch, hidden]
+        expr_seq = self.expr_attention(expr_out.reshape(batch_size, num_comps * expr_len, -1))  # [batch, num_comps*expr_len, hidden]
+        expr_seq = expr_seq.view(batch_size, num_comps, -1)  # [batch, num_comps, hidden]
         
-        # Combine embeddings
-        combined = torch.cat([comp_context, loop_context, expr_context], dim=1)  # [batch, hidden*5]
-        combined = self.norm(combined)
-        return self.fc(combined)
+        # Combine comps and expr hierarchically (mimicking tree structure)
+        comp_expr_seq = torch.cat([comp_seq, expr_seq], dim=2)  # [batch, num_comps, hidden*3]
+        comp_expr_seq = comp_expr_seq.mean(dim=1, keepdim=True)  # [batch, 1, hidden*3], average over computations
+        
+        # Pad loop sequence to match dimensions for aggregation
+        loop_seq = loop_seq.mean(dim=1, keepdim=True)  # [batch, 1, hidden*2]
+        
+        # Aggregate hierarchically with LSTM
+        agg_input = torch.cat([comp_expr_seq, loop_seq], dim=1)  # [batch, 2, hidden*2]
+        agg_out, (agg_h, _) = self.agg_lstm(agg_input)  # [batch, 2, hidden]
+        agg_context = agg_h[-1]  # [batch, hidden]
+        
+        # Final prediction
+        return self.fc(agg_context)
 
 # Training function
 def train_model():
@@ -156,7 +175,7 @@ def train_model():
     expr_input_dim = dataset[0]["expr_tensor"].shape[2]   # 11
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = TiramisuMultiHeadLSTM(comp_input_dim, loop_input_dim, expr_input_dim).to(device)
+    model = TiramisuHierarchicalLSTM(comp_input_dim, loop_input_dim, expr_input_dim).to(device)
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=10)
@@ -176,7 +195,7 @@ def train_model():
             outputs = model(batch_x)
             loss = criterion(outputs, batch_y)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             train_loss += loss.item() * batch_x["comps"].size(0)
         train_loss /= len(train_loader.dataset)
