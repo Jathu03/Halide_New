@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
-from collections import defaultdict
+from sklearn.preprocessing import MinMaxScaler
 
 # Load the processed dataset
 DATASET_FILE = 'tiramisu_graph_dataset.json'
@@ -16,48 +16,42 @@ with open(DATASET_FILE, 'r') as f:
 # Function to serialize graph into a sequence
 def graph_to_sequence(graph):
     sequence = []
-    
-    # Add schedule string
     sequence.append(f"SCHED:{graph['schedule_str']}")
-    
-    # Add nodes and their attributes
     for node, attrs in graph['attributes'].items():
         node_type = attrs['type']
         attr_str = ' '.join([f"{k}={str(v).replace(' ', '_')}" for k, v in attrs.items()])
         sequence.append(f"NODE:{node} TYPE:{node_type} {attr_str}")
-    
-    # Add edges
     for src, dst, edge_type in graph['edges']:
         sequence.append(f"EDGE:{src}->{dst} TYPE:{edge_type}")
-    
-    # Add tree structure (simplified)
     tree_str = str(graph['tree_structure']).replace(' ', '_')
     sequence.append(f"TREE:{tree_str}")
-    
     return ' '.join(sequence)
 
-# Prepare data: Convert graphs to sequences
+# Prepare data
 sequences = [graph_to_sequence(entry['graph']) for entry in dataset]
-execution_times = [entry['avg_execution_time'] for entry in dataset]
+execution_times = np.array([entry['avg_execution_time'] for entry in dataset])
+
+# Normalize execution times
+scaler = MinMaxScaler()
+y_scaled = scaler.fit_transform(execution_times.reshape(-1, 1)).flatten()
 
 # Tokenize sequences and build vocabulary
 tokenized_sequences = [seq.split() for seq in sequences]
 all_tokens = [token for seq in tokenized_sequences for token in seq]
-vocab = {token: idx + 1 for idx, token in enumerate(sorted(set(all_tokens)))}  # 0 reserved for padding
-vocab_size = len(vocab) + 1  # +1 for padding token
+vocab = {token: idx + 1 for idx, token in enumerate(sorted(set(all_tokens)))}
+vocab_size = len(vocab) + 1
 
-# Convert sequences to integer indices
+# Convert sequences to indices
 def sequence_to_indices(sequence, vocab, max_length=200):
-    indices = [vocab.get(token, 0) for token in sequence.split()[:max_length]]  # Unknown tokens -> 0
+    indices = [vocab.get(token, 0) for token in sequence.split()[:max_length]]
     while len(indices) < max_length:
-        indices.append(0)  # Pad with 0
+        indices.append(0)
     return indices
 
 X_indices = np.array([sequence_to_indices(seq, vocab) for seq in sequences])
-y = np.array(execution_times)
 
 # Split into train and test sets
-X_train, X_test, y_train, y_test = train_test_split(X_indices, y, test_size=0.2, random_state=42)
+X_train, X_test, y_train, y_test = train_test_split(X_indices, y_scaled, test_size=0.2, random_state=42)
 
 # Convert to PyTorch tensors
 X_train = torch.tensor(X_train, dtype=torch.long)
@@ -83,19 +77,20 @@ test_dataset = TiramisuDataset(X_test, y_test)
 train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
 test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
 
-# Define LSTM Model with Embedding Layer
+# Define LSTM Model
 class LSTMModel(nn.Module):
     def __init__(self, vocab_size, embedding_dim=100, hidden_size=128, num_layers=2, dropout=0.2):
         super(LSTMModel, self).__init__()
         self.embedding = nn.Embedding(vocab_size, embedding_dim, padding_idx=0)
         self.lstm = nn.LSTM(embedding_dim, hidden_size, num_layers, batch_first=True, dropout=dropout)
         self.fc = nn.Linear(hidden_size, 1)
+        self.sigmoid = nn.Sigmoid()  # Ensure output is in [0, 1] range
     
     def forward(self, x):
-        # x shape: (batch_size, seq_length)
-        embedded = self.embedding(x)  # (batch_size, seq_length, embedding_dim)
-        out, _ = self.lstm(embedded)  # (batch_size, seq_length, hidden_size)
-        out = self.fc(out[:, -1, :])  # Take the last time step: (batch_size, 1)
+        embedded = self.embedding(x)
+        out, _ = self.lstm(embedded)
+        out = self.fc(out[:, -1, :])
+        out = self.sigmoid(out)  # Normalize output to match scaled targets
         return out
 
 # Initialize model, loss, and optimizer
@@ -135,6 +130,15 @@ for epoch in range(num_epochs):
     
     print(f"Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.6f}, Test Loss: {test_loss:.6f}")
 
-# Save the model
+# Save the model and scaler
 torch.save(model.state_dict(), 'tiramisu_lstm_model.pth')
-print("Model saved to 'tiramisu_lstm_model.pth'")
+np.save('scaler_params.npy', [scaler.scale_, scaler.min_])  # Save scaler params for denormalization
+print("Model saved to 'tiramisu_lstm_model.pth', Scaler params saved to 'scaler_params.npy'")
+
+# Example: Denormalize a prediction
+model.eval()
+with torch.no_grad():
+    sample_input = X_test[:1].to(device)
+    sample_pred = model(sample_input).cpu().numpy()
+    denormalized_pred = scaler.inverse_transform(sample_pred)
+    print(f"Sample Prediction (normalized): {sample_pred[0][0]}, Denormalized: {denormalized_pred[0][0]}")
