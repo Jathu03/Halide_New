@@ -10,14 +10,6 @@ MAX_NUM_TRANSFORMATIONS = 4
 MAX_TAGS = 16
 MAX_COMPS = 10
 
-import torch
-from torch import nn
-
-# Define constants
-MAX_NUM_TRANSFORMATIONS = 4
-MAX_TAGS = 16
-MAX_COMPS = 10
-
 class Model_Recursive_LSTM_v2(nn.Module):
     def __init__(
         self,
@@ -76,17 +68,10 @@ class Model_Recursive_LSTM_v2(nn.Module):
         self.no_comps_tensor = nn.Parameter(nn.init.xavier_uniform_(torch.zeros(1, embedding_size)))
         self.no_nodes_tensor = nn.Parameter(nn.init.xavier_uniform_(torch.zeros(1, embedding_size)))
         
-        # Corrected LSTM initializations with batch_first=True
         self.comps_lstm = nn.LSTM(comp_embed_layer_sizes[-1], embedding_size, batch_first=True)
         self.nodes_lstm = nn.LSTM(comp_embed_layer_sizes[-1], embedding_size, batch_first=True)
         self.roots_lstm = nn.LSTM(comp_embed_layer_sizes[-1], embedding_size, batch_first=True)
-        self.transformation_vectors_embed = nn.LSTM(
-            MAX_TAGS, 
-            lstm_embedding_size, 
-            batch_first=True, 
-            bidirectional=bidirectional, 
-            num_layers=num_layers
-        )
+        self.transformation_vectors_embed = nn.LSTM(MAX_TAGS, lstm_embedding_size, batch_first=True, bidirectional=bidirectional, num_layers=num_layers)
         self.exprs_embed = nn.LSTM(11, expr_embed_size, batch_first=True)
 
     def get_hidden_state(self, node, comps_embeddings, loops_tensor):
@@ -124,7 +109,7 @@ class Model_Recursive_LSTM_v2(nn.Module):
         _, (expr_embedding, _) = self.exprs_embed(x)
         expr_embedding = expr_embedding.permute(1, 0, 2).reshape(batch_size * num_comps, -1)
         
-        batch_size, num_comps, __dict__ = comps_tensor_first_part.shape
+        batch_size, num_comps, _ = comps_tensor_first_part.shape
         first_part = comps_tensor_first_part.to(self.device).view(batch_size * num_comps, -1)
         vectors = comps_tensor_vectors.to(self.device)
         third_part = comps_tensor_third_part.to(self.device).view(batch_size * num_comps, -1)
@@ -141,11 +126,10 @@ class Model_Recursive_LSTM_v2(nn.Module):
             x = self.comp_embedding_dropouts[i](self.ELU(x))
         comps_embeddings = x
         
-        # Process each tree in the batch
         roots_list = []
         for batch_idx in range(batch_size):
-            tree = trees[batch_idx]  # Get the tree for this batch item
-            for root in tree["roots"]:  # Iterate over roots in this tree
+            tree = trees[batch_idx]
+            for root in tree["roots"]:
                 roots_list.append(self.get_hidden_state(root, comps_embeddings[batch_idx:batch_idx+1], loops_tensor[batch_idx:batch_idx+1]))
         
         roots_tensor = torch.cat(roots_list, 1)
@@ -157,13 +141,16 @@ class Model_Recursive_LSTM_v2(nn.Module):
             x = self.regression_layers[i](x)
             x = self.regression_dropouts[i](self.ELU(x))
         out = self.predict(x)
-        return self.LeakyReLU(out[:, 0, 0])
-
-# Rest of your code (Dataset, DataLoader, training loop, etc.) remains unchanged
+        # Remove LeakyReLU to allow negative predictions if needed, and ensure output is scalar
+        return out[:, 0, 0]
 
 class TiramisuDataset(Dataset):
     def __init__(self, dataset_path="tiramisu_dataset.pt"):
         self.data = torch.load(dataset_path)
+        # Compute mean and std for normalization
+        exec_times = torch.tensor([sample['exec_time'] for sample in self.data], dtype=torch.float32)
+        self.exec_time_mean = exec_times.mean()
+        self.exec_time_std = exec_times.std()
         
     def __len__(self):
         return len(self.data)
@@ -195,6 +182,9 @@ class TiramisuDataset(Dataset):
                 "loop_index": torch.tensor([0], dtype=torch.long)
             }]
         }
+        # Normalize execution time
+        normalized_exec_time = (sample['exec_time'] - self.exec_time_mean) / self.exec_time_std
+        
         tree_tensors = (
             tree,
             comps_tensor[:, :10],
@@ -203,7 +193,7 @@ class TiramisuDataset(Dataset):
             sample['loops_tensor'],
             expr_tensor
         )
-        return tree_tensors, sample['exec_time']
+        return tree_tensors, normalized_exec_time
 
 def custom_collate_fn(batch):
     tree_tensors_list = []
@@ -230,7 +220,7 @@ def custom_collate_fn(batch):
     
     return (trees, comps_first, comps_vectors, comps_third, loops_tensor, expr_tensor), targets
 
-def train_model(model, train_loader, val_loader, num_epochs=100, device="cuda" if torch.cuda.is_available() else "cpu", learning_rate=0.001):
+def train_model(model, train_loader, val_loader, num_epochs=10, device="cuda" if torch.cuda.is_available() else "cpu", learning_rate=0.0001):
     model = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     criterion = nn.MSELoss()
@@ -246,7 +236,7 @@ def train_model(model, train_loader, val_loader, num_epochs=100, device="cuda" i
         for batch_idx, (tree_tensors, targets) in enumerate(tqdm(train_loader)):
             trees, comps_first, comps_vectors, comps_third, loops_tensor, expr_tensor = tree_tensors
             tree_tensors_device = (
-                trees,  # Pass the list of trees directly
+                trees,
                 comps_first.to(device),
                 comps_vectors.to(device),
                 comps_third.to(device),
@@ -274,7 +264,7 @@ def train_model(model, train_loader, val_loader, num_epochs=100, device="cuda" i
             for tree_tensors, targets in val_loader:
                 trees, comps_first, comps_vectors, comps_third, loops_tensor, expr_tensor = tree_tensors
                 tree_tensors_device = (
-                    trees,  # Pass the list of trees directly
+                    trees,
                     comps_first.to(device),
                     comps_vectors.to(device),
                     comps_third.to(device),
@@ -302,8 +292,8 @@ def train_model(model, train_loader, val_loader, num_epochs=100, device="cuda" i
 
 def main():
     batch_size = 32
-    num_epochs = 10
-    learning_rate = 0.001
+    num_epochs = 10  # Reduced from 100 for quicker testing
+    learning_rate = 0.0001  # Reduced learning rate
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
     dataset = TiramisuDataset("tiramisu_dataset.pt")
@@ -331,9 +321,10 @@ def main():
         bidirectional=True
     )
     
-    expected_input_size = first_part_size + 200 + third_part_size + 100  # Adjust based on bidirectional LSTM
+    expected_input_size = first_part_size + 200 + third_part_size + 100  # 200 from bidirectional LSTM
     print(f"Expected input size to first comp_embedding_layer: {expected_input_size}")
     print(f"Actual first layer input size: {model.comp_embedding_layers[0].weight.shape[1]}")
+    print(f"Execution time mean: {dataset.exec_time_mean:.6f}, std: {dataset.exec_time_std:.6f}")
     
     train_model(model, train_loader, val_loader, num_epochs, device, learning_rate)
 
