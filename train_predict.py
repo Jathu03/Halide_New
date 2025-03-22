@@ -8,8 +8,9 @@ import os
 # Define constants
 MAX_NUM_TRANSFORMATIONS = 4
 MAX_TAGS = 16
+MAX_COMPS = 10  # Define a maximum number of computations to pad to (adjust based on your data)
 
-# Model_Recursive_LSTM_v2 class (unchanged, included here for completeness)
+# Model_Recursive_LSTM_v2 class (unchanged)
 class Model_Recursive_LSTM_v2(nn.Module):
     def __init__(
         self,
@@ -150,26 +151,34 @@ class TiramisuDataset(Dataset):
     def __getitem__(self, idx):
         sample = self.data[idx]
         num_comps = sample['comps_tensor'].shape[0]
-        # Create tree structure as a dictionary, avoiding tensor stacking issues
+        
+        # Pad or truncate comps_tensor to MAX_COMPS
+        comps_tensor = sample['comps_tensor']
+        if num_comps < MAX_COMPS:
+            padding = torch.zeros(MAX_COMPS - num_comps, comps_tensor.shape[1])
+            comps_tensor = torch.cat([comps_tensor, padding], dim=0)
+        elif num_comps > MAX_COMPS:
+            comps_tensor = comps_tensor[:MAX_COMPS]
+        
         tree = {
             "roots": [{
                 "child_list": [],
                 "has_comps": True,
-                "computations_indices": torch.tensor([i for i in range(num_comps)], dtype=torch.long),
+                "computations_indices": torch.tensor([i for i in range(min(num_comps, MAX_COMPS))], dtype=torch.long),
                 "loop_index": torch.tensor([0], dtype=torch.long)
             }]
         }
         tree_tensors = (
             tree,
-            sample['comps_tensor'][:, :10],  # Adjust slicing based on your features
-            sample['comps_tensor'][:, 10:74],  # Transformation vectors (64 elements)
-            sample['comps_tensor'][:, 74:],  # Remaining features
+            comps_tensor[:, :10],  # Adjust slicing based on your features
+            comps_tensor[:, 10:74],  # Transformation vectors (64 elements)
+            comps_tensor[:, 74:],  # Remaining features
             sample['loops_tensor'],
             sample['expr_tensor']
         )
         return tree_tensors, sample['exec_time']
 
-# Custom collate function to handle variable-sized tree structures
+# Custom collate function with padding
 def custom_collate_fn(batch):
     tree_tensors_list = []
     targets_list = []
@@ -178,15 +187,21 @@ def custom_collate_fn(batch):
         tree_tensors_list.append(tree_tensors)
         targets_list.append(target)
     
-    # Stack only the tensor components that have consistent sizes
-    comps_first = torch.stack([t[1] for t in tree_tensors_list])
-    comps_vectors = torch.stack([t[2] for t in tree_tensors_list])
-    comps_third = torch.stack([t[3] for t in tree_tensors_list])
-    loops_tensor = torch.stack([t[4] for t in tree_tensors_list])
-    expr_tensor = torch.stack([t[5] for t in tree_tensors_list])
-    targets = torch.tensor(targets_list, dtype=torch.float32)
+    # Stack tensors with consistent sizes
+    comps_first = torch.stack([t[1] for t in tree_tensors_list])  # Now all are [MAX_COMPS, 10]
+    comps_vectors = torch.stack([t[2] for t in tree_tensors_list])  # Now all are [MAX_COMPS, 64]
+    comps_third = torch.stack([t[3] for t in tree_tensors_list])  # Now all are [MAX_COMPS, remaining]
     
-    # Keep the tree as a list of dictionaries
+    # Pad loops_tensor and expr_tensor to match MAX_COMPS if needed
+    max_loops = max(t[4].shape[0] for t in tree_tensors_list)
+    loops_tensor = torch.stack([
+        torch.cat([t[4], torch.zeros(max_loops - t[4].shape[0], t[4].shape[1])], dim=0) if t[4].shape[0] < max_loops else t[4][:max_loops]
+        for t in tree_tensors_list
+    ])
+    
+    expr_tensor = torch.stack([t[5] for t in tree_tensors_list])  # Assuming expr_tensor is already consistent
+    
+    targets = torch.tensor(targets_list, dtype=torch.float32)
     trees = [t[0] for t in tree_tensors_list]
     
     return (trees, comps_first, comps_vectors, comps_third, loops_tensor, expr_tensor), targets
@@ -205,10 +220,9 @@ def train_model(model, train_loader, val_loader, num_epochs=100, device="cuda" i
         train_count = 0
         
         for batch_idx, (tree_tensors, targets) in enumerate(tqdm(train_loader)):
-            # Unpack tree_tensors, moving tensors to device
             trees, comps_first, comps_vectors, comps_third, loops_tensor, expr_tensor = tree_tensors
             tree_tensors_device = (
-                {"roots": trees},  # Keep trees as a list of dicts
+                {"roots": trees},
                 comps_first.to(device),
                 comps_vectors.to(device),
                 comps_third.to(device),
@@ -234,7 +248,7 @@ def train_model(model, train_loader, val_loader, num_epochs=100, device="cuda" i
         
         with torch.no_grad():
             for tree_tensors, targets in val_loader:
-                trees, comps_first, comps_vectors, comps_third, loops_tensor, expr_tensor = tree_tensors
+                trees, comps_first, comps_vectors, Lafcomps_third, loops_tensor, expr_tensor = tree_tensors
                 tree_tensors_device = (
                     {"roots": trees},
                     comps_first.to(device),
@@ -273,7 +287,6 @@ def main():
     val_size = len(dataset) - train_size
     train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
     
-    # Use custom collate function
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=custom_collate_fn)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, collate_fn=custom_collate_fn)
     
