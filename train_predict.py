@@ -53,60 +53,75 @@ class TiramisuDataset(Dataset):
             "expr": self.data[idx]["expr_tensor"]
         }, self.data[idx]["exec_time"]
 
-# Attention module
-class Attention(nn.Module):
-    def __init__(self, hidden_size):
-        super(Attention, self).__init__()
+# Multi-Head Attention module
+class MultiHeadAttention(nn.Module):
+    def __init__(self, hidden_size, num_heads=4):
+        super(MultiHeadAttention, self).__init__()
+        assert hidden_size % num_heads == 0
         self.hidden_size = hidden_size
-        self.attn = nn.Linear(hidden_size * 2, hidden_size)
-        self.v = nn.Parameter(torch.rand(hidden_size))
-        stdv = 1. / np.sqrt(self.v.size(0))
-        self.v.data.uniform_(-stdv, stdv)
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+        
+        self.query = nn.Linear(hidden_size, hidden_size)
+        self.key = nn.Linear(hidden_size, hidden_size)
+        self.value = nn.Linear(hidden_size, hidden_size)
+        self.fc_out = nn.Linear(hidden_size, hidden_size)
+        self.scale = torch.sqrt(torch.tensor(self.head_dim, dtype=torch.float32))
 
-    def forward(self, hidden, encoder_outputs):
-        batch_size, seq_len, _ = encoder_outputs.size()
-        hidden = hidden.unsqueeze(1).repeat(1, seq_len, 1)  # [batch, seq_len, hidden]
-        energy = torch.tanh(self.attn(torch.cat((hidden, encoder_outputs), dim=2)))
-        energy = energy.matmul(self.v)  # [batch, seq_len]
-        attn_weights = torch.softmax(energy, dim=1).unsqueeze(2)  # [batch, seq_len, 1]
-        context = attn_weights * encoder_outputs  # [batch, seq_len, hidden]
-        return context.sum(dim=1)  # [batch, hidden]
+    def forward(self, x):
+        batch_size, seq_len, _ = x.size()
+        Q = self.query(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        K = self.key(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        V = self.value(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
+        attn_weights = torch.softmax(scores, dim=-1)
+        context = torch.matmul(attn_weights, V).transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_size)
+        return self.fc_out(context).mean(dim=1)  # Average over sequence length
 
-# New Model with Attention
-class TiramisuAttentionLSTM(nn.Module):
-    def __init__(self, comp_input_dim, loop_input_dim, expr_input_dim, hidden_size=256, num_layers=1):
-        super(TiramisuAttentionLSTM, self).__init__()
-        self.comp_lstm = nn.LSTM(comp_input_dim, hidden_size, num_layers, batch_first=True)
-        self.loop_lstm = nn.LSTM(loop_input_dim, hidden_size, num_layers, batch_first=True)
+# Improved Model with Multi-Head Attention
+class TiramisuMultiHeadLSTM(nn.Module):
+    def __init__(self, comp_input_dim, loop_input_dim, expr_input_dim, hidden_size=256, num_layers=2):
+        super(TiramisuMultiHeadLSTM, self).__init__()
+        self.comp_lstm = nn.LSTM(comp_input_dim, hidden_size, num_layers, batch_first=True, bidirectional=True)
+        self.loop_lstm = nn.LSTM(loop_input_dim, hidden_size, num_layers, batch_first=True, bidirectional=True)
         self.expr_lstm = nn.LSTM(expr_input_dim, hidden_size, num_layers, batch_first=True)
         
-        self.comp_attention = Attention(hidden_size)
-        self.loop_attention = Attention(hidden_size)
+        self.comp_attention = MultiHeadAttention(hidden_size * 2)  # *2 for bidirectional
+        self.loop_attention = MultiHeadAttention(hidden_size * 2)  # *2 for bidirectional
+        self.expr_attention = MultiHeadAttention(hidden_size)
         
+        self.norm = nn.LayerNorm(hidden_size * 6)  # *6 = 2*hidden_size (comp) + 2*hidden_size (loop) + hidden_size (expr)
         self.fc = nn.Sequential(
-            nn.Linear(hidden_size * 3, 128),
+            nn.Linear(hidden_size * 6, 512),
             nn.ELU(),
             nn.Dropout(0.3),
-            nn.Linear(128, 1)
+            nn.Linear(512, 128),
+            nn.ELU(),
+            nn.Dropout(0.3),
+            nn.Linear(128, 1),
+            nn.ReLU()  # Ensure non-negative predictions
         )
     
     def forward(self, x):
         # Comps embedding
-        comp_out, (comp_h, _) = self.comp_lstm(x["comps"])  # [batch, seq, hidden]
-        comp_context = self.comp_attention(comp_h[-1], comp_out)  # [batch, hidden]
+        comp_out, _ = self.comp_lstm(x["comps"])  # [batch, max_comps, hidden*2]
+        comp_context = self.comp_attention(comp_out)  # [batch, hidden*2]
         
         # Loops embedding
-        loop_out, (loop_h, _) = self.loop_lstm(x["loops"])  # [batch, seq, hidden]
-        loop_context = self.loop_attention(loop_h[-1], loop_out)  # [batch, hidden]
+        loop_out, _ = self.loop_lstm(x["loops"])  # [batch, max_loops, hidden*2]
+        loop_context = self.loop_attention(loop_out)  # [batch, hidden*2]
         
-        # Expr embedding (flatten comps and expr_len dimensions)
+        # Expr embedding (process per computation)
         batch_size, num_comps, expr_len, _ = x["expr"].size()
-        expr_input = x["expr"].view(batch_size, num_comps * expr_len, -1)  # [batch, seq, input_size]
-        expr_out, (expr_h, _) = self.expr_lstm(expr_input)  # [batch, seq, hidden]
-        expr_context = expr_out[:, -1, :]  # Use last hidden state [batch, hidden]
+        expr_input = x["expr"].view(batch_size * num_comps, expr_len, -1)  # [batch*num_comps, expr_len, input_size]
+        expr_out, _ = self.expr_lstm(expr_input)  # [batch*num_comps, expr_len, hidden]
+        expr_out = expr_out.view(batch_size, num_comps, expr_len, -1)  # [batch, num_comps, expr_len, hidden]
+        expr_context = self.expr_attention(expr_out.view(batch_size, num_comps * expr_len, -1))  # [batch, hidden]
         
         # Combine embeddings
-        combined = torch.cat([comp_context, loop_context, expr_context], dim=1)  # [batch, hidden*3]
+        combined = torch.cat([comp_context, loop_context, expr_context], dim=1)  # [batch, hidden*6]
+        combined = self.norm(combined)
         return self.fc(combined)
 
 # Training function
@@ -114,10 +129,11 @@ def train_model():
     # Load dataset
     dataset = torch.load("tiramisu_dataset.pt")
     
-    # Normalize execution times
-    exec_times = np.array([d["exec_time"] for d in dataset]).reshape(-1, 1)
+    # Normalize execution times (log transform to handle wide range)
+    exec_times = np.array([d["exec_time"] for d in dataset])
+    exec_times = np.log1p(exec_times)  # log(1+x) to handle small values
     scaler = StandardScaler()
-    y_scaled = scaler.fit_transform(exec_times).flatten()
+    y_scaled = scaler.fit_transform(exec_times.reshape(-1, 1)).flatten()
     for i, d in enumerate(dataset):
         d["exec_time"] = y_scaled[i]
     
@@ -139,10 +155,10 @@ def train_model():
     expr_input_dim = dataset[0]["expr_tensor"].shape[2]   # 11
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = TiramisuAttentionLSTM(comp_input_dim, loop_input_dim, expr_input_dim).to(device)
+    model = TiramisuMultiHeadLSTM(comp_input_dim, loop_input_dim, expr_input_dim).to(device)
     criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=5)
+    optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=10)
     
     # Training loop
     num_epochs = 150
@@ -159,6 +175,7 @@ def train_model():
             outputs = model(batch_x)
             loss = criterion(outputs, batch_y)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # Gradient clipping
             optimizer.step()
             train_loss += loss.item() * batch_x["comps"].size(0)
         train_loss /= len(train_loader.dataset)
@@ -195,9 +212,9 @@ def train_model():
             test_preds.extend(outputs.cpu().numpy().flatten())
             test_true.extend(batch_y.cpu().numpy().flatten())
     
-    # Denormalize
-    test_true_denorm = scaler.inverse_transform(np.array(test_true).reshape(-1, 1)).flatten()
-    test_preds_denorm = scaler.inverse_transform(np.array(test_preds).reshape(-1, 1)).flatten()
+    # Denormalize (reverse log transform)
+    test_true_denorm = np.expm1(scaler.inverse_transform(np.array(test_true).reshape(-1, 1)).flatten())
+    test_preds_denorm = np.expm1(scaler.inverse_transform(np.array(test_preds).reshape(-1, 1)).flatten())
     
     # Calculate MAPE
     mape = np.mean(np.abs((test_true_denorm - test_preds_denorm) / test_true_denorm)) * 100
