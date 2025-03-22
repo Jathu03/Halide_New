@@ -746,7 +746,6 @@ def train_tiramisu_model(model, train_loader, val_loader, num_epochs=NUM_EPOCHS,
     
     return model, train_losses, val_losses
 
-# Your corrected evaluate_model function
 def evaluate_model(model, test_loader):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
@@ -820,7 +819,7 @@ def evaluate_model(model, test_loader):
 
 # Main execution block to tie everything together
 if __name__ == "__main__":
-    # Constants (assuming these are defined earlier)
+    # Constants
     HIDDEN_DIM = 128
     NODE_FEATURE_DIM = 64
     BATCH_SIZE = 32
@@ -828,16 +827,27 @@ if __name__ == "__main__":
     LEARNING_RATE = 0.001
 
     # 1. Load and preprocess the data
-    folder_path = "path/to/your/tiramisu/programs"  # Replace with your actual folder path
+    # Replace this with the actual path to your Tiramisu JSON files
+    folder_path = "/path/to/your/tiramisu/json/files"  # UPDATE THIS PATH
+    if not os.path.exists(folder_path):
+        print(f"Error: The folder path '{folder_path}' does not exist. Please provide a valid path.")
+        exit(1)
+
     programs = load_tiramisu_programs(folder_path)
+    if not programs:
+        print("Error: No Tiramisu programs loaded. Check the folder path and ensure it contains valid JSON files.")
+        exit(1)
     
     preprocessed_programs = []
     for program in programs:
         preprocessed = preprocess_tiramisu_program(program)
-        if preprocessed['execution_time'] is not None:  # Filter out programs with no execution time
+        if preprocessed['execution_time'] is not None and preprocessed['execution_time'] != float('inf'):  # Filter out invalid execution times
             preprocessed_programs.append(preprocessed)
     
     print(f"Preprocessed {len(preprocessed_programs)} programs with valid execution times")
+    if not preprocessed_programs:
+        print("Error: No programs with valid execution times found. Cannot proceed with training.")
+        exit(1)
 
     # 2. Split the data into train, validation, and test sets
     train_val_programs, test_programs = train_test_split(preprocessed_programs, test_size=0.2, random_state=42)
