@@ -1,135 +1,170 @@
-import torch
-from torch import nn
-from torch.utils.data import Dataset, DataLoader
+import json
 import numpy as np
-from tqdm import tqdm
+import torch
+from pathlib import Path
 import os
+from tqdm import tqdm
 
-# Assuming Model_Recursive_LSTM_v2 is in a separate file called model.py
-from model import Model_Recursive_LSTM_v2  # You'll need to put the model class in a separate file
+# Constants from the document
+MAX_NUM_TRANSFORMATIONS = 4
+MAX_TAGS = 16
+MAX_DEPTH = 5
+MAX_EXPR_LEN = 66
+MAX_ACCESSES = 15
 
-class TiramisuDataset(Dataset):
-    def __init__(self, dataset_path="tiramisu_dataset.pt"):
-        self.data = torch.load(dataset_path)
-        
-    def __len__(self):
-        return len(self.data)
-    
-    def __getitem__(self, idx):
-        sample = self.data[idx]
-        # The model expects a tuple of tensors in forward()
-        tree_tensors = (
-            {"roots": [{"child_list": [], "has_comps": True, "computations_indices": torch.tensor([i for i in range(sample['comps_tensor'].shape[0])]), "loop_index": torch.tensor([0])}]},
-            sample['comps_tensor'][:, :10],  # First part (adjust slicing based on your features)
-            sample['comps_tensor'][:, 10:74],  # Transformation vectors (adjust based on MAX_TAGS * MAX_NUM_TRANSFORMATIONS)
-            sample['comps_tensor'][:, 74:],  # Third part
-            sample['loops_tensor'],
-            sample['expr_tensor']
-        )
-        return tree_tensors, sample['exec_time']
+# Simplified version of isl_to_write_matrix (assuming access relations are matrices or parsed similarly)
+def isl_to_write_matrix(isl_map):
+    # Placeholder: Assuming isl_map is already a matrix or parsed into one
+    # In practice, you'd parse the ISL string as in the document
+    return np.array(isl_map) if isinstance(isl_map, list) else np.zeros((MAX_DEPTH, MAX_DEPTH + 1))
 
-def train_model(
-    model,
-    train_loader,
-    val_loader,
-    num_epochs=100,
-    device="cuda" if torch.cuda.is_available() else "cpu",
-    learning_rate=0.001
-):
-    model = model.to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-    criterion = nn.MSELoss()
-    
-    best_val_loss = float('inf')
-    best_model_path = "best_model.pt"
-    
-    for epoch in range(num_epochs):
-        # Training phase
-        model.train()
-        train_loss = 0
-        train_count = 0
+def pad_access_matrix(access_matrix):
+    access_matrix = np.array(access_matrix)
+    if access_matrix.size == 0:
+        return np.zeros((MAX_DEPTH + 1, MAX_DEPTH + 2))
+    padded = np.zeros((MAX_DEPTH + 1, MAX_DEPTH + 2))
+    rows, cols = min(access_matrix.shape[0], MAX_DEPTH + 1), min(access_matrix.shape[1], MAX_DEPTH + 1)
+    padded[:rows, :cols] = access_matrix[:rows, :cols]
+    return padded
+
+# Simplified expression representation (one-hot encoding)
+def get_expr_repr(expr_type, comp_type):
+    expr_map = {"add": 0, "sub": 1, "mul": 2, "div": 3, "sqrt": 4, "min": 5, "max": 6, "unknown": 7}
+    type_map = {"int32": 0, "float32": 1, "float64": 2}
+    expr_vec = [0] * 8
+    type_vec = [0] * 3
+    expr_vec[expr_map.get(expr_type, 7)] = 1
+    type_vec[type_map.get(comp_type, 1)] = 1
+    return expr_vec + type_vec
+
+def get_tree_expr_repr(node, comp_type):
+    expr_tensor = []
+    if isinstance(node, dict) and "children" in node and node["children"]:
+        for child in node["children"]:
+            expr_tensor.extend(get_tree_expr_repr(child, comp_type))
+    expr_tensor.append(get_expr_repr(node.get("expr_type", "unknown") if isinstance(node, dict) else "unknown", comp_type))
+    padded = expr_tensor + [[0] * 11] * (MAX_EXPR_LEN - len(expr_tensor))
+    return padded[:MAX_EXPR_LEN]
+
+# Simplified transformation tags (assuming transformations_list is a list of tags)
+def get_padded_transformation_tags(schedule_dict):
+    tags = []
+    for t in schedule_dict.get("transformations_list", []):
+        tags.extend(t if isinstance(t, list) else [0] * MAX_TAGS)
+    return tags + [0] * (MAX_NUM_TRANSFORMATIONS * MAX_TAGS - len(tags))
+
+# Data representation creation
+def create_data_representation(tiramisu_dir="Tiramisu"):
+    dataset = []
+    for json_file in tqdm(list(Path(tiramisu_dir).glob("*.json"))):
+        with open(json_file, "r") as f:
+            data = json.load(f)
         
-        for batch_idx, (tree_tensors, targets) in enumerate(tqdm(train_loader)):
-            # Move data to device
-            tree_tensors = tuple(t.to(device) if isinstance(t, torch.Tensor) else t for t in tree_tensors)
-            targets = targets.to(device).float()
+        function_key = list(data.keys())[0]
+        program_json = data[function_key]["program_annotation"]
+        schedules = data[function_key]["schedules_list"]
+
+        # Computations
+        comps_dict = program_json["computations"]
+        ordered_comps = sorted(comps_dict.keys(), key=lambda x: comps_dict[x]["absolute_order"])
+        
+        for sched in schedules:
+            if not sched.get("execution_times") or min(sched["execution_times"]) <= 0:
+                continue
             
-            optimizer.zero_grad()
-            outputs = model(tree_tensors)
+            comps_repr = []
+            loops_repr = []
+            expr_repr = []
             
-            loss = criterion(outputs, targets)
-            loss.backward()
-            optimizer.step()
-            
-            train_loss += loss.item() * targets.size(0)
-            train_count += targets.size(0)
-        
-        avg_train_loss = train_loss / train_count
-        
-        # Validation phase
-        model.eval()
-        val_loss = 0
-        val_count = 0
-        
-        with torch.no_grad():
-            for tree_tensors, targets in val_loader:
-                tree_tensors = tuple(t.to(device) if isinstance(t, torch.Tensor) else t for t in tree_tensors)
-                targets = targets.to(device).float()
+            # Computation representation
+            for comp_idx, comp_name in enumerate(ordered_comps):
+                comp_dict = comps_dict[comp_name]
+                sched_dict = sched.get(comp_name, {})
                 
-                outputs = model(tree_tensors)
-                loss = criterion(outputs, targets)
+                # Basic features
+                comp_features = [int(comp_dict["comp_is_reduction"])]
                 
-                val_loss += loss.item() * targets.size(0)
-                val_count += targets.size(0)
-        
-        avg_val_loss = val_loss / val_count
-        
-        print(f"Epoch {epoch+1}/{num_epochs}")
-        print(f"Train Loss: {avg_train_loss:.6f}")
-        print(f"Val Loss: {avg_val_loss:.6f}")
-        
-        # Save best model
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-            torch.save(model.state_dict(), best_model_path)
-            print(f"Saved best model with validation loss: {best_val_loss:.6f}")
-
-def main():
-    # Hyperparameters
-    batch_size = 32
-    num_epochs = 100
-    learning_rate = 0.001
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+                # Iterators (loop nest)
+                iterators = comp_dict["iterators"]
+                iter_repr = []
+                for i, iter_name in enumerate(iterators[:MAX_DEPTH]):
+                    l_code = f"C{comp_idx}-L{i}"
+                    # Ensure shiftings and fusions are lists, defaulting to [] if None
+                    shiftings = sched_dict.get("shiftings") if sched_dict.get("shiftings") is not None else []
+                    fusions = sched.get("fusions") if sched.get("fusions") is not None else []
+                    iter_repr.extend([
+                        int(iter_name == sched_dict.get("parallelized_dim", "")),  # Parallelized
+                        int(sched_dict.get("tiling", {}).get("tiling_dims", []).count(iter_name) > 0),  # Tiled
+                        int(sched_dict.get("tiling", {}).get("tiling_factors", [0])[i]) if i < len(sched_dict.get("tiling", {}).get("tiling_factors", [])) else 0,  # TileFactor
+                        int(i in [f[2] for f in fusions if comp_name in f]),  # Fused
+                        int(any(iter_name.startswith(s[0]) for s in shiftings)),  # Shifted
+                        next((s[1] for s in shiftings if iter_name.startswith(s[0])), 0)  # ShiftFactor
+                    ])
+                iter_repr += [0] * 6 * (MAX_DEPTH - len(iterators))  # Pad
+                
+                # Handle unrolling_factor, ensuring None is treated as 0
+                unrolling_factor = sched_dict.get("unrolling_factor")
+                unrolling_factor = 0 if unrolling_factor is None else unrolling_factor
+                iter_repr.extend([
+                    int(bool(unrolling_factor)),  # Unrolled
+                    int(unrolling_factor)  # UnrollFactor
+                ])
+                
+                # Transformation tags
+                tags = get_padded_transformation_tags(sched_dict)
+                iter_repr.extend(tags)
+                
+                # Access matrices (simplified)
+                write_mat = pad_access_matrix(isl_to_write_matrix(comp_dict["write_access_relation"]))
+                comp_features.extend([comp_dict["write_buffer_id"] + 1] + write_mat.flatten().tolist())
+                
+                read_accesses = []
+                for acc in comp_dict["accesses"][:MAX_ACCESSES]:
+                    read_mat = pad_access_matrix(acc["access_matrix"])
+                    read_accesses.extend([int(acc["access_is_reduction"]), acc["buffer_id"] + 1] + read_mat.flatten().tolist())
+                read_accesses += [0] * ((MAX_DEPTH + 1) * (MAX_DEPTH + 2) + 2) * (MAX_ACCESSES - len(comp_dict["accesses"]))
+                comp_features.extend(read_accesses)
+                
+                comps_repr.append(comp_features)
+                
+                # Expression representation
+                expr_repr.append(get_tree_expr_repr(comp_dict["expression_representation"], comp_dict["data_type"]))
+            
+            # Loops representation (simplified, assuming iterators are global)
+            loops_dict = program_json["iterators"]
+            loops_features = []
+            for loop_name in loops_dict.keys():
+                sched_comp = sched.get(ordered_comps[0], {})
+                # Ensure shiftings and fusions are lists, defaulting to [] if None
+                shiftings = sched_comp.get("shiftings") if sched_comp.get("shiftings") is not None else []
+                fusions = sched.get("fusions") if sched.get("fusions") is not None else []
+                # Handle unrolling_factor for loops representation
+                unrolling_factor = sched_comp.get("unrolling_factor")
+                unrolling_factor = 0 if unrolling_factor is None else unrolling_factor
+                l_repr = [
+                    int(loop_name == sched_comp.get("parallelized_dim", "")),
+                    int(sched_comp.get("tiling", {}).get("tiling_dims", []).count(loop_name) > 0),
+                    int(sched_comp.get("tiling", {}).get("tiling_factors", [0])[0]),
+                    int(any(loop_name in comps_dict[c]["iterators"][f[2]] for f in fusions for c in f[:2])),
+                    int(bool(unrolling_factor)),
+                    int(unrolling_factor),
+                    int(any(loop_name.startswith(s[0]) for s in shiftings)),
+                    next((s[1] for s in shiftings if loop_name.startswith(s[0])), 0)
+                ]
+                loops_features.append(l_repr)
+            
+            # Execution time
+            exec_time = np.mean(sched["execution_times"])
+            
+            dataset.append({
+                "comps_tensor": torch.tensor(comps_repr, dtype=torch.float32),
+                "loops_tensor": torch.tensor(loops_features, dtype=torch.float32),
+                "expr_tensor": torch.tensor(expr_repr, dtype=torch.float32),
+                "exec_time": exec_time
+            })
     
-    # Load dataset
-    dataset = TiramisuDataset("tiramisu_dataset.pt")
-    
-    # Split into train and validation
-    train_size = int(0.8 * len(dataset))
-    val_size = len(dataset) - train_size
-    train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
-    
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size)
-    
-    # Initialize model
-    # Adjust input_size based on your computation tensor features
-    input_size = dataset[0][0][1].shape[-1] + dataset[0][0][2].shape[-1] + dataset[0][0][3].shape[-1]
-    model = Model_Recursive_LSTM_v2(
-        input_size=input_size,
-        comp_embed_layer_sizes=[600, 350, 200, 180],
-        drops=[0.225, 0.225, 0.225, 0.225],
-        output_size=1,
-        lstm_embedding_size=100,
-        expr_embed_size=100,
-        loops_tensor_size=8,
-        device=device,
-        num_layers=1,
-        bidirectional=True
-    )
-    
-    # Train the model
-    train_model(model, train_loader, val_loader, num_epochs, device, learning_rate)
+    torch.save(dataset, "tiramisu_dataset.pt")
+    print(f"Dataset saved to tiramisu_dataset.pt with {len(dataset)} samples")
 
 if __name__ == "__main__":
-    main()
+    create_data_representation()
