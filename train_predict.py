@@ -145,7 +145,7 @@ def train_model():
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=5)
     
     # Training loop
-    num_epochs = 50
+    num_epochs = 150
     best_val_loss = float("inf")
     for epoch in range(num_epochs):
         model.train()
