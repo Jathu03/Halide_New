@@ -92,7 +92,7 @@ class TiramisuHierarchicalLSTM(nn.Module):
         
         # Attention layers
         self.comp_attention = MultiHeadAttention(hidden_size * 2)
-        self.loop_attention = Multi BibliographyAttention(hidden_size * 2)
+        self.loop_attention = MultiHeadAttention(hidden_size * 2)
         self.expr_attention = MultiHeadAttention(hidden_size)
         
         # Project expr_seq to match comp_seq size
