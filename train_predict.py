@@ -50,12 +50,15 @@ def sequence_to_indices(sequence, vocab, max_length=200):
 
 X_indices = np.array([sequence_to_indices(seq, vocab) for seq in sequences])
 
-# Split into train and test sets
-X_train, X_test, y_train, y_test = train_test_split(X_indices, y_scaled, test_size=0.2, random_state=42)
+# Split into train, validation, and test sets (70% train, 15% val, 15% test)
+X_temp, X_test, y_temp, y_test = train_test_split(X_indices, y_scaled, test_size=0.15, random_state=42)
+X_train, X_val, y_train, y_val = train_test_split(X_temp, y_temp, test_size=0.1765, random_state=42)  # 0.1765 of 85% is ~15% of total
 
 # Convert to PyTorch tensors
 X_train = torch.tensor(X_train, dtype=torch.long)
 y_train = torch.tensor(y_train, dtype=torch.float32).view(-1, 1)
+X_val = torch.tensor(X_val, dtype=torch.long)
+y_val = torch.tensor(y_val, dtype=torch.float32).view(-1, 1)
 X_test = torch.tensor(X_test, dtype=torch.long)
 y_test = torch.tensor(y_test, dtype=torch.float32).view(-1, 1)
 
@@ -73,8 +76,10 @@ class TiramisuDataset(Dataset):
 
 # Create DataLoaders
 train_dataset = TiramisuDataset(X_train, y_train)
+val_dataset = TiramisuDataset(X_val, y_val)
 test_dataset = TiramisuDataset(X_test, y_test)
 train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
 test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
 
 # Define Enhanced LSTM Model
@@ -89,64 +94,106 @@ class EnhancedLSTMModel(nn.Module):
         self.relu = nn.ReLU()
     
     def forward(self, x):
-        embedded = self.embedding(x)  # (batch_size, seq_length, embedding_dim)
-        out, _ = self.lstm(embedded)  # (batch_size, seq_length, hidden_size)
-        out = self.dropout(out[:, -1, :])  # Last time step: (batch_size, hidden_size)
-        out = self.relu(self.fc1(out))    # (batch_size, 64)
-        out = self.fc2(out)               # (batch_size, 1)
+        embedded = self.embedding(x)
+        out, _ = self.lstm(embedded)
+        out = self.dropout(out[:, -1, :])
+        out = self.relu(self.fc1(out))
+        out = self.fc2(out)
         return out
 
 # Initialize model, loss, optimizer, and scheduler
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-model = EnhancedLSTMModel(vocab_size=vocab_size, hidden_size=256, num_layers=3).to(device)
+model = EnhancedLSTMModel(vocab_size=vocab_size).to(device)
 criterion = nn.MSELoss()
 optimizer = optim.Adam(model.parameters(), lr=0.001)
 scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
 
+# Function to calculate MAPE
+def calculate_mape(y_true, y_pred):
+    y_true, y_pred = np.array(y_true), np.array(y_pred)
+    mask = y_true != 0  # Avoid division by zero
+    return np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100 if mask.any() else float('inf')
+
 # Training loop
 num_epochs = 50
+best_val_loss = float('inf')
 for epoch in range(num_epochs):
+    # Training
     model.train()
     train_loss = 0
     for X_batch, y_batch in train_loader:
         X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-        
         optimizer.zero_grad()
         outputs = model(X_batch)
         loss = criterion(outputs, y_batch)
         loss.backward()
         optimizer.step()
-        
         train_loss += loss.item() * X_batch.size(0)
-    
     train_loss /= len(train_loader.dataset)
-    
-    # Evaluation
+
+    # Validation
     model.eval()
+    val_loss = 0
+    val_preds, val_true = [], []
+    with torch.no_grad():
+        for X_batch, y_batch in val_loader:
+            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+            outputs = model(X_batch)
+            val_loss += criterion(outputs, y_batch).item() * X_batch.size(0)
+            val_preds.extend(outputs.cpu().numpy().flatten())
+            val_true.extend(y_batch.cpu().numpy().flatten())
+    val_loss /= len(val_loader.dataset)
+    val_mape = calculate_mape(scaler.inverse_transform(np.array(val_true).reshape(-1, 1)),
+                              scaler.inverse_transform(np.array(val_preds).reshape(-1, 1)))
+
+    # Test
     test_loss = 0
+    test_preds, test_true = [], []
     with torch.no_grad():
         for X_batch, y_batch in test_loader:
             X_batch, y_batch = X_batch.to(device), y_batch.to(device)
             outputs = model(X_batch)
             test_loss += criterion(outputs, y_batch).item() * X_batch.size(0)
-    
+            test_preds.extend(outputs.cpu().numpy().flatten())
+            test_true.extend(y_batch.cpu().numpy().flatten())
     test_loss /= len(test_loader.dataset)
-    
-    # Step the scheduler
-    scheduler.step(test_loss)
+    test_mape = calculate_mape(scaler.inverse_transform(np.array(test_true).reshape(-1, 1)),
+                               scaler.inverse_transform(np.array(test_preds).reshape(-1, 1)))
+
+    # Scheduler step
+    scheduler.step(val_loss)
     current_lr = optimizer.param_groups[0]['lr']
-    
-    print(f"Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.6f}, Test Loss: {test_loss:.6f}, LR: {current_lr:.6f}")
 
-# Save the model and scaler
-torch.save(model.state_dict(), 'tiramisu_lstm_model.pth')
+    # Save best model based on validation loss
+    if val_loss < best_val_loss:
+        best_val_loss = val_loss
+        torch.save(model.state_dict(), 'tiramisu_lstm_model_best.pth')
+
+    print(f"Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}, Test Loss: {test_loss:.6f}, "
+          f"Val MAPE: {val_mape:.2f}%, Test MAPE: {test_mape:.2f}%, LR: {current_lr:.6f}")
+
+# Save final model and scaler
+torch.save(model.state_dict(), 'tiramisu_lstm_model_final.pth')
 np.save('scaler_params.npy', [scaler.scale_, scaler.min_])
-print("Model saved to 'tiramisu_lstm_model.pth', Scaler params saved to 'scaler_params.npy'")
+print("Final model saved to 'tiramisu_lstm_model_final.pth', Best model saved to 'tiramisu_lstm_model_best.pth', "
+      "Scaler params saved to 'scaler_params.npy'")
 
-# Example: Denormalize a prediction
+# Final evaluation on test set
 model.eval()
+test_preds, test_true = [], []
 with torch.no_grad():
-    sample_input = X_test[:1].to(device)
-    sample_pred = model(sample_input).cpu().numpy()
-    denormalized_pred = scaler.inverse_transform(sample_pred)
-    print(f"Sample Prediction (normalized): {sample_pred[0][0]}, Denormalized: {denormalized_pred[0][0]}")
+    for X_batch, y_batch in test_loader:
+        X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+        outputs = model(X_batch)
+        test_preds.extend(outputs.cpu().numpy().flatten())
+        test_true.extend(y_batch.cpu().numpy().flatten())
+
+# Denormalize and calculate final MAPE
+test_true_denorm = scaler.inverse_transform(np.array(test_true).reshape(-1, 1)).flatten()
+test_preds_denorm = scaler.inverse_transform(np.array(test_preds).reshape(-1, 1)).flatten()
+final_test_mape = calculate_mape(test_true_denorm, test_preds_denorm)
+
+print(f"\nFinal Test MAPE: {final_test_mape:.2f}%")
+print(f"Sample True vs Predicted (denormalized):")
+for i in range(min(5, len(test_true_denorm))):
+    print(f"True: {test_true_denorm[i]:.4f}, Predicted: {test_preds_denorm[i]:.4f}")
