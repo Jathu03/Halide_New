@@ -1,173 +1,156 @@
 import json
 import numpy as np
+import torch
+from pathlib import Path
 import os
-from collections import defaultdict
+from tqdm import tqdm
 
-# Directory containing Tiramisu JSON files
-TIRAMISU_DIR = './Tiramisu'  # Adjust this path if needed
+# Constants from the document
+MAX_NUM_TRANSFORMATIONS = 4
+MAX_TAGS = 16
+MAX_DEPTH = 5
+MAX_EXPR_LEN = 66
+MAX_ACCESSES = 15
 
-# Function to parse expression tree into a string
-def parse_expression(expr):
-    if not isinstance(expr, dict) or 'children' not in expr or not expr['children']:
-        return str(expr.get('expr_type', 'unknown')) if isinstance(expr, dict) else str(expr)
-    children = [parse_expression(child) for child in expr['children']]
-    return f"{expr['expr_type']}({','.join(children)})"
+# Simplified version of isl_to_write_matrix (assuming access relations are matrices or parsed similarly)
+def isl_to_write_matrix(isl_map):
+    # Placeholder: Assuming isl_map is already a matrix or parsed into one
+    # In practice, you'd parse the ISL string as in the document
+    return np.array(isl_map) if isinstance(isl_map, list) else np.zeros((MAX_DEPTH, MAX_DEPTH + 1))
 
-# Build base program graph
-def build_program_graph(program_data):
-    graph = {
-        'nodes': {},
-        'edges': [],
-        'attributes': {}
-    }
-    
-    # Add iterator nodes
-    iterators = program_data.get('iterators', {})
-    for it_name, it_data in iterators.items():
-        lower_bound = it_data.get('lower_bound', 'unknown')
-        upper_bound = it_data.get('upper_bound', 'unknown')
-        if isinstance(lower_bound, int) and isinstance(upper_bound, int):
-            range_str = f"{lower_bound}-{upper_bound}"
-        else:
-            range_str = f"{str(lower_bound)}-{str(upper_bound)}"
-        graph['nodes'][it_name] = 'iterator'
-        graph['attributes'][it_name] = {
-            'type': 'iterator',
-            'lower_bound': lower_bound,
-            'upper_bound': upper_bound,
-            'range': range_str,
-            'parent': it_data.get('parent_iterator', None)
-        }
-        if it_data.get('parent_iterator'):
-            graph['edges'].append((it_data['parent_iterator'], it_name, 'nesting'))
-        computations_list = it_data.get('computations_list', [])
-        for comp in computations_list:
-            graph['edges'].append((it_name, comp, 'contains'))
+def pad_access_matrix(access_matrix):
+    access_matrix = np.array(access_matrix)
+    if access_matrix.size == 0:
+        return np.zeros((MAX_DEPTH + 1, MAX_DEPTH + 2))
+    padded = np.zeros((MAX_DEPTH + 1, MAX_DEPTH + 2))
+    rows, cols = min(access_matrix.shape[0], MAX_DEPTH + 1), min(access_matrix.shape[1], MAX_DEPTH + 1)
+    padded[:rows, :cols] = access_matrix[:rows, :cols]
+    return padded
 
-    # Add computation nodes
-    computations = program_data.get('computations', {})
-    for comp_name, comp_data in computations.items():
-        graph['nodes'][comp_name] = 'computation'
-        accesses = [str(access.get('access_matrix', 'unknown')) for access in comp_data.get('accesses', [])]
-        expr_str = parse_expression(comp_data.get('expression_representation', {}))
-        graph['attributes'][comp_name] = {
-            'type': 'computation',
-            'is_reduction': comp_data.get('comp_is_reduction', False),
-            'write_access': comp_data.get('write_access_relation', 'unknown'),
-            'write_buffer_id': comp_data.get('write_buffer_id', 'unknown'),
-            'data_type': comp_data.get('data_type', 'unknown'),
-            'accesses': accesses,
-            'expression': expr_str,
-            'iterators': comp_data.get('iterators', [])
-        }
-    
-    return graph
+# Simplified expression representation (one-hot encoding)
+def get_expr_repr(expr_type, comp_type):
+    expr_map = {"add": 0, "sub": 1, "mul": 2, "div": 3, "sqrt": 4, "min": 5, "max": 6, "unknown": 7}
+    type_map = {"int32": 0, "float32": 1, "float64": 2}
+    expr_vec = [0] * 8
+    type_vec = [0] * 3
+    expr_vec[expr_map.get(expr_type, 7)] = 1
+    type_vec[type_map.get(comp_type, 1)] = 1
+    return expr_vec + type_vec
 
-# Apply schedule transformations to the graph
-def apply_schedule_to_graph(base_graph, schedule):
-    graph = {
-        'nodes': base_graph['nodes'].copy(),
-        'edges': base_graph['edges'].copy(),
-        'attributes': {k: v.copy() for k, v in base_graph['attributes'].items()},
-        'tree_structure': schedule.get('tree_structure', 'unknown')
-    }
-    
-    # Process fusions
-    fusions = schedule.get('fusions', [])
-    if fusions is not None:
-        for fusion in fusions:
-            if isinstance(fusion, list) and len(fusion) >= 3:
-                comps, level = fusion[0:2], fusion[2]
-                if isinstance(comps, list):
-                    for comp in comps:
-                        graph['attributes'][comp]['fused'] = True
-                        graph['attributes'][comp]['fusion_level'] = f"L{level}"
-            else:
-                print(f"Skipping invalid fusion format: {fusion}")
-    
-    # Process transformations
-    for comp_name, comp_data in schedule.items():
-        if comp_name in ['fusions', 'sched_str', 'tree_structure', 'legality_check', 
-                        'exploration_method', 'execution_times']:
-            continue
-        attrs = graph['attributes'].get(comp_name, {})
-        if isinstance(comp_data, dict):
-            if comp_data.get('shiftings'):
-                attrs['shiftings'] = comp_data['shiftings']
-            if comp_data.get('tiling'):
-                attrs['tiling'] = comp_data['tiling']
-            if comp_data.get('unrolling_factor'):
-                attrs['unrolling_factor'] = comp_data['unrolling_factor']
-            if comp_data.get('parallelized_dim'):
-                attrs['parallelized_dim'] = comp_data['parallelized_dim']
-            if comp_data.get('transformations_list'):
-                attrs['transformations'] = comp_data['transformations_list']
-            graph['attributes'][comp_name] = attrs
-    
-    graph['schedule_str'] = schedule.get('sched_str', 'unknown')
-    return graph
+def get_tree_expr_repr(node, comp_type):
+    expr_tensor = []
+    if isinstance(node, dict) and "children" in node and node["children"]:
+        for child in node["children"]:
+            expr_tensor.extend(get_tree_expr_repr(child, comp_type))
+    expr_tensor.append(get_expr_repr(node.get("expr_type", "unknown") if isinstance(node, dict) else "unknown", comp_type))
+    padded = expr_tensor + [[0] * 11] * (MAX_EXPR_LEN - len(expr_tensor))
+    return padded[:MAX_EXPR_LEN]
 
-# Main processing: Iterate through all JSON files in the Tiramisu folder
-dataset = []
-if not os.path.exists(TIRAMISU_DIR):
-    print(f"Error: Directory '{TIRAMISU_DIR}' not found.")
-    exit(1)
+# Simplified transformation tags (assuming transformations_list is a list of tags)
+def get_padded_transformation_tags(schedule_dict):
+    tags = []
+    for t in schedule_dict.get("transformations_list", []):
+        tags.extend(t if isinstance(t, list) else [0] * MAX_TAGS)
+    return tags + [0] * (MAX_NUM_TRANSFORMATIONS * MAX_TAGS - len(tags))
 
-json_files = [f for f in os.listdir(TIRAMISU_DIR) if f.endswith('.json')]
-if not json_files:
-    print(f"Error: No JSON files found in '{TIRAMISU_DIR}'.")
-    exit(1)
-
-for json_file in json_files:
-    file_path = os.path.join(TIRAMISU_DIR, json_file)
-    print(f"Processing {file_path}...")
-    try:
-        with open(file_path, 'r') as f:
+# Data representation creation
+def create_data_representation(tiramisu_dir="Tiramisu"):
+    dataset = []
+    for json_file in tqdm(list(Path(tiramisu_dir).glob("*.json"))):
+        with open(json_file, "r") as f:
             data = json.load(f)
         
-        # Extract function key dynamically
-        if not data or not isinstance(data, dict):
-            print(f"Skipping {file_path}: Empty or invalid JSON")
-            continue
-        function_key = list(data.keys())[0]  # Assume first key is the function name
-        program_data = data[function_key].get('program_annotation', {})
-        schedules = data[function_key].get('schedules_list', [])
+        function_key = list(data.keys())[0]
+        program_json = data[function_key]["program_annotation"]
+        schedules = data[function_key]["schedules_list"]
 
-        if not program_data or not schedules:
-            print(f"Skipping {file_path}: Missing 'program_annotation' or 'schedules_list'")
-            continue
-
-        # Build base graph for this program
-        base_graph = build_program_graph(program_data)
-
-        # Process each schedule
+        # Computations
+        comps_dict = program_json["computations"]
+        ordered_comps = sorted(comps_dict.keys(), key=lambda x: comps_dict[x]["absolute_order"])
+        
         for sched in schedules:
-            if not isinstance(sched, dict) or 'execution_times' not in sched:
-                print(f"Skipping schedule in {file_path}: Invalid schedule format or missing execution_times")
+            if not sched.get("execution_times") or min(sched["execution_times"]) <= 0:
                 continue
-            sched_graph = apply_schedule_to_graph(base_graph, sched)
-            exec_times = sched['execution_times']
-            if not exec_times or not isinstance(exec_times, list):
-                print(f"Skipping schedule in {file_path}: Invalid execution_times")
-                continue
-            avg_exec_time = np.mean(exec_times)
+            
+            comps_repr = []
+            loops_repr = []
+            expr_repr = []
+            
+            # Computation representation
+            for comp_idx, comp_name in enumerate(ordered_comps):
+                comp_dict = comps_dict[comp_name]
+                sched_dict = sched.get(comp_name, {})
+                
+                # Basic features
+                comp_features = [int(comp_dict["comp_is_reduction"])]
+                
+                # Iterators (loop nest)
+                iterators = comp_dict["iterators"]
+                iter_repr = []
+                for i, iter_name in enumerate(iterators[:MAX_DEPTH]):
+                    l_code = f"C{comp_idx}-L{i}"
+                    iter_repr.extend([
+                        int(iter_name == sched_dict.get("parallelized_dim", "")),  # Parallelized
+                        int(sched_dict.get("tiling", {}).get("tiling_dims", []).count(iter_name) > 0),  # Tiled
+                        int(sched_dict.get("tiling", {}).get("tiling_factors", [0])[i]) if i < len(sched_dict.get("tiling", {}).get("tiling_factors", [])) else 0,  # TileFactor
+                        int(i in [f[2] for f in sched.get("fusions", []) if comp_name in f]),  # Fused
+                        int(any(iter_name.startswith(s[0]) for s in sched_dict.get("shiftings", []))),  # Shifted
+                        next((s[1] for s in sched_dict.get("shiftings", []) if iter_name.startswith(s[0])), 0)  # ShiftFactor
+                    ])
+                iter_repr += [0] * 6 * (MAX_DEPTH - len(iterators))  # Pad
+                iter_repr.extend([
+                    int(bool(sched_dict.get("unrolling_factor", 0))),  # Unrolled
+                    int(sched_dict.get("unrolling_factor", 0))  # UnrollFactor
+                ])
+                
+                # Transformation tags
+                tags = get_padded_transformation_tags(sched_dict)
+                iter_repr.extend(tags)
+                
+                # Access matrices (simplified)
+                write_mat = pad_access_matrix(isl_to_write_matrix(comp_dict["write_access_relation"]))
+                comp_features.extend([comp_dict["write_buffer_id"] + 1] + write_mat.flatten().tolist())
+                
+                read_accesses = []
+                for acc in comp_dict["accesses"][:MAX_ACCESSES]:
+                    read_mat = pad_access_matrix(acc["access_matrix"])
+                    read_accesses.extend([int(acc["access_is_reduction"]), acc["buffer_id"] + 1] + read_mat.flatten().tolist())
+                read_accesses += [0] * ((MAX_DEPTH + 1) * (MAX_DEPTH + 2) + 2) * (MAX_ACCESSES - len(comp_dict["accesses"]))
+                comp_features.extend(read_accesses)
+                
+                comps_repr.append(comp_features)
+                
+                # Expression representation
+                expr_repr.append(get_tree_expr_repr(comp_dict["expression_representation"], comp_dict["data_type"]))
+            
+            # Loops representation (simplified, assuming iterators are global)
+            loops_dict = program_json["iterators"]
+            loops_features = []
+            for loop_name in loops_dict.keys():
+                l_repr = [
+                    int(loop_name == sched.get(ordered_comps[0], {}).get("parallelized_dim", "")),
+                    int(sched.get(ordered_comps[0], {}).get("tiling", {}).get("tiling_dims", []).count(loop_name) > 0),
+                    int(sched.get(ordered_comps[0], {}).get("tiling", {}).get("tiling_factors", [0])[0]),
+                    int(any(loop_name in comps_dict[c]["iterators"][f[2]] for f in sched.get("fusions", []) for c in f[:2])),
+                    int(bool(sched.get(ordered_comps[0], {}).get("unrolling_factor", 0))),
+                    int(sched.get(ordered_comps[0], {}).get("unrolling_factor", 0)),
+                    int(any(loop_name.startswith(s[0]) for s in sched.get(ordered_comps[0], {}).get("shiftings", []))),
+                    next((s[1] for s in sched.get(ordered_comps[0], {}).get("shiftings", []) if loop_name.startswith(s[0])), 0)
+                ]
+                loops_features.append(l_repr)
+            
+            # Execution time
+            exec_time = np.mean(sched["execution_times"])
+            
             dataset.append({
-                'program_file': json_file,
-                'graph': sched_graph,
-                'avg_execution_time': avg_exec_time
+                "comps_tensor": torch.tensor(comps_repr, dtype=torch.float32),
+                "loops_tensor": torch.tensor(loops_features, dtype=torch.float32),
+                "expr_tensor": torch.tensor(expr_repr, dtype=torch.float32),
+                "exec_time": exec_time
             })
-    except Exception as e:
-        print(f"Error processing {file_path}: {e}")
+    
+    torch.save(dataset, "tiramisu_dataset.pt")
+    print(f"Dataset saved to tiramisu_dataset.pt with {len(dataset)} samples")
 
-# Save dataset as JSON
-output_file = 'tiramisu_graph_dataset.json'
-with open(output_file, 'w') as f:
-    json.dump(dataset, f, indent=2)
-print(f"Graph dataset saved to '{output_file}'")
-
-# Print summary
-print(f"\nProcessed {len(json_files)} files, {len(dataset)} schedule graphs.")
-if dataset:
-    print("\nSample Graph Structure (first entry):")
-    print(json.dumps(dataset[0]['graph'], indent=2)[:1000], "... (truncated)")
-    print(f"Avg Execution Time: {dataset[0]['avg_execution_time']}")
+if __name__ == "__main__":
+    create_data_representation()
