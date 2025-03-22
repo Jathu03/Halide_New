@@ -4,7 +4,6 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from gensim.models import Word2Vec
 from sklearn.model_selection import train_test_split
 from collections import defaultdict
 
@@ -41,33 +40,29 @@ def graph_to_sequence(graph):
 sequences = [graph_to_sequence(entry['graph']) for entry in dataset]
 execution_times = [entry['avg_execution_time'] for entry in dataset]
 
-# Tokenize sequences
+# Tokenize sequences and build vocabulary
 tokenized_sequences = [seq.split() for seq in sequences]
+all_tokens = [token for seq in tokenized_sequences for token in seq]
+vocab = {token: idx + 1 for idx, token in enumerate(sorted(set(all_tokens)))}  # 0 reserved for padding
+vocab_size = len(vocab) + 1  # +1 for padding token
 
-# Train Word2Vec model for embeddings
-w2v_model = Word2Vec(sentences=tokenized_sequences, vector_size=100, window=5, min_count=1, workers=4)
-w2v_model.save("tiramisu_w2v.model")
+# Convert sequences to integer indices
+def sequence_to_indices(sequence, vocab, max_length=200):
+    indices = [vocab.get(token, 0) for token in sequence.split()[:max_length]]  # Unknown tokens -> 0
+    while len(indices) < max_length:
+        indices.append(0)  # Pad with 0
+    return indices
 
-# Function to convert sequence to embedding
-def sequence_to_embedding(sequence, w2v_model, max_length=200):
-    embedding = []
-    for token in sequence.split()[:max_length]:  # Truncate or pad to max_length
-        embedding.append(w2v_model.wv[token])
-    while len(embedding) < max_length:  # Pad with zeros
-        embedding.append(np.zeros(100))
-    return np.array(embedding)
-
-# Convert all sequences to embeddings
-X = np.array([sequence_to_embedding(seq, w2v_model) for seq in sequences])
+X_indices = np.array([sequence_to_indices(seq, vocab) for seq in sequences])
 y = np.array(execution_times)
 
 # Split into train and test sets
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+X_train, X_test, y_train, y_test = train_test_split(X_indices, y, test_size=0.2, random_state=42)
 
 # Convert to PyTorch tensors
-X_train = torch.tensor(X_train, dtype=torch.float32)
+X_train = torch.tensor(X_train, dtype=torch.long)
 y_train = torch.tensor(y_train, dtype=torch.float32).view(-1, 1)
-X_test = torch.tensor(X_test, dtype=torch.float32)
+X_test = torch.tensor(X_test, dtype=torch.long)
 y_test = torch.tensor(y_test, dtype=torch.float32).view(-1, 1)
 
 # Define LSTM Dataset
@@ -88,22 +83,24 @@ test_dataset = TiramisuDataset(X_test, y_test)
 train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
 test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
 
-# Define LSTM Model
+# Define LSTM Model with Embedding Layer
 class LSTMModel(nn.Module):
-    def __init__(self, input_size=100, hidden_size=128, num_layers=2, dropout=0.2):
+    def __init__(self, vocab_size, embedding_dim=100, hidden_size=128, num_layers=2, dropout=0.2):
         super(LSTMModel, self).__init__()
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True, dropout=dropout)
+        self.embedding = nn.Embedding(vocab_size, embedding_dim, padding_idx=0)
+        self.lstm = nn.LSTM(embedding_dim, hidden_size, num_layers, batch_first=True, dropout=dropout)
         self.fc = nn.Linear(hidden_size, 1)
     
     def forward(self, x):
-        # x shape: (batch_size, seq_length, input_size)
-        out, _ = self.lstm(x)  # out: (batch_size, seq_length, hidden_size)
+        # x shape: (batch_size, seq_length)
+        embedded = self.embedding(x)  # (batch_size, seq_length, embedding_dim)
+        out, _ = self.lstm(embedded)  # (batch_size, seq_length, hidden_size)
         out = self.fc(out[:, -1, :])  # Take the last time step: (batch_size, 1)
         return out
 
 # Initialize model, loss, and optimizer
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-model = LSTMModel().to(device)
+model = LSTMModel(vocab_size=vocab_size).to(device)
 criterion = nn.MSELoss()
 optimizer = optim.Adam(model.parameters(), lr=0.001)
 
