@@ -163,6 +163,8 @@ def create_data_representation(tiramisu_dir="Tiramisu"):
                 "exec_time": exec_time
             })
     
+    # Added line to print the number of schedules included
+    print(f"Total number of schedules included in the data representation: {len(dataset)}")
     torch.save(dataset, "tiramisu_dataset.pt")
     print(f"Dataset saved to tiramisu_dataset.pt with {len(dataset)} samples")
 
