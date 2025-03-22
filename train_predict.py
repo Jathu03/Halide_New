@@ -807,4 +807,12 @@ def evaluate_model(model, test_loader):
     # Plot predictions vs actual
     plt.figure(figsize=(10, 6))
     plt.scatter(true_times, pred_times, alpha=0.5)
-    plt.plot([min(true_times), max(true_times)], [min(true_times),
+    plt.plot([min(true_times), max(true_times)], [min(true_times), max(true_times)], 'r--', label='Perfect Prediction')
+    plt.xlabel('True Execution Time')
+    plt.ylabel('Predicted Execution Time')
+    plt.title('Predicted vs Actual Execution Times')
+    plt.legend()
+    plt.savefig('prediction_vs_actual.png')
+    plt.close()
+    
+    return avg_test_loss, mae, mape, r2
