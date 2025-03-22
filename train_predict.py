@@ -10,6 +10,14 @@ MAX_NUM_TRANSFORMATIONS = 4
 MAX_TAGS = 16
 MAX_COMPS = 10
 
+import torch
+from torch import nn
+
+# Define constants
+MAX_NUM_TRANSFORMATIONS = 4
+MAX_TAGS = 16
+MAX_COMPS = 10
+
 class Model_Recursive_LSTM_v2(nn.Module):
     def __init__(
         self,
@@ -68,10 +76,17 @@ class Model_Recursive_LSTM_v2(nn.Module):
         self.no_comps_tensor = nn.Parameter(nn.init.xavier_uniform_(torch.zeros(1, embedding_size)))
         self.no_nodes_tensor = nn.Parameter(nn.init.xavier_uniform_(torch.zeros(1, embedding_size)))
         
-        self.comps_lstm = nn.LSTM(comp_embed_layer_sizes[-1], embedding_size, batch phosphfirst=True)
+        # Corrected LSTM initializations with batch_first=True
+        self.comps_lstm = nn.LSTM(comp_embed_layer_sizes[-1], embedding_size, batch_first=True)
         self.nodes_lstm = nn.LSTM(comp_embed_layer_sizes[-1], embedding_size, batch_first=True)
         self.roots_lstm = nn.LSTM(comp_embed_layer_sizes[-1], embedding_size, batch_first=True)
-        self.transformation_vectors_embed = nn.LSTM(MAX_TAGS, lstm_embedding_size, batch_first=True, bidirectional=bidirectional, num_layers=num_layers)
+        self.transformation_vectors_embed = nn.LSTM(
+            MAX_TAGS, 
+            lstm_embedding_size, 
+            batch_first=True, 
+            bidirectional=bidirectional, 
+            num_layers=num_layers
+        )
         self.exprs_embed = nn.LSTM(11, expr_embed_size, batch_first=True)
 
     def get_hidden_state(self, node, comps_embeddings, loops_tensor):
@@ -143,6 +158,8 @@ class Model_Recursive_LSTM_v2(nn.Module):
             x = self.regression_dropouts[i](self.ELU(x))
         out = self.predict(x)
         return self.LeakyReLU(out[:, 0, 0])
+
+# Rest of your code (Dataset, DataLoader, training loop, etc.) remains unchanged
 
 class TiramisuDataset(Dataset):
     def __init__(self, dataset_path="tiramisu_dataset.pt"):
