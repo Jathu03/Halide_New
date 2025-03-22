@@ -9,6 +9,7 @@ import os
 MAX_NUM_TRANSFORMATIONS = 4
 MAX_TAGS = 16
 MAX_COMPS = 10
+NUM_SCHEDULES = 5  # Number of schedules to predict
 
 class Model_Recursive_LSTM_v2(nn.Module):
     def __init__(
@@ -16,7 +17,7 @@ class Model_Recursive_LSTM_v2(nn.Module):
         input_size,
         comp_embed_layer_sizes=[600, 350, 200, 180],
         drops=[0.225, 0.225, 0.225, 0.225],
-        output_size=1,
+        output_size=NUM_SCHEDULES,  # Predict 5 execution times
         lstm_embedding_size=100,
         expr_embed_size=100,
         loops_tensor_size=8,
@@ -141,16 +142,15 @@ class Model_Recursive_LSTM_v2(nn.Module):
             x = self.regression_layers[i](x)
             x = self.regression_dropouts[i](self.ELU(x))
         out = self.predict(x)
-        # Remove LeakyReLU to allow negative predictions if needed, and ensure output is scalar
-        return out[:, 0, 0]
+        return out[:, 0, :]  # Return 5 predictions per sample
 
 class TiramisuDataset(Dataset):
     def __init__(self, dataset_path="tiramisu_dataset.pt"):
         self.data = torch.load(dataset_path)
-        # Compute mean and std for normalization
-        exec_times = torch.tensor([sample['exec_time'] for sample in self.data], dtype=torch.float32)
-        self.exec_time_mean = exec_times.mean()
-        self.exec_time_std = exec_times.std()
+        # Assume exec_times is a tensor of shape [num_samples, 5] for 5 schedules
+        exec_times = torch.tensor([sample['exec_times'] for sample in self.data], dtype=torch.float32)
+        self.exec_time_mean = exec_times.mean(dim=0)  # Mean for each schedule
+        self.exec_time_std = exec_times.std(dim=0)    # Std for each schedule
         
     def __len__(self):
         return len(self.data)
@@ -182,8 +182,8 @@ class TiramisuDataset(Dataset):
                 "loop_index": torch.tensor([0], dtype=torch.long)
             }]
         }
-        # Normalize execution time
-        normalized_exec_time = (sample['exec_time'] - self.exec_time_mean) / self.exec_time_std
+        # Normalize execution times for 5 schedules
+        normalized_exec_times = (sample['exec_times'] - self.exec_time_mean) / self.exec_time_std
         
         tree_tensors = (
             tree,
@@ -193,7 +193,7 @@ class TiramisuDataset(Dataset):
             sample['loops_tensor'],
             expr_tensor
         )
-        return tree_tensors, normalized_exec_time
+        return tree_tensors, normalized_exec_times
 
 def custom_collate_fn(batch):
     tree_tensors_list = []
@@ -215,7 +215,7 @@ def custom_collate_fn(batch):
     
     expr_tensor = torch.stack([t[5] for t in tree_tensors_list])
     
-    targets = torch.tensor(targets_list, dtype=torch.float32)
+    targets = torch.stack(targets_list)  # Stack to get [batch_size, 5]
     trees = [t[0] for t in tree_tensors_list]
     
     return (trees, comps_first, comps_vectors, comps_third, loops_tensor, expr_tensor), targets
@@ -243,10 +243,10 @@ def train_model(model, train_loader, val_loader, num_epochs=10, device="cuda" if
                 loops_tensor.to(device),
                 expr_tensor.to(device)
             )
-            targets = targets.to(device).float()
+            targets = targets.to(device).float()  # [batch_size, 5]
             
             optimizer.zero_grad()
-            outputs = model(tree_tensors_device)
+            outputs = model(tree_tensors_device)  # [batch_size, 5]
             loss = criterion(outputs, targets)
             loss.backward()
             optimizer.step()
@@ -289,11 +289,45 @@ def train_model(model, train_loader, val_loader, num_epochs=10, device="cuda" if
             best_val_loss = avg_val_loss
             torch.save(model.state_dict(), best_model_path)
             print(f"Saved best model with validation loss: {best_val_loss:.6f}")
+    
+    return model
+
+def calculate_error_percentage(model, data_loader, dataset, device):
+    model.eval()
+    with torch.no_grad():
+        for tree_tensors, targets in data_loader:
+            trees, comps_first, comps_vectors, comps_third, loops_tensor, expr_tensor = tree_tensors
+            tree_tensors_device = (
+                trees,
+                comps_first.to(device),
+                comps_vectors.to(device),
+                comps_third.to(device),
+                loops_tensor.to(device),
+                expr_tensor.to(device)
+            )
+            targets = targets.to(device).float()  # [batch_size, 5]
+            outputs = model(tree_tensors_device)  # [batch_size, 5]
+            
+            # Denormalize predictions and targets
+            pred_exec_times = outputs * dataset.exec_time_std.to(device) + dataset.exec_time_mean.to(device)
+            true_exec_times = targets * dataset.exec_time_std.to(device) + dataset.exec_time_mean.to(device)
+            
+            # Calculate error percentage for each schedule
+            error_percentage = torch.abs(pred_exec_times - true_exec_times) / true_exec_times * 100
+            
+            # Print results for the first sample in the batch
+            print("\nExecution Time Predictions and Error Percentages for First Sample:")
+            for i in range(NUM_SCHEDULES):
+                print(f"Schedule {i+1}:")
+                print(f"  Predicted: {pred_exec_times[0, i].item():.6f}")
+                print(f"  True: {true_exec_times[0, i].item():.6f}")
+                print(f"  Error Percentage: {error_percentage[0, i].item():.2f}%")
+            break  # Only process the first batch for demonstration
 
 def main():
     batch_size = 32
-    num_epochs = 5  # Reduced from 100 for quicker testing
-    learning_rate = 0.0001  # Reduced learning rate
+    num_epochs = 10
+    learning_rate = 0.0001
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
     dataset = TiramisuDataset("tiramisu_dataset.pt")
@@ -303,6 +337,7 @@ def main():
     
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=custom_collate_fn)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, collate_fn=custom_collate_fn)
+    test_loader = DataLoader(val_dataset, batch_size=batch_size, collate_fn=custom_collate_fn)  # For prediction
     
     first_part_size = dataset[0][0][1].shape[-1]  # 10
     third_part_size = dataset[0][0][3].shape[-1]  # Verify this in your data
@@ -312,7 +347,7 @@ def main():
         input_size=input_size,
         comp_embed_layer_sizes=[600, 350, 200, 180],
         drops=[0.225, 0.225, 0.225, 0.225],
-        output_size=1,
+        output_size=NUM_SCHEDULES,  # 5 outputs
         lstm_embedding_size=100,
         expr_embed_size=100,
         loops_tensor_size=8,
@@ -321,12 +356,17 @@ def main():
         bidirectional=True
     )
     
-    expected_input_size = first_part_size + 200 + third_part_size + 100  # 200 from bidirectional LSTM
+    expected_input_size = first_part_size + 200 + third_part_size + 100
     print(f"Expected input size to first comp_embedding_layer: {expected_input_size}")
     print(f"Actual first layer input size: {model.comp_embedding_layers[0].weight.shape[1]}")
-    print(f"Execution time mean: {dataset.exec_time_mean:.6f}, std: {dataset.exec_time_std:.6f}")
+    print(f"Execution time means: {dataset.exec_time_mean}")
+    print(f"Execution time stds: {dataset.exec_time_std}")
     
-    train_model(model, train_loader, val_loader, num_epochs, device, learning_rate)
+    # Train the model
+    trained_model = train_model(model, train_loader, val_loader, num_epochs, device, learning_rate)
+    
+    # Calculate predictions and error percentages
+    calculate_error_percentage(trained_model, test_loader, dataset, device)
 
 if __name__ == "__main__":
     main()
