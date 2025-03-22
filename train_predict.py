@@ -827,15 +827,19 @@ if __name__ == "__main__":
     LEARNING_RATE = 0.001
 
     # 1. Load and preprocess the data
-    # Replace this with the actual path to your Tiramisu JSON files
-    folder_path = "/path/to/your/tiramisu/json/files"  # UPDATE THIS PATH
+    # Assuming the 'Tiramisu' folder is in the same directory as this script
+    folder_path = "./Tiramisu"  # Relative path; adjust if necessary (e.g., "/home/user/Tiramisu")
+    
+    # Alternative: Use an absolute path if 'Tiramisu' is elsewhere
+    # folder_path = "/home/kowrisaan/Tiramisu"  # Uncomment and update this if needed
+    
     if not os.path.exists(folder_path):
-        print(f"Error: The folder path '{folder_path}' does not exist. Please provide a valid path.")
+        print(f"Error: The folder path '{folder_path}' does not exist. Please provide a valid path to the 'Tiramisu' folder.")
         exit(1)
 
     programs = load_tiramisu_programs(folder_path)
     if not programs:
-        print("Error: No Tiramisu programs loaded. Check the folder path and ensure it contains valid JSON files.")
+        print("Error: No Tiramisu programs loaded. Check the 'Tiramisu' folder for valid JSON files.")
         exit(1)
     
     preprocessed_programs = []
