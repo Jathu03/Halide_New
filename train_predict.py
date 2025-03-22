@@ -136,7 +136,7 @@ class TiramisuHierarchicalLSTM(nn.Module):
         # Combine comps and expr hierarchically
         comp_expr_seq = torch.cat([comp_seq, expr_seq], dim=2)  # [batch, num_comps, hidden*4]
         comp_expr_seq = comp_expr_seq.mean(dim=1, keepdim=True)  # [batch, 1, hidden*4]
-        comp_expr_seq = nn.Linear(hidden_size * 4, hidden_size * 2)(comp_expr_seq)  # [batch, 1, hidden*2]
+        comp_expr_seq = nn.Linear(self.hidden_size * 4, self.hidden_size * 2)(comp_expr_seq)  # [batch, 1, hidden*2]
         
         # Pad loop sequence to match dimensions for aggregation
         loop_seq = loop_seq.mean(dim=1, keepdim=True)  # [batch, 1, hidden*2]
