@@ -1,10 +1,10 @@
 import json
 import numpy as np
+import os
 from collections import defaultdict
 
-# Load the JSON file
-with open('data.json', 'r') as f:
-    data = json.load(f)
+# Directory containing Tiramisu JSON files
+TIRAMISU_DIR = './Tiramisu'  # Adjust this path if needed
 
 # Function to parse expression tree into a string
 def parse_expression(expr):
@@ -51,7 +51,7 @@ def build_program_graph(program_data):
             'write_access': comp_data['write_access_relation'],
             'write_buffer_id': comp_data['write_buffer_id'],
             'data_type': comp_data['data_type'],
-            'accesses': accesses,  # Keep as list for structure
+            'accesses': accesses,
             'expression': expr_str,
             'iterators': comp_data['iterators']
         }
@@ -64,7 +64,7 @@ def apply_schedule_to_graph(base_graph, schedule):
         'nodes': base_graph['nodes'].copy(),
         'edges': base_graph['edges'].copy(),
         'attributes': {k: v.copy() for k, v in base_graph['attributes'].items()},
-        'tree_structure': schedule['tree_structure']  # Include execution flow
+        'tree_structure': schedule['tree_structure']
     }
     
     # Process fusions
@@ -96,30 +96,54 @@ def apply_schedule_to_graph(base_graph, schedule):
     graph['schedule_str'] = schedule['sched_str']
     return graph
 
-# Main processing
-program_data = data['function003306']['program_annotation']
-schedules = data['function003306']['schedules_list']
-
-# Build base graph
-base_graph = build_program_graph(program_data)
-
-# Prepare dataset as list of graphs
+# Main processing: Iterate through all JSON files in the Tiramisu folder
 dataset = []
-for sched in schedules:
-    sched_graph = apply_schedule_to_graph(base_graph, sched)
-    exec_times = sched['execution_times']
-    avg_exec_time = np.mean(exec_times)
-    dataset.append({
-        'graph': sched_graph,
-        'avg_execution_time': avg_exec_time
-    })
+if not os.path.exists(TIRAMISU_DIR):
+    print(f"Error: Directory '{TIRAMISU_DIR}' not found.")
+    exit(1)
 
-# Save dataset as JSON (preserving structure)
-with open('tiramisu_graph_dataset.json', 'w') as f:
+json_files = [f for f in os.listdir(TIRAMISU_DIR) if f.endswith('.json')]
+if not json_files:
+    print(f"Error: No JSON files found in '{TIRAMISU_DIR}'.")
+    exit(1)
+
+for json_file in json_files:
+    file_path = os.path.join(TIRAMISU_DIR, json_file)
+    print(f"Processing {file_path}...")
+    try:
+        with open(file_path, 'r') as f:
+            data = json.load(f)
+        
+        # Extract function key (assuming each file has a single function key like "function003306")
+        function_key = list(data.keys())[0]  # Take the first key (e.g., "function003306")
+        program_data = data[function_key]['program_annotation']
+        schedules = data[function_key]['schedules_list']
+
+        # Build base graph for this program
+        base_graph = build_program_graph(program_data)
+
+        # Process each schedule
+        for sched in schedules:
+            sched_graph = apply_schedule_to_graph(base_graph, sched)
+            exec_times = sched['execution_times']
+            avg_exec_time = np.mean(exec_times)
+            dataset.append({
+                'program_file': json_file,
+                'graph': sched_graph,
+                'avg_execution_time': avg_exec_time
+            })
+    except Exception as e:
+        print(f"Error processing {file_path}: {e}")
+
+# Save dataset as JSON
+output_file = 'tiramisu_graph_dataset.json'
+with open(output_file, 'w') as f:
     json.dump(dataset, f, indent=2)
-print("Graph dataset saved to 'tiramisu_graph_dataset.json'")
+print(f"Graph dataset saved to '{output_file}'")
 
-# Example: Print first graph’s structure
-print("\nSample Graph Structure:")
-print(json.dumps(dataset[0]['graph'], indent=2)[:1000], "... (truncated)")
-print(f"Avg Execution Time: {dataset[0]['avg_execution_time']}")
+# Example: Print summary
+print(f"\nProcessed {len(json_files)} files, {len(dataset)} schedule graphs.")
+if dataset:
+    print("\nSample Graph Structure (first entry):")
+    print(json.dumps(dataset[0]['graph'], indent=2)[:1000], "... (truncated)")
+    print(f"Avg Execution Time: {dataset[0]['avg_execution_time']}")
