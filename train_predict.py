@@ -6,6 +6,40 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 import numpy as np
 
+# Custom collate function to handle variable-sized tensors
+def custom_collate_fn(batch):
+    # batch is a list of (input_dict, exec_time) tuples
+    comps_list = [item[0]["comps"] for item in batch]
+    loops_list = [item[0]["loops"] for item in batch]
+    expr_list = [item[0]["expr"] for item in batch]
+    exec_times = torch.tensor([item[1] for item in batch], dtype=torch.float32)
+
+    # Find max sizes for padding
+    max_comps = max(c.shape[0] for c in comps_list)
+    max_loops = max(l.shape[0] for l in loops_list)
+    comp_feature_size = comps_list[0].shape[1]
+    loop_feature_size = loops_list[0].shape[1]
+    expr_feature_size = expr_list[0].shape[2]  # [num_comps, MAX_EXPR_LEN, feature_size]
+
+    # Pad tensors to max sizes
+    padded_comps = torch.zeros(len(batch), max_comps, comp_feature_size)
+    padded_loops = torch.zeros(len(batch), max_loops, loop_feature_size)
+    padded_expr = torch.zeros(len(batch), max_comps, expr_list[0].shape[1], expr_feature_size)
+
+    for i in range(len(batch)):
+        comps = comps_list[i]
+        loops = loops_list[i]
+        expr = expr_list[i]
+        padded_comps[i, :comps.shape[0], :] = comps
+        padded_loops[i, :loops.shape[0], :] = loops
+        padded_expr[i, :expr.shape[0], :, :] = expr
+
+    return {
+        "comps": padded_comps,
+        "loops": padded_loops,
+        "expr": padded_expr
+    }, exec_times
+
 # Dataset class
 class TiramisuDataset(Dataset):
     def __init__(self, data):
@@ -68,12 +102,13 @@ def train_model():
     val_dataset = TiramisuDataset(val)
     test_dataset = TiramisuDataset(test)
     
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
+    # Use custom collate function in DataLoader
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, collate_fn=custom_collate_fn)
+    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, collate_fn=custom_collate_fn)
+    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, collate_fn=custom_collate_fn)
     
     # Model setup
-    comp_input_dim = dataset[0]["comps_tensor"].shape[1]  # e.g., 263 from the document
+    comp_input_dim = dataset[0]["comps_tensor"].shape[1]  # e.g., 704 from the error
     loop_input_dim = dataset[0]["loops_tensor"].shape[1]  # e.g., 8
     expr_input_dim = dataset[0]["expr_tensor"].shape[2]   # 11 (8 expr + 3 type)
     
