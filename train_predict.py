@@ -95,6 +95,9 @@ class TiramisuHierarchicalLSTM(nn.Module):
         self.loop_attention = MultiHeadAttention(hidden_size * 2)
         self.expr_attention = MultiHeadAttention(hidden_size)
         
+        # Project expr_seq to match comp_seq size
+        self.expr_proj = nn.Linear(hidden_size, hidden_size * 2)
+        
         # Final aggregation LSTM to combine components hierarchically
         self.agg_lstm = nn.LSTM(hidden_size * 2, hidden_size, num_layers=1, batch_first=True)
         
@@ -128,10 +131,12 @@ class TiramisuHierarchicalLSTM(nn.Module):
         expr_out = expr_out.view(batch_size, num_comps, expr_len, -1)  # [batch, num_comps, expr_len, hidden]
         expr_seq = self.expr_attention(expr_out.reshape(batch_size, num_comps * expr_len, -1))  # [batch, num_comps*expr_len, hidden]
         expr_seq = expr_seq.view(batch_size, num_comps, -1)  # [batch, num_comps, hidden]
+        expr_seq = self.expr_proj(expr_seq)  # [batch, num_comps, hidden*2]
         
-        # Combine comps and expr hierarchically (mimicking tree structure)
-        comp_expr_seq = torch.cat([comp_seq, expr_seq], dim=2)  # [batch, num_comps, hidden*3]
-        comp_expr_seq = comp_expr_seq.mean(dim=1, keepdim=True)  # [batch, 1, hidden*3], average over computations
+        # Combine comps and expr hierarchically
+        comp_expr_seq = torch.cat([comp_seq, expr_seq], dim=2)  # [batch, num_comps, hidden*4]
+        comp_expr_seq = comp_expr_seq.mean(dim=1, keepdim=True)  # [batch, 1, hidden*4]
+        comp_expr_seq = nn.Linear(hidden_size * 4, hidden_size * 2)(comp_expr_seq)  # [batch, 1, hidden*2]
         
         # Pad loop sequence to match dimensions for aggregation
         loop_seq = loop_seq.mean(dim=1, keepdim=True)  # [batch, 1, hidden*2]
