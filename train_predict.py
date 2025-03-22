@@ -117,7 +117,7 @@ class TiramisuMultiHeadLSTM(nn.Module):
         expr_input = x["expr"].view(batch_size * num_comps, expr_len, -1)  # [batch*num_comps, expr_len, input_size]
         expr_out, _ = self.expr_lstm(expr_input)  # [batch*num_comps, expr_len, hidden]
         expr_out = expr_out.view(batch_size, num_comps, expr_len, -1)  # [batch, num_comps, expr_len, hidden]
-        expr_context = self.expr_attention(expr_out.view(batch_size, num_comps * expr_len, -1))  # [batch, hidden]
+        expr_context = self.expr_attention(expr_out.reshape(batch_size, num_comps * expr_len, -1))  # [batch, hidden]
         
         # Combine embeddings
         combined = torch.cat([comp_context, loop_context, expr_context], dim=1)  # [batch, hidden*6]
