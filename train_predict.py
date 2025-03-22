@@ -292,7 +292,7 @@ def train_model(model, train_loader, val_loader, num_epochs=10, device="cuda" if
 
 def main():
     batch_size = 32
-    num_epochs = 10  # Reduced from 100 for quicker testing
+    num_epochs = 5  # Reduced from 100 for quicker testing
     learning_rate = 0.0001  # Reduced learning rate
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
