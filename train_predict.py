@@ -13,15 +13,13 @@ def custom_collate_fn(batch):
     expr_list = [item[0]["expr"] for item in batch]
     exec_times = torch.tensor([item[1] for item in batch], dtype=torch.float32)
 
-    # Find max sizes for padding
     max_comps = max(c.shape[0] for c in comps_list)
     max_loops = max(l.shape[0] for l in loops_list)
     comp_feature_size = comps_list[0].shape[1]
     loop_feature_size = loops_list[0].shape[1]
-    expr_feature_size = expr_list[0].shape[2]  # [num_comps, MAX_EXPR_LEN, feature_size]
-    max_expr_len = expr_list[0].shape[1]  # MAX_EXPR_LEN from data creation
+    expr_feature_size = expr_list[0].shape[2]
+    max_expr_len = expr_list[0].shape[1]
 
-    # Pad tensors to max sizes
     padded_comps = torch.zeros(len(batch), max_comps, comp_feature_size)
     padded_loops = torch.zeros(len(batch), max_loops, loop_feature_size)
     padded_expr = torch.zeros(len(batch), max_comps, max_expr_len, expr_feature_size)
@@ -33,9 +31,6 @@ def custom_collate_fn(batch):
         padded_comps[i, :comps.shape[0], :] = comps
         padded_loops[i, :loops.shape[0], :] = loops
         padded_expr[i, :expr.shape[0], :, :] = expr
-
-    # Reshape expr to (batch_size, max_comps * max_expr_len, expr_feature_size) for LSTM
-    padded_expr = padded_expr.view(len(batch), max_comps * max_expr_len, expr_feature_size)
 
     return {
         "comps": padded_comps,
@@ -58,31 +53,60 @@ class TiramisuDataset(Dataset):
             "expr": self.data[idx]["expr_tensor"]
         }, self.data[idx]["exec_time"]
 
-# LSTM Model
-class TiramisuLSTM(nn.Module):
-    def __init__(self, comp_input_dim, loop_input_dim, expr_input_dim, hidden_size=256, num_layers=2):
-        super(TiramisuLSTM, self).__init__()
+# Attention module
+class Attention(nn.Module):
+    def __init__(self, hidden_size):
+        super(Attention, self).__init__()
+        self.hidden_size = hidden_size
+        self.attn = nn.Linear(hidden_size * 2, hidden_size)
+        self.v = nn.Parameter(torch.rand(hidden_size))
+        stdv = 1. / np.sqrt(self.v.size(0))
+        self.v.data.uniform_(-stdv, stdv)
+
+    def forward(self, hidden, encoder_outputs):
+        batch_size, seq_len, _ = encoder_outputs.size()
+        hidden = hidden.unsqueeze(1).repeat(1, seq_len, 1)  # [batch, seq_len, hidden]
+        energy = torch.tanh(self.attn(torch.cat((hidden, encoder_outputs), dim=2)))
+        energy = energy.matmul(self.v)  # [batch, seq_len]
+        attn_weights = torch.softmax(energy, dim=1).unsqueeze(2)  # [batch, seq_len, 1]
+        context = attn_weights * encoder_outputs  # [batch, seq_len, hidden]
+        return context.sum(dim=1)  # [batch, hidden]
+
+# New Model with Attention
+class TiramisuAttentionLSTM(nn.Module):
+    def __init__(self, comp_input_dim, loop_input_dim, expr_input_dim, hidden_size=256, num_layers=1):
+        super(TiramisuAttentionLSTM, self).__init__()
         self.comp_lstm = nn.LSTM(comp_input_dim, hidden_size, num_layers, batch_first=True)
         self.loop_lstm = nn.LSTM(loop_input_dim, hidden_size, num_layers, batch_first=True)
         self.expr_lstm = nn.LSTM(expr_input_dim, hidden_size, num_layers, batch_first=True)
+        
+        self.comp_attention = Attention(hidden_size)
+        self.loop_attention = Attention(hidden_size)
+        
         self.fc = nn.Sequential(
             nn.Linear(hidden_size * 3, 128),
-            nn.ReLU(),
+            nn.ELU(),
             nn.Dropout(0.3),
             nn.Linear(128, 1)
         )
     
     def forward(self, x):
-        comp_out, _ = self.comp_lstm(x["comps"])  # (batch, seq, hidden)
-        loop_out, _ = self.loop_lstm(x["loops"])  # (batch, seq, hidden)
-        expr_out, _ = self.expr_lstm(x["expr"])   # (batch, seq, hidden)
+        # Comps embedding
+        comp_out, (comp_h, _) = self.comp_lstm(x["comps"])  # [batch, seq, hidden]
+        comp_context = self.comp_attention(comp_h[-1], comp_out)  # [batch, hidden]
         
-        # Take the last output of each LSTM
-        comp_out = comp_out[:, -1, :]
-        loop_out = loop_out[:, -1, :]
-        expr_out = expr_out[:, -1, :]
+        # Loops embedding
+        loop_out, (loop_h, _) = self.loop_lstm(x["loops"])  # [batch, seq, hidden]
+        loop_context = self.loop_attention(loop_h[-1], loop_out)  # [batch, hidden]
         
-        combined = torch.cat([comp_out, loop_out, expr_out], dim=1)
+        # Expr embedding (flatten comps and expr_len dimensions)
+        batch_size, num_comps, expr_len, _ = x["expr"].size()
+        expr_input = x["expr"].view(batch_size, num_comps * expr_len, -1)  # [batch, seq, input_size]
+        expr_out, (expr_h, _) = self.expr_lstm(expr_input)  # [batch, seq, hidden]
+        expr_context = expr_out[:, -1, :]  # Use last hidden state [batch, hidden]
+        
+        # Combine embeddings
+        combined = torch.cat([comp_context, loop_context, expr_context], dim=1)  # [batch, hidden*3]
         return self.fc(combined)
 
 # Training function
@@ -99,13 +123,12 @@ def train_model():
     
     # Split into train, val, test (70%, 15%, 15%)
     train_val, test = train_test_split(dataset, test_size=0.15, random_state=42)
-    train, val = train_test_split(train_val, test_size=0.1765, random_state=42)  # 0.1765 of 85% = 15% of total
+    train, val = train_test_split(train_val, test_size=0.1765, random_state=42)
     
     train_dataset = TiramisuDataset(train)
     val_dataset = TiramisuDataset(val)
     test_dataset = TiramisuDataset(test)
     
-    # Use custom collate function in DataLoader
     train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, collate_fn=custom_collate_fn)
     val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, collate_fn=custom_collate_fn)
     test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, collate_fn=custom_collate_fn)
@@ -113,10 +136,10 @@ def train_model():
     # Model setup
     comp_input_dim = dataset[0]["comps_tensor"].shape[1]  # e.g., 704
     loop_input_dim = dataset[0]["loops_tensor"].shape[1]  # e.g., 8
-    expr_input_dim = dataset[0]["expr_tensor"].shape[2]   # 11 (8 expr + 3 type)
+    expr_input_dim = dataset[0]["expr_tensor"].shape[2]   # 11
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = TiramisuLSTM(comp_input_dim, loop_input_dim, expr_input_dim).to(device)
+    model = TiramisuAttentionLSTM(comp_input_dim, loop_input_dim, expr_input_dim).to(device)
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=0.001)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=5)
