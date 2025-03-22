@@ -5,11 +5,11 @@ import numpy as np
 from tqdm import tqdm
 import os
 
-# Define constants (these should match your data creation script)
+# Define constants
 MAX_NUM_TRANSFORMATIONS = 4
 MAX_TAGS = 16
 
-# Define the Model_Recursive_LSTM_v2 class (copied from your first document)
+# Model_Recursive_LSTM_v2 class (unchanged, included here for completeness)
 class Model_Recursive_LSTM_v2(nn.Module):
     def __init__(
         self,
@@ -29,13 +29,9 @@ class Model_Recursive_LSTM_v2(nn.Module):
         embedding_size = comp_embed_layer_sizes[-1]
         
         regression_layer_sizes = [embedding_size] + comp_embed_layer_sizes[-2:]
-        concat_layer_sizes = [
-            embedding_size * 2 + loops_tensor_size
-        ] + comp_embed_layer_sizes[-2:]
+        concat_layer_sizes = [embedding_size * 2 + loops_tensor_size] + comp_embed_layer_sizes[-2:]
         
-        comp_embed_layer_sizes = [
-            input_size + lstm_embedding_size * (2 if bidirectional else 1) * num_layers + expr_embed_size
-        ] + comp_embed_layer_sizes
+        comp_embed_layer_sizes = [input_size + lstm_embedding_size * (2 if bidirectional else 1) * num_layers + expr_embed_size] + comp_embed_layer_sizes
         
         self.comp_embedding_layers = nn.ModuleList()
         self.comp_embedding_dropouts = nn.ModuleList()
@@ -44,52 +40,37 @@ class Model_Recursive_LSTM_v2(nn.Module):
         self.concat_layers = nn.ModuleList()
         self.concat_dropouts = nn.ModuleList()
         
-        # Create the transformation encoding layers
         self.encode_vectors = nn.Linear(MAX_TAGS, MAX_TAGS, bias=True)
         
-        # Create the computation embedding layers
         for i in range(len(comp_embed_layer_sizes) - 1):
-            self.comp_embedding_layers.append(
-                nn.Linear(comp_embed_layer_sizes[i], comp_embed_layer_sizes[i + 1], bias=True)
-            )
+            self.comp_embedding_layers.append(nn.Linear(comp_embed_layer_sizes[i], comp_embed_layer_sizes[i + 1], bias=True))
             nn.init.xavier_uniform_(self.comp_embedding_layers[i].weight)
             self.comp_embedding_dropouts.append(nn.Dropout(drops[i]))
             
-        # Create the final regression layers
         for i in range(len(regression_layer_sizes) - 1):
-            self.regression_layers.append(
-                nn.Linear(regression_layer_sizes[i], regression_layer_sizes[i + 1], bias=True)
-            )
+            self.regression_layers.append(nn.Linear(regression_layer_sizes[i], regression_layer_sizes[i + 1], bias=True))
             nn.init.xavier_uniform_(self.regression_layers[i].weight)
             self.regression_dropouts.append(nn.Dropout(drops[i]))
             
-        # Create the feed forward network for embedding loop levels
         for i in range(len(concat_layer_sizes) - 1):
-            self.concat_layers.append(
-                nn.Linear(concat_layer_sizes[i], concat_layer_sizes[i + 1], bias=True)
-            )
+            self.concat_layers.append(nn.Linear(concat_layer_sizes[i], concat_layer_sizes[i + 1], bias=True))
             nn.init.xavier_uniform_(self.concat_layers[i].weight)
             nn.init.zeros_(self.concat_layers[i].weight)
             self.concat_dropouts.append(nn.Dropout(drops[i]))
             
-        # Output layer
         self.predict = nn.Linear(regression_layer_sizes[-1], output_size, bias=True)
         nn.init.xavier_uniform_(self.predict.weight)
         
         self.ELU = nn.ELU()
         self.LeakyReLU = nn.LeakyReLU(0.01)
         
-        # Parameter tensors
         self.no_comps_tensor = nn.Parameter(nn.init.xavier_uniform_(torch.zeros(1, embedding_size)))
         self.no_nodes_tensor = nn.Parameter(nn.init.xavier_uniform_(torch.zeros(1, embedding_size)))
         
-        # LSTM layers
         self.comps_lstm = nn.LSTM(comp_embed_layer_sizes[-1], embedding_size, batch_first=True)
         self.nodes_lstm = nn.LSTM(comp_embed_layer_sizes[-1], embedding_size, batch_first=True)
         self.roots_lstm = nn.LSTM(comp_embed_layer_sizes[-1], embedding_size, batch_first=True)
-        self.transformation_vectors_embed = nn.LSTM(
-            MAX_TAGS, lstm_embedding_size, batch_first=True, bidirectional=bidirectional, num_layers=num_layers
-        )
+        self.transformation_vectors_embed = nn.LSTM(MAX_TAGS, lstm_embedding_size, batch_first=True, bidirectional=bidirectional, num_layers=num_layers)
         self.exprs_embed = nn.LSTM(11, expr_embed_size, batch_first=True)
 
     def get_hidden_state(self, node, comps_embeddings, loops_tensor):
@@ -122,13 +103,11 @@ class Model_Recursive_LSTM_v2(nn.Module):
     def forward(self, tree_tensors):
         tree, comps_tensor_first_part, comps_tensor_vectors, comps_tensor_third_part, loops_tensor, functions_comps_expr_tree = tree_tensors
         
-        # Embed expressions
         batch_size, num_comps, len_sequence, len_vector = functions_comps_expr_tree.shape
         x = functions_comps_expr_tree.view(batch_size * num_comps, len_sequence, len_vector)
         _, (expr_embedding, _) = self.exprs_embed(x)
         expr_embedding = expr_embedding.permute(1, 0, 2).reshape(batch_size * num_comps, -1)
         
-        # Embed computations
         batch_size, num_comps, __dict__ = comps_tensor_first_part.shape
         first_part = comps_tensor_first_part.to(self.device).view(batch_size * num_comps, -1)
         vectors = comps_tensor_vectors.to(self.device)
@@ -170,8 +149,18 @@ class TiramisuDataset(Dataset):
     
     def __getitem__(self, idx):
         sample = self.data[idx]
+        num_comps = sample['comps_tensor'].shape[0]
+        # Create tree structure as a dictionary, avoiding tensor stacking issues
+        tree = {
+            "roots": [{
+                "child_list": [],
+                "has_comps": True,
+                "computations_indices": torch.tensor([i for i in range(num_comps)], dtype=torch.long),
+                "loop_index": torch.tensor([0], dtype=torch.long)
+            }]
+        }
         tree_tensors = (
-            {"roots": [{"child_list": [], "has_comps": True, "computations_indices": torch.tensor([i for i in range(sample['comps_tensor'].shape[0])]), "loop_index": torch.tensor([0])}]},
+            tree,
             sample['comps_tensor'][:, :10],  # Adjust slicing based on your features
             sample['comps_tensor'][:, 10:74],  # Transformation vectors (64 elements)
             sample['comps_tensor'][:, 74:],  # Remaining features
@@ -179,6 +168,28 @@ class TiramisuDataset(Dataset):
             sample['expr_tensor']
         )
         return tree_tensors, sample['exec_time']
+
+# Custom collate function to handle variable-sized tree structures
+def custom_collate_fn(batch):
+    tree_tensors_list = []
+    targets_list = []
+    
+    for tree_tensors, target in batch:
+        tree_tensors_list.append(tree_tensors)
+        targets_list.append(target)
+    
+    # Stack only the tensor components that have consistent sizes
+    comps_first = torch.stack([t[1] for t in tree_tensors_list])
+    comps_vectors = torch.stack([t[2] for t in tree_tensors_list])
+    comps_third = torch.stack([t[3] for t in tree_tensors_list])
+    loops_tensor = torch.stack([t[4] for t in tree_tensors_list])
+    expr_tensor = torch.stack([t[5] for t in tree_tensors_list])
+    targets = torch.tensor(targets_list, dtype=torch.float32)
+    
+    # Keep the tree as a list of dictionaries
+    trees = [t[0] for t in tree_tensors_list]
+    
+    return (trees, comps_first, comps_vectors, comps_third, loops_tensor, expr_tensor), targets
 
 def train_model(model, train_loader, val_loader, num_epochs=100, device="cuda" if torch.cuda.is_available() else "cpu", learning_rate=0.001):
     model = model.to(device)
@@ -194,11 +205,20 @@ def train_model(model, train_loader, val_loader, num_epochs=100, device="cuda" i
         train_count = 0
         
         for batch_idx, (tree_tensors, targets) in enumerate(tqdm(train_loader)):
-            tree_tensors = tuple(t.to(device) if isinstance(t, torch.Tensor) else t for t in tree_tensors)
+            # Unpack tree_tensors, moving tensors to device
+            trees, comps_first, comps_vectors, comps_third, loops_tensor, expr_tensor = tree_tensors
+            tree_tensors_device = (
+                {"roots": trees},  # Keep trees as a list of dicts
+                comps_first.to(device),
+                comps_vectors.to(device),
+                comps_third.to(device),
+                loops_tensor.to(device),
+                expr_tensor.to(device)
+            )
             targets = targets.to(device).float()
             
             optimizer.zero_grad()
-            outputs = model(tree_tensors)
+            outputs = model(tree_tensors_device)
             loss = criterion(outputs, targets)
             loss.backward()
             optimizer.step()
@@ -214,10 +234,18 @@ def train_model(model, train_loader, val_loader, num_epochs=100, device="cuda" i
         
         with torch.no_grad():
             for tree_tensors, targets in val_loader:
-                tree_tensors = tuple(t.to(device) if isinstance(t, torch.Tensor) else t for t in tree_tensors)
+                trees, comps_first, comps_vectors, comps_third, loops_tensor, expr_tensor = tree_tensors
+                tree_tensors_device = (
+                    {"roots": trees},
+                    comps_first.to(device),
+                    comps_vectors.to(device),
+                    comps_third.to(device),
+                    loops_tensor.to(device),
+                    expr_tensor.to(device)
+                )
                 targets = targets.to(device).float()
                 
-                outputs = model(tree_tensors)
+                outputs = model(tree_tensors_device)
                 loss = criterion(outputs, targets)
                 
                 val_loss += loss.item() * targets.size(0)
@@ -245,8 +273,9 @@ def main():
     val_size = len(dataset) - train_size
     train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
     
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size)
+    # Use custom collate function
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=custom_collate_fn)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, collate_fn=custom_collate_fn)
     
     input_size = dataset[0][0][1].shape[-1] + dataset[0][0][2].shape[-1] + dataset[0][0][3].shape[-1]
     model = Model_Recursive_LSTM_v2(
