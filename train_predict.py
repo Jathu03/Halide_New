@@ -28,11 +28,10 @@ class Model_Recursive_LSTM_v2(nn.Module):
         self.device = device
         embedding_size = comp_embed_layer_sizes[-1]
         
-        # Adjust input size to account for processed embeddings
         total_embedding_size = lstm_embedding_size * (2 if bidirectional else 1) * num_layers + expr_embed_size
         comp_embed_layer_sizes = [input_size + total_embedding_size] + comp_embed_layer_sizes
         
-        regression_layer_sizes = [embedding_size] + comp_embed_layer_sizes[-2:]  # Fixed syntax here
+        regression_layer_sizes = [embedding_size] + comp_embed_layer_sizes[-2:]
         concat_layer_sizes = [embedding_size * 2 + loops_tensor_size] + comp_embed_layer_sizes[-2:]
         
         self.comp_embedding_layers = nn.ModuleList()
@@ -69,7 +68,7 @@ class Model_Recursive_LSTM_v2(nn.Module):
         self.no_comps_tensor = nn.Parameter(nn.init.xavier_uniform_(torch.zeros(1, embedding_size)))
         self.no_nodes_tensor = nn.Parameter(nn.init.xavier_uniform_(torch.zeros(1, embedding_size)))
         
-        self.comps_lstm = nn.LSTM(comp_embed_layer_sizes[-1], embedding_size, batch_first=True)
+        self.comps_lstm = nn.LSTM(comp_embed_layer_sizes[-1], embedding_size, batch phosphfirst=True)
         self.nodes_lstm = nn.LSTM(comp_embed_layer_sizes[-1], embedding_size, batch_first=True)
         self.roots_lstm = nn.LSTM(comp_embed_layer_sizes[-1], embedding_size, batch_first=True)
         self.transformation_vectors_embed = nn.LSTM(MAX_TAGS, lstm_embedding_size, batch_first=True, bidirectional=bidirectional, num_layers=num_layers)
@@ -103,7 +102,7 @@ class Model_Recursive_LSTM_v2(nn.Module):
         return x
 
     def forward(self, tree_tensors):
-        tree, comps_tensor_first_part, comps_tensor_vectors, comps_tensor_third_part, loops_tensor, functions_comps_expr_tree = tree_tensors
+        trees, comps_tensor_first_part, comps_tensor_vectors, comps_tensor_third_part, loops_tensor, functions_comps_expr_tree = tree_tensors
         
         batch_size, num_comps, len_sequence, len_vector = functions_comps_expr_tree.shape
         x = functions_comps_expr_tree.view(batch_size * num_comps, len_sequence, len_vector)
@@ -127,9 +126,12 @@ class Model_Recursive_LSTM_v2(nn.Module):
             x = self.comp_embedding_dropouts[i](self.ELU(x))
         comps_embeddings = x
         
+        # Process each tree in the batch
         roots_list = []
-        for root in tree["roots"]:
-            roots_list.append(self.get_hidden_state(root, comps_embeddings, loops_tensor))
+        for batch_idx in range(batch_size):
+            tree = trees[batch_idx]  # Get the tree for this batch item
+            for root in tree["roots"]:  # Iterate over roots in this tree
+                roots_list.append(self.get_hidden_state(root, comps_embeddings[batch_idx:batch_idx+1], loops_tensor[batch_idx:batch_idx+1]))
         
         roots_tensor = torch.cat(roots_list, 1)
         _, (roots_h_n, _) = self.roots_lstm(roots_tensor)
@@ -227,7 +229,7 @@ def train_model(model, train_loader, val_loader, num_epochs=100, device="cuda" i
         for batch_idx, (tree_tensors, targets) in enumerate(tqdm(train_loader)):
             trees, comps_first, comps_vectors, comps_third, loops_tensor, expr_tensor = tree_tensors
             tree_tensors_device = (
-                {"roots": trees},
+                trees,  # Pass the list of trees directly
                 comps_first.to(device),
                 comps_vectors.to(device),
                 comps_third.to(device),
@@ -255,7 +257,7 @@ def train_model(model, train_loader, val_loader, num_epochs=100, device="cuda" i
             for tree_tensors, targets in val_loader:
                 trees, comps_first, comps_vectors, comps_third, loops_tensor, expr_tensor = tree_tensors
                 tree_tensors_device = (
-                    {"roots": trees},
+                    trees,  # Pass the list of trees directly
                     comps_first.to(device),
                     comps_vectors.to(device),
                     comps_third.to(device),
@@ -312,7 +314,7 @@ def main():
         bidirectional=True
     )
     
-    expected_input_size = first_part_size + 200 + third_part_size + 100
+    expected_input_size = first_part_size + 200 + third_part_size + 100  # Adjust based on bidirectional LSTM
     print(f"Expected input size to first comp_embedding_layer: {expected_input_size}")
     print(f"Actual first layer input size: {model.comp_embedding_layers[0].weight.shape[1]}")
     
