@@ -32,7 +32,7 @@ class Model_Recursive_LSTM_v2(nn.Module):
         total_embedding_size = lstm_embedding_size * (2 if bidirectional else 1) * num_layers + expr_embed_size
         comp_embed_layer_sizes = [input_size + total_embedding_size] + comp_embed_layer_sizes
         
-        regression_layer_sizes = [embedding_size] + comp_embed_layer линииsizes[-2:]
+        regression_layer_sizes = [embedding_size] + comp_embed_layer_sizes[-2:]  # Fixed syntax here
         concat_layer_sizes = [embedding_size * 2 + loops_tensor_size] + comp_embed_layer_sizes[-2:]
         
         self.comp_embedding_layers = nn.ModuleList()
@@ -108,19 +108,19 @@ class Model_Recursive_LSTM_v2(nn.Module):
         batch_size, num_comps, len_sequence, len_vector = functions_comps_expr_tree.shape
         x = functions_comps_expr_tree.view(batch_size * num_comps, len_sequence, len_vector)
         _, (expr_embedding, _) = self.exprs_embed(x)
-        expr_embedding = expr_embedding.permute(1, 0, 2).reshape(batch_size * num_comps, -1)  # [320, 100]
+        expr_embedding = expr_embedding.permute(1, 0, 2).reshape(batch_size * num_comps, -1)
         
         batch_size, num_comps, __dict__ = comps_tensor_first_part.shape
-        first_part = comps_tensor_first_part.to(self.device).view(batch_size * num_comps, -1)  # [320, 10]
-        vectors = comps_tensor_vectors.to(self.device)  # [batch_size, MAX_COMPS, 64]
-        third_part = comps_tensor_third_part.to(self.device).view(batch_size * num_comps, -1)  # [320, 630]
+        first_part = comps_tensor_first_part.to(self.device).view(batch_size * num_comps, -1)
+        vectors = comps_tensor_vectors.to(self.device)
+        third_part = comps_tensor_third_part.to(self.device).view(batch_size * num_comps, -1)
         
-        vectors = vectors.view(batch_size * num_comps, MAX_NUM_TRANSFORMATIONS, MAX_TAGS)  # [320, 4, 16]
-        vectors = self.encode_vectors(vectors)  # [320, 4, 16]
-        _, (prog_embedding, _) = self.transformation_vectors_embed(vectors)  # [1, 320, 200]
-        prog_embedding = prog_embedding.permute(1, 0, 2).reshape(batch_size * num_comps, -1)  # [320, 200]
+        vectors = vectors.view(batch_size * num_comps, MAX_NUM_TRANSFORMATIONS, MAX_TAGS)
+        vectors = self.encode_vectors(vectors)
+        _, (prog_embedding, _) = self.transformation_vectors_embed(vectors)
+        prog_embedding = prog_embedding.permute(1, 0, 2).reshape(batch_size * num_comps, -1)
         
-        x = torch.cat((first_part, prog_embedding, third_part, expr_embedding), dim=1).view(batch_size, num_comps, -1)  # [32, 10, 940]
+        x = torch.cat((first_part, prog_embedding, third_part, expr_embedding), dim=1).view(batch_size, num_comps, -1)
         
         for i in range(len(self.comp_embedding_layers)):
             x = self.comp_embedding_layers[i](x)
@@ -295,10 +295,9 @@ def main():
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=custom_collate_fn)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, collate_fn=custom_collate_fn)
     
-    # Correct input_size calculation
     first_part_size = dataset[0][0][1].shape[-1]  # 10
-    third_part_size = dataset[0][0][3].shape[-1]  # 630 (or whatever your data shows)
-    input_size = first_part_size + third_part_size  # Exclude vectors size, add processed sizes in model
+    third_part_size = dataset[0][0][3].shape[-1]  # Verify this in your data
+    input_size = first_part_size + third_part_size
     
     model = Model_Recursive_LSTM_v2(
         input_size=input_size,
@@ -313,8 +312,7 @@ def main():
         bidirectional=True
     )
     
-    # Verify input size
-    expected_input_size = first_part_size + 200 + third_part_size + 100  # 940 in this case
+    expected_input_size = first_part_size + 200 + third_part_size + 100
     print(f"Expected input size to first comp_embedding_layer: {expected_input_size}")
     print(f"Actual first layer input size: {model.comp_embedding_layers[0].weight.shape[1]}")
     
