@@ -746,6 +746,7 @@ def train_tiramisu_model(model, train_loader, val_loader, num_epochs=NUM_EPOCHS,
     
     return model, train_losses, val_losses
 
+# Your corrected evaluate_model function
 def evaluate_model(model, test_loader):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
@@ -816,3 +817,60 @@ def evaluate_model(model, test_loader):
     plt.close()
     
     return avg_test_loss, mae, mape, r2
+
+# Main execution block to tie everything together
+if __name__ == "__main__":
+    # Constants (assuming these are defined earlier)
+    HIDDEN_DIM = 128
+    NODE_FEATURE_DIM = 64
+    BATCH_SIZE = 32
+    NUM_EPOCHS = 100
+    LEARNING_RATE = 0.001
+
+    # 1. Load and preprocess the data
+    folder_path = "path/to/your/tiramisu/programs"  # Replace with your actual folder path
+    programs = load_tiramisu_programs(folder_path)
+    
+    preprocessed_programs = []
+    for program in programs:
+        preprocessed = preprocess_tiramisu_program(program)
+        if preprocessed['execution_time'] is not None:  # Filter out programs with no execution time
+            preprocessed_programs.append(preprocessed)
+    
+    print(f"Preprocessed {len(preprocessed_programs)} programs with valid execution times")
+
+    # 2. Split the data into train, validation, and test sets
+    train_val_programs, test_programs = train_test_split(preprocessed_programs, test_size=0.2, random_state=42)
+    train_programs, val_programs = train_test_split(train_val_programs, test_size=0.25, random_state=42)  # 0.25 x 0.8 = 0.2
+
+    print(f"Training set: {len(train_programs)} programs")
+    print(f"Validation set: {len(val_programs)} programs")
+    print(f"Test set: {len(test_programs)} programs")
+
+    # 3. Create datasets and dataloaders
+    train_dataset = TiramisuDataset(train_programs)
+    val_dataset = TiramisuDataset(val_programs)
+    test_dataset = TiramisuDataset(test_programs)
+
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
+    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
+
+    # 4. Initialize the model
+    # Calculate input size based on feature extraction functions
+    input_size = (len(extract_computation_features({})) + len(extract_schedule_features({})))
+    model = TiramisuCostModel(input_size, HIDDEN_DIM)
+
+    # 5. Train the model
+    print("Starting training...")
+    model, train_losses, val_losses = train_tiramisu_model(
+        model, train_loader, val_loader, num_epochs=NUM_EPOCHS, lr=LEARNING_RATE
+    )
+
+    # 6. Evaluate the model on the test set
+    print("\nEvaluating on test set...")
+    test_loss, mae, mape, r2 = evaluate_model(model, test_loader)
+
+    # 7. Save the final model
+    torch.save(model.state_dict(), "final_tiramisu_model.pth")
+    print("Training and evaluation completed. Final model saved as 'final_tiramisu_model.pth'")
