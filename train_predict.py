@@ -53,60 +53,57 @@ class TiramisuDataset(Dataset):
             "expr": self.data[idx]["expr_tensor"]
         }, self.data[idx]["exec_time"]
 
-# Multi-Head Attention module
-class MultiHeadAttention(nn.Module):
-    def __init__(self, hidden_size, num_heads=4):
-        super(MultiHeadAttention, self).__init__()
-        assert hidden_size % num_heads == 0
-        self.hidden_size = hidden_size
-        self.num_heads = num_heads
-        self.head_dim = hidden_size // num_heads
-        
-        self.query = nn.Linear(hidden_size, hidden_size)
-        self.key = nn.Linear(hidden_size, hidden_size)
-        self.value = nn.Linear(hidden_size, hidden_size)
-        self.fc_out = nn.Linear(hidden_size, hidden_size)
-        self.scale = torch.sqrt(torch.tensor(self.head_dim, dtype=torch.float32))
+# Positional Encoding for Transformer
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=5000):
+        super(PositionalEncoding, self).__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-np.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)  # [1, max_len, d_model]
+        self.register_buffer('pe', pe)
 
     def forward(self, x):
-        batch_size, seq_len, _ = x.size()
-        Q = self.query(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        K = self.key(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        V = self.value(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
-        attn_weights = torch.softmax(scores, dim=-1)
-        context = torch.matmul(attn_weights, V).transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_size)
-        return self.fc_out(context)
+        # x: [batch_size, seq_len, d_model]
+        seq_len = x.size(1)
+        x = x + self.pe[:, :seq_len, :]
+        return x
 
-# Recursive LSTM Model
-class TiramisuRecursiveLSTM(nn.Module):
-    def __init__(self, comp_input_dim, loop_input_dim, expr_input_dim, hidden_size=256, num_layers=2):
-        super(TiramisuRecursiveLSTM, self).__init__()
-        self.hidden_size = hidden_size
+# Transformer-based Model
+class TiramisuTransformer(nn.Module):
+    def __init__(self, comp_input_dim, loop_input_dim, expr_input_dim, d_model=256, n_heads=8, n_layers=4):
+        super(TiramisuTransformer, self).__init__()
+        self.d_model = d_model
         
-        # Leaf-level LSTM for expressions
-        self.expr_lstm = nn.LSTM(expr_input_dim, hidden_size, num_layers, batch_first=True)
-        self.expr_attention = MultiHeadAttention(hidden_size)
+        # Input projections to d_model
+        self.expr_proj = nn.Linear(expr_input_dim, d_model)
+        self.comp_proj = nn.Linear(comp_input_dim, d_model)
+        self.loop_proj = nn.Linear(loop_input_dim, d_model)
         
-        # Computation-level LSTM (combines expr embedding with comp features)
-        self.comp_lstm = nn.LSTM(comp_input_dim + hidden_size, hidden_size, num_layers, batch_first=True)
-        self.comp_attention = MultiHeadAttention(hidden_size)
+        # Positional encodings
+        self.expr_pos_enc = PositionalEncoding(d_model)
+        self.comp_pos_enc = PositionalEncoding(d_model)
+        self.loop_pos_enc = PositionalEncoding(d_model)
         
-        # Loop-level LSTM
-        self.loop_lstm = nn.LSTM(loop_input_dim, hidden_size, num_layers, batch_first=True)
+        # Transformer encoders
+        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=n_heads, batch_first=True)
+        self.expr_transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.comp_transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.loop_transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
         
-        # Final aggregator LSTM
-        self.agg_lstm = nn.LSTM(hidden_size, hidden_size, num_layers=1, batch_first=True)
+        # Attention for aggregation
+        self.global_attention = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
         
         # Output layers
         self.fc = nn.Sequential(
-            nn.Linear(hidden_size, 512),
+            nn.Linear(d_model, 512),
             nn.ELU(),
-            nn.Dropout(0.2),
+            nn.Dropout(0.1),
             nn.Linear(512, 128),
             nn.ELU(),
-            nn.Dropout(0.2),
+            nn.Dropout(0.1),
             nn.Linear(128, 1),
             nn.ReLU()  # Ensure non-negative predictions
         )
@@ -114,31 +111,34 @@ class TiramisuRecursiveLSTM(nn.Module):
     def forward(self, x):
         batch_size = x["comps"].size(0)
         
-        # Step 1: Embed expressions (leaf level)
+        # Step 1: Process expressions
         num_comps, expr_len = x["expr"].size(1), x["expr"].size(2)
         expr_input = x["expr"].view(batch_size * num_comps, expr_len, -1)  # [batch*num_comps, expr_len, expr_input_dim]
-        expr_out, (expr_h, _) = self.expr_lstm(expr_input)  # [batch*num_comps, expr_len, hidden]
-        expr_seq = self.expr_attention(expr_out)  # [batch*num_comps, expr_len, hidden]
-        expr_embed = expr_seq[:, -1, :].view(batch_size, num_comps, -1)  # [batch, num_comps, hidden], take last hidden state
+        expr_embed = self.expr_proj(expr_input)  # [batch*num_comps, expr_len, d_model]
+        expr_embed = self.expr_pos_enc(expr_embed)
+        expr_out = self.expr_transformer(expr_embed)  # [batch*num_comps, expr_len, d_model]
+        expr_embed = expr_out.mean(dim=1).view(batch_size, num_comps, -1)  # [batch, num_comps, d_model]
         
-        # Step 2: Combine computations with expression embeddings
-        comp_input = x["comps"]  # [batch, max_comps, comp_input_dim]
-        comp_expr_input = torch.cat([comp_input, expr_embed], dim=2)  # [batch, num_comps, comp_input_dim + hidden]
-        comp_out, (comp_h, _) = self.comp_lstm(comp_expr_input)  # [batch, num_comps, hidden]
-        comp_seq = self.comp_attention(comp_out)  # [batch, num_comps, hidden]
-        comp_embed = comp_seq.mean(dim=1, keepdim=True)  # [batch, 1, hidden]
+        # Step 2: Process computations with expression embeddings
+        comp_input = self.comp_proj(x["comps"])  # [batch, max_comps, d_model]
+        comp_input = comp_input + expr_embed  # Add expression embeddings to comp features
+        comp_input = self.comp_pos_enc(comp_input)
+        comp_out = self.comp_transformer(comp_input)  # [batch, max_comps, d_model]
+        comp_embed = comp_out.mean(dim=1, keepdim=True)  # [batch, 1, d_model]
         
-        # Step 3: Embed loops
-        loop_out, (loop_h, _) = self.loop_lstm(x["loops"])  # [batch, max_loops, hidden]
-        loop_embed = loop_out.mean(dim=1, keepdim=True)  # [batch, 1, hidden]
+        # Step 3: Process loops
+        loop_input = self.loop_proj(x["loops"])  # [batch, max_loops, d_model]
+        loop_input = self.loop_pos_enc(loop_input)
+        loop_out = self.loop_transformer(loop_input)  # [batch, max_loops, d_model]
+        loop_embed = loop_out.mean(dim=1, keepdim=True)  # [batch, 1, d_model]
         
-        # Step 4: Aggregate hierarchically
-        agg_input = torch.cat([comp_embed, loop_embed], dim=1)  # [batch, 2, hidden]
-        agg_out, (agg_h, _) = self.agg_lstm(agg_input)  # [batch, 2, hidden]
-        agg_context = agg_h[-1]  # [batch, hidden]
+        # Step 4: Global attention to combine comp and loop embeddings
+        combined_embed = torch.cat([comp_embed, loop_embed], dim=1)  # [batch, 2, d_model]
+        attn_output, _ = self.global_attention(combined_embed, combined_embed, combined_embed)  # [batch, 2, d_model]
+        global_embed = attn_output.mean(dim=1)  # [batch, d_model]
         
         # Step 5: Final prediction
-        return self.fc(agg_context)
+        return self.fc(global_embed)
 
 # Training function
 def train_model():
@@ -147,7 +147,7 @@ def train_model():
     
     # Normalize execution times (log transform to handle wide range)
     exec_times = np.array([d["exec_time"] for d in dataset])
-    exec_times = np.log1p(exec_times)  # log(1+x) to handle small values
+    exec_times = np.log1p(exec_times)
     scaler = StandardScaler()
     y_scaled = scaler.fit_transform(exec_times.reshape(-1, 1)).flatten()
     for i, d in enumerate(dataset):
@@ -171,13 +171,13 @@ def train_model():
     expr_input_dim = dataset[0]["expr_tensor"].shape[2]   # 11
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = TiramisuRecursiveLSTM(comp_input_dim, loop_input_dim, expr_input_dim).to(device)
+    model = TiramisuTransformer(comp_input_dim, loop_input_dim, expr_input_dim).to(device)
     criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=10)
+    optimizer = optim.AdamW(model.parameters(), lr=0.0005, weight_decay=1e-4)  # AdamW for better regularization
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=15)
     
     # Training loop
-    num_epochs = 100  # Increased epochs for better convergence
+    num_epochs = 200  # More epochs for Transformer convergence
     best_val_loss = float("inf")
     for epoch in range(num_epochs):
         model.train()
@@ -213,10 +213,10 @@ def train_model():
         
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            torch.save(model.state_dict(), "tiramisu_recursive_lstm_best.pth")
+            torch.save(model.state_dict(), "tiramisu_transformer_best.pth")
     
     # Test evaluation
-    model.load_state_dict(torch.load("tiramisu_recursive_lstm_best.pth"))
+    model.load_state_dict(torch.load("tiramisu_transformer_best.pth"))
     model.eval()
     test_preds, test_true = [], []
     with torch.no_grad():
@@ -239,7 +239,7 @@ def train_model():
     for i in range(min(5, len(test_true_denorm))):
         print(f"True: {test_true_denorm[i]:.4f}, Predicted: {test_preds_denorm[i]:.4f}")
     
-    torch.save({"model": model.state_dict(), "scaler": scaler}, "tiramisu_recursive_lstm_final.pt")
+    torch.save({"model": model.state_dict(), "scaler": scaler}, "tiramisu_transformer_final.pt")
 
 if __name__ == "__main__":
     train_model()
