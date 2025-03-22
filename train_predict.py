@@ -91,9 +91,10 @@ class TiramisuMultiHeadLSTM(nn.Module):
         self.loop_attention = MultiHeadAttention(hidden_size * 2)  # *2 for bidirectional
         self.expr_attention = MultiHeadAttention(hidden_size)
         
-        self.norm = nn.LayerNorm(hidden_size * 6)  # *6 = 2*hidden_size (comp) + 2*hidden_size (loop) + hidden_size (expr)
+        # Corrected normalization size: 512 (comp) + 512 (loop) + 256 (expr) = 1280
+        self.norm = nn.LayerNorm(hidden_size * 5)  # *5 = 2*hidden_size (comp) + 2*hidden_size (loop) + hidden_size (expr)
         self.fc = nn.Sequential(
-            nn.Linear(hidden_size * 6, 512),
+            nn.Linear(hidden_size * 5, 512),
             nn.ELU(),
             nn.Dropout(0.3),
             nn.Linear(512, 128),
@@ -120,7 +121,7 @@ class TiramisuMultiHeadLSTM(nn.Module):
         expr_context = self.expr_attention(expr_out.reshape(batch_size, num_comps * expr_len, -1))  # [batch, hidden]
         
         # Combine embeddings
-        combined = torch.cat([comp_context, loop_context, expr_context], dim=1)  # [batch, hidden*6]
+        combined = torch.cat([comp_context, loop_context, expr_context], dim=1)  # [batch, hidden*5]
         combined = self.norm(combined)
         return self.fc(combined)
 
