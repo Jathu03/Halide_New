@@ -100,9 +100,13 @@ def create_data_representation(tiramisu_dir="Tiramisu"):
                         next((s[1] for s in shiftings if iter_name.startswith(s[0])), 0)  # ShiftFactor
                     ])
                 iter_repr += [0] * 6 * (MAX_DEPTH - len(iterators))  # Pad
+                
+                # Handle unrolling_factor, ensuring None is treated as 0
+                unrolling_factor = sched_dict.get("unrolling_factor")
+                unrolling_factor = 0 if unrolling_factor is None else unrolling_factor
                 iter_repr.extend([
-                    int(bool(sched_dict.get("unrolling_factor", 0))),  # Unrolled
-                    int(sched_dict.get("unrolling_factor", 0))  # UnrollFactor
+                    int(bool(unrolling_factor)),  # Unrolled
+                    int(unrolling_factor)  # UnrollFactor
                 ])
                 
                 # Transformation tags
@@ -132,13 +136,16 @@ def create_data_representation(tiramisu_dir="Tiramisu"):
                 sched_comp = sched.get(ordered_comps[0], {})
                 # Ensure shiftings is a list, defaulting to [] if None
                 shiftings = sched_comp.get("shiftings") if sched_comp.get("shiftings") is not None else []
+                # Handle unrolling_factor for loops representation
+                unrolling_factor = sched_comp.get("unrolling_factor")
+                unrolling_factor = 0 if unrolling_factor is None else unrolling_factor
                 l_repr = [
                     int(loop_name == sched_comp.get("parallelized_dim", "")),
                     int(sched_comp.get("tiling", {}).get("tiling_dims", []).count(loop_name) > 0),
                     int(sched_comp.get("tiling", {}).get("tiling_factors", [0])[0]),
                     int(any(loop_name in comps_dict[c]["iterators"][f[2]] for f in sched.get("fusions", []) for c in f[:2])),
-                    int(bool(sched_comp.get("unrolling_factor", 0))),
-                    int(sched_comp.get("unrolling_factor", 0)),
+                    int(bool(unrolling_factor)),
+                    int(unrolling_factor),
                     int(any(loop_name.startswith(s[0]) for s in shiftings)),
                     next((s[1] for s in shiftings if loop_name.startswith(s[0])), 0)
                 ]
