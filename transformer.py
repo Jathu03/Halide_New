@@ -89,13 +89,14 @@ def create_data_representation(tiramisu_dir="Tiramisu"):
                 iter_repr = []
                 for i, iter_name in enumerate(iterators[:MAX_DEPTH]):
                     l_code = f"C{comp_idx}-L{i}"
-                    # Ensure shiftings is a list, defaulting to [] if None
+                    # Ensure shiftings and fusions are lists, defaulting to [] if None
                     shiftings = sched_dict.get("shiftings") if sched_dict.get("shiftings") is not None else []
+                    fusions = sched.get("fusions") if sched.get("fusions") is not None else []
                     iter_repr.extend([
                         int(iter_name == sched_dict.get("parallelized_dim", "")),  # Parallelized
                         int(sched_dict.get("tiling", {}).get("tiling_dims", []).count(iter_name) > 0),  # Tiled
                         int(sched_dict.get("tiling", {}).get("tiling_factors", [0])[i]) if i < len(sched_dict.get("tiling", {}).get("tiling_factors", [])) else 0,  # TileFactor
-                        int(i in [f[2] for f in sched.get("fusions", []) if comp_name in f]),  # Fused
+                        int(i in [f[2] for f in fusions if comp_name in f]),  # Fused
                         int(any(iter_name.startswith(s[0]) for s in shiftings)),  # Shifted
                         next((s[1] for s in shiftings if iter_name.startswith(s[0])), 0)  # ShiftFactor
                     ])
@@ -134,8 +135,9 @@ def create_data_representation(tiramisu_dir="Tiramisu"):
             loops_features = []
             for loop_name in loops_dict.keys():
                 sched_comp = sched.get(ordered_comps[0], {})
-                # Ensure shiftings is a list, defaulting to [] if None
+                # Ensure shiftings and fusions are lists, defaulting to [] if None
                 shiftings = sched_comp.get("shiftings") if sched_comp.get("shiftings") is not None else []
+                fusions = sched.get("fusions") if sched.get("fusions") is not None else []
                 # Handle unrolling_factor for loops representation
                 unrolling_factor = sched_comp.get("unrolling_factor")
                 unrolling_factor = 0 if unrolling_factor is None else unrolling_factor
@@ -143,7 +145,7 @@ def create_data_representation(tiramisu_dir="Tiramisu"):
                     int(loop_name == sched_comp.get("parallelized_dim", "")),
                     int(sched_comp.get("tiling", {}).get("tiling_dims", []).count(loop_name) > 0),
                     int(sched_comp.get("tiling", {}).get("tiling_factors", [0])[0]),
-                    int(any(loop_name in comps_dict[c]["iterators"][f[2]] for f in sched.get("fusions", []) for c in f[:2])),
+                    int(any(loop_name in comps_dict[c]["iterators"][f[2]] for f in fusions for c in f[:2])),
                     int(bool(unrolling_factor)),
                     int(unrolling_factor),
                     int(any(loop_name.startswith(s[0]) for s in shiftings)),
