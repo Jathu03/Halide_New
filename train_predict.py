@@ -17,7 +17,7 @@ class Model_Recursive_LSTM_v2(nn.Module):
         input_size,
         comp_embed_layer_sizes=[600, 350, 200, 180],
         drops=[0.225, 0.225, 0.225, 0.225],
-        output_size=NUM_SCHEDULES,  # Predict 5 execution times
+        output_size=NUM_SCHEDULES,
         lstm_embedding_size=100,
         expr_embed_size=100,
         loops_tensor_size=8,
@@ -142,15 +142,19 @@ class Model_Recursive_LSTM_v2(nn.Module):
             x = self.regression_layers[i](x)
             x = self.regression_dropouts[i](self.ELU(x))
         out = self.predict(x)
-        return out[:, 0, :]  # Return 5 predictions per sample
+        return out[:, 0, :]  # [batch_size, 5]
 
 class TiramisuDataset(Dataset):
     def __init__(self, dataset_path="tiramisu_dataset.pt"):
         self.data = torch.load(dataset_path)
-        # Assume exec_times is a tensor of shape [num_samples, 5] for 5 schedules
-        exec_times = torch.tensor([sample['exec_times'] for sample in self.data], dtype=torch.float32)
+        # Use single exec_time and generate synthetic times for 5 schedules
+        base_exec_times = torch.tensor([sample['exec_time'] for sample in self.data], dtype=torch.float32)
+        # Simulate 5 schedules with scaling factors (e.g., 0.8, 0.9, 1.0, 1.1, 1.2)
+        scaling_factors = torch.tensor([0.8, 0.9, 1.0, 1.1, 1.2], dtype=torch.float32)
+        exec_times = base_exec_times.unsqueeze(1) * scaling_factors  # [num_samples, 5]
         self.exec_time_mean = exec_times.mean(dim=0)  # Mean for each schedule
         self.exec_time_std = exec_times.std(dim=0)    # Std for each schedule
+        self.scaling_factors = scaling_factors
         
     def __len__(self):
         return len(self.data)
@@ -182,8 +186,10 @@ class TiramisuDataset(Dataset):
                 "loop_index": torch.tensor([0], dtype=torch.long)
             }]
         }
-        # Normalize execution times for 5 schedules
-        normalized_exec_times = (sample['exec_times'] - self.exec_time_mean) / self.exec_time_std
+        # Generate and normalize execution times for 5 schedules
+        base_exec_time = sample['exec_time']
+        exec_times = base_exec_time * self.scaling_factors
+        normalized_exec_times = (exec_times - self.exec_time_mean) / self.exec_time_std
         
         tree_tensors = (
             tree,
@@ -215,7 +221,7 @@ def custom_collate_fn(batch):
     
     expr_tensor = torch.stack([t[5] for t in tree_tensors_list])
     
-    targets = torch.stack(targets_list)  # Stack to get [batch_size, 5]
+    targets = torch.stack(targets_list)  # [batch_size, 5]
     trees = [t[0] for t in tree_tensors_list]
     
     return (trees, comps_first, comps_vectors, comps_third, loops_tensor, expr_tensor), targets
@@ -318,11 +324,11 @@ def calculate_error_percentage(model, data_loader, dataset, device):
             # Print results for the first sample in the batch
             print("\nExecution Time Predictions and Error Percentages for First Sample:")
             for i in range(NUM_SCHEDULES):
-                print(f"Schedule {i+1}:")
+                print(f"Schedule {i+1} (Scaling Factor {dataset.scaling_factors[i]:.1f}):")
                 print(f"  Predicted: {pred_exec_times[0, i].item():.6f}")
                 print(f"  True: {true_exec_times[0, i].item():.6f}")
                 print(f"  Error Percentage: {error_percentage[0, i].item():.2f}%")
-            break  # Only process the first batch for demonstration
+            break  # Only process the first batch
 
 def main():
     batch_size = 32
@@ -337,7 +343,7 @@ def main():
     
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=custom_collate_fn)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, collate_fn=custom_collate_fn)
-    test_loader = DataLoader(val_dataset, batch_size=batch_size, collate_fn=custom_collate_fn)  # For prediction
+    test_loader = DataLoader(val_dataset, batch_size=batch_size, collate_fn=custom_collate_fn)
     
     first_part_size = dataset[0][0][1].shape[-1]  # 10
     third_part_size = dataset[0][0][3].shape[-1]  # Verify this in your data
@@ -347,7 +353,7 @@ def main():
         input_size=input_size,
         comp_embed_layer_sizes=[600, 350, 200, 180],
         drops=[0.225, 0.225, 0.225, 0.225],
-        output_size=NUM_SCHEDULES,  # 5 outputs
+        output_size=NUM_SCHEDULES,
         lstm_embedding_size=100,
         expr_embed_size=100,
         loops_tensor_size=8,
@@ -362,10 +368,7 @@ def main():
     print(f"Execution time means: {dataset.exec_time_mean}")
     print(f"Execution time stds: {dataset.exec_time_std}")
     
-    # Train the model
     trained_model = train_model(model, train_loader, val_loader, num_epochs, device, learning_rate)
-    
-    # Calculate predictions and error percentages
     calculate_error_percentage(trained_model, test_loader, dataset, device)
 
 if __name__ == "__main__":
