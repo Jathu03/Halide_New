@@ -1,0 +1,238 @@
+{
+    "filename": "./function608857_explored_schedules.json",
+    "node_name": "lanka14",
+    "parameters": {
+        "beam_size": 3,
+        "max_depth": 6
+    },
+    "program_annotation": {
+        "memory_size": 0.523681640625,
+        "iterators": {
+            "i0": {
+                "lower_bound": 0,
+                "upper_bound": 32,
+                "parent_iterator": null,
+                "child_iterators": [
+                    "i1"
+                ],
+                "computations_list": []
+            },
+            "i1": {
+                "lower_bound": 1,
+                "upper_bound": 33,
+                "parent_iterator": "i0",
+                "child_iterators": [
+                    "i2"
+                ],
+                "computations_list": []
+            },
+            "i2": {
+                "lower_bound": 0,
+                "upper_bound": 32,
+                "parent_iterator": "i1",
+                "child_iterators": [],
+                "computations_list": [
+                    "comp00"
+                ]
+            }
+        },
+        "computations": {
+            "comp00": {
+                "absolute_order": 1,
+                "iterators": [
+                    "i0",
+                    "i1",
+                    "i2"
+                ],
+                "comp_is_reduction": true,
+                "number_of_additions": 1,
+                "number_of_subtraction": 0,
+                "number_of_multiplication": 1,
+                "number_of_division": 0,
+                "write_access_relation": "{ comp00[i0, i1, i2] -> buf00[i0, i1] }",
+                "write_buffer_id": 0,
+                "data_type": "float64",
+                "data_type_size": 0,
+                "accesses": [
+                    {
+                        "access_is_reduction": true,
+                        "buffer_id": 0,
+                        "access_matrix": [
+                            [
+                                1,
+                                0,
+                                0,
+                                0
+                            ],
+                            [
+                                0,
+                                1,
+                                0,
+                                0
+                            ]
+                        ]
+                    },
+                    {
+                        "access_is_reduction": false,
+                        "buffer_id": 1,
+                        "access_matrix": [
+                            [
+                                1,
+                                0,
+                                0,
+                                0
+                            ],
+                            [
+                                0,
+                                1,
+                                0,
+                                -1
+                            ],
+                            [
+                                0,
+                                0,
+                                1,
+                                0
+                            ]
+                        ]
+                    },
+                    {
+                        "access_is_reduction": false,
+                        "buffer_id": 2,
+                        "access_matrix": [
+                            [
+                                1,
+                                0,
+                                0,
+                                0
+                            ],
+                            [
+                                0,
+                                1,
+                                0,
+                                0
+                            ],
+                            [
+                                0,
+                                0,
+                                1,
+                                0
+                            ]
+                        ]
+                    }
+                ],
+                "expression_representation": {
+                    "expr_type": "add",
+                    "children": [
+                        {
+                            "expr_type": "access",
+                            "children": []
+                        },
+                        {
+                            "expr_type": "mul",
+                            "children": [
+                                {
+                                    "expr_type": "access",
+                                    "children": []
+                                },
+                                {
+                                    "expr_type": "access",
+                                    "children": []
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+        }
+    },
+    "initial_execution_time": 0.036409,
+    "schedule_index": 27,
+    "schedule_details": {
+        "comp00": {
+            "tiling": {},
+            "unrolling_factor": 4,
+            "parallelized_dim": null,
+            "shiftings": null,
+            "transformations_list": [
+                [
+                    1,
+                    0,
+                    1,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0
+                ]
+            ]
+        },
+        "unfuse_iterators": [],
+        "tree_structure": {
+            "roots": [
+                {
+                    "loop_name": "i0",
+                    "computations_list": [],
+                    "child_list": [
+                        {
+                            "loop_name": "i1",
+                            "computations_list": [],
+                            "child_list": [
+                                {
+                                    "loop_name": "i2",
+                                    "computations_list": [
+                                        "comp00"
+                                    ],
+                                    "child_list": []
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ]
+        },
+        "execution_times": [
+            0.15728,
+            0.046312,
+            0.045586,
+            0.045834,
+            0.045407,
+            0.045511,
+            0.045354,
+            0.045511,
+            0.045644,
+            0.070299,
+            0.051808,
+            0.051952,
+            0.052457,
+            0.078923,
+            0.064212,
+            0.064243,
+            0.064513,
+            0.064127,
+            0.064445,
+            0.064367,
+            0.064413,
+            0.064363,
+            0.064329,
+            0.064133,
+            0.064252,
+            0.064016,
+            0.064643,
+            0.06427,
+            0.064274,
+            0.064382
+        ],
+        "legality_check": true,
+        "exploration_method": 1,
+        "sched_str": "{comp00}:I(L0,L1)U(L2,4)"
+    }
+}

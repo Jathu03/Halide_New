@@ -1,0 +1,209 @@
+{
+    "filename": "./function714685_explored_schedules.json",
+    "node_name": "lanka09",
+    "parameters": {
+        "beam_size": 2,
+        "max_depth": 6
+    },
+    "program_annotation": {
+        "memory_size": 25.009765625,
+        "iterators": {
+            "i0": {
+                "lower_bound": 0,
+                "upper_bound": 1280,
+                "parent_iterator": null,
+                "child_iterators": [
+                    "i1"
+                ],
+                "computations_list": []
+            },
+            "i1": {
+                "lower_bound": 0,
+                "upper_bound": 1280,
+                "parent_iterator": "i0",
+                "child_iterators": [],
+                "computations_list": [
+                    "comp00"
+                ]
+            }
+        },
+        "computations": {
+            "comp00": {
+                "absolute_order": 1,
+                "iterators": [
+                    "i0",
+                    "i1"
+                ],
+                "comp_is_reduction": true,
+                "number_of_additions": 2,
+                "number_of_subtraction": 0,
+                "number_of_multiplication": 0,
+                "number_of_division": 0,
+                "write_access_relation": "{ comp00[i0, i1] -> buf00[i1] }",
+                "write_buffer_id": 0,
+                "data_type": "float64",
+                "data_type_size": 0,
+                "accesses": [
+                    {
+                        "access_is_reduction": true,
+                        "buffer_id": 0,
+                        "access_matrix": [
+                            [
+                                0,
+                                1,
+                                0
+                            ]
+                        ]
+                    },
+                    {
+                        "access_is_reduction": false,
+                        "buffer_id": 1,
+                        "access_matrix": [
+                            [
+                                1,
+                                0,
+                                0
+                            ],
+                            [
+                                0,
+                                1,
+                                0
+                            ]
+                        ]
+                    },
+                    {
+                        "access_is_reduction": false,
+                        "buffer_id": 2,
+                        "access_matrix": [
+                            [
+                                1,
+                                0,
+                                0
+                            ],
+                            [
+                                0,
+                                1,
+                                0
+                            ]
+                        ]
+                    }
+                ],
+                "expression_representation": {
+                    "expr_type": "add",
+                    "children": [
+                        {
+                            "expr_type": "add",
+                            "children": [
+                                {
+                                    "expr_type": "access",
+                                    "children": []
+                                },
+                                {
+                                    "expr_type": "access",
+                                    "children": []
+                                }
+                            ]
+                        },
+                        {
+                            "expr_type": "access",
+                            "children": []
+                        }
+                    ]
+                }
+            }
+        }
+    },
+    "initial_execution_time": 1.63818,
+    "schedule_index": 64,
+    "schedule_details": {
+        "comp00": {
+            "tiling": {
+                "tiling_depth": 2,
+                "tiling_dims": [
+                    "i1",
+                    "i0"
+                ],
+                "tiling_factors": [
+                    32,
+                    128
+                ]
+            },
+            "unrolling_factor": 4,
+            "parallelized_dim": null,
+            "shiftings": null,
+            "transformations_list": [
+                [
+                    1,
+                    0,
+                    1,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0
+                ]
+            ]
+        },
+        "unfuse_iterators": [],
+        "tree_structure": {
+            "roots": [
+                {
+                    "loop_name": "i0",
+                    "computations_list": [],
+                    "child_list": [
+                        {
+                            "loop_name": "i1",
+                            "computations_list": [
+                                "comp00"
+                            ],
+                            "child_list": []
+                        }
+                    ]
+                }
+            ]
+        },
+        "execution_times": [
+            10.7483,
+            8.57818,
+            8.69275,
+            8.6432,
+            8.63121,
+            8.53239,
+            8.47251,
+            8.4688,
+            8.44632,
+            8.43838,
+            8.40363,
+            8.41014,
+            8.44331,
+            8.35527,
+            8.34961,
+            8.43334,
+            8.43099,
+            8.43875,
+            8.41543,
+            8.4345,
+            8.43459,
+            8.41569,
+            8.41792,
+            8.43954,
+            8.43435,
+            8.45067,
+            8.44599,
+            8.43909,
+            8.42235,
+            8.49098
+        ],
+        "legality_check": true,
+        "exploration_method": 1,
+        "sched_str": "{comp00}:I(L0,L1)T2(L1,L0,32,128)U(L3,4)"
+    }
+}

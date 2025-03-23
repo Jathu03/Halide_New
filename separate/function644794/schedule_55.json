@@ -1,0 +1,164 @@
+{
+    "filename": "./function644794_explored_schedules.json",
+    "node_name": "lanka14",
+    "parameters": {
+        "beam_size": 2,
+        "max_depth": 6
+    },
+    "program_annotation": {
+        "memory_size": 6.0,
+        "iterators": {
+            "i0": {
+                "lower_bound": 0,
+                "upper_bound": 768,
+                "parent_iterator": null,
+                "child_iterators": [
+                    "i1"
+                ],
+                "computations_list": []
+            },
+            "i1": {
+                "lower_bound": 0,
+                "upper_bound": 512,
+                "parent_iterator": "i0",
+                "child_iterators": [],
+                "computations_list": [
+                    "comp00"
+                ]
+            }
+        },
+        "computations": {
+            "comp00": {
+                "absolute_order": 1,
+                "iterators": [
+                    "i0",
+                    "i1"
+                ],
+                "comp_is_reduction": false,
+                "number_of_additions": 0,
+                "number_of_subtraction": 0,
+                "number_of_multiplication": 0,
+                "number_of_division": 0,
+                "write_access_relation": "{ comp00[i0, i1] -> buf00[i0' = i0, i1' = i1] }",
+                "write_buffer_id": 1,
+                "data_type": "float64",
+                "data_type_size": 0,
+                "accesses": [
+                    {
+                        "access_is_reduction": false,
+                        "buffer_id": 0,
+                        "access_matrix": [
+                            [
+                                1,
+                                0,
+                                0
+                            ],
+                            [
+                                0,
+                                1,
+                                0
+                            ]
+                        ]
+                    }
+                ],
+                "expression_representation": {
+                    "expr_type": "access",
+                    "children": []
+                }
+            }
+        }
+    },
+    "initial_execution_time": 0.260542,
+    "schedule_index": 55,
+    "schedule_details": {
+        "comp00": {
+            "tiling": {
+                "tiling_depth": 2,
+                "tiling_dims": [
+                    "i1",
+                    "i0"
+                ],
+                "tiling_factors": [
+                    128,
+                    64
+                ]
+            },
+            "unrolling_factor": null,
+            "parallelized_dim": "i1",
+            "shiftings": null,
+            "transformations_list": [
+                [
+                    1,
+                    0,
+                    1,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0
+                ]
+            ]
+        },
+        "unfuse_iterators": [],
+        "tree_structure": {
+            "roots": [
+                {
+                    "loop_name": "i0",
+                    "computations_list": [],
+                    "child_list": [
+                        {
+                            "loop_name": "i1",
+                            "computations_list": [
+                                "comp00"
+                            ],
+                            "child_list": []
+                        }
+                    ]
+                }
+            ]
+        },
+        "execution_times": [
+            3.25477,
+            0.758142,
+            0.74266,
+            0.727431,
+            0.737196,
+            0.772714,
+            0.763915,
+            0.761739,
+            0.575437,
+            0.563996,
+            0.567699,
+            0.562973,
+            0.574413,
+            0.564936,
+            0.564495,
+            0.56523,
+            0.565196,
+            0.58943,
+            0.550075,
+            0.574604,
+            0.573174,
+            0.567025,
+            0.566276,
+            0.565839,
+            0.591724,
+            0.550794,
+            0.565367,
+            0.565248,
+            0.56458,
+            0.565168
+        ],
+        "legality_check": true,
+        "exploration_method": 1,
+        "sched_str": "{comp00}:I(L0,L1)P(L1)T2(L1,L0,128,64)"
+    }
+}

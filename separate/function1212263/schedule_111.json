@@ -1,0 +1,1095 @@
+{
+    "filename": "./function1212263_explored_schedules.json",
+    "node_name": "lanka17",
+    "parameters": {
+        "beam_size": 3,
+        "max_depth": 3
+    },
+    "program_annotation": {
+        "memory_size": 45.48883056640625,
+        "iterators": {
+            "i0": {
+                "lower_bound": 1,
+                "upper_bound": 257,
+                "parent_iterator": null,
+                "child_iterators": [
+                    "i4"
+                ],
+                "computations_list": []
+            },
+            "i4": {
+                "lower_bound": 1,
+                "upper_bound": 96,
+                "parent_iterator": "i0",
+                "child_iterators": [
+                    "i5"
+                ],
+                "computations_list": [
+                    "comp03"
+                ]
+            },
+            "i5": {
+                "lower_bound": 0,
+                "upper_bound": "(i4 - 1)+1",
+                "parent_iterator": "i4",
+                "child_iterators": [
+                    "i6"
+                ],
+                "computations_list": [
+                    "comp00"
+                ]
+            },
+            "i6": {
+                "lower_bound": 0,
+                "upper_bound": 5,
+                "parent_iterator": "i5",
+                "child_iterators": [],
+                "computations_list": [
+                    "comp01",
+                    "comp02"
+                ]
+            },
+            "i1": {
+                "lower_bound": 1,
+                "upper_bound": 8,
+                "parent_iterator": null,
+                "child_iterators": [
+                    "i7"
+                ],
+                "computations_list": []
+            },
+            "i7": {
+                "lower_bound": 0,
+                "upper_bound": 8,
+                "parent_iterator": "i1",
+                "child_iterators": [],
+                "computations_list": [
+                    "comp04"
+                ]
+            },
+            "i2": {
+                "lower_bound": 0,
+                "upper_bound": 7,
+                "parent_iterator": null,
+                "child_iterators": [
+                    "i8"
+                ],
+                "computations_list": []
+            },
+            "i8": {
+                "lower_bound": 0,
+                "upper_bound": 4,
+                "parent_iterator": "i2",
+                "child_iterators": [],
+                "computations_list": [
+                    "comp05"
+                ]
+            },
+            "i3": {
+                "lower_bound": 1,
+                "upper_bound": 8,
+                "parent_iterator": null,
+                "child_iterators": [
+                    "i9"
+                ],
+                "computations_list": []
+            },
+            "i9": {
+                "lower_bound": 1,
+                "upper_bound": 193,
+                "parent_iterator": "i3",
+                "child_iterators": [],
+                "computations_list": [
+                    "comp06"
+                ]
+            }
+        },
+        "computations": {
+            "comp00": {
+                "absolute_order": 1,
+                "iterators": [
+                    "i0",
+                    "i4",
+                    "i5"
+                ],
+                "comp_is_reduction": true,
+                "write_access_relation": "{ comp00[i0, i4, i5] -> buf00[i4, i5] }",
+                "write_buffer_id": 0,
+                "data_type": "float32",
+                "data_type_size": 0,
+                "accesses": [],
+                "expression_representation": {
+                    "expr_type": "value",
+                    "children": []
+                }
+            },
+            "comp01": {
+                "absolute_order": 2,
+                "iterators": [
+                    "i0",
+                    "i4",
+                    "i5",
+                    "i6"
+                ],
+                "comp_is_reduction": true,
+                "write_access_relation": "{ comp01[i0, i4, i5, i6] -> buf01[i4, i5, i6] }",
+                "write_buffer_id": 1,
+                "data_type": "float32",
+                "data_type_size": 0,
+                "accesses": [
+                    {
+                        "access_is_reduction": false,
+                        "buffer_id": 0,
+                        "access_matrix": [
+                            [
+                                0,
+                                1,
+                                0,
+                                0,
+                                0
+                            ],
+                            [
+                                0,
+                                0,
+                                1,
+                                0,
+                                0
+                            ]
+                        ]
+                    }
+                ],
+                "expression_representation": {
+                    "expr_type": "access",
+                    "children": []
+                }
+            },
+            "comp02": {
+                "absolute_order": 3,
+                "iterators": [
+                    "i0",
+                    "i4",
+                    "i5",
+                    "i6"
+                ],
+                "comp_is_reduction": false,
+                "write_access_relation": "{ comp02[i0, i4, i5, i6] -> buf02[i0, i4, i5, i6] }",
+                "write_buffer_id": 9,
+                "data_type": "float32",
+                "data_type_size": 0,
+                "accesses": [
+                    {
+                        "access_is_reduction": false,
+                        "buffer_id": 1,
+                        "access_matrix": [
+                            [
+                                0,
+                                1,
+                                0,
+                                0,
+                                0
+                            ],
+                            [
+                                0,
+                                0,
+                                1,
+                                0,
+                                0
+                            ],
+                            [
+                                0,
+                                0,
+                                0,
+                                1,
+                                0
+                            ]
+                        ]
+                    }
+                ],
+                "expression_representation": {
+                    "expr_type": "sqrt",
+                    "children": [
+                        {
+                            "expr_type": "mul",
+                            "children": [
+                                {
+                                    "expr_type": "value",
+                                    "children": []
+                                },
+                                {
+                                    "expr_type": "access",
+                                    "children": []
+                                }
+                            ]
+                        }
+                    ]
+                }
+            },
+            "comp03": {
+                "absolute_order": 4,
+                "iterators": [
+                    "i0",
+                    "i4"
+                ],
+                "comp_is_reduction": true,
+                "write_access_relation": "{ comp03[i0, i4] -> buf03[i0] }",
+                "write_buffer_id": 2,
+                "data_type": "float32",
+                "data_type_size": 0,
+                "accesses": [
+                    {
+                        "access_is_reduction": true,
+                        "buffer_id": 2,
+                        "access_matrix": [
+                            [
+                                1,
+                                0,
+                                0
+                            ]
+                        ]
+                    },
+                    {
+                        "access_is_reduction": true,
+                        "buffer_id": 2,
+                        "access_matrix": [
+                            [
+                                1,
+                                0,
+                                0
+                            ]
+                        ]
+                    },
+                    {
+                        "access_is_reduction": false,
+                        "buffer_id": 3,
+                        "access_matrix": [
+                            [
+                                1,
+                                0,
+                                0
+                            ],
+                            [
+                                0,
+                                1,
+                                0
+                            ]
+                        ]
+                    },
+                    {
+                        "access_is_reduction": true,
+                        "buffer_id": 2,
+                        "access_matrix": [
+                            [
+                                1,
+                                0,
+                                -1
+                            ]
+                        ]
+                    },
+                    {
+                        "access_is_reduction": true,
+                        "buffer_id": 2,
+                        "access_matrix": [
+                            [
+                                1,
+                                0,
+                                1
+                            ]
+                        ]
+                    }
+                ],
+                "expression_representation": {
+                    "expr_type": "div",
+                    "children": [
+                        {
+                            "expr_type": "mul",
+                            "children": [
+                                {
+                                    "expr_type": "mul",
+                                    "children": [
+                                        {
+                                            "expr_type": "mul",
+                                            "children": [
+                                                {
+                                                    "expr_type": "value",
+                                                    "children": []
+                                                },
+                                                {
+                                                    "expr_type": "sqrt",
+                                                    "children": [
+                                                        {
+                                                            "expr_type": "add",
+                                                            "children": [
+                                                                {
+                                                                    "expr_type": "access",
+                                                                    "children": []
+                                                                },
+                                                                {
+                                                                    "expr_type": "value",
+                                                                    "children": []
+                                                                }
+                                                            ]
+                                                        }
+                                                    ]
+                                                }
+                                            ]
+                                        },
+                                        {
+                                            "expr_type": "access",
+                                            "children": []
+                                        }
+                                    ]
+                                },
+                                {
+                                    "expr_type": "access",
+                                    "children": []
+                                }
+                            ]
+                        },
+                        {
+                            "expr_type": "add",
+                            "children": [
+                                {
+                                    "expr_type": "access",
+                                    "children": []
+                                },
+                                {
+                                    "expr_type": "access",
+                                    "children": []
+                                }
+                            ]
+                        }
+                    ]
+                }
+            },
+            "comp04": {
+                "absolute_order": 5,
+                "iterators": [
+                    "i1",
+                    "i7"
+                ],
+                "comp_is_reduction": true,
+                "write_access_relation": "{ comp04[i1, i7] -> buf05[i1] }",
+                "write_buffer_id": 10,
+                "data_type": "float32",
+                "data_type_size": 0,
+                "accesses": [
+                    {
+                        "access_is_reduction": false,
+                        "buffer_id": 4,
+                        "access_matrix": [
+                            [
+                                1,
+                                0,
+                                0
+                            ],
+                            [
+                                0,
+                                1,
+                                0
+                            ]
+                        ]
+                    },
+                    {
+                        "access_is_reduction": false,
+                        "buffer_id": 5,
+                        "access_matrix": [
+                            [
+                                1,
+                                0,
+                                0
+                            ]
+                        ]
+                    },
+                    {
+                        "access_is_reduction": false,
+                        "buffer_id": 5,
+                        "access_matrix": [
+                            [
+                                1,
+                                0,
+                                -1
+                            ]
+                        ]
+                    },
+                    {
+                        "access_is_reduction": false,
+                        "buffer_id": 5,
+                        "access_matrix": [
+                            [
+                                1,
+                                0,
+                                1
+                            ]
+                        ]
+                    }
+                ],
+                "expression_representation": {
+                    "expr_type": "add",
+                    "children": [
+                        {
+                            "expr_type": "sub",
+                            "children": [
+                                {
+                                    "expr_type": "add",
+                                    "children": [
+                                        {
+                                            "expr_type": "sub",
+                                            "children": [
+                                                {
+                                                    "expr_type": "value",
+                                                    "children": []
+                                                },
+                                                {
+                                                    "expr_type": "access",
+                                                    "children": []
+                                                }
+                                            ]
+                                        },
+                                        {
+                                            "expr_type": "access",
+                                            "children": []
+                                        }
+                                    ]
+                                },
+                                {
+                                    "expr_type": "access",
+                                    "children": []
+                                }
+                            ]
+                        },
+                        {
+                            "expr_type": "access",
+                            "children": []
+                        }
+                    ]
+                }
+            },
+            "comp05": {
+                "absolute_order": 6,
+                "iterators": [
+                    "i2",
+                    "i8"
+                ],
+                "comp_is_reduction": true,
+                "write_access_relation": "{ comp05[i2, i8] -> buf08[i8] }",
+                "write_buffer_id": 6,
+                "data_type": "float32",
+                "data_type_size": 0,
+                "accesses": [
+                    {
+                        "access_is_reduction": true,
+                        "buffer_id": 6,
+                        "access_matrix": [
+                            [
+                                0,
+                                1,
+                                0
+                            ]
+                        ]
+                    },
+                    {
+                        "access_is_reduction": false,
+                        "buffer_id": 7,
+                        "access_matrix": [
+                            [
+                                1,
+                                0,
+                                0
+                            ]
+                        ]
+                    }
+                ],
+                "expression_representation": {
+                    "expr_type": "sub",
+                    "children": [
+                        {
+                            "expr_type": "access",
+                            "children": []
+                        },
+                        {
+                            "expr_type": "access",
+                            "children": []
+                        }
+                    ]
+                }
+            },
+            "comp06": {
+                "absolute_order": 7,
+                "iterators": [
+                    "i3",
+                    "i9"
+                ],
+                "comp_is_reduction": false,
+                "write_access_relation": "{ comp06[i3, i9] -> buf10[i3, i9] }",
+                "write_buffer_id": 8,
+                "data_type": "float32",
+                "data_type_size": 0,
+                "accesses": [
+                    {
+                        "access_is_reduction": true,
+                        "buffer_id": 8,
+                        "access_matrix": [
+                            [
+                                1,
+                                0,
+                                0
+                            ],
+                            [
+                                0,
+                                1,
+                                -1
+                            ]
+                        ]
+                    },
+                    {
+                        "access_is_reduction": true,
+                        "buffer_id": 8,
+                        "access_matrix": [
+                            [
+                                1,
+                                0,
+                                1
+                            ],
+                            [
+                                0,
+                                1,
+                                -1
+                            ]
+                        ]
+                    },
+                    {
+                        "access_is_reduction": true,
+                        "buffer_id": 8,
+                        "access_matrix": [
+                            [
+                                1,
+                                0,
+                                0
+                            ],
+                            [
+                                0,
+                                1,
+                                0
+                            ]
+                        ]
+                    },
+                    {
+                        "access_is_reduction": true,
+                        "buffer_id": 8,
+                        "access_matrix": [
+                            [
+                                1,
+                                0,
+                                -1
+                            ],
+                            [
+                                0,
+                                1,
+                                0
+                            ]
+                        ]
+                    },
+                    {
+                        "access_is_reduction": true,
+                        "buffer_id": 8,
+                        "access_matrix": [
+                            [
+                                1,
+                                0,
+                                -1
+                            ],
+                            [
+                                0,
+                                1,
+                                -1
+                            ]
+                        ]
+                    },
+                    {
+                        "access_is_reduction": true,
+                        "buffer_id": 8,
+                        "access_matrix": [
+                            [
+                                1,
+                                0,
+                                0
+                            ],
+                            [
+                                0,
+                                1,
+                                1
+                            ]
+                        ]
+                    },
+                    {
+                        "access_is_reduction": true,
+                        "buffer_id": 8,
+                        "access_matrix": [
+                            [
+                                1,
+                                0,
+                                -1
+                            ],
+                            [
+                                0,
+                                1,
+                                1
+                            ]
+                        ]
+                    },
+                    {
+                        "access_is_reduction": true,
+                        "buffer_id": 8,
+                        "access_matrix": [
+                            [
+                                1,
+                                0,
+                                1
+                            ],
+                            [
+                                0,
+                                1,
+                                0
+                            ]
+                        ]
+                    },
+                    {
+                        "access_is_reduction": true,
+                        "buffer_id": 8,
+                        "access_matrix": [
+                            [
+                                1,
+                                0,
+                                1
+                            ],
+                            [
+                                0,
+                                1,
+                                1
+                            ]
+                        ]
+                    }
+                ],
+                "expression_representation": {
+                    "expr_type": "max",
+                    "children": [
+                        {
+                            "expr_type": "sqrt",
+                            "children": [
+                                {
+                                    "expr_type": "sub",
+                                    "children": [
+                                        {
+                                            "expr_type": "add",
+                                            "children": [
+                                                {
+                                                    "expr_type": "sub",
+                                                    "children": [
+                                                        {
+                                                            "expr_type": "mul",
+                                                            "children": [
+                                                                {
+                                                                    "expr_type": "value",
+                                                                    "children": []
+                                                                },
+                                                                {
+                                                                    "expr_type": "sqrt",
+                                                                    "children": [
+                                                                        {
+                                                                            "expr_type": "add",
+                                                                            "children": [
+                                                                                {
+                                                                                    "expr_type": "mul",
+                                                                                    "children": [
+                                                                                        {
+                                                                                            "expr_type": "value",
+                                                                                            "children": []
+                                                                                        },
+                                                                                        {
+                                                                                            "expr_type": "sqrt",
+                                                                                            "children": [
+                                                                                                {
+                                                                                                    "expr_type": "add",
+                                                                                                    "children": [
+                                                                                                        {
+                                                                                                            "expr_type": "mul",
+                                                                                                            "children": [
+                                                                                                                {
+                                                                                                                    "expr_type": "access",
+                                                                                                                    "children": []
+                                                                                                                },
+                                                                                                                {
+                                                                                                                    "expr_type": "access",
+                                                                                                                    "children": []
+                                                                                                                }
+                                                                                                            ]
+                                                                                                        },
+                                                                                                        {
+                                                                                                            "expr_type": "div",
+                                                                                                            "children": [
+                                                                                                                {
+                                                                                                                    "expr_type": "mul",
+                                                                                                                    "children": [
+                                                                                                                        {
+                                                                                                                            "expr_type": "value",
+                                                                                                                            "children": []
+                                                                                                                        },
+                                                                                                                        {
+                                                                                                                            "expr_type": "access",
+                                                                                                                            "children": []
+                                                                                                                        }
+                                                                                                                    ]
+                                                                                                                },
+                                                                                                                {
+                                                                                                                    "expr_type": "sqrt",
+                                                                                                                    "children": [
+                                                                                                                        {
+                                                                                                                            "expr_type": "sqrt",
+                                                                                                                            "children": [
+                                                                                                                                {
+                                                                                                                                    "expr_type": "div",
+                                                                                                                                    "children": [
+                                                                                                                                        {
+                                                                                                                                            "expr_type": "mul",
+                                                                                                                                            "children": [
+                                                                                                                                                {
+                                                                                                                                                    "expr_type": "add",
+                                                                                                                                                    "children": [
+                                                                                                                                                        {
+                                                                                                                                                            "expr_type": "access",
+                                                                                                                                                            "children": []
+                                                                                                                                                        },
+                                                                                                                                                        {
+                                                                                                                                                            "expr_type": "value",
+                                                                                                                                                            "children": []
+                                                                                                                                                        }
+                                                                                                                                                    ]
+                                                                                                                                                },
+                                                                                                                                                {
+                                                                                                                                                    "expr_type": "access",
+                                                                                                                                                    "children": []
+                                                                                                                                                }
+                                                                                                                                            ]
+                                                                                                                                        },
+                                                                                                                                        {
+                                                                                                                                            "expr_type": "access",
+                                                                                                                                            "children": []
+                                                                                                                                        }
+                                                                                                                                    ]
+                                                                                                                                }
+                                                                                                                            ]
+                                                                                                                        }
+                                                                                                                    ]
+                                                                                                                }
+                                                                                                            ]
+                                                                                                        }
+                                                                                                    ]
+                                                                                                }
+                                                                                            ]
+                                                                                        }
+                                                                                    ]
+                                                                                },
+                                                                                {
+                                                                                    "expr_type": "mul",
+                                                                                    "children": [
+                                                                                        {
+                                                                                            "expr_type": "value",
+                                                                                            "children": []
+                                                                                        },
+                                                                                        {
+                                                                                            "expr_type": "access",
+                                                                                            "children": []
+                                                                                        }
+                                                                                    ]
+                                                                                }
+                                                                            ]
+                                                                        }
+                                                                    ]
+                                                                }
+                                                            ]
+                                                        },
+                                                        {
+                                                            "expr_type": "mul",
+                                                            "children": [
+                                                                {
+                                                                    "expr_type": "value",
+                                                                    "children": []
+                                                                },
+                                                                {
+                                                                    "expr_type": "access",
+                                                                    "children": []
+                                                                }
+                                                            ]
+                                                        }
+                                                    ]
+                                                },
+                                                {
+                                                    "expr_type": "mul",
+                                                    "children": [
+                                                        {
+                                                            "expr_type": "value",
+                                                            "children": []
+                                                        },
+                                                        {
+                                                            "expr_type": "access",
+                                                            "children": []
+                                                        }
+                                                    ]
+                                                }
+                                            ]
+                                        },
+                                        {
+                                            "expr_type": "value",
+                                            "children": []
+                                        }
+                                    ]
+                                }
+                            ]
+                        },
+                        {
+                            "expr_type": "value",
+                            "children": []
+                        }
+                    ]
+                }
+            }
+        }
+    },
+    "initial_execution_time": 11.8075,
+    "schedule_index": 111,
+    "schedule_details": {
+        "comp00": {
+            "shiftings": null,
+            "tiling": {},
+            "unrolling_factor": null,
+            "parallelized_dim": null,
+            "transformations_list": []
+        },
+        "comp01": {
+            "shiftings": null,
+            "tiling": {},
+            "unrolling_factor": null,
+            "parallelized_dim": null,
+            "transformations_list": []
+        },
+        "comp02": {
+            "shiftings": null,
+            "tiling": {},
+            "unrolling_factor": null,
+            "parallelized_dim": null,
+            "transformations_list": []
+        },
+        "comp03": {
+            "shiftings": null,
+            "tiling": {},
+            "unrolling_factor": null,
+            "parallelized_dim": null,
+            "transformations_list": []
+        },
+        "comp04": {
+            "shiftings": null,
+            "tiling": {},
+            "unrolling_factor": null,
+            "parallelized_dim": null,
+            "transformations_list": [
+                [
+                    1,
+                    0,
+                    1,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0
+                ]
+            ]
+        },
+        "comp05": {
+            "shiftings": null,
+            "tiling": {},
+            "unrolling_factor": null,
+            "parallelized_dim": null,
+            "transformations_list": [
+                [
+                    2,
+                    0,
+                    0,
+                    1,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0
+                ]
+            ]
+        },
+        "comp06": {
+            "shiftings": null,
+            "tiling": {},
+            "unrolling_factor": null,
+            "parallelized_dim": null,
+            "transformations_list": [
+                [
+                    3,
+                    0,
+                    0,
+                    0,
+                    0,
+                    1,
+                    0,
+                    3,
+                    1,
+                    2,
+                    1,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0
+                ],
+                [
+                    3,
+                    0,
+                    0,
+                    0,
+                    0,
+                    1,
+                    0,
+                    1,
+                    2,
+                    0,
+                    1,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0
+                ]
+            ]
+        },
+        "fusions": null,
+        "sched_str": "M({C0},1,0,0,0,1,0,0,0,1)M({C1},1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1)M({C2},1,0,0,0,0,1,0,0,0,0,1,0,0,0,0,1)M({C3},1,0,0,1)M({C4},0,1,1,0)M({C5},1,0,0,-1)M({C6},7,3,2,1)",
+        "tree_structure": {
+            "roots": [
+                {
+                    "loop_name": "i0",
+                    "computations_list": [],
+                    "child_list": [
+                        {
+                            "loop_name": "i4",
+                            "computations_list": [
+                                "comp03"
+                            ],
+                            "child_list": [
+                                {
+                                    "loop_name": "i5",
+                                    "computations_list": [
+                                        "comp00"
+                                    ],
+                                    "child_list": [
+                                        {
+                                            "loop_name": "i6",
+                                            "computations_list": [
+                                                "comp01",
+                                                "comp02"
+                                            ],
+                                            "child_list": []
+                                        }
+                                    ]
+                                }
+                            ]
+                        }
+                    ]
+                },
+                {
+                    "loop_name": "i1",
+                    "computations_list": [],
+                    "child_list": [
+                        {
+                            "loop_name": "i7",
+                            "computations_list": [
+                                "comp04"
+                            ],
+                            "child_list": []
+                        }
+                    ]
+                },
+                {
+                    "loop_name": "i2",
+                    "computations_list": [],
+                    "child_list": [
+                        {
+                            "loop_name": "i8",
+                            "computations_list": [
+                                "comp05"
+                            ],
+                            "child_list": []
+                        }
+                    ]
+                },
+                {
+                    "loop_name": "i3",
+                    "computations_list": [],
+                    "child_list": [
+                        {
+                            "loop_name": "i9",
+                            "computations_list": [
+                                "comp06"
+                            ],
+                            "child_list": []
+                        }
+                    ]
+                }
+            ]
+        },
+        "legality_check": true,
+        "exploration_method": 1,
+        "execution_times": [
+            35.566002,
+            14.3847,
+            12.3117,
+            12.066,
+            11.9664,
+            11.9187,
+            11.8863,
+            11.9744,
+            11.7976,
+            11.8212,
+            11.8192,
+            11.8049,
+            11.8175,
+            11.8103,
+            11.7813,
+            11.7757,
+            11.7341,
+            11.937,
+            11.8362,
+            11.7701,
+            11.7558,
+            11.7389,
+            11.7733,
+            11.7604,
+            11.7256,
+            11.7507,
+            11.8035,
+            11.7604,
+            11.9004,
+            11.8473
+        ]
+    }
+}
