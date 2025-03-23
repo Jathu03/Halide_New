@@ -7,9 +7,11 @@ from torch.utils.data import Dataset, DataLoader
 import numpy as np
 from collections import OrderedDict, Counter
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.preprocessing import StandardScaler, RobustScaler, PowerTransformer
 import matplotlib.pyplot as plt
 import random
+from sklearn.feature_selection import SelectKBest, f_regression
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 # Set seed for reproducibility
 def set_seed(seed=42):
@@ -27,22 +29,20 @@ set_seed()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
-# Recursive function to flatten JSON data and extract features
+# Improved feature extraction for JSON data (from user's code)
 def flatten_json(data, parent_key=''):
     features = {}
     
     if isinstance(data, dict):
         for key, value in data.items():
             new_key = f"{parent_key}_{key}" if parent_key else key
-            # Recursively flatten nested structures
+            if key in ['metadata', 'description', 'comments']:
+                continue
             nested_features = flatten_json(value, new_key)
             features.update(nested_features)
     elif isinstance(data, list):
-        # For lists, extract length and aggregate statistics
         if parent_key:
             features[f"{parent_key}_length"] = len(data)
-            
-            # If list is not empty and contains simple types, extract statistics
             if data and all(not isinstance(x, (dict, list)) for x in data):
                 numeric_values = []
                 for item in data:
@@ -50,124 +50,152 @@ def flatten_json(data, parent_key=''):
                         numeric_values.append(float(item))
                     except (ValueError, TypeError):
                         pass
-                
                 if numeric_values:
                     features[f"{parent_key}_mean"] = np.mean(numeric_values)
+                    features[f"{parent_key}_median"] = np.median(numeric_values)
                     features[f"{parent_key}_std"] = np.std(numeric_values)
                     features[f"{parent_key}_max"] = np.max(numeric_values)
                     features[f"{parent_key}_min"] = np.min(numeric_values)
-            
-            # Recursively process list items (sample up to 5 to avoid explosion)
-            for i, value in enumerate(data[:5]):
+                    features[f"{parent_key}_range"] = np.max(numeric_values) - np.min(numeric_values)
+            for i, value in enumerate(data[:3]):
                 nested_features = flatten_json(value, f"{parent_key}_{i}")
                 features.update(nested_features)
     else:
-        # Extract value directly for simple types
         try:
             features[parent_key] = float(data)
         except (ValueError, TypeError):
-            # For non-numeric values, use simple encoding
             if isinstance(data, str):
-                # Use a hash for strings, normalized
                 features[parent_key] = hash(str(data)) % 1000 / 1000.0
+            elif data is True:
+                features[parent_key] = 1.0
+            elif data is False:
+                features[parent_key] = 0.0
             else:
                 features[parent_key] = 0.0
     
     return features
 
-# Extract target variable (total_execution_time_ms)
+# Extract target variable
 def extract_target(data):
-    for item in data.get("scheduling_data", []):
-        if item.get("name") == "total_execution_time_ms":
-            return item["value"]
+    if "scheduling_data" in data:
+        for item in data.get("scheduling_data", []):
+            if item.get("name") == "total_execution_time_ms":
+                return item["value"]
+    elif "schedule_details" in data and "execution_times" in data["schedule_details"]:
+        return np.mean(data["schedule_details"]["execution_times"])  # Tiramisu case
     return None
 
-# Extract key statistics and features from scheduling data
+# Enhanced feature extraction combining user's approach and thinking trace
 def extract_important_features(data):
     features = {}
     
-    # Extract direct features known to be important for performance
+    # Hardware features
     if "hardware" in data:
         hw = data["hardware"]
         features["num_cores"] = hw.get("num_cores", 0)
         features["has_gpu"] = 1.0 if hw.get("has_gpu", False) else 0.0
         features["memory_gb"] = hw.get("memory_gb", 0)
+        if hw.get("memory_gb", 0) > 0 and hw.get("num_cores", 0) > 0:
+            features["core_memory_ratio"] = hw.get("num_cores", 0) / hw.get("memory_gb", 1)
     
-    # Extract program complexity metrics
-    if "program" in data:
-        prog = data["program"]
-        features["num_statements"] = prog.get("num_statements", 0)
-        features["loop_count"] = prog.get("loop_count", 0)
-        features["recursion_depth"] = prog.get("recursion_depth", 0)
+    # Program complexity (Halide or Tiramisu)
+    if "programming_details" in data:  # Halide
+        nodes = data["programming_details"]["Nodes"]
+        features["num_computations"] = len(nodes)
+        op_counts = Counter()
+        for node in nodes:
+            for op in node["Details"]["Op histogram"]:
+                op_type, count = op.split(":")
+                op_counts[op_type.strip()] += int(count.strip())
+        for op, count in op_counts.items():
+            features[f"op_{op}"] = count
+        features["num_edges"] = len(data["programming_details"]["Edges"])
+    elif "program_annotation" in data:  # Tiramisu
+        comps = data["program_annotation"]["computations"]
+        features["num_computations"] = len(comps)
+        features["num_iterators"] = len(data["program_annotation"]["iterators"])
+        reductions = sum(1 for c in comps.values() if c["comp_is_reduction"])
+        features["num_reductions"] = reductions
     
-    # Extract optimization flags
-    if "compiler_options" in data:
-        opt = data["compiler_options"]
-        features["optimization_level"] = opt.get("optimization_level", 0)
-        features["vectorization"] = 1.0 if opt.get("vectorization", False) else 0.0
-        features["parallelization"] = 1.0 if opt.get("parallelization", False) else 0.0
-    
-    # Extract scheduling data metrics
-    if "scheduling_data" in data:
-        sched_data = data["scheduling_data"]
-        for item in sched_data:
-            if isinstance(item, dict) and "name" in item and "value" in item:
-                if item["name"] != "total_execution_time_ms":  # Don't include target
-                    features[f"sched_{item['name']}"] = item["value"]
+    # Scheduling features
+    if "scheduling_data" in data:  # Halide
+        sched = data["scheduling_data"]
+        for item in sched[:-1]:  # Exclude total_execution_time_ms
+            sched_feat = item["Details"]["scheduling_feature"]
+            features["inner_parallelism"] = sched_feat.get("inner_parallelism", 0)
+            features["outer_parallelism"] = sched_feat.get("outer_parallelism", 0)
+            features["vector_size"] = sched_feat.get("vector_size", 0)
+            features["unrolled_loop_extent"] = sched_feat.get("unrolled_loop_extent", 0)
+    elif "schedule_details" in data:  # Tiramisu
+        sched = data["schedule_details"]
+        tiling_total = 0
+        unroll_total = 0
+        parallel_count = 0
+        for comp in sched:
+            if comp not in ['fusions', 'sched_str', 'tree_structure', 'legality_check', 'exploration_method', 'execution_times']:
+                tiling = sched[comp].get("tiling", {})
+                tiling_total += sum(int(v) for v in tiling.values()) if tiling else 0
+                unroll = sched[comp].get("unrolling_factor", 0) or 0
+                unroll_total += unroll
+                parallel_count += 1 if sched[comp].get("parallelized_dim") else 0
+        features["total_tiling"] = tiling_total
+        features["total_unrolling"] = unroll_total
+        features["parallel_count"] = parallel_count
     
     return features
 
-# Custom Dataset with enhanced feature extraction
+# Dataset class
 class EnhancedScheduleDataset(Dataset):
-    def __init__(self, json_data_list, targets=None, feature_scaler=None, target_scaler=None, train=True):
+    def __init__(self, json_data_list, targets=None, feature_scaler=None, target_scaler=None, 
+                 train=True, feature_selector=None, k_best_features=150):
         self.json_data = json_data_list
         
-        # Extract features from JSON data
         print("Extracting features...")
         all_features = []
         for data in json_data_list:
-            # Get important features
             direct_features = extract_important_features(data)
-            
-            # Also get flattened features for completeness
             flat_features = flatten_json(data)
-            
-            # Combine both
             combined_features = {**flat_features, **direct_features}
             all_features.append(combined_features)
         
-        # Create unified feature set
         print("Creating feature matrix...")
-        self.feature_names = set()
-        for features in all_features:
-            self.feature_names.update(features.keys())
-        
-        self.feature_names = sorted(list(self.feature_names))
+        self.feature_names = sorted(set().union(*[set(f.keys()) for f in all_features]))
         print(f"Total features extracted: {len(self.feature_names)}")
         
-        # Convert to feature matrix
         X = np.zeros((len(all_features), len(self.feature_names)))
         for i, features in enumerate(all_features):
             for j, name in enumerate(self.feature_names):
                 X[i, j] = features.get(name, 0.0)
         
-        # Scale features
+        if train and targets is not None:
+            print("Performing feature selection...")
+            self.feature_selector = SelectKBest(f_regression, k=k_best_features)
+            X = self.feature_selector.fit_transform(X, targets)
+            selected_indices = self.feature_selector.get_support(indices=True)
+            self.selected_feature_names = [self.feature_names[i] for i in selected_indices]
+            print(f"Selected {len(self.selected_feature_names)} features")
+        elif feature_selector is not None:
+            X = feature_selector.transform(X)
+            self.feature_selector = feature_selector
+            self.selected_feature_names = None
+        else:
+            self.feature_selector = None
+            self.selected_feature_names = self.feature_names
+        
         if train:
-            self.feature_scaler = StandardScaler()
+            self.feature_scaler = RobustScaler()
             self.X = self.feature_scaler.fit_transform(X)
         else:
             self.X = feature_scaler.transform(X)
             self.feature_scaler = feature_scaler
         
-        # Handle targets
         if targets is not None:
             if train:
-                self.target_scaler = StandardScaler()
+                self.target_scaler = PowerTransformer(method='yeo-johnson')
                 self.y = self.target_scaler.fit_transform(np.array(targets).reshape(-1, 1)).flatten()
             else:
                 self.y = target_scaler.transform(np.array(targets).reshape(-1, 1)).flatten()
                 self.target_scaler = target_scaler
-            
             self.targets = torch.tensor(self.y, dtype=torch.float32).to(device)
         else:
             self.targets = None
@@ -177,42 +205,50 @@ class EnhancedScheduleDataset(Dataset):
     
     def __getitem__(self, idx):
         features = torch.tensor(self.X[idx], dtype=torch.float32).to(device)
-        
         if self.targets is not None:
-            target = self.targets[idx]
-            return features, target
-        else:
-            return features
+            return features, self.targets[idx]
+        return features
 
-# Define a simple but effective MLP model
-class ExecutionTimePredictor(nn.Module):
-    def __init__(self, input_size, hidden_sizes=[256, 128, 64], dropout=0.3):
-        super(ExecutionTimePredictor, self).__init__()
+# Model with residual connections
+class ImprovedExecutionTimePredictor(nn.Module):
+    def __init__(self, input_size, hidden_sizes=[512, 256, 128, 64], dropout=0.3):
+        super(ImprovedExecutionTimePredictor, self).__init__()
+        self.input_layer = nn.Linear(input_size, hidden_sizes[0])
+        self.batch_norm_input = nn.BatchNorm1d(hidden_sizes[0])
         
-        layers = []
+        self.hidden_layers = nn.ModuleList()
+        self.batch_norms = nn.ModuleList()
+        self.dropouts = nn.ModuleList()
+        self.shortcuts = nn.ModuleList()
         
-        # Input layer
-        layers.append(nn.Linear(input_size, hidden_sizes[0]))
-        layers.append(nn.ReLU())
-        layers.append(nn.BatchNorm1d(hidden_sizes[0]))
-        layers.append(nn.Dropout(dropout))
-        
-        # Hidden layers
         for i in range(1, len(hidden_sizes)):
-            layers.append(nn.Linear(hidden_sizes[i-1], hidden_sizes[i]))
-            layers.append(nn.ReLU())
-            layers.append(nn.BatchNorm1d(hidden_sizes[i]))
-            layers.append(nn.Dropout(dropout))
+            self.hidden_layers.append(nn.Linear(hidden_sizes[i-1], hidden_sizes[i]))
+            self.batch_norms.append(nn.BatchNorm1d(hidden_sizes[i]))
+            self.dropouts.append(nn.Dropout(dropout))
+            if hidden_sizes[i-1] != hidden_sizes[i]:
+                self.shortcuts.append(nn.Linear(hidden_sizes[i-1], hidden_sizes[i], bias=False))
+            else:
+                self.shortcuts.append(nn.Identity())
         
-        # Output layer
-        layers.append(nn.Linear(hidden_sizes[-1], 1))
-        
-        self.model = nn.Sequential(*layers)
+        self.output_layer = nn.Linear(hidden_sizes[-1], 1)
+        self.relu = nn.LeakyReLU(0.1)
     
     def forward(self, x):
-        return self.model(x)
+        x = self.input_layer(x)
+        x = self.batch_norm_input(x)
+        x = self.relu(x)
+        
+        for i in range(len(self.hidden_layers)):
+            identity = x
+            x = self.hidden_layers[i](x)
+            x = self.batch_norms[i](x)
+            x = self.relu(x)
+            x = self.dropouts[i](x)
+            x = x + self.shortcuts[i](identity)
+        
+        return self.output_layer(x)
 
-# Load and preprocess all data
+# Load data
 def load_data(folder_path):
     all_json_data = []
     all_targets = []
@@ -221,34 +257,44 @@ def load_data(folder_path):
         program_path = os.path.join(folder_path, program_folder)
         if not os.path.isdir(program_path):
             continue
-        
         for schedule_file in os.listdir(program_path):
             if not schedule_file.endswith('.json'):
                 continue
-            
             file_path = os.path.join(program_path, schedule_file)
             try:
                 with open(file_path, 'r') as f:
                     data = json.load(f)
-                
                 target = extract_target(data)
-                
-                if target is not None:
+                if target is not None and target > 0:
                     all_json_data.append(data)
                     all_targets.append(target)
             except Exception as e:
                 print(f"Error loading {file_path}: {e}")
     
+    if all_targets:
+        q1, q3 = np.percentile(all_targets, [1, 99])
+        iqr = q3 - q1
+        lower_bound = q1 - 1.5 * iqr
+        upper_bound = q3 + 1.5 * iqr
+        filtered_json_data = []
+        filtered_targets = []
+        for data, target in zip(all_json_data, all_targets):
+            if lower_bound <= target <= upper_bound:
+                filtered_json_data.append(data)
+                filtered_targets.append(target)
+        print(f"Removed {len(all_targets) - len(filtered_targets)} outliers from {len(all_targets)} samples")
+        return filtered_json_data, filtered_targets
     return all_json_data, all_targets
 
-# Training function with early stopping and lr scheduling
+# Training function
 def train_model(model, train_loader, val_loader, criterion, num_epochs=100, patience=15):
     optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-4)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=5, verbose=True
+    scheduler = optim.lr_scheduler.OneCycleLR(
+        optimizer, max_lr=0.01, epochs=num_epochs, steps_per_epoch=len(train_loader),
+        pct_start=0.3, anneal_strategy='cos'
     )
+    scaler = torch.cuda.amp.GradScaler() if device.type == 'cuda' else None
     
-    # For tracking training progress
     train_losses = []
     val_losses = []
     best_val_loss = float('inf')
@@ -256,25 +302,31 @@ def train_model(model, train_loader, val_loader, criterion, num_epochs=100, pati
     
     print(f"Starting training for {num_epochs} epochs...")
     for epoch in range(num_epochs):
-        # Training
         model.train()
         epoch_train_loss = 0
         for X_batch, y_batch in train_loader:
             optimizer.zero_grad()
-            outputs = model(X_batch)
-            loss = criterion(outputs.squeeze(), y_batch)
-            loss.backward()
-            
-            # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            
-            optimizer.step()
+            if scaler:
+                with torch.cuda.amp.autocast():
+                    outputs = model(X_batch)
+                    loss = criterion(outputs.squeeze(), y_batch)
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                outputs = model(X_batch)
+                loss = criterion(outputs.squeeze(), y_batch)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
             epoch_train_loss += loss.item()
+            scheduler.step()
         
         avg_train_loss = epoch_train_loss / len(train_loader)
         train_losses.append(avg_train_loss)
         
-        # Validation
         model.eval()
         epoch_val_loss = 0
         with torch.no_grad():
@@ -286,32 +338,20 @@ def train_model(model, train_loader, val_loader, criterion, num_epochs=100, pati
         avg_val_loss = epoch_val_loss / len(val_loader)
         val_losses.append(avg_val_loss)
         
-        # Learning rate scheduling
-        scheduler.step(avg_val_loss)
+        print(f"Epoch {epoch+1}/{num_epochs} - Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}, LR: {optimizer.param_groups[0]['lr']:.6f}")
         
-        print(f"Epoch {epoch+1}/{num_epochs} - "
-              f"Train Loss: {avg_train_loss:.6f}, "
-              f"Val Loss: {avg_val_loss:.6f}, "
-              f"LR: {optimizer.param_groups[0]['lr']:.6f}")
-        
-        # Early stopping
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             patience_counter = 0
-            
-            # Save best model
             print(f"Saving best model with validation loss: {best_val_loss:.6f}")
-            torch.save(model.state_dict(), 'best_model.pth')
+            torch.save(model.state_dict(), f'best_model_{id(model)}.pth')
         else:
             patience_counter += 1
             if patience_counter >= patience:
                 print(f"Early stopping at epoch {epoch+1}")
                 break
     
-    # Load best model
-    model.load_state_dict(torch.load('best_model.pth'))
-    
-    # Plot training curves
+    model.load_state_dict(torch.load(f'best_model_{id(model)}.pth'))
     plt.figure(figsize=(10, 5))
     plt.plot(train_losses, label='Training Loss')
     plt.plot(val_losses, label='Validation Loss')
@@ -319,15 +359,14 @@ def train_model(model, train_loader, val_loader, criterion, num_epochs=100, pati
     plt.ylabel('Loss')
     plt.title('Training and Validation Loss')
     plt.legend()
-    plt.savefig('training_curve.png')
+    plt.savefig(f'training_curve_{id(model)}.png')
     plt.close()
     
     return model, train_losses, val_losses
 
-# Prediction and evaluation function
+# Evaluation function
 def evaluate_model(model, test_dataset, target_scaler=None, num_samples=None):
     model.eval()
-    
     if num_samples is None or num_samples > len(test_dataset):
         num_samples = len(test_dataset)
     
@@ -336,64 +375,76 @@ def evaluate_model(model, test_dataset, target_scaler=None, num_samples=None):
     with torch.no_grad():
         for X_batch, y_batch in test_loader:
             outputs = model(X_batch)
-            # Denormalize predictions and true values
             norm_preds = outputs.cpu().numpy().reshape(-1, 1)
             norm_trues = y_batch.cpu().numpy().reshape(-1, 1)
-            
             predictions = target_scaler.inverse_transform(norm_preds).flatten()
             true_values = target_scaler.inverse_transform(norm_trues).flatten()
-            
-            break  # Only need one batch since we loaded all samples
+            break
     
-    # Calculate metrics
     abs_errors = np.abs(predictions - true_values)
-    rel_errors = abs_errors / np.maximum(true_values, 1e-10) * 100  # Avoid division by zero
+    rel_errors = abs_errors / np.maximum(true_values, 1e-10) * 100
     
-    mse = np.mean(np.square(predictions - true_values))
-    mae = np.mean(abs_errors)
-    mape = np.mean(rel_errors)
+    mse = mean_squared_error(true_values, predictions)
     rmse = np.sqrt(mse)
+    mae = mean_absolute_error(true_values, predictions)
+    mape = np.mean(rel_errors)
+    r2 = r2_score(true_values, predictions)
     
-    # Return sample predictions and overall metrics
-    sample_results = []
-    for i in range(min(10, num_samples)):
-        sample_results.append({
-            'predicted': predictions[i],
-            'true': true_values[i],
-            'error_pct': rel_errors[i]
-        })
+    metrics_by_range = {}
+    ranges = [(0, 100, "Short (<100ms)"), (100, 1000, "Medium (100-1000ms)"), (1000, float('inf'), "Long (>1000ms)")]
+    for min_val, max_val, label in ranges:
+        mask = (true_values >= min_val) & (true_values < max_val)
+        if np.sum(mask) > 0:
+            range_true = true_values[mask]
+            range_pred = predictions[mask]
+            range_abs_err = abs_errors[mask]
+            range_rel_err = rel_errors[mask]
+            metrics_by_range[label] = {
+                'count': np.sum(mask),
+                'mae': np.mean(range_abs_err),
+                'mape': np.mean(range_rel_err),
+                'rmse': np.sqrt(mean_squared_error(range_true, range_pred)),
+                'r2': r2_score(range_true, range_pred) if len(range_true) > 1 else float('nan')
+            }
     
-    metrics = {
-        'MSE': mse,
-        'RMSE': rmse,
-        'MAE': mae,
-        'MAPE': mape
-    }
+    sample_results = [{'predicted': predictions[i], 'true': true_values[i], 'error_pct': rel_errors[i], 'abs_error': abs_errors[i]} 
+                      for i in range(min(10, num_samples))]
     
-    return sample_results, metrics, predictions, true_values
+    metrics = {'MSE': mse, 'RMSE': rmse, 'MAE': mae, 'MAPE': mape, 'R2': r2}
+    return sample_results, metrics, metrics_by_range, predictions, true_values
 
 # Feature importance analysis
 def analyze_feature_importance(model, feature_names):
-    # Extract weights from the first layer
-    first_layer = next(layer for layer in model.model if isinstance(layer, nn.Linear))
-    weights = first_layer.weight.data.abs().mean(dim=0).cpu().numpy()
-    
-    # Create features importance dictionary
+    weights = model.input_layer.weight.data.abs().mean(dim=0).cpu().numpy()
     importance = {name: weight for name, weight in zip(feature_names, weights)}
+    return sorted(importance.items(), key=lambda x: x[1], reverse=True)
+
+# Ensemble class
+class ExecutionTimeEnsemble:
+    def __init__(self, models, feature_scaler, target_scaler):
+        self.models = models
+        self.feature_scaler = feature_scaler
+        self.target_scaler = target_scaler
     
-    # Sort by importance
-    sorted_importance = sorted(importance.items(), key=lambda x: x[1], reverse=True)
-    
-    return sorted_importance
+    def predict(self, features):
+        if isinstance(features, np.ndarray):
+            features = self.feature_scaler.transform(features)
+        if not isinstance(features, torch.Tensor):
+            features = torch.tensor(features, dtype=torch.float32).to(device)
+        
+        with torch.no_grad():
+            predictions = [model(features).cpu().numpy() for model in self.models]
+        avg_pred = np.mean(predictions, axis=0)
+        return self.target_scaler.inverse_transform(avg_pred)
 
 # Main execution
 def main():
     # Hyperparameters
-    batch_size = 32
-    num_epochs = 200
+    batch_size = 64
+    num_epochs = 300
     
     # Load data
-    folder_path = 'synthetic_data'
+    folder_path = 'synthetic_data'  # Adjust to your data path
     print("Loading data...")
     all_json_data, all_targets = load_data(folder_path)
     
@@ -403,7 +454,7 @@ def main():
     
     print(f"Loaded {len(all_json_data)} samples.")
     
-    # Look at the distribution of targets
+    # Plot target distribution
     plt.figure(figsize=(10, 5))
     plt.hist(all_targets, bins=50)
     plt.xlabel('Execution Time (ms)')
@@ -412,129 +463,119 @@ def main():
     plt.savefig('target_distribution.png')
     plt.close()
     
-    # Apply log transformation if data is skewed
-    log_transform = False
-    if np.mean(all_targets) > 10 * np.median(all_targets):
-        print("Applying log transformation to targets due to skewed distribution")
-        all_targets = np.log1p(all_targets)
-        log_transform = True
+    plt.figure(figsize=(10, 5))
+    plt.hist(np.log1p(all_targets), bins=50)
+    plt.xlabel('Log(Execution Time + 1) (ms)')
+    plt.ylabel('Frequency')
+    plt.title('Log Distribution of Execution Times')
+    plt.savefig('log_target_distribution.png')
+    plt.close()
     
-    # Split into train, validation, and test sets
-    train_data, test_data, train_targets, test_targets = train_test_split(
-        all_json_data, all_targets, test_size=0.2, random_state=42
+    # Stratified split
+    time_ranges = [0, 100, 1000, 10000, float('inf')]
+    range_labels = ['very_short', 'short', 'medium', 'long']
+    data_ranges = [next(label for i, upper in enumerate(time_ranges[1:]) if target < upper) 
+                   for target in all_targets]
+    
+    train_data, test_data, train_targets, test_targets, train_ranges, test_ranges = train_test_split(
+        all_json_data, all_targets, data_ranges, test_size=0.2, random_state=42, stratify=data_ranges
     )
-    
-    train_data, val_data, train_targets, val_targets = train_test_split(
-        train_data, train_targets, test_size=0.25, random_state=42  # 0.25 * 0.8 = 0.2 of original
+    train_data, val_data, train_targets, val_targets, train_ranges, val_ranges = train_test_split(
+        train_data, train_targets, train_ranges, test_size=0.25, random_state=42, stratify=train_ranges
     )
     
     print(f"Train set: {len(train_data)} samples")
     print(f"Validation set: {len(val_data)} samples")
     print(f"Test set: {len(test_data)} samples")
     
-    # Create datasets with normalization
+    # Create datasets
     print("Creating datasets...")
-    train_dataset = EnhancedScheduleDataset(train_data, train_targets, train=True)
+    train_dataset = EnhancedScheduleDataset(train_data, train_targets, train=True, k_best_features=150)
     feature_scaler = train_dataset.feature_scaler
     target_scaler = train_dataset.target_scaler
+    feature_selector = train_dataset.feature_selector
     
-    val_dataset = EnhancedScheduleDataset(
-        val_data, val_targets, 
-        feature_scaler=feature_scaler, 
-        target_scaler=target_scaler, 
-        train=False
-    )
+    val_dataset = EnhancedScheduleDataset(val_data, val_targets, feature_scaler=feature_scaler, 
+                                          target_scaler=target_scaler, feature_selector=feature_selector, train=False)
+    test_dataset = EnhancedScheduleDataset(test_data, test_targets, feature_scaler=feature_scaler, 
+                                           target_scaler=target_scaler, feature_selector=feature_selector, train=False)
     
-    test_dataset = EnhancedScheduleDataset(
-        test_data, test_targets, 
-        feature_scaler=feature_scaler, 
-        target_scaler=target_scaler, 
-        train=False
-    )
-    
-    # Create data loaders
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
     
-    # Get input dimension
     input_size = train_dataset.X.shape[1]
-    print(f"Input dimension: {input_size}")
+    print(f"Input dimension after feature selection: {input_size}")
     
-    # Initialize model
-    model = ExecutionTimePredictor(
-        input_size, 
-        hidden_sizes=[512, 256, 128, 64],  # Deeper network
-        dropout=0.4  # Increased dropout for regularization
-    ).to(device)
+    # Train ensemble of models
+    models = []
+    for i in range(3):
+        hidden_sizes_options = [[512, 256, 128, 64], [384, 256, 128, 64], [512, 384, 256, 128, 64]]
+        dropout_options = [0.3, 0.4, 0.35]
+        
+        model = ImprovedExecutionTimePredictor(input_size, hidden_sizes=hidden_sizes_options[i], 
+                                               dropout=dropout_options[i]).to(device)
+        print(f"Model {i+1} has {sum(p.numel() for p in model.parameters()):,} parameters")
+        
+        criterion_options = [nn.MSELoss(), nn.SmoothL1Loss(beta=0.5), 
+                             lambda pred, target: torch.mean((1 + torch.log1p(torch.abs(pred - target))) * torch.square(pred - target))]
+        criterion = criterion_options[i]
+        
+        print(f"\nTraining model {i+1}...")
+        model, _, _ = train_model(model, train_loader, val_loader, criterion, num_epochs=num_epochs, patience=20)
+        models.append(model)
     
-    # Print model summary
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"Model has {total_params:,} parameters")
+    # Create ensemble
+    ensemble = ExecutionTimeEnsemble(models, feature_scaler, target_scaler)
     
-    # Define loss function - use Huber loss for robustness to outliers
-    criterion = nn.SmoothL1Loss()
+    # Evaluate on test set
+    print("\nEvaluating ensemble on test set...")
+    sample_results, metrics, metrics_by_range, predictions, true_values = evaluate_model(
+        models[0], test_dataset, target_scaler=target_scaler)  # Use first model for detailed evaluation
     
-    # Train model
-    model, train_losses, val_losses = train_model(
-        model, train_loader, val_loader, criterion, num_epochs=num_epochs
-    )
+    # Ensemble predictions
+    ensemble_preds = ensemble.predict(test_dataset.X)
+    ensemble_mae = mean_absolute_error(true_values, ensemble_preds)
+    ensemble_rmse = np.sqrt(mean_squared_error(true_values, ensemble_preds))
+    ensemble_r2 = r2_score(true_values, ensemble_preds)
     
-    # Evaluate model
-    print("\nEvaluating model on test set...")
-    sample_results, metrics, all_preds, all_trues = evaluate_model(
-        model, test_dataset, target_scaler
-    )
+    # Print results
+    print("\nSample Predictions (First Model):")
+    for result in sample_results:
+        print(f"Predicted: {result['predicted']:.2f}ms, True: {result['true']:.2f}ms, "
+              f"Error: {result['abs_error']:.2f}ms ({result['error_pct']:.2f}%)")
     
-    # If we applied log transform, adjust the metrics message
-    transform_msg = " (log-transformed)" if log_transform else ""
-    
-    # Print sample results
-    print(f"\nSample Predictions{transform_msg}:")
-    for i, result in enumerate(sample_results, 1):
-        print(f"Sample {i}:")
-        print(f"  Predicted Time: {result['predicted']:.2f} ms")
-        print(f"  True Time: {result['true']:.2f} ms")
-        print(f"  Error Percentage: {result['error_pct']:.2f}%")
-    
-    # Print overall metrics
-    print(f"\nOverall Metrics{transform_msg}:")
+    print("\nOverall Metrics (First Model):")
     for metric, value in metrics.items():
-        print(f"  {metric}: {value:.2f}")
+        print(f"{metric}: {value:.4f}")
     
-    # Plot predictions vs actual
-    plt.figure(figsize=(10, 7))
-    plt.scatter(all_trues, all_preds, alpha=0.5)
+    print("\nMetrics by Execution Time Range (First Model):")
+    for range_name, range_metrics in metrics_by_range.items():
+        print(f"{range_name} ({range_metrics['count']} samples):")
+        for m, v in range_metrics.items():
+            if m != 'count':
+                print(f"  {m.upper()}: {v:.4f}")
     
-    # Add diagonal line for perfect prediction
-    max_val = max(np.max(all_trues), np.max(all_preds))
-    min_val = min(np.min(all_trues), np.min(all_preds))
-    plt.plot([min_val, max_val], [min_val, max_val], 'r--')
+    print("\nEnsemble Metrics:")
+    print(f"MAE: {ensemble_mae:.4f}")
+    print(f"RMSE: {ensemble_rmse:.4f}")
+    print(f"R2: {ensemble_r2:.4f}")
     
+    # Feature importance (from first model)
+    print("\nTop 10 Feature Importances (First Model):")
+    importance = analyze_feature_importance(models[0], train_dataset.selected_feature_names)
+    for name, weight in importance[:10]:
+        print(f"{name}: {weight:.6f}")
+    
+    # Plot predictions vs true values
+    plt.figure(figsize=(10, 5))
+    plt.scatter(true_values, predictions, alpha=0.5, label='First Model')
+    plt.scatter(true_values, ensemble_preds, alpha=0.5, label='Ensemble')
+    plt.plot([min(true_values), max(true_values)], [min(true_values), max(true_values)], 'r--')
     plt.xlabel('True Execution Time (ms)')
     plt.ylabel('Predicted Execution Time (ms)')
-    plt.title('Predicted vs Actual Execution Times')
-    plt.savefig('predictions_vs_actual.png')
-    plt.close()
-    
-    # Analyze feature importance
-    print("\nAnalyzing feature importance...")
-    feature_importance = analyze_feature_importance(model, train_dataset.feature_names)
-    
-    print("\nTop 20 most important features:")
-    for feature, importance in feature_importance[:20]:
-        print(f"  {feature}: {importance:.4f}")
-    
-    # Plot feature importance (top 30)
-    plt.figure(figsize=(12, 8))
-    top_features = feature_importance[:30]
-    features, importances = zip(*top_features)
-    
-    plt.barh(range(len(features)), importances, align='center')
-    plt.yticks(range(len(features)), features)
-    plt.xlabel('Importance')
-    plt.title('Top 30 Feature Importances')
-    plt.tight_layout()
-    plt.savefig('feature_importance.png')
+    plt.title('Predicted vs True Execution Times')
+    plt.legend()
+    plt.savefig('prediction_scatter.png')
     plt.close()
 
 if __name__ == "__main__":
