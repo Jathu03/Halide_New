@@ -203,18 +203,28 @@ class HalideDataset(Dataset):
         all_indices = set(range(len(nodes)))
         root_candidates = all_indices - to_nodes  # Nodes with no outgoing edges
         if not root_candidates:
-            # Fallback: Choose a node with no incoming edges or the last node
-            root_candidates = all_indices - from_nodes  # Nodes with no incoming edges
+            # Fallback: Try nodes with no incoming edges
+            root_candidates = all_indices - from_nodes
             if not root_candidates:
-                # If still no candidates (fully cyclic), use the last node as a heuristic
-                root_idx = len(nodes) - 1
-                warnings.warn("No clear root node found (possible cyclic graph), using last node as root")
+                # If still no candidates (fully cyclic or no edges), use the last valid node
+                if len(nodes) > 0:
+                    root_idx = len(nodes) - 1
+                    warnings.warn(f"No clear root node found (possible cyclic graph or no edges), using last node {nodes[root_idx]['Name']} as root")
+                else:
+                    raise ValueError("No nodes available to select as root")
             else:
-                root_idx = max(root_candidates)  # Use the last node with no incoming edges
+                root_idx = max(root_candidates)
+                warnings.warn(f"No nodes without outgoing edges, using node {nodes[root_idx]['Name']} with no incoming edges as root")
         else:
-            root_idx = max(root_candidates)  # Use the last node with no outgoing edges
+            root_idx = max(root_candidates)
+
+        # Ensure root_idx is valid
+        if root_idx >= len(nodes) or root_idx < 0:
+            raise ValueError(f"Invalid root_idx {root_idx} for nodes list of length {len(nodes)}")
 
         def build_node(idx):
+            if idx >= len(nodes) or idx < 0:
+                raise ValueError(f"Invalid node index {idx} for nodes list of length {len(nodes)}")
             return {
                 "name": nodes[idx]["Name"],
                 "has_comps": True,
@@ -375,3 +385,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
