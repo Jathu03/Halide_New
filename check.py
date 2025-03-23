@@ -166,6 +166,14 @@ class HalideDataset(Dataset):
         def clean_name(name):
             return name.split(".update")[0]
 
+        # Helper function to parse fractions or numbers
+        def parse_value(val):
+            val = val.strip()
+            if '/' in val:
+                num, denom = map(float, val.split('/'))
+                return num / denom
+            return float(val)
+
         # Filter edges and determine dependencies
         child_map = {i: [] for i in range(len(nodes))}
         valid_edges = []
@@ -201,7 +209,7 @@ class HalideDataset(Dataset):
         num_comps = len(nodes)
         comps_tensor_first_part = torch.zeros(num_comps, 26)  # 26 scheduling features
         comps_tensor_vectors = torch.zeros(num_comps, 3)     # Load Jacobians (3D)
-        comps_tensor_third_part = torch.zeros(num_comps, 24) # 24 op histogram features (corrected from 23)
+        comps_tensor_third_part = torch.zeros(num_comps, 24) # 24 op histogram features
         
         for i, node in enumerate(nodes):
             name = node["Name"]
@@ -212,7 +220,8 @@ class HalideDataset(Dataset):
                 if clean_name(edge["To"]) == name:
                     jacobians = edge["Details"]["Load Jacobians"]
                     if jacobians and isinstance(jacobians, list) and len(jacobians) > 0:
-                        comps_tensor_vectors[i] = torch.tensor([float(x) for x in jacobians[0].split()][:3])
+                        values = [parse_value(x) for x in jacobians[0].split()]
+                        comps_tensor_vectors[i] = torch.tensor(values[:3])  # Take first 3 values
                     break
             op_hist = [int(x.split()[-1]) for x in node["Details"]["Op histogram"]]
             comps_tensor_third_part[i] = torch.tensor(op_hist[:24])  # Ensure exactly 24 elements
@@ -243,7 +252,6 @@ class HalideDataset(Dataset):
             self.scaler.fit(comps_tensor_first_part.numpy())
         comps_tensor_first_part = torch.tensor(self.scaler.transform(comps_tensor_first_part.numpy()))
 
-        # Update input_size based on corrected third_part size
         tree_tensors = (
             tree,
             comps_tensor_first_part.unsqueeze(0),
@@ -308,7 +316,7 @@ def evaluate_model(model, test_loader, device="cuda" if torch.cuda.is_available(
     errors = [abs(pred - actual) / actual * 100 for pred, actual in zip(speedups_pred, speedups_actual)]
     return predictions, actuals, speedups_pred, speedups_actual, errors
 
-# Main Execution (updated input_size)
+# Main Execution (unchanged)
 def main():
     data_dir = "synthetic_data"
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -323,7 +331,6 @@ def main():
     val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
     
-    # Updated input_size: 26 (first_part) + 3 (vectors) + 24 (third_part) + 100 (expr_embed_size)
     input_size = 26 + 3 + 24 + 100
     model = Model_Recursive_LSTM_v2(input_size=input_size, device=device)
     
