@@ -31,7 +31,7 @@ def lowercase_keys(data):
 
 ### Data Loading and Preprocessing
 def load_tiramisu_programs(folder_path):
-    """Load Tiramisu programs from the folder, converting keys to lowercase and providing diagnostics."""
+    """Load Tiramisu programs from the folder, expecting a nested structure."""
     programs = []
     for root, _, files in os.walk(folder_path):
         for file in files:
@@ -40,14 +40,23 @@ def load_tiramisu_programs(folder_path):
                 try:
                     with open(file_path, 'r') as f:
                         program_data = json.load(f)
-                        # Convert all keys to lowercase
                         program_data = lowercase_keys(program_data)
-                        # Check for required keys
-                        if 'program_annotation' not in program_data or 'schedules_list' not in program_data:
-                            print(f"Skipping {file_path}: Missing 'program_annotation' or 'schedules_list'. Available keys: {list(program_data.keys())}")
+                        # Expect a single top-level key like 'function003306'
+                        if not program_data or len(program_data) == 0:
+                            print(f"Skipping {file_path}: Empty JSON or no top-level key. Available keys: {list(program_data.keys())}")
                             continue
-                        program_data['file_path'] = file_path
-                        programs.append(program_data)
+                        # Get the first (and assumed only) top-level key
+                        function_key = list(program_data.keys())[0]
+                        nested_data = program_data[function_key]
+                        if not isinstance(nested_data, dict):
+                            print(f"Skipping {file_path}: Nested data under '{function_key}' is not a dictionary. Available keys: {list(program_data.keys())}")
+                            continue
+                        if 'program_annotation' not in nested_data or 'schedules_list' not in nested_data:
+                            print(f"Skipping {file_path}: Missing 'program_annotation' or 'schedules_list' under '{function_key}'. Available keys: {list(nested_data.keys())}")
+                            continue
+                        nested_data['file_path'] = file_path
+                        nested_data['function_key'] = function_key  # Store for reference if needed
+                        programs.append(nested_data)
                 except json.JSONDecodeError:
                     print(f"Error decoding JSON in {file_path}. Skipping.")
                 except Exception as e:
@@ -602,7 +611,7 @@ if __name__ == "__main__":
     
     raw_programs = load_tiramisu_programs(folder_path)
     if not raw_programs:
-        print("No valid programs loaded. Check the available keys in the output above to adjust the code. Exiting.")
+        print("No valid programs loaded. Ensure each JSON file has a top-level key (e.g., 'function003306') containing 'program_annotation' and 'schedules_list'. Exiting.")
         exit(1)
     
     preprocessed_items = []
@@ -611,7 +620,7 @@ if __name__ == "__main__":
         preprocessed_items.extend(items)
     
     if not preprocessed_items:
-        print("No valid schedule items found. Verify 'tree_structure' and 'execution_times' in schedules. Exiting.")
+        print("No valid schedule items found. Verify 'tree_structure' and 'execution_times' in schedules_list. Exiting.")
         exit(1)
     
     train_items, temp_items = train_test_split(preprocessed_items, test_size=0.3, random_state=42)
