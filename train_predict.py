@@ -218,18 +218,22 @@ def preprocess_tiramisu_program(program):
     preprocessed_items = []
     for schedule_entry in schedules_list:
         if not isinstance(schedule_entry, dict):
+            print(f"Skipping schedule in {file_path}: Not a dictionary")
             continue
         
         tree_structure_data = schedule_entry.get('tree_structure', {})
         if 'roots' not in tree_structure_data:
+            print(f"Skipping schedule in {file_path}: No 'roots' in tree_structure")
             continue
         tree_roots = tree_structure_data['roots']
         if not tree_roots:
+            print(f"Skipping schedule in {file_path}: Empty 'roots' in tree_structure")
             continue
         
         execution_times = schedule_entry.get('execution_times', [])
         execution_time = compute_execution_time(execution_times)
-        if execution_time is None:
+        if execution_time is None or not isinstance(execution_time, (int, float)):
+            print(f"Skipping schedule in {file_path}: Invalid execution time {execution_time}")
             continue
         
         schedules_info = {
@@ -247,7 +251,7 @@ def preprocess_tiramisu_program(program):
         if tree_structure:
             preprocessed_items.append({
                 'tree_structure': tree_structure,
-                'execution_time': execution_time,
+                'execution_time': float(execution_time),  # Ensure it's a float
                 'file_path': file_path,
                 'schedule_entry': schedule_entry
             })
@@ -286,7 +290,7 @@ class TreeLSTMCell(nn.Module):
         self.U_u = nn.Linear(hidden_size, hidden_size)
     
     def forward(self, x, child_h, child_c):
-        device = x.device  # Use the device of the input
+        device = x.device
         if not child_h:
             child_h = [torch.zeros(1, self.hidden_size, device=device)]
             child_c = [torch.zeros(1, self.hidden_size, device=device)]
@@ -350,7 +354,8 @@ class TiramisuCostModel(nn.Module):
         super(TiramisuCostModel, self).__init__()
         self.hidden_size = hidden_size
         self.tree_lstm = RecursiveTreeLSTM(input_size, hidden_size)
-        self.seq_lstm = SequenceLSTM(input_size + 1, hidden_size)
+        # Corrected input_size to 126 (5 from loop_features + 120 from comp_combined + 1 from depth)
+        self.seq_lstm = SequenceLSTM(126, hidden_size)
         self.fc1 = nn.Linear(hidden_size * 2, hidden_size)
         self.fc2 = nn.Linear(hidden_size, 1)
     
@@ -393,7 +398,7 @@ class TiramisuCostModel(nn.Module):
 ### Dataset and DataLoader
 class TiramisuDataset(Dataset):
     def __init__(self, preprocessed_items):
-        self.items = [item for item in preprocessed_items if item['execution_time'] is not None]
+        self.items = [item for item in preprocessed_items if item['execution_time'] is not None and isinstance(item['execution_time'], (int, float))]
         print(f"Created dataset with {len(self.items)} valid schedule items")
     
     def __len__(self):
@@ -409,11 +414,11 @@ class TiramisuDataset(Dataset):
 
 def collate_fn(batch):
     """Custom collate function to filter out invalid items."""
-    filtered_batch = [item for item in batch if item['execution_time'] is not None]
+    filtered_batch = [item for item in batch if item['execution_time'] is not None and isinstance(item['execution_time'], (int, float))]
     if len(filtered_batch) < len(batch):
-        print(f"Warning: Filtered out {len(batch) - len(filtered_batch)} items with None execution times in batch")
+        print(f"Warning: Filtered out {len(batch) - len(filtered_batch)} items with invalid execution times in batch")
     if not filtered_batch:
-        print("Warning: Entire batch had None execution times")
+        print("Warning: Entire batch had invalid execution times")
         return []
     return filtered_batch
 
