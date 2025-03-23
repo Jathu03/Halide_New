@@ -97,7 +97,7 @@ class Model_Recursive_LSTM_v2(nn.Module):
     def forward(self, tree_tensors):
         tree, comps_tensor_first_part, comps_tensor_vectors, comps_tensor_third_part, loops_tensor, functions_comps_expr_tree = tree_tensors
         
-        # Check and fix the shape of functions_comps_expr_tree
+        # Ensure 4D shape
         if len(functions_comps_expr_tree.shape) != 4:
             raise ValueError(f"Expected functions_comps_expr_tree to have 4 dimensions, got {functions_comps_expr_tree.shape}")
         
@@ -161,7 +161,6 @@ class HalideDataset(Dataset):
                         warnings.warn(f"Skipping invalid schedule file {schedule_file}: {e}")
 
     def _process_schedule(self, data):
-        # Extract nodes and edges
         nodes = data["programming_details"]["Nodes"]
         if not nodes:
             raise ValueError("No nodes found in the schedule")
@@ -169,14 +168,11 @@ class HalideDataset(Dataset):
         scheduling_data = {item["Name"]: item["Details"]["scheduling_feature"] for item in data["scheduling_data"] if "Name" in item}
         execution_time = next(item["value"] for item in data["scheduling_data"] if item.get("name") == "total_execution_time_ms")
 
-        # Build node map (only base function names)
         node_map = {node["Name"]: i for i, node in enumerate(nodes)}
 
-        # Helper function to strip update suffixes
         def clean_name(name):
             return name.split(".update")[0]
 
-        # Helper function to parse fractions or numbers, handling invalid values
         def parse_value(val):
             val = val.strip()
             if '/' in val:
@@ -189,13 +185,11 @@ class HalideDataset(Dataset):
             try:
                 return float(val)
             except ValueError:
-                # Optionally, handle '_' explicitly if it has a specific meaning
                 if val == '_':
-                    return 0.0  # Default for underscore, adjust if needed
+                    return 0.0
                 warnings.warn(f"Invalid value '{val}' in Load Jacobians, defaulting to 0.0")
                 return 0.0
 
-        # Filter edges and determine dependencies
         child_map = {i: [] for i in range(len(nodes))}
         valid_edges = []
         to_nodes = set()
@@ -211,7 +205,6 @@ class HalideDataset(Dataset):
                 to_nodes.add(to_idx)
                 from_nodes.add(from_idx)
 
-        # Dynamically find the root
         all_indices = set(range(len(nodes)))
         root_candidates = all_indices - to_nodes
         if not root_candidates:
@@ -235,7 +228,6 @@ class HalideDataset(Dataset):
             }
         tree = {"roots": [build_node(root_idx)]}
 
-        # Computation tensors
         num_comps = len(nodes)
         comps_tensor_first_part = torch.zeros(num_comps, 26)
         comps_tensor_vectors = torch.zeros(num_comps, 3)
@@ -257,7 +249,6 @@ class HalideDataset(Dataset):
             op_hist = [int(x.split()[-1]) for x in node["Details"]["Op histogram"]]
             comps_tensor_third_part[i] = torch.tensor(op_hist[:24])
 
-        # Loops tensor
         loops_tensor = torch.zeros(num_comps, 8)
         for i, node in enumerate(nodes):
             name = node["Name"]
@@ -272,24 +263,23 @@ class HalideDataset(Dataset):
                 ]
                 loops_tensor[i] = torch.tensor(loops)
 
-        # Expression tensor
         functions_comps_expr_tree = torch.zeros(num_comps, 10, 11)
         for i, node in enumerate(nodes):
             op_hist = [int(x.split()[-1]) for x in node["Details"]["Op histogram"][:10]]
             functions_comps_expr_tree[i, :, :10] = torch.tensor(op_hist).float().view(10, 1).expand(10, 10)
 
-        # Normalize features
         if not hasattr(self.scaler, "mean_"):
             self.scaler.fit(comps_tensor_first_part.numpy())
         comps_tensor_first_part = torch.tensor(self.scaler.transform(comps_tensor_first_part.numpy()))
 
+        # Remove .unsqueeze(0) here; let DataLoader add the batch dimension
         tree_tensors = (
             tree,
-            comps_tensor_first_part.unsqueeze(0),
-            comps_tensor_vectors.unsqueeze(0),
-            comps_tensor_third_part.unsqueeze(0),
-            loops_tensor.unsqueeze(0),
-            functions_comps_expr_tree.unsqueeze(0)
+            comps_tensor_first_part,
+            comps_tensor_vectors,
+            comps_tensor_third_part,
+            loops_tensor,
+            functions_comps_expr_tree
         )
         return tree_tensors, execution_time
 
