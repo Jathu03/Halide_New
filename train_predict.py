@@ -41,11 +41,9 @@ def load_tiramisu_programs(folder_path):
                     with open(file_path, 'r') as f:
                         program_data = json.load(f)
                         program_data = lowercase_keys(program_data)
-                        # Expect a single top-level key like 'function003306'
                         if not program_data or len(program_data) == 0:
                             print(f"Skipping {file_path}: Empty JSON or no top-level key. Available keys: {list(program_data.keys())}")
                             continue
-                        # Get the first (and assumed only) top-level key
                         function_key = list(program_data.keys())[0]
                         nested_data = program_data[function_key]
                         if not isinstance(nested_data, dict):
@@ -55,7 +53,7 @@ def load_tiramisu_programs(folder_path):
                             print(f"Skipping {file_path}: Missing 'program_annotation' or 'schedules_list' under '{function_key}'. Available keys: {list(nested_data.keys())}")
                             continue
                         nested_data['file_path'] = file_path
-                        nested_data['function_key'] = function_key  # Store for reference if needed
+                        nested_data['function_key'] = function_key
                         programs.append(nested_data)
                 except json.JSONDecodeError:
                     print(f"Error decoding JSON in {file_path}. Skipping.")
@@ -288,9 +286,10 @@ class TreeLSTMCell(nn.Module):
         self.U_u = nn.Linear(hidden_size, hidden_size)
     
     def forward(self, x, child_h, child_c):
+        device = x.device  # Use the device of the input
         if not child_h:
-            child_h = [torch.zeros(1, self.hidden_size).to(x.device)]
-            child_c = [torch.zeros(1, self.hidden_size).to(x.device)]
+            child_h = [torch.zeros(1, self.hidden_size, device=device)]
+            child_c = [torch.zeros(1, self.hidden_size, device=device)]
         h_sum = torch.sum(torch.stack(child_h), dim=0)
         i = torch.sigmoid(self.W_i(x) + self.U_i(h_sum))
         f_k = [torch.sigmoid(self.W_f(x) + self.U_f(h_k)) for h_k in child_h]
@@ -311,28 +310,28 @@ class RecursiveTreeLSTM(nn.Module):
         self.comp_embedding = nn.Linear(comp_sched_feature_size, hidden_size // 4)
         self.cell = TreeLSTMCell(hidden_size, hidden_size)
     
-    def forward(self, tree_node):
+    def forward(self, tree_node, device):
         if tree_node is None:
-            return (torch.zeros(1, self.hidden_size), torch.zeros(1, self.hidden_size))
+            return (torch.zeros(1, self.hidden_size, device=device), torch.zeros(1, self.hidden_size, device=device))
         
         child_h, child_c = [], []
         for child in tree_node['children']:
             if child is not None:
-                h_k, c_k = self.forward(child)
+                h_k, c_k = self.forward(child, device)
                 child_h.append(h_k)
                 child_c.append(c_k)
         
-        loop_features = torch.tensor(tree_node['loop_features'], dtype=torch.float32).unsqueeze(0)
+        loop_features = torch.tensor(tree_node['loop_features'], dtype=torch.float32, device=device).unsqueeze(0)
         loop_embed = self.loop_embedding(loop_features)
         
         comp_embeds = []
         for comp_features in tree_node['computation_features']:
-            comp_tensor = torch.tensor(comp_features, dtype=torch.float32).unsqueeze(0)
+            comp_tensor = torch.tensor(comp_features, dtype=torch.float32, device=device).unsqueeze(0)
             comp_embed = self.comp_embedding(comp_tensor)
             comp_embeds.append(comp_embed)
         
-        comp_combined = torch.mean(torch.stack(comp_embeds), dim=0) if comp_embeds else torch.zeros(1, self.hidden_size // 4)
-        padding = torch.zeros(1, self.hidden_size // 2)
+        comp_combined = torch.mean(torch.stack(comp_embeds), dim=0) if comp_embeds else torch.zeros(1, self.hidden_size // 4, device=device)
+        padding = torch.zeros(1, self.hidden_size // 2, device=device)
         x = torch.cat([loop_embed, comp_combined, padding], dim=1)
         h, c = self.cell(x, child_h, child_c)
         return h, c
@@ -355,27 +354,27 @@ class TiramisuCostModel(nn.Module):
         self.fc1 = nn.Linear(hidden_size * 2, hidden_size)
         self.fc2 = nn.Linear(hidden_size, 1)
     
-    def forward(self, tree_structure):
+    def forward(self, tree_structure, device):
         if not tree_structure:
-            return torch.tensor([[0.0]])
+            return torch.tensor([[0.0]], device=device)
         
         tree_outputs = []
         for tree in tree_structure:
             if tree is not None:
-                h, _ = self.tree_lstm(tree)
+                h, _ = self.tree_lstm(tree, device)
                 tree_outputs.append(h)
         
-        tree_encoding = torch.mean(torch.stack(tree_outputs), dim=0) if tree_outputs else torch.zeros(1, self.hidden_size)
+        tree_encoding = torch.mean(torch.stack(tree_outputs), dim=0) if tree_outputs else torch.zeros(1, self.hidden_size, device=device)
         
         seq_features = []
         for tree in tree_structure:
             if tree is not None:
                 seq_nodes = flatten_tree_to_sequence(tree)
                 for node in seq_nodes:
-                    loop_features = torch.tensor(node['loop_features'], dtype=torch.float32)
-                    comp_tensors = [torch.tensor(comp, dtype=torch.float32) for comp in node['computation_features']]
-                    comp_combined = torch.mean(torch.stack(comp_tensors), dim=0) if comp_tensors else torch.zeros(120)
-                    depth = torch.tensor([node['depth']], dtype=torch.float32)
+                    loop_features = torch.tensor(node['loop_features'], dtype=torch.float32, device=device)
+                    comp_tensors = [torch.tensor(comp, dtype=torch.float32, device=device) for comp in node['computation_features']]
+                    comp_combined = torch.mean(torch.stack(comp_tensors), dim=0) if comp_tensors else torch.zeros(120, device=device)
+                    depth = torch.tensor([node['depth']], dtype=torch.float32, device=device)
                     node_features = torch.cat([loop_features, comp_combined, depth])
                     seq_features.append(node_features)
         
@@ -384,7 +383,7 @@ class TiramisuCostModel(nn.Module):
             _, (h_n, _) = self.seq_lstm(seq_tensor)
             seq_encoding = h_n.squeeze(0)
         else:
-            seq_encoding = torch.zeros(1, self.hidden_size)
+            seq_encoding = torch.zeros(1, self.hidden_size, device=device)
         
         combined = torch.cat([tree_encoding, seq_encoding], dim=1)
         hidden = F.relu(self.fc1(combined))
@@ -450,8 +449,8 @@ def train_tiramisu_model(model, train_loader, val_loader, num_epochs=NUM_EPOCHS,
                     if not tree_structure:
                         continue
                     
-                    true_time = torch.tensor(item['execution_time'], dtype=torch.float32).to(device)
-                    pred_time = model(tree_structure).squeeze()
+                    true_time = torch.tensor([item['execution_time']], dtype=torch.float32, device=device)
+                    pred_time = model(tree_structure, device).squeeze()
                     loss = criterion(pred_time, true_time)
                     batch_loss += loss
                     batch_item_count += 1
@@ -492,8 +491,8 @@ def train_tiramisu_model(model, train_loader, val_loader, num_epochs=NUM_EPOCHS,
                         if not tree_structure:
                             continue
                         
-                        true_time = torch.tensor(item['execution_time'], dtype=torch.float32).to(device)
-                        pred_time = model(tree_structure).squeeze()
+                        true_time = torch.tensor([item['execution_time']], dtype=torch.float32, device=device)
+                        pred_time = model(tree_structure, device).squeeze()
                         loss = criterion(pred_time, true_time)
                         batch_loss += loss
                         batch_item_count += 1
@@ -556,8 +555,8 @@ def evaluate_model(model, test_loader):
                     if not tree_structure:
                         continue
                     
-                    true_time = torch.tensor(item['execution_time'], dtype=torch.float32).to(device)
-                    pred_time = model(tree_structure).squeeze()
+                    true_time = torch.tensor([item['execution_time']], dtype=torch.float32, device=device)
+                    pred_time = model(tree_structure, device).squeeze()
                     loss = criterion(pred_time, true_time)
                     batch_loss += loss
                     batch_item_count += 1
