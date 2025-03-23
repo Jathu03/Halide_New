@@ -27,7 +27,7 @@ def flatten_json(data, parent_key='', sep='_'):
         try:
             value = float(data)
         except (ValueError, TypeError):
-            # Improved categorical encoding - one-hot for common values
+            # Improved categorical encoding
             if isinstance(data, str):
                 # Create a more meaningful hash for strings
                 value = hash(str(data)) / 1e10  # Normalize hash value
@@ -63,7 +63,7 @@ def prepare_sequences(flattened_data):
         else:
             seq = seq + [0.0] * (max_seq_len - len(seq))
         
-        tensor_seq = torch.tensor(seq, dtype=torch.float32).unsqueeze(1)  # [seq_len, 1]
+        tensor_seq = torch.tensor(seq, dtype=torch.float32)  # [seq_len]
         tensor_sequences.append(tensor_seq)
     
     return tensor_sequences
@@ -103,6 +103,7 @@ class ImprovedLSTM(nn.Module):
         super(ImprovedLSTM, self).__init__()
         self.hidden_size = hidden_size
         self.num_layers = num_layers
+        self.input_size = input_size
         
         # Main LSTM
         self.lstm = nn.LSTM(
@@ -154,19 +155,43 @@ class ImprovedLSTM(nn.Module):
 
     def process_sequences(self, sequences_list):
         batch_size = len(sequences_list)
+        max_features = len(sequences_list[0]) if sequences_list else 0
         
-        # Process each sample in the batch
-        outputs = []
+        # Process each sequence in the batch
+        processed_batch = []
+        
         for sequences in sequences_list:
-            # Concatenate sequences along feature dimension for each sample
-            # Each sequence is [seq_len, 1], we want to make it [seq_len, num_sequences]
-            sample_tensor = torch.cat(sequences, dim=1).to(device)  # [seq_len, num_sequences]
-            sample_tensor = sample_tensor.transpose(0, 1).unsqueeze(0)  # [1, num_sequences, seq_len]
-            outputs.append(sample_tensor)
+            # Stack sequences for each sample
+            # Each sequence is now [seq_len], we want to make a feature vector
+            seq_features = []
+            
+            for seq in sequences:
+                # Compute sequence statistics as features
+                mean_val = torch.mean(seq)
+                std_val = torch.std(seq) if seq.size(0) > 1 else torch.tensor(0.0)
+                max_val = torch.max(seq)
+                min_val = torch.min(seq)
+                # You can add more statistical features if needed
+                
+                seq_features.extend([mean_val, std_val, max_val, min_val])
+            
+            # Make sure we have consistent feature length
+            while len(seq_features) < self.input_size * max_features:
+                seq_features.append(torch.tensor(0.0))
+            
+            # Truncate if too long
+            if len(seq_features) > self.input_size * max_features:
+                seq_features = seq_features[:self.input_size * max_features]
+                
+            # Create tensor from features
+            sample_tensor = torch.tensor(seq_features, dtype=torch.float32).to(device)
+            processed_batch.append(sample_tensor)
         
-        # Combine all samples in batch
-        if outputs:
-            batch_tensor = torch.cat(outputs, dim=0)  # [batch_size, num_sequences, seq_len]
+        # Stack all samples in the batch
+        if processed_batch:
+            batch_tensor = torch.stack(processed_batch)
+            # Reshape to [batch_size, seq_len, input_size]
+            batch_tensor = batch_tensor.view(batch_size, -1, self.input_size)
             return self.forward(batch_tensor)
         else:
             return torch.zeros(batch_size, 1).to(device)
@@ -281,12 +306,12 @@ def predict_and_evaluate(model, sequences_list, true_targets, target_scaler, num
 # Main execution
 def main():
     # Hyperparameters
-    input_size = 1  # Feature dimension
+    input_size = 1  # Size of each feature (1D)
     hidden_size = 128  # Increased from 64
     num_layers = 3    # Increased from 2
     output_size = 1   # Predicting total_execution_time_ms
     batch_size = 16   # Increased from 4
-    num_epochs = 50
+    num_epochs = 100
     
     # Load data
     folder_path = 'synthetic_data'
