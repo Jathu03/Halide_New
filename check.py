@@ -72,14 +72,13 @@ def custom_collate_fn(batch):
     targets = torch.stack([item[1] for item in batch])  # Stack targets
     return sequences_list, targets
 
-# Define Recursive LSTM Model
+# Define Recursive LSTM Model (Simplified without Embedding)
 class RecursiveLSTM(nn.Module):
-    def __init__(self, input_size, embedding_dim, hidden_size, num_layers, output_size, vocab_size=1000):
+    def __init__(self, input_size, hidden_size, num_layers, output_size):
         super(RecursiveLSTM, self).__init__()
-        self.embedding = nn.Embedding(vocab_size, embedding_dim)
         self.hidden_size = hidden_size
         self.num_layers = num_layers
-        self.lstm = nn.LSTM(input_size + embedding_dim, hidden_size, num_layers, batch_first=True)
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)  # Input size matches data
         self.fc = nn.Linear(hidden_size, output_size)
         
     def forward(self, x, hidden=None):
@@ -88,7 +87,6 @@ class RecursiveLSTM(nn.Module):
             c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(device)
             hidden = (h0, c0)
         
-        # Simplified: Treat all as numerical data (no embedding split here)
         out, hidden = self.lstm(x, hidden)
         out = self.fc(out[:, -1, :])  # Take the last output
         return out, hidden
@@ -178,8 +176,7 @@ def predict_and_evaluate(model, sequences_list, true_targets, num_samples=10):
 # Main execution
 def main():
     # Hyperparameters
-    input_size = 1
-    embedding_dim = 8
+    input_size = 1  # Matches the actual input data size
     hidden_size = 64
     num_layers = 2
     output_size = 1  # Predicting total_execution_time_ms
@@ -206,7 +203,7 @@ def main():
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=custom_collate_fn)
     
     # Initialize model
-    model = RecursiveLSTM(input_size, embedding_dim, hidden_size, num_layers, output_size).to(device)
+    model = RecursiveLSTM(input_size, hidden_size, num_layers, output_size).to(device)
     
     # Train model
     train_model(model, train_loader, test_loader, num_epochs)
