@@ -1,324 +1,217 @@
 import os
 import json
-import numpy as np
-import pandas as pd
-from sklearn.preprocessing import StandardScaler
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import TensorDataset, DataLoader
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
+from collections import OrderedDict
+from sklearn.model_selection import train_test_split
 
-def get_execution_time(file_path):
-    try:
-        with open(file_path, 'rb') as f:
-            raw_content = f.read()
-            content = raw_content.decode('utf-8', errors='replace').replace('\0', '')
-            data = json.loads(content)
-        schedules = data["scheduling_data"]
-        for item in schedules:
-            if isinstance(item, dict) and item.get('name') == 'total_execution_time_ms':
-                execution_time = item.get('value')
-                if execution_time is not None:
-                    return float(execution_time)
-        print(f"Warning: 'total_execution_time_ms' not found in 'Schedules' of {file_path}")
-        return schedules[-1]["value"]
-    except Exception as e:
-        print(f"Error processing {file_path}: {str(e)}")
-        return None
+# Set device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def create_program_template(subdir_path):
-    """Create a template from the first JSON file in the folder."""
-    json_files = [f for f in sorted(os.listdir(subdir_path)) if f.endswith('.json')]
-    if not json_files:
-        print(f"No JSON files found in {subdir_path}")
-        return None
-    
-    first_file = os.path.join(subdir_path, json_files[0])
-    try:
-        with open(first_file, 'r') as f:
-            data = json.load(f)
-        # Template is just the programming_details, which is constant across all schedules
-        template = {"programming_details": data["programming_details"]}
-        return template
-    except Exception as e:
-        print(f"Error creating template from {first_file}: {str(e)}")
-        return None
+# Recursive function to flatten and encode JSON data
+def flatten_json(data, parent_key='', sep='_'):
+    items = []
+    if isinstance(data, dict):
+        for key, value in data.items():
+            new_key = f"{parent_key}{sep}{key}" if parent_key else key
+            items.extend(flatten_json(value, new_key, sep=sep))
+    elif isinstance(data, list):
+        for i, value in enumerate(data):
+            new_key = f"{parent_key}{sep}{i}"
+            items.extend(flatten_json(value, new_key, sep=sep))
+    else:
+        # Convert value to float if possible, otherwise encode as categorical
+        try:
+            value = float(data)
+        except (ValueError, TypeError):
+            value = hash(str(data)) % 1000  # Simple categorical encoding
+        items.append((parent_key, value))
+    return items
 
-def extract_features_from_scheduling(file_path, template):
-    """Extract features from scheduling_data and combine with template."""
-    try:
-        with open(file_path, 'r') as f:
-            data = json.load(f)
-        
-        execution_time = get_execution_time(file_path)
-        if execution_time is None or execution_time < 0:
-            print(f"Invalid execution time in {file_path}: {execution_time}")
-            return None
-        
-        # Extract scheduling features
-        sched_dict = {item["Name"]: item["Details"]["scheduling_feature"] 
-                     for item in data["scheduling_data"] if "Name" in item and "Details" in item}
-        
-        # Computation features from programming_details (template)
-        nodes = template["programming_details"]["Nodes"]
-        edges = template["programming_details"]["Edges"]
-        node_dict = {node["Name"]: node["Details"] for node in nodes}
-        
-        op_counts = []
-        for node_name, details in node_dict.items():
-            op_hist = details.get("Op histogram", [])
-            ops = {'add': 0, 'mul': 0, 'div': 0, 'min': 0, 'max': 0}
-            for entry in op_hist:
-                parts = entry.split(':')
-                if len(parts) == 2:
-                    op_name = parts[0].strip().lower()
-                    op_count = int(parts[1].strip().split()[0])
-                    if op_name in ops:
-                        ops[op_name] = op_count
-            op_counts.append([ops['add'], ops['mul'], ops['div'], ops['min'], ops['max']])
-        comps_tensor = torch.tensor(op_counts, dtype=torch.float32).mean(dim=0)  # [5]
-        
-        # Scheduling features
-        sched_vector = [
-            sum(1 for sched in sched_dict.values() if sched.get("inner_parallelism", 1.0) > 1.0),
-            sum(sched.get("unrolled_loop_extent", 1.0) for sched in sched_dict.values()),
-            sum(sched.get("vector_size", 1.0) for sched in sched_dict.values()),
-            sum(1 for sched in sched_dict.values() if sched.get("unrolled_loop_extent", 1.0) > 1.0),
-            sum(sched.get('bytes_at_production', 0) for sched in sched_dict.values()),
-            sum(sched.get('num_vectors', 0) for sched in sched_dict.values())
-        ]
-        sched_tensor = torch.tensor(sched_vector, dtype=torch.float32)  # [6]
-        
-        # Structural features from edges
-        struct_vector = [
-            len(nodes),
-            len(edges),
-            np.mean([len([e for e in edges if e["To"] == n["Name"]]) for n in nodes]) if nodes else 0,
-            sum(1 for e in edges if ".update(" in e["To"])
-        ]
-        struct_tensor = torch.tensor(struct_vector, dtype=torch.float32)  # [4]
-        
-        # Combine features
-        features = torch.cat([comps_tensor, sched_tensor, struct_tensor])  # [15]
-        
-        return {"features": features, "execution_time": execution_time}
-    
-    except Exception as e:
-        print(f"Error extracting features from {file_path}: {str(e)}")
-        return None
+# Extract target variable (total_execution_time_ms)
+def extract_target(data):
+    for item in data.get("scheduling_data", []):
+        if item.get("name") == "total_execution_time_ms":
+            return item["value"]
+    return None
 
-def process_main_directory(main_dir, train_ratio=30/32):
-    train_data = []
-    test_data = []
-    test_file_names = []
+# Prepare sequences for LSTM
+def prepare_sequences(flattened_data):
+    sequences = {}
+    for key, value in flattened_data:
+        top_key = key.split('_')[0]
+        if top_key not in sequences:
+            sequences[top_key] = []
+        sequences[top_key].append(value)
     
-    subdirs = sorted([d for d in os.listdir(main_dir) if os.path.isdir(os.path.join(main_dir, d))])
+    tensor_sequences = []
+    for seq in sequences.values():
+        tensor_seq = torch.tensor(seq, dtype=torch.float32).unsqueeze(1)  # [seq_len, 1]
+        tensor_sequences.append(tensor_seq)
+    return tensor_sequences
+
+# Custom Dataset
+class ScheduleDataset(Dataset):
+    def __init__(self, sequences_list, targets):
+        self.sequences_list = sequences_list  # List of lists of sequences
+        self.targets = torch.tensor(targets, dtype=torch.float32).to(device)
+
+    def __len__(self):
+        return len(self.sequences_list)
+
+    def __getitem__(self, idx):
+        sequences = self.sequences_list[idx]
+        target = self.targets[idx]
+        return sequences, target
+
+# Define Recursive LSTM Model with Embedding
+class RecursiveLSTM(nn.Module):
+    def __init__(self, input_size, embedding_dim, hidden_size, num_layers, output_size, vocab_size=1000):
+        super(RecursiveLSTM, self).__init__()
+        self.embedding = nn.Embedding(vocab_size, embedding_dim)  # For categorical data
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.lstm = nn.LSTM(input_size + embedding_dim, hidden_size, num_layers, batch_first=True)
+        self.fc = nn.Linear(hidden_size, output_size)
+        
+    def forward(self, x, hidden=None):
+        if hidden is None:
+            h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(device)
+            c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(device)
+            hidden = (h0, c0)
+        
+        # Assuming x contains both numerical and categorical data; split not implemented here
+        # For simplicity, treat all as numerical here and skip embedding
+        out, hidden = self.lstm(x, hidden)
+        out = self.fc(out[:, -1, :])  # Take the last output
+        return out, hidden
+
+    def process_recursive(self, sequences):
+        outputs = []
+        hidden = None
+        for seq in sequences:
+            seq = seq.unsqueeze(0).to(device)  # [1, seq_len, input_size]
+            out, hidden = self.forward(seq, hidden)
+            outputs.append(out)
+        return torch.mean(torch.stack(outputs), dim=0), hidden  # Average outputs
+
+# Load and preprocess all data
+def load_synthetic_data(folder_path):
+    all_sequences = []
+    all_targets = []
     
-    if not subdirs:
-        raise ValueError(f"No subdirectories found in {main_dir}")
-    
-    for subdir in subdirs:
-        subdir_path = os.path.join(main_dir, subdir)
-        template = create_program_template(subdir_path)
-        if template is None:
+    for program_folder in os.listdir(folder_path):
+        program_path = os.path.join(folder_path, program_folder)
+        if not os.path.isdir(program_path):
             continue
         
-        all_data = []
-        all_file_names = []
-        
-        for filename in sorted(os.listdir(subdir_path)):
-            if filename.endswith('.json'):
-                file_path = os.path.join(subdir_path, filename)
-                data = extract_features_from_scheduling(file_path, template)
-                if data is not None:
-                    all_data.append(data)
-                    all_file_names.append(filename)
-        
-        if len(all_data) != 32:
-            print(f"Warning: Expected 32 files in {subdir_path}, found {len(all_data)}")
-            continue
-        
-        train_size = int(train_ratio * 32)  # 30 files for training
-        train_data.extend(all_data[:train_size])
-        test_data.extend(all_data[train_size:])
-        test_file_names.extend([os.path.join(subdir, fname) for fname in all_file_names[train_size:]])
-        print(f"Processed {len(all_data)} files from {subdir}: {train_size} for training, {32 - train_size} for testing")
+        for schedule_file in os.listdir(program_path):
+            if not schedule_file.endswith('.json'):
+                continue
+            
+            file_path = os.path.join(program_path, schedule_file)
+            with open(file_path, 'r') as f:
+                data = json.load(f)
+            
+            flattened_data = flatten_json(data)
+            sequences = prepare_sequences(flattened_data)
+            target = extract_target(data)
+            
+            if target is not None:
+                all_sequences.append(sequences)
+                all_targets.append(target)
     
-    return train_data, test_data, test_file_names
+    return all_sequences, all_targets
 
-def prepare_data_for_model(train_data, test_data):
-    X_train = torch.stack([item["features"] for item in train_data])  # [N_train, input_size]
-    y_train = torch.tensor([item["execution_time"] for item in train_data], dtype=torch.float32).view(-1, 1)
-    X_test = torch.stack([item["features"] for item in test_data])    # [N_test, input_size]
-    y_test = torch.tensor([item["execution_time"] for item in test_data], dtype=torch.float32).view(-1, 1)
-    
-    scaler_X = StandardScaler()
-    scaler_y = StandardScaler()
-    
-    X_train_scaled = scaler_X.fit_transform(X_train.numpy())
-    y_train_scaled = scaler_y.fit_transform(y_train.numpy())
-    X_test_scaled = scaler_X.transform(X_test.numpy())
-    y_test_scaled = scaler_y.transform(y_test.numpy())
-    
-    X_train_tensor = torch.FloatTensor(X_train_scaled).unsqueeze(1)  # [N_train, 1, input_size]
-    y_train_tensor = torch.FloatTensor(y_train_scaled)
-    X_test_tensor = torch.FloatTensor(X_test_scaled).unsqueeze(1)   # [N_test, 1, input_size]
-    y_test_tensor = torch.FloatTensor(y_test_scaled)
-    
-    return X_train_tensor, y_train_tensor, X_test_tensor, y_test_tensor, scaler_y
-
-def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=16):
-    train_dataset = TensorDataset(X_train, y_train)
-    test_dataset = TensorDataset(X_test, y_test)
-    
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-    
-    return train_loader, test_loader
-
-class SchedulePredictor(nn.Module):
-    def __init__(self, input_size=15, hidden_sizes=[128, 64], lstm_hidden_size=100, output_size=1, device="cpu"):
-        super(SchedulePredictor, self).__init__()
-        self.device = device
-        
-        self.lstm = nn.LSTM(input_size, lstm_hidden_size, batch_first=True, bidirectional=True)
-        self.lstm_dropout = nn.Dropout(0.3)
-        
-        layer_sizes = [lstm_hidden_size * 2] + hidden_sizes  # *2 for bidirectional
-        self.ff_layers = nn.ModuleList()
-        self.ff_dropouts = nn.ModuleList()
-        for i in range(len(layer_sizes) - 1):
-            self.ff_layers.append(nn.Linear(layer_sizes[i], layer_sizes[i + 1], bias=True))
-            nn.init.xavier_uniform_(self.ff_layers[i].weight)
-            self.ff_dropouts.append(nn.Dropout(0.3))
-        
-        self.predict = nn.Linear(hidden_sizes[-1], output_size, bias=True)
-        nn.init.xavier_uniform_(self.predict.weight)
-        
-        self.elu = nn.ELU()
-        self.leaky_relu = nn.LeakyReLU(0.01)
-    
-    def forward(self, x):
-        lstm_out, _ = self.lstm(x)  # [batch_size, seq_len=1, lstm_hidden_size * 2]
-        lstm_out = self.lstm_dropout(lstm_out[:, -1, :])  # [batch_size, lstm_hidden_size * 2]
-        
-        x = lstm_out
-        for i in range(len(self.ff_layers)):
-            x = self.ff_layers[i](x)
-            x = self.ff_dropouts[i](self.elu(x))
-        
-        out = self.predict(x)
-        return self.leaky_relu(out)
-
-def train_model(model, train_loader, test_loader, criterion, optimizer, scheduler, num_epochs=200, patience=20):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
-    model.to(device)
-    
-    best_val_loss = float('inf')
-    epochs_no_improve = 0
-    best_model_state = None
+# Training function
+def train_model(model, train_loader, val_loader, num_epochs=10):
+    criterion = nn.MSELoss()
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
     
     for epoch in range(num_epochs):
         model.train()
-        running_loss = 0.0
-        for inputs, targets in train_loader:
-            inputs, targets = inputs.to(device), targets.to(device)
+        train_loss = 0
+        for sequences, target in train_loader:
             optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = criterion(outputs, targets.squeeze())
+            output, _ = model.process_recursive(sequences)
+            loss = criterion(output.squeeze(), target)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
-            running_loss += loss.item() * inputs.size(0)
-        
-        train_loss = running_loss / len(train_loader.dataset)
+            train_loss += loss.item()
         
         model.eval()
-        val_loss = 0.0
+        val_loss = 0
         with torch.no_grad():
-            for inputs, targets in test_loader:
-                inputs, targets = inputs.to(device), targets.to(device)
-                outputs = model(inputs)
-                loss = criterion(outputs, targets.squeeze())
-                val_loss += loss.item() * inputs.size(0)
+            for sequences, target in val_loader:
+                output, _ = model.process_recursive(sequences)
+                loss = criterion(output.squeeze(), target)
+                val_loss += loss.item()
         
-        val_loss /= len(test_loader.dataset)
-        print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
-        
-        scheduler.step(val_loss)
-        
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            epochs_no_improve = 0
-            best_model_state = model.state_dict().copy()
-        else:
-            epochs_no_improve += 1
-        
-        if epochs_no_improve >= patience:
-            print(f'Early stopping after {epoch+1} epochs')
-            model.load_state_dict(best_model_state)
-            break
-    
-    if best_model_state is not None and epochs_no_improve > 0:
-        model.load_state_dict(best_model_state)
-    
-    return model
+        print(f"Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss/len(train_loader):.4f}, Val Loss: {val_loss/len(val_loader):.4f}")
 
-def evaluate_model(model, X_test, y_test, y_scaler, file_names_test):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model.to(device)
+# Prediction function for 10 schedules
+def predict_and_evaluate(model, sequences_list, true_targets, num_samples=10):
     model.eval()
-    
+    predictions = []
     with torch.no_grad():
-        X_test = X_test.to(device)
-        y_pred_scaled = model(X_test)
+        for sequences in sequences_list[:num_samples]:
+            output, _ = model.process_recursive(sequences)
+            predictions.append(output.item())
     
-    y_pred_scaled = y_pred_scaled.cpu().numpy()
-    y_test = y_test.cpu().numpy()
+    true_targets = true_targets[:num_samples]
+    errors = [abs(pred - true) / true * 100 for pred, true in zip(predictions, true_targets)]
     
-    y_test_actual = y_scaler.inverse_transform(y_test)
-    y_pred_actual = y_scaler.inverse_transform(y_pred_scaled)
-    y_pred_actual = np.clip(y_pred_actual, 0, None)
-    
-    print("\nPredicted vs Actual Execution Times for Test Files:")
-    for i, file_name in enumerate(file_names_test):
-        print(f"File: {file_name}")
-        print(f"  Actual Execution Time: {y_test_actual[i][0]:.2f} ms")
-        print(f"  Predicted Execution Time: {y_pred_actual[i][0]:.2f} ms")
-    
-    return y_test_actual, y_pred_actual
+    return predictions, true_targets, errors
 
-def main(main_dir):
-    print(f"Processing main directory: {main_dir}")
-    train_data, test_data, test_file_names = process_main_directory(main_dir)
+# Main execution
+def main():
+    # Hyperparameters
+    input_size = 1
+    embedding_dim = 8
+    hidden_size = 64
+    num_layers = 2
+    output_size = 1  # Predicting total_execution_time_ms
+    batch_size = 4
+    num_epochs = 10
     
-    print(f"Total training samples: {len(train_data)}")
-    print(f"Total test samples: {len(test_data)}")
+    # Load data
+    folder_path = 'synthetic_data'
+    all_sequences, all_targets = load_synthetic_data(folder_path)
     
-    if len(train_data) == 0 or len(test_data) == 0:
-        print("Error: No valid training or test data found")
-        return None, None, None
+    if not all_sequences:
+        print("No valid data found.")
+        return
     
-    X_train, y_train, X_test, y_test, y_scaler = prepare_data_for_model(train_data, test_data)
-    train_loader, test_loader = create_data_loaders(X_train, y_train, X_test, y_test, batch_size=16)
+    # Split into train and test
+    train_seqs, test_seqs, train_targets, test_targets = train_test_split(
+        all_sequences, all_targets, test_size=0.2, random_state=42
+    )
     
-    model = SchedulePredictor(input_size=15, device="cuda" if torch.cuda.is_available() else "cpu")
-    criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.0005)
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10, verbose=True)
+    # Create datasets and loaders
+    train_dataset = ScheduleDataset(train_seqs, train_targets)
+    test_dataset = ScheduleDataset(test_seqs, test_targets)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
     
-    print("Training Schedule Predictor model...")
-    model = train_model(model, train_loader, test_loader, criterion, optimizer, scheduler)
+    # Initialize model
+    model = RecursiveLSTM(input_size, embedding_dim, hidden_size, num_layers, output_size).to(device)
     
-    print("\nEvaluating the model...")
-    y_test_actual, y_pred_actual = evaluate_model(model, X_test, y_test, y_scaler, test_file_names)
+    # Train model
+    train_model(model, train_loader, test_loader, num_epochs)
     
-    return model, y_test_actual, y_pred_actual
+    # Predict and evaluate
+    predictions, true_targets, errors = predict_and_evaluate(model, test_seqs, test_targets)
+    
+    # Print results
+    print("\nPredictions and Error Percentages for 10 Schedules:")
+    for i, (pred, true, error) in enumerate(zip(predictions, true_targets, errors), 1):
+        print(f"Schedule {i}:")
+        print(f"  Predicted Time: {pred:.2f} ms")
+        print(f"  True Time: {true:.2f} ms")
+        print(f"  Error Percentage: {error:.2f}%")
 
 if __name__ == "__main__":
-    main_dir = "Output_Programs"
-    model, y_test_actual, y_pred_actual = main(main_dir)
-    if model is not None:
-        print("\nModel training and prediction completed!")
+    main()
