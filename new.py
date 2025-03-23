@@ -1,54 +1,86 @@
 import json
 import os
 
-# Sample JSON data (replace this with your actual JSON input)
-json_data = '''<your JSON document here>'''  # Paste your JSON string here
+# Input folder containing the program JSON files
+input_folder = "Tiramisu"
 
-# Parse the JSON data
-data = json.loads(json_data)
+# Output base directory
+output_base_dir = "separate"
 
-# Base output directory
-output_base_dir = "output_schedules"
+# Ensure the input folder exists
+if not os.path.exists(input_folder):
+    print(f"Error: Input folder '{input_folder}' does not exist.")
+    exit(1)
 
-# Ensure the base directory exists
+# Ensure the output base directory exists
 if not os.path.exists(output_base_dir):
     os.makedirs(output_base_dir)
 
-# Iterate over each program (in this case, only "function003306")
-for program_name, program_data in data.items():
-    # Create a subfolder for the program
-    program_dir = os.path.join(output_base_dir, program_name)
-    if not os.path.exists(program_dir):
-        os.makedirs(program_dir)
+# Function to process a single JSON file
+def process_program_file(file_path, program_name):
+    # Read the JSON file
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            json_data = f.read()
+        data = json.loads(json_data)
+    except json.JSONDecodeError as e:
+        print(f"Error: Invalid JSON in file '{file_path}' - {e}")
+        return
+    except FileNotFoundError:
+        print(f"Error: File '{file_path}' not found.")
+        return
 
-    # Common features to include in every file
-    common_features = {
-        "filename": program_data["filename"],
-        "node_name": program_data["node_name"],
-        "parameters": program_data["parameters"],
-        "program_annotation": program_data["program_annotation"],
-        "initial_execution_time": program_data["initial_execution_time"]
-    }
+    # Assuming each file has a single program as the top-level key
+    for prog_key, program_data in data.items():
+        # Use the program key (e.g., "function003306") or file name as the subfolder name
+        subfolder_name = prog_key if prog_key else program_name.replace('.json', '')
+        program_dir = os.path.join(output_base_dir, subfolder_name)
 
-    # Iterate over each schedule in schedules_list
-    for idx, schedule in enumerate(program_data["schedules_list"]):
-        # Schedule-specific data
-        schedule_data = {
-            "schedule_index": idx,
-            "schedule_details": schedule
+        # Create a subfolder for the program
+        if not os.path.exists(program_dir):
+            os.makedirs(program_dir)
+
+        # Common features to include in every schedule file
+        common_features = {
+            "filename": program_data.get("filename", file_path),
+            "node_name": program_data.get("node_name", "unknown"),
+            "parameters": program_data.get("parameters", {}),
+            "program_annotation": program_data.get("program_annotation", {}),
+            "initial_execution_time": program_data.get("initial_execution_time", 0.0)
         }
 
-        # Combine common features with schedule-specific data
-        output_data = {**common_features, **schedule_data}
+        # Check if schedules_list exists
+        if "schedules_list" not in program_data:
+            print(f"Warning: No 'schedules_list' found in '{file_path}' for program '{prog_key}'.")
+            return
 
-        # Define the output file name (e.g., schedule_0.json, schedule_1.json)
-        output_filename = f"schedule_{idx}.json"
-        output_path = os.path.join(program_dir, output_filename)
+        # Iterate over each schedule in schedules_list
+        for idx, schedule in enumerate(program_data["schedules_list"]):
+            # Schedule-specific data
+            schedule_data = {
+                "schedule_index": idx,
+                "schedule_details": schedule
+            }
 
-        # Write the data to a JSON file
-        with open(output_path, 'w', encoding='utf-8') as f:
-            json.dump(output_data, f, indent=4)
+            # Combine common features with schedule-specific data
+            output_data = {**common_features, **schedule_data}
 
-        print(f"Created file: {output_path}")
+            # Define the output file name (e.g., schedule_0.json)
+            output_filename = f"schedule_{idx}.json"
+            output_path = os.path.join(program_dir, output_filename)
+
+            # Write the data to a JSON file
+            try:
+                with open(output_path, 'w', encoding='utf-8') as f:
+                    json.dump(output_data, f, indent=4)
+                print(f"Created file: {output_path}")
+            except Exception as e:
+                print(f"Error writing file '{output_path}': {e}")
+
+# Iterate over all JSON files in the Tiramisu folder
+for filename in os.listdir(input_folder):
+    if filename.endswith(".json"):
+        file_path = os.path.join(input_folder, filename)
+        process_program_file(file_path, filename)
 
 print(f"All schedules have been written to the '{output_base_dir}' directory.")
