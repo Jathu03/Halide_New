@@ -6,7 +6,7 @@ from torch.utils.data import Dataset, DataLoader
 import numpy as np
 from sklearn.preprocessing import StandardScaler
 
-# Define the Model_Recursive_LSTM_v2 (copied from your provided code with minor adjustments)
+# Define the Model_Recursive_LSTM_v2 (unchanged)
 class Model_Recursive_LSTM_v2(nn.Module):
     def __init__(
         self,
@@ -39,7 +39,7 @@ class Model_Recursive_LSTM_v2(nn.Module):
         self.concat_layers = nn.ModuleList()
         self.concat_dropouts = nn.ModuleList()
         
-        self.encode_vectors = nn.Linear(3, 3, bias=True)  # Assuming MAX_TAGS=3 (Jacobians)
+        self.encode_vectors = nn.Linear(3, 3, bias=True)
         for i in range(len(comp_embed_layer_sizes) - 1):
             self.comp_embedding_layers.append(nn.Linear(comp_embed_layer_sizes[i], comp_embed_layer_sizes[i + 1], bias=True))
             nn.init.xavier_uniform_(self.comp_embedding_layers[i].weight)
@@ -159,17 +159,30 @@ class HalideDataset(Dataset):
         scheduling_data = {item["Name"]: item["Details"]["scheduling_feature"] for item in data["scheduling_data"] if "Name" in item}
         execution_time = next(item["value"] for item in data["scheduling_data"] if item.get("name") == "total_execution_time_ms")
 
-        # Build tree
-        tree = {"roots": []}
+        # Build node map (only base function names)
         node_map = {node["Name"]: i for i, node in enumerate(nodes)}
+
+        # Helper function to strip update suffixes
+        def clean_name(name):
+            return name.split(".update")[0]
+
+        # Filter edges to include only valid nodes and build child map
         child_map = {i: [] for i in range(len(nodes))}
+        valid_edges = []
         for edge in edges:
-            from_idx = node_map[edge["From"]]
-            to_idx = node_map[edge["To"]]
-            child_map[from_idx].append(to_idx)
+            from_name = clean_name(edge["From"])
+            to_name = clean_name(edge["To"])
+            if from_name in node_map and to_name in node_map:
+                from_idx = node_map[from_name]
+                to_idx = node_map[to_name]
+                child_map[from_idx].append(to_idx)
+                valid_edges.append(edge)  # Keep only valid edges
+
+        # Build tree starting from 'output'
+        root_idx = node_map.get("output")
+        if root_idx is None:
+            raise ValueError("No 'output' node found in the schedule")
         
-        # Assume the last node (output) is the root
-        root_idx = node_map["output"]
         def build_node(idx):
             return {
                 "name": nodes[idx]["Name"],
@@ -178,7 +191,7 @@ class HalideDataset(Dataset):
                 "loop_index": torch.tensor([idx]),
                 "child_list": [build_node(child_idx) for child_idx in child_map[idx]]
             }
-        tree["roots"] = [build_node(root_idx)]
+        tree = {"roots": [build_node(root_idx)]}
 
         # Computation tensors
         num_comps = len(nodes)
@@ -191,9 +204,12 @@ class HalideDataset(Dataset):
             if name in scheduling_data:
                 features = list(scheduling_data[name].values())
                 comps_tensor_first_part[i] = torch.tensor(features[:26])  # Truncate/pad to 26
-            for edge in edges:
-                if edge["To"] == name:
-                    comps_tensor_vectors[i] = torch.tensor([float(x) for x in edge["Details"]["Load Jacobians"][0].split()])
+            # Find edge where this node is the "To" (use cleaned name for lookup)
+            for edge in valid_edges:
+                if clean_name(edge["To"]) == name:
+                    jacobians = edge["Details"]["Load Jacobians"]
+                    if jacobians and isinstance(jacobians, list) and len(jacobians) > 0:
+                        comps_tensor_vectors[i] = torch.tensor([float(x) for x in jacobians[0].split()][:3])  # Take first 3 values
                     break
             op_hist = [int(x.split()[-1]) for x in node["Details"]["Op histogram"]]
             comps_tensor_third_part[i] = torch.tensor(op_hist)
@@ -240,7 +256,7 @@ class HalideDataset(Dataset):
     def __getitem__(self, idx):
         return self.samples[idx]
 
-# Training Function
+# Training Function (unchanged)
 def train_model(model, train_loader, val_loader, num_epochs=50, device="cuda" if torch.cuda.is_available() else "cpu"):
     model = model.to(device)
     criterion = nn.MSELoss()
@@ -270,7 +286,7 @@ def train_model(model, train_loader, val_loader, num_epochs=50, device="cuda" if
     
     return model
 
-# Evaluation and Speedup Prediction
+# Evaluation and Speedup Prediction (unchanged)
 def evaluate_model(model, test_loader, device="cuda" if torch.cuda.is_available() else "cpu"):
     model.eval()
     predictions = []
@@ -282,21 +298,17 @@ def evaluate_model(model, test_loader, device="cuda" if torch.cuda.is_available(
             predictions.append(pred.item())
             actuals.append(execution_time.item())
     
-    # Calculate speedup (assuming baseline is the mean execution time)
     baseline = np.mean(actuals)
     speedups_pred = [baseline / pred for pred in predictions]
     speedups_actual = [baseline / actual for actual in actuals]
-    
-    # Calculate error percentage
     errors = [abs(pred - actual) / actual * 100 for pred, actual in zip(speedups_pred, speedups_actual)]
     return predictions, actuals, speedups_pred, speedups_actual, errors
 
-# Main Execution
+# Main Execution (unchanged)
 def main():
     data_dir = "synthetic_data"
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
-    # Load and split data
     dataset = HalideDataset(data_dir)
     train_size = int(0.7 * len(dataset))
     val_size = int(0.15 * len(dataset))
@@ -307,20 +319,16 @@ def main():
     val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
     
-    # Initialize model
-    input_size = 26 + 3 + 23 + 100  # first_part (26) + vectors (3) + third_part (23) + expr_embed_size (100)
+    input_size = 26 + 3 + 23 + 100
     model = Model_Recursive_LSTM_v2(input_size=input_size, device=device)
     
-    # Train model
     model = train_model(model, train_loader, val_loader)
     
-    # Evaluate on 10 test schedules
     test_subset, _ = torch.utils.data.random_split(test_dataset, [10, len(test_dataset) - 10])
     test_subset_loader = DataLoader(test_subset, batch_size=1, shuffle=False)
     
     predictions, actuals, speedups_pred, speedups_actual, errors = evaluate_model(model, test_subset_loader)
     
-    # Print results
     print("\nEvaluation Results for 10 Test Schedules:")
     for i in range(10):
         print(f"Schedule {i+1}:")
