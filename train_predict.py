@@ -42,27 +42,35 @@ def load_tiramisu_programs(folder_path):
     print(f"Loaded {len(programs)} Tiramisu programs from {folder_path}")
     return programs
 
-def extract_execution_time(exploration_trace):
-    """Extract execution time from exploration trace."""
-    if exploration_trace is None or not exploration_trace:
-        return None
-    return exploration_trace.get('evaluation', None)
-
-def extract_best_schedule(exploration_trace, depth_limit=None):
-    """Recursively find the best schedule in the exploration trace."""
-    if exploration_trace is None or not exploration_trace:
+def extract_best_schedule_from_list(schedules_list):
+    """
+    Find the schedule with the minimum execution time from schedules_list.
+    Returns a tuple of (best_schedule, best_execution_time).
+    """
+    if not schedules_list:
         return None, None
-    current_schedule = exploration_trace.get('schedule', '')
-    current_time = exploration_trace.get('evaluation', None)
-    current_depth = exploration_trace.get('depth', 0)
-    if depth_limit is not None and current_depth >= depth_limit:
-        return current_schedule, current_time
-    best_schedule, best_time = current_schedule, current_time
-    children = exploration_trace.get('children', [])
-    for child in children:
-        child_schedule, child_time = extract_best_schedule(child, depth_limit)
-        if child_time is not None and (best_time is None or child_time < best_time):
-            best_schedule, best_time = child_schedule, child_time
+    
+    best_schedule = None
+    best_time = None
+    
+    for schedule_entry in schedules_list:
+        # Skip metadata entries
+        if 'fusions' in schedule_entry or 'sched_str' in schedule_entry or 'tree_structure' in schedule_entry:
+            continue
+        
+        # Look for execution time in the schedule entry
+        # Assuming 'evaluation' holds the execution time; adjust key if different
+        for comp_name, comp_schedule in schedule_entry.items():
+            if comp_name in ['fusions', 'sched_str', 'tree_structure', 'legality_check', 'exploration_method']:
+                continue
+            execution_time = comp_schedule.get('evaluation', None)
+            if execution_time is not None and isinstance(execution_time, (int, float)) and execution_time != float('inf'):
+                if best_time is None or execution_time < best_time:
+                    best_time = execution_time
+                    best_schedule = comp_schedule
+    
+    if best_time is None:
+        print(f"Warning: No valid execution time found in schedules_list: {schedules_list[:1]}")  # Show first entry for debug
     return best_schedule, best_time
 
 def extract_access_patterns(accesses):
@@ -212,32 +220,6 @@ def build_tree_structure(node, iterators_info, computations_info, schedules_info
         'children': children
     }
 
-def find_execution_time(program):
-    """Attempt to find execution time from various parts of the JSON."""
-    # First try exploration_trace
-    exploration_trace = program.get('exploration_trace', {})
-    best_schedule, execution_time = extract_best_schedule(exploration_trace)
-    if execution_time is not None and isinstance(execution_time, (int, float)) and execution_time != float('inf'):
-        return execution_time, best_schedule
-    
-    # If not found, look in schedules_list for any timing info
-    schedules_list = program.get('schedules_list', [])
-    for schedule_entry in schedules_list:
-        # Check if there's an execution time field (guessing possible names)
-        for key in ['execution_time', 'time', 'eval', 'performance']:
-            if key in schedule_entry:
-                time = schedule_entry[key]
-                if isinstance(time, (int, float)) and time != float('inf'):
-                    return time, schedule_entry.get('schedule', None)
-        # Check nested computation schedules
-        for comp_name, comp_schedule in schedule_entry.items():
-            if comp_name not in ['fusions', 'sched_str', 'tree_structure', 'legality_check', 'exploration_method']:
-                time = comp_schedule.get('execution_time', None) or comp_schedule.get('time', None)
-                if isinstance(time, (int, float)) and time != float('inf'):
-                    return time, comp_schedule
-    
-    return None, None  # No valid execution time found
-
 def preprocess_tiramisu_program(program):
     """Preprocess a single Tiramisu program."""
     annotation = program.get('program_annotation', {})
@@ -251,12 +233,15 @@ def preprocess_tiramisu_program(program):
         }
     computations_info = annotation.get('computations', {})
     schedules_info = {}
-    for schedule_entry in program.get('schedules_list', []):
+    schedules_list = program.get('schedules_list', [])
+    for schedule_entry in schedules_list:
         for comp_name, comp_schedule in schedule_entry.items():
             if comp_name not in ['fusions', 'sched_str', 'tree_structure', 'legality_check', 'exploration_method']:
                 schedules_info[comp_name] = comp_schedule
+    
+    # Extract tree structure from schedules_list
     tree_roots = []
-    for schedule_entry in program.get('schedules_list', []):
+    for schedule_entry in schedules_list:
         if 'tree_structure' in schedule_entry and 'roots' in schedule_entry['tree_structure']:
             tree_roots = schedule_entry['tree_structure']['roots']
             break
@@ -266,15 +251,12 @@ def preprocess_tiramisu_program(program):
         if tree_node:
             tree_structure.append(tree_node)
     
-    # Try to find execution time
-    execution_time, best_schedule = find_execution_time(program)
-    file_path = program.get('file_path', 'unknown')
+    # Get best schedule and execution time from schedules_list
+    best_schedule, execution_time = extract_best_schedule_from_list(schedules_list)
     
-    # Debugging output
+    file_path = program.get('file_path', 'unknown')
     if execution_time is None:
         print(f"Warning: No valid execution time found in {file_path}")
-        print(f"  Exploration trace: {program.get('exploration_trace', 'Missing')}")
-        print(f"  Schedules list sample: {program.get('schedules_list', [])[:2]}")
     
     return {
         'tree_structure': tree_structure,
@@ -559,12 +541,11 @@ if __name__ == "__main__":
     
     print(f"Preprocessed {len(preprocessed_programs)} programs with valid execution times")
     if not preprocessed_programs:
-        print("Error: No programs with valid execution times found.")
-        print("Sample JSON structures for debugging (first 3 files):")
+        print("Error: No programs with valid execution times found in 'schedules_list'. Check the JSON structure.")
+        print("Sample a few JSON files to verify their 'schedules_list':")
         for i, program in enumerate(programs[:3]):
             print(f"Program {i+1} from {program['file_path']}:")
-            print(json.dumps(program, indent=2)[:1000] + "..." if len(json.dumps(program)) > 1000 else json.dumps(program, indent=2))
-        print("Please verify where execution times are stored (e.g., 'exploration_trace', 'schedules_list') and update the code accordingly.")
+            print(f"  Schedules list: {program.get('schedules_list', 'Missing')[:1]}")  # Show first entry
         exit(1)
 
     train_val_programs, test_programs = train_test_split(preprocessed_programs, test_size=0.2, random_state=42)
