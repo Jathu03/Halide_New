@@ -181,7 +181,7 @@ def main():
     num_layers = 2
     output_size = 1  # Predicting total_execution_time_ms
     batch_size = 4
-    num_epochs = 10
+    num_epochs = 50
     
     # Load data
     folder_path = 'synthetic_data'
