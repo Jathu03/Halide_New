@@ -19,12 +19,19 @@ BATCH_SIZE = 32
 NUM_EPOCHS = 100
 LEARNING_RATE = 0.001
 
-###########################################
-# Data Loading and Preprocessing
-###########################################
+### Utility Function to Handle Case Sensitivity
+def lowercase_keys(data):
+    """Recursively convert all keys in a dictionary or list of dictionaries to lowercase."""
+    if isinstance(data, dict):
+        return {k.lower(): lowercase_keys(v) for k, v in data.items()}
+    elif isinstance(data, list):
+        return [lowercase_keys(item) for item in data]
+    else:
+        return data
 
+### Data Loading and Preprocessing
 def load_tiramisu_programs(folder_path):
-    """Load all Tiramisu programs from the specified folder."""
+    """Load Tiramisu programs from the folder, converting keys to lowercase and providing diagnostics."""
     programs = []
     for root, _, files in os.walk(folder_path):
         for file in files:
@@ -33,8 +40,11 @@ def load_tiramisu_programs(folder_path):
                 try:
                     with open(file_path, 'r') as f:
                         program_data = json.load(f)
+                        # Convert all keys to lowercase
+                        program_data = lowercase_keys(program_data)
+                        # Check for required keys
                         if 'program_annotation' not in program_data or 'schedules_list' not in program_data:
-                            print(f"Skipping {file_path}: Missing 'program_annotation' or 'schedules_list'")
+                            print(f"Skipping {file_path}: Missing 'program_annotation' or 'schedules_list'. Available keys: {list(program_data.keys())}")
                             continue
                         program_data['file_path'] = file_path
                         programs.append(program_data)
@@ -203,7 +213,6 @@ def preprocess_tiramisu_program(program):
         if not isinstance(schedule_entry, dict):
             continue
         
-        # Check for tree_structure and execution_times
         tree_structure_data = schedule_entry.get('tree_structure', {})
         if 'roots' not in tree_structure_data:
             continue
@@ -216,14 +225,12 @@ def preprocess_tiramisu_program(program):
         if execution_time is None:
             continue
         
-        # Extract schedule-specific information
         schedules_info = {
             comp_name: comp_schedule 
             for comp_name, comp_schedule in schedule_entry.items() 
             if comp_name not in ['tree_structure', 'execution_times', 'fusions', 'sched_str', 'legality_check', 'exploration_method']
         }
         
-        # Build tree structure for this schedule
         tree_structure = []
         for root in tree_roots:
             tree_node = build_tree_structure(root, iterators_info, computations_info, schedules_info)
@@ -256,10 +263,7 @@ def flatten_tree_to_sequence(tree_node, depth=0):
             node_seq.extend(flatten_tree_to_sequence(child, depth + 1))
     return node_seq
 
-###########################################
-# Neural Network Model
-###########################################
-
+### Neural Network Model
 class TreeLSTMCell(nn.Module):
     def __init__(self, input_size, hidden_size):
         super(TreeLSTMCell, self).__init__()
@@ -378,10 +382,7 @@ class TiramisuCostModel(nn.Module):
         execution_time = self.fc2(hidden)
         return execution_time
 
-###########################################
-# Dataset and DataLoader
-###########################################
-
+### Dataset and DataLoader
 class TiramisuDataset(Dataset):
     def __init__(self, preprocessed_items):
         self.items = [item for item in preprocessed_items if item['execution_time'] is not None]
@@ -408,10 +409,7 @@ def collate_fn(batch):
         return []
     return filtered_batch
 
-###########################################
-# Training and Evaluation
-###########################################
-
+### Training and Evaluation
 def train_tiramisu_model(model, train_loader, val_loader, num_epochs=NUM_EPOCHS, lr=LEARNING_RATE):
     """Train the Tiramisu cost model."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -576,7 +574,7 @@ def evaluate_model(model, test_loader):
         true_times = np.array(true_times)
         pred_times = np.array(pred_times)
         mae = np.mean(np.abs(true_times - pred_times))
-        mape = np.mean(np.abs((true_times - pred_times) / true_times)) * 100  # Percentage
+        mape = np.mean(np.abs((true_times - pred_times) / true_times)) * 100
         print(f"Test Loss (MSE): {avg_test_loss:.6f}")
         print(f"Mean Absolute Error (MAE): {mae:.6f}")
         print(f"Mean Absolute Percentage Error (MAPE): {mape:.2f}%")
@@ -595,38 +593,30 @@ def evaluate_model(model, test_loader):
     
     return avg_test_loss, mae, mape
 
-###########################################
-# Main Execution
-###########################################
-
+### Main Execution
 if __name__ == "__main__":
-    # Specify the folder path
     folder_path = "./Tiramisu"
     if not os.path.exists(folder_path):
-        print(f"Directory {folder_path} does not exist. Please create the 'Tiramisu' folder and add your JSON files.")
+        print(f"Directory {folder_path} does not exist. Please create it and add your JSON files.")
         exit(1)
     
-    # Load raw programs
     raw_programs = load_tiramisu_programs(folder_path)
     if not raw_programs:
-        print("No valid programs loaded. Ensure JSON files contain 'program_annotation' and 'schedules_list'. Exiting.")
+        print("No valid programs loaded. Check the available keys in the output above to adjust the code. Exiting.")
         exit(1)
     
-    # Preprocess all programs into individual schedule items
     preprocessed_items = []
     for program in raw_programs:
         items = preprocess_tiramisu_program(program)
         preprocessed_items.extend(items)
     
     if not preprocessed_items:
-        print("No valid schedule items found. Check JSON files for 'tree_structure' and 'execution_times'. Exiting.")
+        print("No valid schedule items found. Verify 'tree_structure' and 'execution_times' in schedules. Exiting.")
         exit(1)
     
-    # Split into train, validation, and test sets
     train_items, temp_items = train_test_split(preprocessed_items, test_size=0.3, random_state=42)
     val_items, test_items = train_test_split(temp_items, test_size=0.5, random_state=42)
     
-    # Create datasets
     train_dataset = TiramisuDataset(train_items)
     val_dataset = TiramisuDataset(val_items)
     test_dataset = TiramisuDataset(test_items)
@@ -635,19 +625,15 @@ if __name__ == "__main__":
         print("One or more datasets are empty. Verify input data. Exiting.")
         exit(1)
     
-    # Create data loaders
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
     test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
     
-    # Initialize the model
     input_size = HIDDEN_DIM
     model = TiramisuCostModel(input_size, HIDDEN_DIM)
     
-    # Train the model
     trained_model, train_losses, val_losses = train_tiramisu_model(model, train_loader, val_loader)
     
-    # Evaluate the model
     test_loss, mae, mape = evaluate_model(trained_model, test_loader)
     
     print(f"\nFinal Test Results:")
