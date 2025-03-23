@@ -7,7 +7,7 @@ import numpy as np
 from sklearn.preprocessing import StandardScaler
 import warnings
 
-# Define the Model_Recursive_LSTM_v2 (unchanged)
+# Define the Model_Recursive_LSTM_v2
 class Model_Recursive_LSTM_v2(nn.Module):
     def __init__(
         self,
@@ -150,12 +150,18 @@ class HalideDataset(Dataset):
                     continue
                 with open(os.path.join(program_path, schedule_file), "r") as f:
                     data = json.load(f)
-                    tree_tensors, execution_time = self._process_schedule(data)
-                    self.samples.append((tree_tensors, execution_time))
+                    try:
+                        tree_tensors, execution_time = self._process_schedule(data)
+                        self.samples.append((tree_tensors, execution_time))
+                    except ValueError as e:
+                        warnings.warn(f"Skipping invalid schedule file {schedule_file}: {e}")
 
     def _process_schedule(self, data):
         # Extract nodes and edges
         nodes = data["programming_details"]["Nodes"]
+        # Check for empty nodes list
+        if not nodes:
+            raise ValueError("No nodes found in the schedule")
         edges = data["programming_details"]["Edges"]
         scheduling_data = {item["Name"]: item["Details"]["scheduling_feature"] for item in data["scheduling_data"] if "Name" in item}
         execution_time = next(item["value"] for item in data["scheduling_data"] if item.get("name") == "total_execution_time_ms")
@@ -203,28 +209,18 @@ class HalideDataset(Dataset):
         all_indices = set(range(len(nodes)))
         root_candidates = all_indices - to_nodes  # Nodes with no outgoing edges
         if not root_candidates:
-            # Fallback: Try nodes with no incoming edges
-            root_candidates = all_indices - from_nodes
+            root_candidates = all_indices - from_nodes  # Nodes with no incoming edges
             if not root_candidates:
-                # If still no candidates (fully cyclic or no edges), use the last valid node
-                if len(nodes) > 0:
-                    root_idx = len(nodes) - 1
-                    warnings.warn(f"No clear root node found (possible cyclic graph or no edges), using last node {nodes[root_idx]['Name']} as root")
-                else:
-                    raise ValueError("No nodes available to select as root")
+                # Fallback: Use the first node and issue a warning
+                root_idx = 0
+                warnings.warn(f"No clear root node found (possible cyclic graph or invalid edges), using first node {nodes[root_idx]['Name']} as root")
             else:
                 root_idx = max(root_candidates)
                 warnings.warn(f"No nodes without outgoing edges, using node {nodes[root_idx]['Name']} with no incoming edges as root")
         else:
             root_idx = max(root_candidates)
 
-        # Ensure root_idx is valid
-        if root_idx >= len(nodes) or root_idx < 0:
-            raise ValueError(f"Invalid root_idx {root_idx} for nodes list of length {len(nodes)}")
-
         def build_node(idx):
-            if idx >= len(nodes) or idx < 0:
-                raise ValueError(f"Invalid node index {idx} for nodes list of length {len(nodes)}")
             return {
                 "name": nodes[idx]["Name"],
                 "has_comps": True,
@@ -298,7 +294,7 @@ class HalideDataset(Dataset):
     def __getitem__(self, idx):
         return self.samples[idx]
 
-# Training Function (unchanged)
+# Training Function
 def train_model(model, train_loader, val_loader, num_epochs=50, device="cuda" if torch.cuda.is_available() else "cpu"):
     model = model.to(device)
     criterion = nn.MSELoss()
@@ -328,7 +324,7 @@ def train_model(model, train_loader, val_loader, num_epochs=50, device="cuda" if
     
     return model
 
-# Evaluation and Speedup Prediction (unchanged)
+# Evaluation and Speedup Prediction
 def evaluate_model(model, test_loader, device="cuda" if torch.cuda.is_available() else "cpu"):
     model.eval()
     predictions = []
@@ -346,12 +342,15 @@ def evaluate_model(model, test_loader, device="cuda" if torch.cuda.is_available(
     errors = [abs(pred - actual) / actual * 100 for pred, actual in zip(speedups_pred, speedups_actual)]
     return predictions, actuals, speedups_pred, speedups_actual, errors
 
-# Main Execution (unchanged)
+# Main Execution
 def main():
     data_dir = "synthetic_data"
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
     dataset = HalideDataset(data_dir)
+    if len(dataset) == 0:
+        raise ValueError("No valid schedules found in the dataset")
+    
     train_size = int(0.7 * len(dataset))
     val_size = int(0.15 * len(dataset))
     test_size = len(dataset) - train_size - val_size
@@ -385,4 +384,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
