@@ -29,7 +29,7 @@ set_seed()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
-# Improved feature extraction for JSON data (from user's code)
+# Improved feature extraction for JSON data
 def flatten_json(data, parent_key=''):
     features = {}
     
@@ -82,14 +82,13 @@ def extract_target(data):
             if item.get("name") == "total_execution_time_ms":
                 return item["value"]
     elif "schedule_details" in data and "execution_times" in data["schedule_details"]:
-        return np.mean(data["schedule_details"]["execution_times"])  # Tiramisu case
+        return np.mean(data["schedule_details"]["execution_times"])
     return None
 
-# Enhanced feature extraction combining user's approach and thinking trace
+# Enhanced feature extraction
 def extract_important_features(data):
     features = {}
     
-    # Hardware features
     if "hardware" in data:
         hw = data["hardware"]
         features["num_cores"] = hw.get("num_cores", 0)
@@ -98,7 +97,6 @@ def extract_important_features(data):
         if hw.get("memory_gb", 0) > 0 and hw.get("num_cores", 0) > 0:
             features["core_memory_ratio"] = hw.get("num_cores", 0) / hw.get("memory_gb", 1)
     
-    # Program complexity (Halide or Tiramisu)
     if "programming_details" in data:  # Halide
         nodes = data["programming_details"]["Nodes"]
         features["num_computations"] = len(nodes)
@@ -117,10 +115,9 @@ def extract_important_features(data):
         reductions = sum(1 for c in comps.values() if c["comp_is_reduction"])
         features["num_reductions"] = reductions
     
-    # Scheduling features
     if "scheduling_data" in data:  # Halide
         sched = data["scheduling_data"]
-        for item in sched[:-1]:  # Exclude total_execution_time_ms
+        for item in sched[:-1]:
             sched_feat = item["Details"]["scheduling_feature"]
             features["inner_parallelism"] = sched_feat.get("inner_parallelism", 0)
             features["outer_parallelism"] = sched_feat.get("outer_parallelism", 0)
@@ -471,10 +468,10 @@ def main():
     plt.savefig('log_target_distribution.png')
     plt.close()
     
-    # Stratified split
+    # Stratified split with corrected data_ranges computation
     time_ranges = [0, 100, 1000, 10000, float('inf')]
     range_labels = ['very_short', 'short', 'medium', 'long']
-    data_ranges = [next(label for i, upper in enumerate(time_ranges[1:]) if target < upper) 
+    data_ranges = [next(label for label, upper in zip(range_labels, time_ranges[1:]) if target < upper)
                    for target in all_targets]
     
     train_data, test_data, train_targets, test_targets, train_ranges, test_ranges = train_test_split(
@@ -530,7 +527,7 @@ def main():
     # Evaluate on test set
     print("\nEvaluating ensemble on test set...")
     sample_results, metrics, metrics_by_range, predictions, true_values = evaluate_model(
-        models[0], test_dataset, target_scaler=target_scaler)  # Use first model for detailed evaluation
+        models[0], test_dataset, target_scaler=target_scaler)
     
     # Ensemble predictions
     ensemble_preds = ensemble.predict(test_dataset.X)
@@ -560,7 +557,7 @@ def main():
     print(f"RMSE: {ensemble_rmse:.4f}")
     print(f"R2: {ensemble_r2:.4f}")
     
-    # Feature importance (from first model)
+    # Feature importance
     print("\nTop 10 Feature Importances (First Model):")
     importance = analyze_feature_importance(models[0], train_dataset.selected_feature_names)
     for name, weight in importance[:10]:
