@@ -166,9 +166,10 @@ class HalideDataset(Dataset):
         def clean_name(name):
             return name.split(".update")[0]
 
-        # Filter edges to include only valid nodes and build child map
+        # Filter edges and determine dependencies
         child_map = {i: [] for i in range(len(nodes))}
         valid_edges = []
+        to_nodes = set()
         for edge in edges:
             from_name = clean_name(edge["From"])
             to_name = clean_name(edge["To"])
@@ -176,13 +177,16 @@ class HalideDataset(Dataset):
                 from_idx = node_map[from_name]
                 to_idx = node_map[to_name]
                 child_map[from_idx].append(to_idx)
-                valid_edges.append(edge)  # Keep only valid edges
+                valid_edges.append(edge)
+                to_nodes.add(to_idx)
 
-        # Build tree starting from 'output'
-        root_idx = node_map.get("output")
-        if root_idx is None:
-            raise ValueError("No 'output' node found in the schedule")
-        
+        # Dynamically find the root (node with no outgoing edges)
+        all_indices = set(range(len(nodes)))
+        root_candidates = all_indices - to_nodes  # Nodes not in any "To" field
+        if not root_candidates:
+            raise ValueError("No root node found in the schedule (no node without outgoing edges)")
+        root_idx = max(root_candidates)  # Take the last one as a heuristic (often the final output)
+
         def build_node(idx):
             return {
                 "name": nodes[idx]["Name"],
@@ -204,12 +208,11 @@ class HalideDataset(Dataset):
             if name in scheduling_data:
                 features = list(scheduling_data[name].values())
                 comps_tensor_first_part[i] = torch.tensor(features[:26])  # Truncate/pad to 26
-            # Find edge where this node is the "To" (use cleaned name for lookup)
             for edge in valid_edges:
                 if clean_name(edge["To"]) == name:
                     jacobians = edge["Details"]["Load Jacobians"]
                     if jacobians and isinstance(jacobians, list) and len(jacobians) > 0:
-                        comps_tensor_vectors[i] = torch.tensor([float(x) for x in jacobians[0].split()][:3])  # Take first 3 values
+                        comps_tensor_vectors[i] = torch.tensor([float(x) for x in jacobians[0].split()][:3])
                     break
             op_hist = [int(x.split()[-1]) for x in node["Details"]["Op histogram"]]
             comps_tensor_third_part[i] = torch.tensor(op_hist)
