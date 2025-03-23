@@ -97,7 +97,6 @@ class Model_Recursive_LSTM_v2(nn.Module):
     def forward(self, tree_tensors):
         tree, comps_tensor_first_part, comps_tensor_vectors, comps_tensor_third_part, loops_tensor, functions_comps_expr_tree = tree_tensors
         
-        # Ensure 4D shape
         if len(functions_comps_expr_tree.shape) != 4:
             raise ValueError(f"Expected functions_comps_expr_tree to have 4 dimensions, got {functions_comps_expr_tree.shape}")
         
@@ -272,7 +271,6 @@ class HalideDataset(Dataset):
             self.scaler.fit(comps_tensor_first_part.numpy())
         comps_tensor_first_part = torch.tensor(self.scaler.transform(comps_tensor_first_part.numpy()))
 
-        # Remove .unsqueeze(0) here; let DataLoader add the batch dimension
         tree_tensors = (
             tree,
             comps_tensor_first_part,
@@ -299,6 +297,11 @@ def train_model(model, train_loader, val_loader, num_epochs=50, device="cuda" if
         model.train()
         train_loss = 0
         for tree_tensors, execution_time in train_loader:
+            # Move all tensors in tree_tensors to the correct device
+            tree_tensors = tuple(
+                t.to(device) if isinstance(t, torch.Tensor) else t
+                for t in tree_tensors
+            )
             execution_time = execution_time.to(device).float()
             optimizer.zero_grad()
             output = model(tree_tensors)
@@ -311,6 +314,11 @@ def train_model(model, train_loader, val_loader, num_epochs=50, device="cuda" if
         val_loss = 0
         with torch.no_grad():
             for tree_tensors, execution_time in val_loader:
+                # Move all tensors in tree_tensors to the correct device
+                tree_tensors = tuple(
+                    t.to(device) if isinstance(t, torch.Tensor) else t
+                    for t in tree_tensors
+                )
                 execution_time = execution_time.to(device).float()
                 output = model(tree_tensors)
                 val_loss += criterion(output, execution_time).item()
@@ -326,6 +334,11 @@ def evaluate_model(model, test_loader, device="cuda" if torch.cuda.is_available(
     actuals = []
     with torch.no_grad():
         for tree_tensors, execution_time in test_loader:
+            # Move all tensors in tree_tensors to the correct device
+            tree_tensors = tuple(
+                t.to(device) if isinstance(t, torch.Tensor) else t
+                for t in tree_tensors
+            )
             execution_time = execution_time.to(device).float()
             pred = model(tree_tensors)
             predictions.append(pred.item())
