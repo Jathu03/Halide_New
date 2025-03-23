@@ -24,7 +24,7 @@ LEARNING_RATE = 0.001
 ###########################################
 
 def load_tiramisu_programs(folder_path):
-    """Load all Tiramisu programs from a folder, skipping invalid files."""
+    """Load all Tiramisu programs from the specified folder."""
     programs = []
     for root, _, files in os.walk(folder_path):
         for file in files:
@@ -33,7 +33,6 @@ def load_tiramisu_programs(folder_path):
                 try:
                     with open(file_path, 'r') as f:
                         program_data = json.load(f)
-                        # Check for essential fields
                         if 'program_annotation' not in program_data or 'schedules_list' not in program_data:
                             print(f"Skipping {file_path}: Missing 'program_annotation' or 'schedules_list'")
                             continue
@@ -46,29 +45,12 @@ def load_tiramisu_programs(folder_path):
     print(f"Loaded {len(programs)} valid Tiramisu programs from {folder_path}")
     return programs
 
-def extract_best_schedule_from_list(schedules_list):
-    """Find the schedule with the minimum execution time from schedules_list."""
-    if not schedules_list:
-        return None, None
-    
-    best_schedule = None
-    best_time = float('inf')
-    
-    for schedule_entry in schedules_list:
-        if 'execution_times' in schedule_entry:
-            times = schedule_entry['execution_times']
-            if times and isinstance(times, list):
-                valid_times = [t for t in times if isinstance(t, (int, float)) and t != float('inf')]
-                if valid_times:
-                    avg_time = np.mean(valid_times)
-                    if avg_time < best_time:
-                        best_time = avg_time
-                        best_schedule = schedule_entry
-    
-    if best_time == float('inf'):
-        return None, None  # No valid execution time found
-    
-    return best_schedule, best_time
+def compute_execution_time(execution_times):
+    """Compute the average execution time from a list of times."""
+    if not execution_times:
+        return None
+    valid_times = [t for t in execution_times if isinstance(t, (int, float)) and t != float('inf')]
+    return np.mean(valid_times) if valid_times else None
 
 def extract_access_patterns(accesses):
     """Extract features from access patterns."""
@@ -79,17 +61,12 @@ def extract_access_patterns(accesses):
         buffer_id = access.get('buffer_id', -1)
         is_reduction = access.get('access_is_reduction', False)
         matrix = access.get('access_matrix', [])
-        matrix_flat = []
-        for row in matrix:
-            matrix_flat.extend(row)
-        matrix_flat = matrix_flat[:10]
-        while len(matrix_flat) < 10:
-            matrix_flat.append(0)
+        matrix_flat = [item for row in matrix for item in row][:10]
+        matrix_flat += [0] * (10 - len(matrix_flat))
         access_features = [buffer_id, int(is_reduction)] + matrix_flat
         features.append(access_features)
     padded_features = features[:5]
-    while len(padded_features) < 5:
-        padded_features.append([0] * 12)
+    padded_features += [[0] * 12] * (5 - len(padded_features))
     return padded_features
 
 def flatten_expression(expr):
@@ -98,45 +75,34 @@ def flatten_expression(expr):
         return []
     expr_type = expr.get('expr_type', 'unknown')
     expr_types = ['add', 'mul', 'div', 'sub', 'max', 'min', 'sqrt', 'access', 'value', 'unknown']
-    expr_type_encoding = [0] * len(expr_types)
-    if expr_type in expr_types:
-        expr_type_encoding[expr_types.index(expr_type)] = 1
+    expr_type_encoding = [int(expr_type == et) for et in expr_types]
     children = expr.get('children', [])
-    child_features = []
-    for child in children[:2]:
-        child_features.extend(flatten_expression(child))
-    all_features = expr_type_encoding + child_features
+    child_features = [flatten_expression(child) for child in children[:2]]
+    all_features = expr_type_encoding + [item for sublist in child_features for item in sublist]
     all_features = all_features[:30]
-    while len(all_features) < 30:
-        all_features.append(0)
+    all_features += [0] * (30 - len(all_features))
     return all_features
 
 def extract_computation_features(computation):
     """Extract features from a computation."""
     if not computation:
         return [0] * 100
-    
-    features = []
-    features.append(computation.get('absolute_order', 0))
-    features.append(1 if computation.get('comp_is_reduction', False) else 0)
+    features = [
+        computation.get('absolute_order', 0),
+        int(computation.get('comp_is_reduction', False))
+    ]
     data_types = ['float32', 'float64', 'int32', 'int64', 'unknown']
     data_type = computation.get('data_type', 'unknown')
-    data_type_encoding = [0] * len(data_types)
-    if data_type in data_types:
-        data_type_encoding[data_types.index(data_type)] = 1
-    features.extend(data_type_encoding)
+    data_type_encoding = [int(data_type == dt) for dt in data_types]
+    features += data_type_encoding
     iterators = computation.get('iterators', [])
     features.append(len(iterators))
-    access_pattern_features = []
-    for access_pattern in extract_access_patterns(computation.get('accesses', [])):
-        access_pattern_features.extend(access_pattern)
-    features.extend(access_pattern_features[:60])
+    access_pattern_features = [item for sublist in extract_access_patterns(computation.get('accesses', [])) for item in sublist][:60]
+    features += access_pattern_features
     expr_features = flatten_expression(computation.get('expression_representation', {}))
-    features.extend(expr_features)
-    
+    features += expr_features
     features = features[:100]
-    while len(features) < 100:
-        features.append(0)
+    features += [0] * (100 - len(features))
     return features
 
 def extract_schedule_features(schedule):
@@ -145,55 +111,43 @@ def extract_schedule_features(schedule):
         return [0] * 20
     features = []
     tiling = schedule.get('tiling', {})
-    has_tiling = 1 if tiling else 0
-    features.append(has_tiling)
-    tiling_factors = []
-    for i in range(3):
-        if i < len(tiling.keys()):
-            factor = list(tiling.values())[i]
-            tiling_factors.append(factor)
-        else:
-            tiling_factors.append(0)
-    features.extend(tiling_factors)
+    features.append(int(bool(tiling)))
+    tiling_factors = [tiling.get(f'l{i}_factor', 0) for i in range(3)]
+    features += tiling_factors
     unrolling_factor = schedule.get('unrolling_factor', 0)
-    features.append(1 if unrolling_factor else 0)
-    features.append(unrolling_factor if unrolling_factor else 0)
+    features += [int(bool(unrolling_factor)), unrolling_factor]
     parallelized_dim = schedule.get('parallelized_dim', None)
-    features.append(1 if parallelized_dim is not None else 0)
+    features.append(int(parallelized_dim is not None))
     if parallelized_dim is not None:
         dim_encoding = [0] * 5
         if isinstance(parallelized_dim, int) and 0 <= parallelized_dim < 5:
             dim_encoding[parallelized_dim] = 1
         elif isinstance(parallelized_dim, str) and parallelized_dim in ['i0', 'i1', 'i2', 'i3', 'i4']:
             dim_encoding[int(parallelized_dim[1])] = 1
-        features.extend(dim_encoding)
+        features += dim_encoding
     else:
-        features.extend([0] * 5)
+        features += [0] * 5
     transformations = schedule.get('transformations_list', [])
     features.append(len(transformations))
     features = features[:20]
-    while len(features) < 20:
-        features.append(0)
+    features += [0] * (20 - len(features))
     return features
 
 def extract_loop_features(loop_node, iterators_info):
     """Extract features from a loop node."""
     if not loop_node or not iterators_info:
         return [0] * 5
-    
     loop_name = loop_node.get('loop_name', '')
     iterator_info = iterators_info.get(loop_name, {})
-    features = []
     lower_bound = iterator_info.get('lower_bound', 0)
     upper_bound = iterator_info.get('upper_bound', 0)
     if isinstance(lower_bound, str):
         lower_bound = -1
     if isinstance(upper_bound, str):
         upper_bound = -1
-    features.append(lower_bound)
-    features.append(upper_bound)
+    features = [lower_bound, upper_bound]
     parent = iterator_info.get('parent_iterator', None)
-    features.append(1 if parent else 0)
+    features.append(int(bool(parent)))
     children = iterator_info.get('child_iterators', [])
     features.append(len(children))
     computations = loop_node.get('computations_list', [])
@@ -229,13 +183,12 @@ def build_tree_structure(node, iterators_info, computations_info, schedules_info
     }
 
 def preprocess_tiramisu_program(program):
-    """Preprocess a single Tiramisu program."""
+    """Preprocess a Tiramisu program, creating one item per schedule."""
     file_path = program.get('file_path', 'unknown')
-    
     annotation = program.get('program_annotation', {})
     if not annotation:
         print(f"Warning: No program annotation found in {file_path}")
-        return None
+        return []
     
     iterators_info = annotation.get('iterators', {})
     computations_info = annotation.get('computations', {})
@@ -243,44 +196,51 @@ def preprocess_tiramisu_program(program):
     schedules_list = program.get('schedules_list', [])
     if not schedules_list:
         print(f"Warning: No schedules found in {file_path}")
-        return None
+        return []
     
-    schedules_info = {}
+    preprocessed_items = []
     for schedule_entry in schedules_list:
         if not isinstance(schedule_entry, dict):
             continue
-        for comp_name, comp_schedule in schedule_entry.items():
-            if comp_name not in ['fusions', 'sched_str', 'tree_structure', 'legality_check', 'exploration_method']:
-                schedules_info[comp_name] = comp_schedule
+        
+        # Check for tree_structure and execution_times
+        tree_structure_data = schedule_entry.get('tree_structure', {})
+        if 'roots' not in tree_structure_data:
+            continue
+        tree_roots = tree_structure_data['roots']
+        if not tree_roots:
+            continue
+        
+        execution_times = schedule_entry.get('execution_times', [])
+        execution_time = compute_execution_time(execution_times)
+        if execution_time is None:
+            continue
+        
+        # Extract schedule-specific information
+        schedules_info = {
+            comp_name: comp_schedule 
+            for comp_name, comp_schedule in schedule_entry.items() 
+            if comp_name not in ['tree_structure', 'execution_times', 'fusions', 'sched_str', 'legality_check', 'exploration_method']
+        }
+        
+        # Build tree structure for this schedule
+        tree_structure = []
+        for root in tree_roots:
+            tree_node = build_tree_structure(root, iterators_info, computations_info, schedules_info)
+            if tree_node:
+                tree_structure.append(tree_node)
+        
+        if tree_structure:
+            preprocessed_items.append({
+                'tree_structure': tree_structure,
+                'execution_time': execution_time,
+                'file_path': file_path,
+                'schedule_entry': schedule_entry
+            })
     
-    tree_roots = []
-    for schedule_entry in schedules_list:
-        if isinstance(schedule_entry, dict) and 'tree_structure' in schedule_entry and 'roots' in schedule_entry['tree_structure']:
-            tree_roots = schedule_entry['tree_structure']['roots']
-            break
-    
-    if not tree_roots:
-        print(f"Warning: No tree structure found in {file_path}")
-        return None
-    
-    tree_structure = []
-    for root in tree_roots:
-        tree_node = build_tree_structure(root, iterators_info, computations_info, schedules_info)
-        if tree_node:
-            tree_structure.append(tree_node)
-    
-    best_schedule, execution_time = extract_best_schedule_from_list(schedules_list)
-    
-    if execution_time is None:
-        print(f"Warning: No valid execution time found in {file_path}")
-        return None
-    
-    return {
-        'tree_structure': tree_structure,
-        'execution_time': execution_time,
-        'best_schedule': best_schedule,
-        'file_path': file_path
-    }
+    if not preprocessed_items:
+        print(f"Warning: No valid schedules processed in {file_path}")
+    return preprocessed_items
 
 def flatten_tree_to_sequence(tree_node, depth=0):
     """Flatten a tree structure into a sequence of nodes."""
@@ -423,22 +383,23 @@ class TiramisuCostModel(nn.Module):
 ###########################################
 
 class TiramisuDataset(Dataset):
-    def __init__(self, preprocessed_programs):
-        self.programs = [p for p in preprocessed_programs if p is not None and p['execution_time'] is not None]
-        print(f"Created dataset with {len(self.programs)} valid programs (filtered out {len(preprocessed_programs) - len(self.programs)} invalid or missing execution times)")
+    def __init__(self, preprocessed_items):
+        self.items = [item for item in preprocessed_items if item['execution_time'] is not None]
+        print(f"Created dataset with {len(self.items)} valid schedule items")
     
     def __len__(self):
-        return len(self.programs)
+        return len(self.items)
     
     def __getitem__(self, idx):
-        program = self.programs[idx]
+        item = self.items[idx]
         return {
-            'tree_structure': program['tree_structure'],
-            'execution_time': program['execution_time'],
-            'file_path': program['file_path']
+            'tree_structure': item['tree_structure'],
+            'execution_time': item['execution_time'],
+            'file_path': item['file_path']
         }
 
 def collate_fn(batch):
+    """Custom collate function to filter out invalid items."""
     filtered_batch = [item for item in batch if item['execution_time'] is not None]
     if len(filtered_batch) < len(batch):
         print(f"Warning: Filtered out {len(batch) - len(filtered_batch)} items with None execution times in batch")
@@ -452,6 +413,7 @@ def collate_fn(batch):
 ###########################################
 
 def train_tiramisu_model(model, train_loader, val_loader, num_epochs=NUM_EPOCHS, lr=LEARNING_RATE):
+    """Train the Tiramisu cost model."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
@@ -563,6 +525,7 @@ def train_tiramisu_model(model, train_loader, val_loader, num_epochs=NUM_EPOCHS,
     return model, train_losses, val_losses
 
 def evaluate_model(model, test_loader):
+    """Evaluate the trained model on the test set."""
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
     model.eval()
@@ -637,36 +600,39 @@ def evaluate_model(model, test_loader):
 ###########################################
 
 if __name__ == "__main__":
-    # Load programs from the 'Tiramisu' folder
+    # Specify the folder path
     folder_path = "./Tiramisu"
     if not os.path.exists(folder_path):
         print(f"Directory {folder_path} does not exist. Please create the 'Tiramisu' folder and add your JSON files.")
         exit(1)
     
+    # Load raw programs
     raw_programs = load_tiramisu_programs(folder_path)
     if not raw_programs:
-        print("No valid programs loaded from 'Tiramisu' folder. Please ensure your JSON files contain 'program_annotation' and 'schedules_list'. Exiting.")
+        print("No valid programs loaded. Ensure JSON files contain 'program_annotation' and 'schedules_list'. Exiting.")
         exit(1)
     
-    # Preprocess programs
-    preprocessed_programs = [preprocess_tiramisu_program(p) for p in raw_programs]
-    preprocessed_programs = [p for p in preprocessed_programs if p is not None]
+    # Preprocess all programs into individual schedule items
+    preprocessed_items = []
+    for program in raw_programs:
+        items = preprocess_tiramisu_program(program)
+        preprocessed_items.extend(items)
     
-    if not preprocessed_programs:
-        print("No valid preprocessed programs after filtering. Please check your JSON files for required fields ('program_annotation', 'schedules_list', 'execution_times'). Exiting.")
+    if not preprocessed_items:
+        print("No valid schedule items found. Check JSON files for 'tree_structure' and 'execution_times'. Exiting.")
         exit(1)
     
-    # Split dataset
-    train_programs, temp_programs = train_test_split(preprocessed_programs, test_size=0.3, random_state=42)
-    val_programs, test_programs = train_test_split(temp_programs, test_size=0.5, random_state=42)
+    # Split into train, validation, and test sets
+    train_items, temp_items = train_test_split(preprocessed_items, test_size=0.3, random_state=42)
+    val_items, test_items = train_test_split(temp_items, test_size=0.5, random_state=42)
     
     # Create datasets
-    train_dataset = TiramisuDataset(train_programs)
-    val_dataset = TiramisuDataset(val_programs)
-    test_dataset = TiramisuDataset(test_programs)
+    train_dataset = TiramisuDataset(train_items)
+    val_dataset = TiramisuDataset(val_items)
+    test_dataset = TiramisuDataset(test_items)
     
     if len(train_dataset) == 0 or len(val_dataset) == 0 or len(test_dataset) == 0:
-        print("One or more datasets are empty after filtering. Please verify your input data. Exiting.")
+        print("One or more datasets are empty. Verify input data. Exiting.")
         exit(1)
     
     # Create data loaders
@@ -674,17 +640,17 @@ if __name__ == "__main__":
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
     test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
     
-    # Initialize model
-    input_size = HIDDEN_DIM  # Adjusted based on embeddings
+    # Initialize the model
+    input_size = HIDDEN_DIM
     model = TiramisuCostModel(input_size, HIDDEN_DIM)
     
-    # Train model
+    # Train the model
     trained_model, train_losses, val_losses = train_tiramisu_model(model, train_loader, val_loader)
     
-    # Evaluate model
+    # Evaluate the model
     test_loss, mae, mape = evaluate_model(trained_model, test_loader)
     
-    print(f"Final Test Results:")
+    print(f"\nFinal Test Results:")
     print(f"Test Loss (MSE): {test_loss:.6f}")
     print(f"Mean Absolute Error (MAE): {mae:.6f}")
     print(f"Mean Absolute Percentage Error (MAPE): {mape:.2f}%")
