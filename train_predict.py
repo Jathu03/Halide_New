@@ -637,15 +637,15 @@ def evaluate_model(model, test_loader):
 ###########################################
 
 if __name__ == "__main__":
-    # Load programs from a directory (adjust path as needed)
-    folder_path = "./tiramisu_programs"  # Replace with your directory path
+    # Load programs from the 'Tiramisu' folder
+    folder_path = "./Tiramisu"
     if not os.path.exists(folder_path):
-        print(f"Directory {folder_path} does not exist. Please provide a valid path.")
+        print(f"Directory {folder_path} does not exist. Please create the 'Tiramisu' folder and add your JSON files.")
         exit(1)
     
     raw_programs = load_tiramisu_programs(folder_path)
     if not raw_programs:
-        print("No programs loaded. Exiting.")
+        print("No programs loaded from 'Tiramisu' folder. Exiting.")
         exit(1)
     
     # Preprocess programs
