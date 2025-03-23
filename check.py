@@ -97,6 +97,10 @@ class Model_Recursive_LSTM_v2(nn.Module):
     def forward(self, tree_tensors):
         tree, comps_tensor_first_part, comps_tensor_vectors, comps_tensor_third_part, loops_tensor, functions_comps_expr_tree = tree_tensors
         
+        # Check and fix the shape of functions_comps_expr_tree
+        if len(functions_comps_expr_tree.shape) != 4:
+            raise ValueError(f"Expected functions_comps_expr_tree to have 4 dimensions, got {functions_comps_expr_tree.shape}")
+        
         batch_size, num_comps, len_sequence, len_vector = functions_comps_expr_tree.shape
         x = functions_comps_expr_tree.view(batch_size * num_comps, len_sequence, len_vector)
         _, (expr_embedding, _) = self.exprs_embed(x)
@@ -159,7 +163,6 @@ class HalideDataset(Dataset):
     def _process_schedule(self, data):
         # Extract nodes and edges
         nodes = data["programming_details"]["Nodes"]
-        # Check for empty nodes list
         if not nodes:
             raise ValueError("No nodes found in the schedule")
         edges = data["programming_details"]["Edges"]
@@ -186,6 +189,9 @@ class HalideDataset(Dataset):
             try:
                 return float(val)
             except ValueError:
+                # Optionally, handle '_' explicitly if it has a specific meaning
+                if val == '_':
+                    return 0.0  # Default for underscore, adjust if needed
                 warnings.warn(f"Invalid value '{val}' in Load Jacobians, defaulting to 0.0")
                 return 0.0
 
@@ -207,11 +213,10 @@ class HalideDataset(Dataset):
 
         # Dynamically find the root
         all_indices = set(range(len(nodes)))
-        root_candidates = all_indices - to_nodes  # Nodes with no outgoing edges
+        root_candidates = all_indices - to_nodes
         if not root_candidates:
-            root_candidates = all_indices - from_nodes  # Nodes with no incoming edges
+            root_candidates = all_indices - from_nodes
             if not root_candidates:
-                # Fallback: Use the first node and issue a warning
                 root_idx = 0
                 warnings.warn(f"No clear root node found (possible cyclic graph or invalid edges), using first node {nodes[root_idx]['Name']} as root")
             else:
@@ -232,15 +237,15 @@ class HalideDataset(Dataset):
 
         # Computation tensors
         num_comps = len(nodes)
-        comps_tensor_first_part = torch.zeros(num_comps, 26)  # 26 scheduling features
-        comps_tensor_vectors = torch.zeros(num_comps, 3)     # Load Jacobians (3D)
-        comps_tensor_third_part = torch.zeros(num_comps, 24) # 24 op histogram features
+        comps_tensor_first_part = torch.zeros(num_comps, 26)
+        comps_tensor_vectors = torch.zeros(num_comps, 3)
+        comps_tensor_third_part = torch.zeros(num_comps, 24)
         
         for i, node in enumerate(nodes):
             name = node["Name"]
             if name in scheduling_data:
                 features = list(scheduling_data[name].values())
-                comps_tensor_first_part[i] = torch.tensor(features[:26])  # Truncate/pad to 26
+                comps_tensor_first_part[i] = torch.tensor(features[:26])
             for edge in valid_edges:
                 if clean_name(edge["To"]) == name:
                     jacobians = edge["Details"]["Load Jacobians"]
@@ -250,7 +255,7 @@ class HalideDataset(Dataset):
                         comps_tensor_vectors[i] = torch.tensor(values)
                     break
             op_hist = [int(x.split()[-1]) for x in node["Details"]["Op histogram"]]
-            comps_tensor_third_part[i] = torch.tensor(op_hist[:24])  # Ensure exactly 24 elements
+            comps_tensor_third_part[i] = torch.tensor(op_hist[:24])
 
         # Loops tensor
         loops_tensor = torch.zeros(num_comps, 8)
@@ -263,14 +268,14 @@ class HalideDataset(Dataset):
                     scheduling_data[name]["unrolled_loop_extent"],
                     scheduling_data[name]["inner_parallelism"],
                     scheduling_data[name]["outer_parallelism"],
-                    0, 0, 0  # Padding
+                    0, 0, 0
                 ]
                 loops_tensor[i] = torch.tensor(loops)
 
-        # Expression tensor (simplified)
-        functions_comps_expr_tree = torch.zeros(num_comps, 10, 11)  # 10 ops, 11 features
+        # Expression tensor
+        functions_comps_expr_tree = torch.zeros(num_comps, 10, 11)
         for i, node in enumerate(nodes):
-            op_hist = [int(x.split()[-1]) for x in node["Details"]["Op histogram"][:10]]  # First 10 ops
+            op_hist = [int(x.split()[-1]) for x in node["Details"]["Op histogram"][:10]]
             functions_comps_expr_tree[i, :, :10] = torch.tensor(op_hist).float().view(10, 1).expand(10, 10)
 
         # Normalize features
