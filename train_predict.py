@@ -24,7 +24,7 @@ LEARNING_RATE = 0.001
 ###########################################
 
 def load_tiramisu_programs(folder_path):
-    """Load all Tiramisu programs from a folder."""
+    """Load all Tiramisu programs from a folder, skipping invalid files."""
     programs = []
     for root, _, files in os.walk(folder_path):
         for file in files:
@@ -33,20 +33,21 @@ def load_tiramisu_programs(folder_path):
                 try:
                     with open(file_path, 'r') as f:
                         program_data = json.load(f)
+                        # Check for essential fields
+                        if 'program_annotation' not in program_data or 'schedules_list' not in program_data:
+                            print(f"Skipping {file_path}: Missing 'program_annotation' or 'schedules_list'")
+                            continue
                         program_data['file_path'] = file_path
                         programs.append(program_data)
                 except json.JSONDecodeError:
-                    print(f"Error decoding JSON in {file_path}")
+                    print(f"Error decoding JSON in {file_path}. Skipping.")
                 except Exception as e:
-                    print(f"Error loading {file_path}: {e}")
-    print(f"Loaded {len(programs)} Tiramisu programs from {folder_path}")
+                    print(f"Error loading {file_path}: {e}. Skipping.")
+    print(f"Loaded {len(programs)} valid Tiramisu programs from {folder_path}")
     return programs
 
 def extract_best_schedule_from_list(schedules_list):
-    """
-    Find the schedule with the minimum execution time from schedules_list.
-    Returns a tuple of (best_schedule, best_execution_time).
-    """
+    """Find the schedule with the minimum execution time from schedules_list."""
     if not schedules_list:
         return None, None
     
@@ -65,8 +66,7 @@ def extract_best_schedule_from_list(schedules_list):
                         best_schedule = schedule_entry
     
     if best_time == float('inf'):
-        best_time = None
-        print(f"Warning: No valid execution time found in schedules_list")
+        return None, None  # No valid execution time found
     
     return best_schedule, best_time
 
@@ -137,7 +137,6 @@ def extract_computation_features(computation):
     features = features[:100]
     while len(features) < 100:
         features.append(0)
-    
     return features
 
 def extract_schedule_features(schedule):
@@ -236,6 +235,7 @@ def preprocess_tiramisu_program(program):
     annotation = program.get('program_annotation', {})
     if not annotation:
         print(f"Warning: No program annotation found in {file_path}")
+        return None
     
     iterators_info = annotation.get('iterators', {})
     computations_info = annotation.get('computations', {})
@@ -243,12 +243,7 @@ def preprocess_tiramisu_program(program):
     schedules_list = program.get('schedules_list', [])
     if not schedules_list:
         print(f"Warning: No schedules found in {file_path}")
-        return {
-            'tree_structure': [],
-            'execution_time': None,
-            'best_schedule': None,
-            'file_path': file_path
-        }
+        return None
     
     schedules_info = {}
     for schedule_entry in schedules_list:
@@ -266,6 +261,7 @@ def preprocess_tiramisu_program(program):
     
     if not tree_roots:
         print(f"Warning: No tree structure found in {file_path}")
+        return None
     
     tree_structure = []
     for root in tree_roots:
@@ -274,6 +270,10 @@ def preprocess_tiramisu_program(program):
             tree_structure.append(tree_node)
     
     best_schedule, execution_time = extract_best_schedule_from_list(schedules_list)
+    
+    if execution_time is None:
+        print(f"Warning: No valid execution time found in {file_path}")
+        return None
     
     return {
         'tree_structure': tree_structure,
@@ -424,8 +424,8 @@ class TiramisuCostModel(nn.Module):
 
 class TiramisuDataset(Dataset):
     def __init__(self, preprocessed_programs):
-        self.programs = [p for p in preprocessed_programs if p['execution_time'] is not None]
-        print(f"Created dataset with {len(self.programs)} valid programs (filtered out {len(preprocessed_programs) - len(self.programs)} with None execution times)")
+        self.programs = [p for p in preprocessed_programs if p is not None and p['execution_time'] is not None]
+        print(f"Created dataset with {len(self.programs)} valid programs (filtered out {len(preprocessed_programs) - len(self.programs)} invalid or missing execution times)")
     
     def __len__(self):
         return len(self.programs)
@@ -645,11 +645,16 @@ if __name__ == "__main__":
     
     raw_programs = load_tiramisu_programs(folder_path)
     if not raw_programs:
-        print("No programs loaded from 'Tiramisu' folder. Exiting.")
+        print("No valid programs loaded from 'Tiramisu' folder. Please ensure your JSON files contain 'program_annotation' and 'schedules_list'. Exiting.")
         exit(1)
     
     # Preprocess programs
     preprocessed_programs = [preprocess_tiramisu_program(p) for p in raw_programs]
+    preprocessed_programs = [p for p in preprocessed_programs if p is not None]
+    
+    if not preprocessed_programs:
+        print("No valid preprocessed programs after filtering. Please check your JSON files for required fields ('program_annotation', 'schedules_list', 'execution_times'). Exiting.")
+        exit(1)
     
     # Split dataset
     train_programs, temp_programs = train_test_split(preprocessed_programs, test_size=0.3, random_state=42)
@@ -661,7 +666,7 @@ if __name__ == "__main__":
     test_dataset = TiramisuDataset(test_programs)
     
     if len(train_dataset) == 0 or len(val_dataset) == 0 or len(test_dataset) == 0:
-        print("One or more datasets are empty after filtering. Exiting.")
+        print("One or more datasets are empty after filtering. Please verify your input data. Exiting.")
         exit(1)
     
     # Create data loaders
