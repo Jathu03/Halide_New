@@ -7,11 +7,11 @@ from torch.utils.data import Dataset, DataLoader
 import numpy as np
 from collections import OrderedDict, Counter
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler, RobustScaler, PowerTransformer
-import matplotlib.pyplot as plt
-import random
+from sklearn.preprocessing import RobustScaler, PowerTransformer
 from sklearn.feature_selection import SelectKBest, f_regression
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+import matplotlib.pyplot as plt
+import random
 
 # Set seed for reproducibility
 def set_seed(seed=42):
@@ -29,10 +29,9 @@ set_seed()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
-# Improved feature extraction for JSON data
+# Feature extraction
 def flatten_json(data, parent_key=''):
     features = {}
-    
     if isinstance(data, dict):
         for key, value in data.items():
             new_key = f"{parent_key}_{key}" if parent_key else key
@@ -44,25 +43,24 @@ def flatten_json(data, parent_key=''):
         if parent_key:
             features[f"{parent_key}_length"] = len(data)
             if data and all(not isinstance(x, (dict, list)) for x in data):
-                numeric_values = []
-                for item in data:
-                    try:
-                        numeric_values.append(float(item))
-                    except (ValueError, TypeError):
-                        pass
+                numeric_values = [float(item) for item in data if isinstance(item, (int, float)) and not np.isnan(item)]
                 if numeric_values:
                     features[f"{parent_key}_mean"] = np.mean(numeric_values)
                     features[f"{parent_key}_median"] = np.median(numeric_values)
-                    features[f"{parent_key}_std"] = np.std(numeric_values)
+                    features[f"{parent_key}_std"] = np.std(numeric_values) if len(numeric_values) > 1 else 0
                     features[f"{parent_key}_max"] = np.max(numeric_values)
                     features[f"{parent_key}_min"] = np.min(numeric_values)
-                    features[f"{parent_key}_range"] = np.max(numeric_values) - np.min(numeric_values)
+                    features[f"{parent_key}_range"] = features[f"{parent_key}_max"] - features[f"{parent_key}_min"]
             for i, value in enumerate(data[:3]):
                 nested_features = flatten_json(value, f"{parent_key}_{i}")
                 features.update(nested_features)
     else:
         try:
-            features[parent_key] = float(data)
+            val = float(data)
+            if not np.isnan(val) and not np.isinf(val):
+                features[parent_key] = val
+            else:
+                features[parent_key] = 0.0
         except (ValueError, TypeError):
             if isinstance(data, str):
                 features[parent_key] = hash(str(data)) % 1000 / 1000.0
@@ -72,23 +70,21 @@ def flatten_json(data, parent_key=''):
                 features[parent_key] = 0.0
             else:
                 features[parent_key] = 0.0
-    
     return features
 
-# Extract target variable
 def extract_target(data):
     if "scheduling_data" in data:
         for item in data.get("scheduling_data", []):
             if item.get("name") == "total_execution_time_ms":
-                return item["value"]
+                val = item["value"]
+                return val if isinstance(val, (int, float)) and val > 0 and not np.isnan(val) else None
     elif "schedule_details" in data and "execution_times" in data["schedule_details"]:
-        return np.mean(data["schedule_details"]["execution_times"])
+        times = [t for t in data["schedule_details"]["execution_times"] if isinstance(t, (int, float)) and t > 0 and not np.isnan(t)]
+        return np.mean(times) if times else None
     return None
 
-# Enhanced feature extraction
 def extract_important_features(data):
     features = {}
-    
     if "hardware" in data:
         hw = data["hardware"]
         features["num_cores"] = hw.get("num_cores", 0)
@@ -97,7 +93,7 @@ def extract_important_features(data):
         if hw.get("memory_gb", 0) > 0 and hw.get("num_cores", 0) > 0:
             features["core_memory_ratio"] = hw.get("num_cores", 0) / hw.get("memory_gb", 1)
     
-    if "programming_details" in data:  # Halide
+    if "programming_details" in data:
         nodes = data["programming_details"]["Nodes"]
         features["num_computations"] = len(nodes)
         op_counts = Counter()
@@ -108,14 +104,14 @@ def extract_important_features(data):
         for op, count in op_counts.items():
             features[f"op_{op}"] = count
         features["num_edges"] = len(data["programming_details"]["Edges"])
-    elif "program_annotation" in data:  # Tiramisu
+    elif "program_annotation" in data:
         comps = data["program_annotation"]["computations"]
         features["num_computations"] = len(comps)
         features["num_iterators"] = len(data["program_annotation"]["iterators"])
         reductions = sum(1 for c in comps.values() if c["comp_is_reduction"])
         features["num_reductions"] = reductions
     
-    if "scheduling_data" in data:  # Halide
+    if "scheduling_data" in data:
         sched = data["scheduling_data"]
         for item in sched[:-1]:
             sched_feat = item["Details"]["scheduling_feature"]
@@ -123,7 +119,7 @@ def extract_important_features(data):
             features["outer_parallelism"] = sched_feat.get("outer_parallelism", 0)
             features["vector_size"] = sched_feat.get("vector_size", 0)
             features["unrolled_loop_extent"] = sched_feat.get("unrolled_loop_extent", 0)
-    elif "schedule_details" in data:  # Tiramisu
+    elif "schedule_details" in data:
         sched = data["schedule_details"]
         tiling_total = 0
         unroll_total = 0
@@ -138,10 +134,8 @@ def extract_important_features(data):
         features["total_tiling"] = tiling_total
         features["total_unrolling"] = unroll_total
         features["parallel_count"] = parallel_count
-    
     return features
 
-# Dataset class
 class EnhancedScheduleDataset(Dataset):
     def __init__(self, json_data_list, targets=None, feature_scaler=None, target_scaler=None, 
                  train=True, feature_selector=None, k_best_features=150):
@@ -155,18 +149,18 @@ class EnhancedScheduleDataset(Dataset):
             combined_features = {**flat_features, **direct_features}
             all_features.append(combined_features)
         
-        print("Creating feature matrix...")
         self.feature_names = sorted(set().union(*[set(f.keys()) for f in all_features]))
         print(f"Total features extracted: {len(self.feature_names)}")
         
         X = np.zeros((len(all_features), len(self.feature_names)))
         for i, features in enumerate(all_features):
             for j, name in enumerate(self.feature_names):
-                X[i, j] = features.get(name, 0.0)
+                val = features.get(name, 0.0)
+                X[i, j] = val if not np.isnan(val) and not np.isinf(val) else 0.0
         
         if train and targets is not None:
             print("Performing feature selection...")
-            self.feature_selector = SelectKBest(f_regression, k=k_best_features)
+            self.feature_selector = SelectKBest(f_regression, k=min(k_best_features, X.shape[1]))
             X = self.feature_selector.fit_transform(X, targets)
             selected_indices = self.feature_selector.get_support(indices=True)
             self.selected_feature_names = [self.feature_names[i] for i in selected_indices]
@@ -189,7 +183,8 @@ class EnhancedScheduleDataset(Dataset):
         if targets is not None:
             if train:
                 self.target_scaler = PowerTransformer(method='yeo-johnson')
-                self.y = self.target_scaler.fit_transform(np.array(targets).reshape(-1, 1)).flatten()
+                targets_array = np.array(targets).reshape(-1, 1)
+                self.y = self.target_scaler.fit_transform(targets_array).flatten()
             else:
                 self.y = target_scaler.transform(np.array(targets).reshape(-1, 1)).flatten()
                 self.target_scaler = target_scaler
@@ -206,11 +201,11 @@ class EnhancedScheduleDataset(Dataset):
             return features, self.targets[idx]
         return features
 
-# Model with residual connections
 class ImprovedExecutionTimePredictor(nn.Module):
     def __init__(self, input_size, hidden_sizes=[512, 256, 128, 64], dropout=0.3):
         super(ImprovedExecutionTimePredictor, self).__init__()
         self.input_layer = nn.Linear(input_size, hidden_sizes[0])
+        nn.init.kaiming_normal_(self.input_layer.weight, nonlinearity='leaky_relu')
         self.batch_norm_input = nn.BatchNorm1d(hidden_sizes[0])
         
         self.hidden_layers = nn.ModuleList()
@@ -219,7 +214,9 @@ class ImprovedExecutionTimePredictor(nn.Module):
         self.shortcuts = nn.ModuleList()
         
         for i in range(1, len(hidden_sizes)):
-            self.hidden_layers.append(nn.Linear(hidden_sizes[i-1], hidden_sizes[i]))
+            layer = nn.Linear(hidden_sizes[i-1], hidden_sizes[i])
+            nn.init.kaiming_normal_(layer.weight, nonlinearity='leaky_relu')
+            self.hidden_layers.append(layer)
             self.batch_norms.append(nn.BatchNorm1d(hidden_sizes[i]))
             self.dropouts.append(nn.Dropout(dropout))
             if hidden_sizes[i-1] != hidden_sizes[i]:
@@ -228,6 +225,7 @@ class ImprovedExecutionTimePredictor(nn.Module):
                 self.shortcuts.append(nn.Identity())
         
         self.output_layer = nn.Linear(hidden_sizes[-1], 1)
+        nn.init.kaiming_normal_(self.output_layer.weight, nonlinearity='linear')
         self.relu = nn.LeakyReLU(0.1)
     
     def forward(self, x):
@@ -245,7 +243,6 @@ class ImprovedExecutionTimePredictor(nn.Module):
         
         return self.output_layer(x)
 
-# Load data
 def load_data(folder_path):
     all_json_data = []
     all_targets = []
@@ -262,7 +259,7 @@ def load_data(folder_path):
                 with open(file_path, 'r') as f:
                     data = json.load(f)
                 target = extract_target(data)
-                if target is not None and target > 0:
+                if target is not None and target > 0 and not np.isnan(target) and not np.isinf(target):
                     all_json_data.append(data)
                     all_targets.append(target)
             except Exception as e:
@@ -283,7 +280,6 @@ def load_data(folder_path):
         return filtered_json_data, filtered_targets
     return all_json_data, all_targets
 
-# Training function
 def train_model(model, train_loader, val_loader, criterion, num_epochs=100, patience=15):
     optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.OneCycleLR(
@@ -296,6 +292,7 @@ def train_model(model, train_loader, val_loader, criterion, num_epochs=100, pati
     val_losses = []
     best_val_loss = float('inf')
     patience_counter = 0
+    model_saved = False
     
     print(f"Starting training for {num_epochs} epochs...")
     for epoch in range(num_epochs):
@@ -307,18 +304,20 @@ def train_model(model, train_loader, val_loader, criterion, num_epochs=100, pati
                 with torch.cuda.amp.autocast():
                     outputs = model(X_batch)
                     loss = criterion(outputs.squeeze(), y_batch)
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                scaler.step(optimizer)
-                scaler.update()
+                if not torch.isnan(loss) and not torch.isinf(loss):
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
             else:
                 outputs = model(X_batch)
                 loss = criterion(outputs.squeeze(), y_batch)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
-            epoch_train_loss += loss.item()
+                if not torch.isnan(loss) and not torch.isinf(loss):
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    optimizer.step()
+            epoch_train_loss += loss.item() if not torch.isnan(loss) else 0
             scheduler.step()
         
         avg_train_loss = epoch_train_loss / len(train_loader)
@@ -330,25 +329,30 @@ def train_model(model, train_loader, val_loader, criterion, num_epochs=100, pati
             for X_batch, y_batch in val_loader:
                 outputs = model(X_batch)
                 loss = criterion(outputs.squeeze(), y_batch)
-                epoch_val_loss += loss.item()
+                epoch_val_loss += loss.item() if not torch.isnan(loss) else 0
         
         avg_val_loss = epoch_val_loss / len(val_loader)
         val_losses.append(avg_val_loss)
         
         print(f"Epoch {epoch+1}/{num_epochs} - Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}, LR: {optimizer.param_groups[0]['lr']:.6f}")
         
-        if avg_val_loss < best_val_loss:
+        if not np.isnan(avg_val_loss) and not np.isinf(avg_val_loss) and avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             patience_counter = 0
             print(f"Saving best model with validation loss: {best_val_loss:.6f}")
             torch.save(model.state_dict(), f'best_model_{id(model)}.pth')
+            model_saved = True
         else:
             patience_counter += 1
             if patience_counter >= patience:
                 print(f"Early stopping at epoch {epoch+1}")
                 break
     
-    model.load_state_dict(torch.load(f'best_model_{id(model)}.pth'))
+    if model_saved:
+        model.load_state_dict(torch.load(f'best_model_{id(model)}.pth'))
+    else:
+        print("No valid model saved due to NaN or inf losses. Using last model state.")
+    
     plt.figure(figsize=(10, 5))
     plt.plot(train_losses, label='Training Loss')
     plt.plot(val_losses, label='Validation Loss')
@@ -361,7 +365,6 @@ def train_model(model, train_loader, val_loader, criterion, num_epochs=100, pati
     
     return model, train_losses, val_losses
 
-# Evaluation function
 def evaluate_model(model, test_dataset, target_scaler=None, num_samples=None):
     model.eval()
     if num_samples is None or num_samples > len(test_dataset):
@@ -410,13 +413,11 @@ def evaluate_model(model, test_dataset, target_scaler=None, num_samples=None):
     metrics = {'MSE': mse, 'RMSE': rmse, 'MAE': mae, 'MAPE': mape, 'R2': r2}
     return sample_results, metrics, metrics_by_range, predictions, true_values
 
-# Feature importance analysis
 def analyze_feature_importance(model, feature_names):
     weights = model.input_layer.weight.data.abs().mean(dim=0).cpu().numpy()
     importance = {name: weight for name, weight in zip(feature_names, weights)}
     return sorted(importance.items(), key=lambda x: x[1], reverse=True)
 
-# Ensemble class
 class ExecutionTimeEnsemble:
     def __init__(self, models, feature_scaler, target_scaler):
         self.models = models
@@ -434,14 +435,11 @@ class ExecutionTimeEnsemble:
         avg_pred = np.mean(predictions, axis=0)
         return self.target_scaler.inverse_transform(avg_pred)
 
-# Main execution
 def main():
-    # Hyperparameters
     batch_size = 64
     num_epochs = 300
     
-    # Load data
-    folder_path = 'synthetic_data'  # Adjust to your data path
+    folder_path = 'synthetic_data'
     print("Loading data...")
     all_json_data, all_targets = load_data(folder_path)
     
@@ -451,7 +449,6 @@ def main():
     
     print(f"Loaded {len(all_json_data)} samples.")
     
-    # Plot target distribution
     plt.figure(figsize=(10, 5))
     plt.hist(all_targets, bins=50)
     plt.xlabel('Execution Time (ms)')
@@ -468,7 +465,6 @@ def main():
     plt.savefig('log_target_distribution.png')
     plt.close()
     
-    # Stratified split with corrected data_ranges computation
     time_ranges = [0, 100, 1000, 10000, float('inf')]
     range_labels = ['very_short', 'short', 'medium', 'long']
     data_ranges = [next(label for label, upper in zip(range_labels, time_ranges[1:]) if target < upper)
@@ -485,7 +481,6 @@ def main():
     print(f"Validation set: {len(val_data)} samples")
     print(f"Test set: {len(test_data)} samples")
     
-    # Create datasets
     print("Creating datasets...")
     train_dataset = EnhancedScheduleDataset(train_data, train_targets, train=True, k_best_features=150)
     feature_scaler = train_dataset.feature_scaler
@@ -503,7 +498,6 @@ def main():
     input_size = train_dataset.X.shape[1]
     print(f"Input dimension after feature selection: {input_size}")
     
-    # Train ensemble of models
     models = []
     for i in range(3):
         hidden_sizes_options = [[512, 256, 128, 64], [384, 256, 128, 64], [512, 384, 256, 128, 64]]
@@ -521,21 +515,17 @@ def main():
         model, _, _ = train_model(model, train_loader, val_loader, criterion, num_epochs=num_epochs, patience=20)
         models.append(model)
     
-    # Create ensemble
     ensemble = ExecutionTimeEnsemble(models, feature_scaler, target_scaler)
     
-    # Evaluate on test set
     print("\nEvaluating ensemble on test set...")
     sample_results, metrics, metrics_by_range, predictions, true_values = evaluate_model(
         models[0], test_dataset, target_scaler=target_scaler)
     
-    # Ensemble predictions
     ensemble_preds = ensemble.predict(test_dataset.X)
     ensemble_mae = mean_absolute_error(true_values, ensemble_preds)
     ensemble_rmse = np.sqrt(mean_squared_error(true_values, ensemble_preds))
     ensemble_r2 = r2_score(true_values, ensemble_preds)
     
-    # Print results
     print("\nSample Predictions (First Model):")
     for result in sample_results:
         print(f"Predicted: {result['predicted']:.2f}ms, True: {result['true']:.2f}ms, "
@@ -557,13 +547,11 @@ def main():
     print(f"RMSE: {ensemble_rmse:.4f}")
     print(f"R2: {ensemble_r2:.4f}")
     
-    # Feature importance
     print("\nTop 10 Feature Importances (First Model):")
     importance = analyze_feature_importance(models[0], train_dataset.selected_feature_names)
     for name, weight in importance[:10]:
         print(f"{name}: {weight:.6f}")
     
-    # Plot predictions vs true values
     plt.figure(figsize=(10, 5))
     plt.scatter(true_values, predictions, alpha=0.5, label='First Model')
     plt.scatter(true_values, ensemble_preds, alpha=0.5, label='Ensemble')
