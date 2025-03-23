@@ -51,26 +51,23 @@ def extract_best_schedule_from_list(schedules_list):
         return None, None
     
     best_schedule = None
-    best_time = None
+    best_time = float('inf')
     
     for schedule_entry in schedules_list:
-        # Skip metadata entries
-        if 'fusions' in schedule_entry or 'sched_str' in schedule_entry or 'tree_structure' in schedule_entry:
-            continue
-        
-        # Look for execution time in the schedule entry
-        # Assuming 'evaluation' holds the execution time; adjust key if different
-        for comp_name, comp_schedule in schedule_entry.items():
-            if comp_name in ['fusions', 'sched_str', 'tree_structure', 'legality_check', 'exploration_method']:
-                continue
-            execution_time = comp_schedule.get('evaluation', None)
-            if execution_time is not None and isinstance(execution_time, (int, float)) and execution_time != float('inf'):
-                if best_time is None or execution_time < best_time:
-                    best_time = execution_time
-                    best_schedule = comp_schedule
+        if 'execution_times' in schedule_entry:
+            times = schedule_entry['execution_times']
+            if times and isinstance(times, list):
+                valid_times = [t for t in times if isinstance(t, (int, float)) and t != float('inf')]
+                if valid_times:
+                    avg_time = np.mean(valid_times)
+                    if avg_time < best_time:
+                        best_time = avg_time
+                        best_schedule = schedule_entry
     
-    if best_time is None:
-        print(f"Warning: No valid execution time found in schedules_list: {schedules_list[:1]}")  # Show first entry for debug
+    if best_time == float('inf'):
+        best_time = None
+        print(f"Warning: No valid execution time found in schedules_list")
+    
     return best_schedule, best_time
 
 def extract_access_patterns(accesses):
@@ -116,6 +113,9 @@ def flatten_expression(expr):
 
 def extract_computation_features(computation):
     """Extract features from a computation."""
+    if not computation:
+        return [0] * 100
+    
     features = []
     features.append(computation.get('absolute_order', 0))
     features.append(1 if computation.get('comp_is_reduction', False) else 0)
@@ -133,6 +133,11 @@ def extract_computation_features(computation):
     features.extend(access_pattern_features[:60])
     expr_features = flatten_expression(computation.get('expression_representation', {}))
     features.extend(expr_features)
+    
+    features = features[:100]
+    while len(features) < 100:
+        features.append(0)
+    
     return features
 
 def extract_schedule_features(schedule):
@@ -160,6 +165,8 @@ def extract_schedule_features(schedule):
         dim_encoding = [0] * 5
         if isinstance(parallelized_dim, int) and 0 <= parallelized_dim < 5:
             dim_encoding[parallelized_dim] = 1
+        elif isinstance(parallelized_dim, str) and parallelized_dim in ['i0', 'i1', 'i2', 'i3', 'i4']:
+            dim_encoding[int(parallelized_dim[1])] = 1
         features.extend(dim_encoding)
     else:
         features.extend([0] * 5)
@@ -172,6 +179,9 @@ def extract_schedule_features(schedule):
 
 def extract_loop_features(loop_node, iterators_info):
     """Extract features from a loop node."""
+    if not loop_node or not iterators_info:
+        return [0] * 5
+    
     loop_name = loop_node.get('loop_name', '')
     iterator_info = iterators_info.get(loop_name, {})
     features = []
@@ -183,9 +193,9 @@ def extract_loop_features(loop_node, iterators_info):
         upper_bound = -1
     features.append(lower_bound)
     features.append(upper_bound)
-    parent = iterator_info.get('parent', None)
+    parent = iterator_info.get('parent_iterator', None)
     features.append(1 if parent else 0)
-    children = iterator_info.get('children', [])
+    children = iterator_info.get('child_iterators', [])
     features.append(len(children))
     computations = loop_node.get('computations_list', [])
     features.append(len(computations))
@@ -203,8 +213,7 @@ def build_tree_structure(node, iterators_info, computations_info, schedules_info
             schedule_features = extract_schedule_features(schedules_info.get(comp_name, {}))
             computation_features.append(comp_features + schedule_features)
     while len(computation_features) < MAX_COMPUTATIONS_PER_NODE:
-        computation_features.append([0] * (len(extract_computation_features({})) + 
-                                          len(extract_schedule_features({}))))
+        computation_features.append([0] * (100 + 20))
     computation_features = computation_features[:MAX_COMPUTATIONS_PER_NODE]
     children = []
     for child in node.get('child_list', [])[:MAX_CHILDREN]:
@@ -222,41 +231,49 @@ def build_tree_structure(node, iterators_info, computations_info, schedules_info
 
 def preprocess_tiramisu_program(program):
     """Preprocess a single Tiramisu program."""
+    file_path = program.get('file_path', 'unknown')
+    
     annotation = program.get('program_annotation', {})
-    iterators_info = {}
-    for it_name, it_info in annotation.get('iterators', {}).items():
-        iterators_info[it_name] = {
-            'lower_bound': it_info.get('lower_bound', 0),
-            'upper_bound': it_info.get('upper_bound', 0),
-            'parent': it_info.get('parent_iterator', None),
-            'children': it_info.get('child_iterators', [])
-        }
+    if not annotation:
+        print(f"Warning: No program annotation found in {file_path}")
+    
+    iterators_info = annotation.get('iterators', {})
     computations_info = annotation.get('computations', {})
-    schedules_info = {}
+    
     schedules_list = program.get('schedules_list', [])
+    if not schedules_list:
+        print(f"Warning: No schedules found in {file_path}")
+        return {
+            'tree_structure': [],
+            'execution_time': None,
+            'best_schedule': None,
+            'file_path': file_path
+        }
+    
+    schedules_info = {}
     for schedule_entry in schedules_list:
+        if not isinstance(schedule_entry, dict):
+            continue
         for comp_name, comp_schedule in schedule_entry.items():
             if comp_name not in ['fusions', 'sched_str', 'tree_structure', 'legality_check', 'exploration_method']:
                 schedules_info[comp_name] = comp_schedule
     
-    # Extract tree structure from schedules_list
     tree_roots = []
     for schedule_entry in schedules_list:
-        if 'tree_structure' in schedule_entry and 'roots' in schedule_entry['tree_structure']:
+        if isinstance(schedule_entry, dict) and 'tree_structure' in schedule_entry and 'roots' in schedule_entry['tree_structure']:
             tree_roots = schedule_entry['tree_structure']['roots']
             break
+    
+    if not tree_roots:
+        print(f"Warning: No tree structure found in {file_path}")
+    
     tree_structure = []
     for root in tree_roots:
         tree_node = build_tree_structure(root, iterators_info, computations_info, schedules_info)
         if tree_node:
             tree_structure.append(tree_node)
     
-    # Get best schedule and execution time from schedules_list
     best_schedule, execution_time = extract_best_schedule_from_list(schedules_list)
-    
-    file_path = program.get('file_path', 'unknown')
-    if execution_time is None:
-        print(f"Warning: No valid execution time found in {file_path}")
     
     return {
         'tree_structure': tree_structure,
@@ -317,26 +334,30 @@ class RecursiveTreeLSTM(nn.Module):
         super(RecursiveTreeLSTM, self).__init__()
         self.hidden_size = hidden_size
         self.loop_embedding = nn.Linear(5, hidden_size // 4)
-        comp_sched_feature_size = len(extract_computation_features({})) + len(extract_schedule_features({}))
+        comp_sched_feature_size = 100 + 20
         self.comp_embedding = nn.Linear(comp_sched_feature_size, hidden_size // 4)
         self.cell = TreeLSTMCell(hidden_size, hidden_size)
     
     def forward(self, tree_node):
         if tree_node is None:
             return (torch.zeros(1, self.hidden_size), torch.zeros(1, self.hidden_size))
+        
         child_h, child_c = [], []
         for child in tree_node['children']:
             if child is not None:
                 h_k, c_k = self.forward(child)
                 child_h.append(h_k)
                 child_c.append(c_k)
+        
         loop_features = torch.tensor(tree_node['loop_features'], dtype=torch.float32).unsqueeze(0)
         loop_embed = self.loop_embedding(loop_features)
+        
         comp_embeds = []
         for comp_features in tree_node['computation_features']:
             comp_tensor = torch.tensor(comp_features, dtype=torch.float32).unsqueeze(0)
             comp_embed = self.comp_embedding(comp_tensor)
             comp_embeds.append(comp_embed)
+        
         comp_combined = torch.mean(torch.stack(comp_embeds), dim=0) if comp_embeds else torch.zeros(1, self.hidden_size // 4)
         padding = torch.zeros(1, self.hidden_size // 2)
         x = torch.cat([loop_embed, comp_combined, padding], dim=1)
@@ -362,12 +383,17 @@ class TiramisuCostModel(nn.Module):
         self.fc2 = nn.Linear(hidden_size, 1)
     
     def forward(self, tree_structure):
+        if not tree_structure:
+            return torch.tensor([[0.0]])
+        
         tree_outputs = []
         for tree in tree_structure:
             if tree is not None:
                 h, _ = self.tree_lstm(tree)
                 tree_outputs.append(h)
+        
         tree_encoding = torch.mean(torch.stack(tree_outputs), dim=0) if tree_outputs else torch.zeros(1, self.hidden_size)
+        
         seq_features = []
         for tree in tree_structure:
             if tree is not None:
@@ -375,16 +401,18 @@ class TiramisuCostModel(nn.Module):
                 for node in seq_nodes:
                     loop_features = torch.tensor(node['loop_features'], dtype=torch.float32)
                     comp_tensors = [torch.tensor(comp, dtype=torch.float32) for comp in node['computation_features']]
-                    comp_combined = torch.mean(torch.stack(comp_tensors), dim=0) if comp_tensors else torch.zeros(len(extract_computation_features({})) + len(extract_schedule_features({})))
+                    comp_combined = torch.mean(torch.stack(comp_tensors), dim=0) if comp_tensors else torch.zeros(120)
                     depth = torch.tensor([node['depth']], dtype=torch.float32)
                     node_features = torch.cat([loop_features, comp_combined, depth])
                     seq_features.append(node_features)
+        
         if seq_features:
             seq_tensor = torch.stack(seq_features).unsqueeze(0)
             _, (h_n, _) = self.seq_lstm(seq_tensor)
             seq_encoding = h_n.squeeze(0)
         else:
             seq_encoding = torch.zeros(1, self.hidden_size)
+        
         combined = torch.cat([tree_encoding, seq_encoding], dim=1)
         hidden = F.relu(self.fc1(combined))
         execution_time = self.fc2(hidden)
@@ -396,7 +424,8 @@ class TiramisuCostModel(nn.Module):
 
 class TiramisuDataset(Dataset):
     def __init__(self, preprocessed_programs):
-        self.programs = preprocessed_programs
+        self.programs = [p for p in preprocessed_programs if p['execution_time'] is not None]
+        print(f"Created dataset with {len(self.programs)} valid programs (filtered out {len(preprocessed_programs) - len(self.programs)} with None execution times)")
     
     def __len__(self):
         return len(self.programs)
@@ -410,7 +439,13 @@ class TiramisuDataset(Dataset):
         }
 
 def collate_fn(batch):
-    return batch
+    filtered_batch = [item for item in batch if item['execution_time'] is not None]
+    if len(filtered_batch) < len(batch):
+        print(f"Warning: Filtered out {len(batch) - len(filtered_batch)} items with None execution times in batch")
+    if not filtered_batch:
+        print("Warning: Entire batch had None execution times")
+        return []
+    return filtered_batch
 
 ###########################################
 # Training and Evaluation
@@ -418,6 +453,8 @@ def collate_fn(batch):
 
 def train_tiramisu_model(model, train_loader, val_loader, num_epochs=NUM_EPOCHS, lr=LEARNING_RATE):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    
     model = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     criterion = nn.MSELoss()
@@ -428,41 +465,89 @@ def train_tiramisu_model(model, train_loader, val_loader, num_epochs=NUM_EPOCHS,
     for epoch in range(num_epochs):
         model.train()
         epoch_loss = 0
+        batch_count = 0
+        
         for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} (Training)"):
+            if not batch:
+                continue
+            
             optimizer.zero_grad()
             batch_loss = 0
+            batch_item_count = 0
+            
             for item in batch:
-                tree_structure = item['tree_structure']
-                true_time = torch.tensor(item['execution_time'], dtype=torch.float32).to(device)
-                pred_time = model(tree_structure).squeeze()
-                loss = criterion(pred_time, true_time)
-                batch_loss += loss
-            batch_loss /= len(batch)
-            batch_loss.backward()
-            optimizer.step()
-            epoch_loss += batch_loss.item()
-        avg_train_loss = epoch_loss / len(train_loader)
-        train_losses.append(avg_train_loss)
-        
-        model.eval()
-        val_loss = 0
-        with torch.no_grad():
-            for batch in tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} (Validation)"):
-                batch_loss = 0
-                for item in batch:
+                try:
                     tree_structure = item['tree_structure']
+                    if not tree_structure:
+                        continue
+                    
                     true_time = torch.tensor(item['execution_time'], dtype=torch.float32).to(device)
                     pred_time = model(tree_structure).squeeze()
                     loss = criterion(pred_time, true_time)
                     batch_loss += loss
-                batch_loss /= len(batch)
-                val_loss += batch_loss.item()
-        avg_val_loss = val_loss / len(val_loader)
-        val_losses.append(avg_val_loss)
+                    batch_item_count += 1
+                except Exception as e:
+                    print(f"Error processing training item: {str(e)}")
+                    print(f"Item path: {item['file_path']}")
+                    continue
+            
+            if batch_item_count > 0:
+                batch_loss /= batch_item_count
+                batch_loss.backward()
+                optimizer.step()
+                epoch_loss += batch_loss.item()
+                batch_count += 1
         
-        print(f"Epoch {epoch+1}/{num_epochs}, Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}")
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
+        if batch_count > 0:
+            avg_train_loss = epoch_loss / batch_count
+            train_losses.append(avg_train_loss)
+        else:
+            print("Warning: No valid batches in training epoch")
+            train_losses.append(float('inf'))
+        
+        model.eval()
+        val_loss = 0
+        val_batch_count = 0
+        
+        with torch.no_grad():
+            for batch in tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} (Validation)"):
+                if not batch:
+                    continue
+                
+                batch_loss = 0
+                batch_item_count = 0
+                
+                for item in batch:
+                    try:
+                        tree_structure = item['tree_structure']
+                        if not tree_structure:
+                            continue
+                        
+                        true_time = torch.tensor(item['execution_time'], dtype=torch.float32).to(device)
+                        pred_time = model(tree_structure).squeeze()
+                        loss = criterion(pred_time, true_time)
+                        batch_loss += loss
+                        batch_item_count += 1
+                    except Exception as e:
+                        print(f"Error processing validation item: {str(e)}")
+                        continue
+                
+                if batch_item_count > 0:
+                    batch_loss /= batch_item_count
+                    val_loss += batch_loss.item()
+                    val_batch_count += 1
+        
+        if val_batch_count > 0:
+            avg_val_loss = val_loss / val_batch_count
+            val_losses.append(avg_val_loss)
+        else:
+            print("Warning: No valid batches in validation")
+            val_losses.append(float('inf'))
+        
+        print(f"Epoch {epoch+1}/{num_epochs}, Train Loss: {train_losses[-1]:.6f}, Val Loss: {val_losses[-1]:.6f}")
+        
+        if val_losses[-1] < best_val_loss:
+            best_val_loss = val_losses[-1]
             torch.save(model.state_dict(), "best_tiramisu_model.pth")
             print(f"Saved best model with validation loss: {best_val_loss:.6f}")
     
@@ -485,92 +570,116 @@ def evaluate_model(model, test_loader):
     test_loss = 0
     true_times = []
     pred_times = []
+    batch_count = 0
+    
     with torch.no_grad():
         for batch in tqdm(test_loader, desc="Testing"):
+            if not batch:
+                continue
+            
             batch_loss = 0
+            batch_item_count = 0
+            
             for item in batch:
-                tree_structure = item['tree_structure']
-                true_time = torch.tensor(item['execution_time'], dtype=torch.float32).to(device)
-                pred_time = model(tree_structure).squeeze()
-                loss = criterion(pred_time, true_time)
-                batch_loss += loss
-                true_times.append(true_time.item())
-                pred_times.append(pred_time.item())
-            batch_loss /= len(batch)
-            test_loss += batch_loss.item()
-    avg_test_loss = test_loss / len(test_loader)
-    true_times = np.array(true_times)
-    pred_times = np.array(pred_times)
-    mae = np.mean(np.abs(true_times - pred_times))
-    mape = np.mean(np.abs((true_times - pred_times) / true_times)) * 100
-    ss_tot = np.sum((true_times - np.mean(true_times)) ** 2)
-    ss_res = np.sum((true_times - pred_times) ** 2)
-    r2 = 1 - (ss_res / ss_tot)
-    print(f"Test Loss (MSE): {avg_test_loss:.6f}")
-    print(f"Mean Absolute Error: {mae:.6f}")
-    print(f"Mean Absolute Percentage Error: {mape:.2f}%")
-    print(f"R^2 Score: {r2:.4f}")
-    plt.figure(figsize=(10, 6))
-    plt.scatter(true_times, pred_times, alpha=0.5)
-    plt.plot([min(true_times), max(true_times)], [min(true_times), max(true_times)], 'r--', label='Perfect Prediction')
-    plt.xlabel('True Execution Time')
-    plt.ylabel('Predicted Execution Time')
-    plt.title('Predicted vs Actual Execution Times')
-    plt.legend()
-    plt.savefig('prediction_vs_actual.png')
-    plt.close()
-    return avg_test_loss, mae, mape, r2
+                try:
+                    tree_structure = item['tree_structure']
+                    if not tree_structure:
+                        continue
+                    
+                    true_time = torch.tensor(item['execution_time'], dtype=torch.float32).to(device)
+                    pred_time = model(tree_structure).squeeze()
+                    loss = criterion(pred_time, true_time)
+                    batch_loss += loss
+                    batch_item_count += 1
+                    
+                    true_times.append(true_time.item())
+                    pred_times.append(pred_time.item())
+                except Exception as e:
+                    print(f"Error processing test item: {str(e)}")
+                    continue
+            
+            if batch_item_count > 0:
+                batch_loss /= batch_item_count
+                test_loss += batch_loss.item()
+                batch_count += 1
+    
+    if batch_count > 0:
+        avg_test_loss = test_loss / batch_count
+    else:
+        print("Warning: No valid batches in testing")
+        avg_test_loss = float('inf')
+    
+    if true_times and pred_times:
+        true_times = np.array(true_times)
+        pred_times = np.array(pred_times)
+        mae = np.mean(np.abs(true_times - pred_times))
+        mape = np.mean(np.abs((true_times - pred_times) / true_times)) * 100  # Percentage
+        print(f"Test Loss (MSE): {avg_test_loss:.6f}")
+        print(f"Mean Absolute Error (MAE): {mae:.6f}")
+        print(f"Mean Absolute Percentage Error (MAPE): {mape:.2f}%")
+        
+        plt.figure(figsize=(10, 5))
+        plt.scatter(true_times, pred_times, alpha=0.5)
+        plt.plot([min(true_times), max(true_times)], [min(true_times), max(true_times)], 'r--')
+        plt.xlabel('True Execution Time')
+        plt.ylabel('Predicted Execution Time')
+        plt.title('True vs Predicted Execution Times')
+        plt.savefig('prediction_scatter.png')
+        plt.close()
+    else:
+        print("Warning: No valid predictions made during evaluation")
+        mae, mape = float('inf'), float('inf')
+    
+    return avg_test_loss, mae, mape
 
-# Main execution block
+###########################################
+# Main Execution
+###########################################
+
 if __name__ == "__main__":
-    folder_path = "./Tiramisu"
+    # Load programs from a directory (adjust path as needed)
+    folder_path = "./tiramisu_programs"  # Replace with your directory path
     if not os.path.exists(folder_path):
-        print(f"Error: The folder path '{folder_path}' does not exist.")
-        exit(1)
-
-    programs = load_tiramisu_programs(folder_path)
-    if not programs:
-        print("Error: No Tiramisu programs loaded. Check the 'Tiramisu' folder for valid JSON files.")
+        print(f"Directory {folder_path} does not exist. Please provide a valid path.")
         exit(1)
     
-    preprocessed_programs = []
-    for program in programs:
-        preprocessed = preprocess_tiramisu_program(program)
-        if preprocessed['execution_time'] is not None and isinstance(preprocessed['execution_time'], (int, float)) and preprocessed['execution_time'] != float('inf'):
-            preprocessed_programs.append(preprocessed)
-    
-    print(f"Preprocessed {len(preprocessed_programs)} programs with valid execution times")
-    if not preprocessed_programs:
-        print("Error: No programs with valid execution times found in 'schedules_list'. Check the JSON structure.")
-        print("Sample a few JSON files to verify their 'schedules_list':")
-        for i, program in enumerate(programs[:3]):
-            print(f"Program {i+1} from {program['file_path']}:")
-            print(f"  Schedules list: {program.get('schedules_list', 'Missing')[:1]}")  # Show first entry
+    raw_programs = load_tiramisu_programs(folder_path)
+    if not raw_programs:
+        print("No programs loaded. Exiting.")
         exit(1)
-
-    train_val_programs, test_programs = train_test_split(preprocessed_programs, test_size=0.2, random_state=42)
-    train_programs, val_programs = train_test_split(train_val_programs, test_size=0.25, random_state=42)
-
-    print(f"Training set: {len(train_programs)} programs")
-    print(f"Validation set: {len(val_programs)} programs")
-    print(f"Test set: {len(test_programs)} programs")
-
+    
+    # Preprocess programs
+    preprocessed_programs = [preprocess_tiramisu_program(p) for p in raw_programs]
+    
+    # Split dataset
+    train_programs, temp_programs = train_test_split(preprocessed_programs, test_size=0.3, random_state=42)
+    val_programs, test_programs = train_test_split(temp_programs, test_size=0.5, random_state=42)
+    
+    # Create datasets
     train_dataset = TiramisuDataset(train_programs)
     val_dataset = TiramisuDataset(val_programs)
     test_dataset = TiramisuDataset(test_programs)
-
+    
+    if len(train_dataset) == 0 or len(val_dataset) == 0 or len(test_dataset) == 0:
+        print("One or more datasets are empty after filtering. Exiting.")
+        exit(1)
+    
+    # Create data loaders
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
     test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
-
-    input_size = (len(extract_computation_features({})) + len(extract_schedule_features({})))
+    
+    # Initialize model
+    input_size = HIDDEN_DIM  # Adjusted based on embeddings
     model = TiramisuCostModel(input_size, HIDDEN_DIM)
-
-    print("Starting training...")
-    model, train_losses, val_losses = train_tiramisu_model(model, train_loader, val_loader)
-
-    print("\nEvaluating on test set...")
-    test_loss, mae, mape, r2 = evaluate_model(model, test_loader)
-
-    torch.save(model.state_dict(), "final_tiramisu_model.pth")
-    print("Training and evaluation completed. Final model saved as 'final_tiramisu_model.pth'")
+    
+    # Train model
+    trained_model, train_losses, val_losses = train_tiramisu_model(model, train_loader, val_loader)
+    
+    # Evaluate model
+    test_loss, mae, mape = evaluate_model(trained_model, test_loader)
+    
+    print(f"Final Test Results:")
+    print(f"Test Loss (MSE): {test_loss:.6f}")
+    print(f"Mean Absolute Error (MAE): {mae:.6f}")
+    print(f"Mean Absolute Percentage Error (MAPE): {mape:.2f}%")
