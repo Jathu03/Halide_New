@@ -182,10 +182,10 @@ class HalideDataset(Dataset):
 
         # Dynamically find the root (node with no outgoing edges)
         all_indices = set(range(len(nodes)))
-        root_candidates = all_indices - to_nodes  # Nodes not in any "To" field
+        root_candidates = all_indices - to_nodes
         if not root_candidates:
             raise ValueError("No root node found in the schedule (no node without outgoing edges)")
-        root_idx = max(root_candidates)  # Take the last one as a heuristic (often the final output)
+        root_idx = max(root_candidates)
 
         def build_node(idx):
             return {
@@ -201,7 +201,7 @@ class HalideDataset(Dataset):
         num_comps = len(nodes)
         comps_tensor_first_part = torch.zeros(num_comps, 26)  # 26 scheduling features
         comps_tensor_vectors = torch.zeros(num_comps, 3)     # Load Jacobians (3D)
-        comps_tensor_third_part = torch.zeros(num_comps, 23) # 23 op histogram features
+        comps_tensor_third_part = torch.zeros(num_comps, 24) # 24 op histogram features (corrected from 23)
         
         for i, node in enumerate(nodes):
             name = node["Name"]
@@ -215,7 +215,7 @@ class HalideDataset(Dataset):
                         comps_tensor_vectors[i] = torch.tensor([float(x) for x in jacobians[0].split()][:3])
                     break
             op_hist = [int(x.split()[-1]) for x in node["Details"]["Op histogram"]]
-            comps_tensor_third_part[i] = torch.tensor(op_hist)
+            comps_tensor_third_part[i] = torch.tensor(op_hist[:24])  # Ensure exactly 24 elements
 
         # Loops tensor
         loops_tensor = torch.zeros(num_comps, 8)
@@ -243,6 +243,7 @@ class HalideDataset(Dataset):
             self.scaler.fit(comps_tensor_first_part.numpy())
         comps_tensor_first_part = torch.tensor(self.scaler.transform(comps_tensor_first_part.numpy()))
 
+        # Update input_size based on corrected third_part size
         tree_tensors = (
             tree,
             comps_tensor_first_part.unsqueeze(0),
@@ -307,7 +308,7 @@ def evaluate_model(model, test_loader, device="cuda" if torch.cuda.is_available(
     errors = [abs(pred - actual) / actual * 100 for pred, actual in zip(speedups_pred, speedups_actual)]
     return predictions, actuals, speedups_pred, speedups_actual, errors
 
-# Main Execution (unchanged)
+# Main Execution (updated input_size)
 def main():
     data_dir = "synthetic_data"
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -322,7 +323,8 @@ def main():
     val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
     
-    input_size = 26 + 3 + 23 + 100
+    # Updated input_size: 26 (first_part) + 3 (vectors) + 24 (third_part) + 100 (expr_embed_size)
+    input_size = 26 + 3 + 24 + 100
     model = Model_Recursive_LSTM_v2(input_size=input_size, device=device)
     
     model = train_model(model, train_loader, val_loader)
