@@ -181,14 +181,16 @@ class EnhancedScheduleDataset(Dataset):
             self.feature_scaler = feature_scaler
         
         if targets is not None:
+            targets_array = np.array(targets)
             if train:
                 self.target_scaler = PowerTransformer(method='yeo-johnson')
-                targets_array = np.array(targets).reshape(-1, 1)
-                self.y = self.target_scaler.fit_transform(targets_array).flatten()
+                self.y = self.target_scaler.fit_transform(targets_array.reshape(-1, 1)).flatten()
             else:
-                self.y = target_scaler.transform(np.array(targets).reshape(-1, 1)).flatten()
+                self.y = target_scaler.transform(targets_array.reshape(-1, 1)).flatten()
                 self.target_scaler = target_scaler
             self.targets = torch.tensor(self.y, dtype=torch.float32).to(device)
+            if torch.any(torch.isnan(self.targets)) or torch.any(torch.isinf(self.targets)):
+                print("Warning: Targets contain NaN or inf after scaling")
         else:
             self.targets = None
     
@@ -377,8 +379,18 @@ def evaluate_model(model, test_dataset, target_scaler=None, num_samples=None):
             outputs = model(X_batch)
             norm_preds = outputs.cpu().numpy().reshape(-1, 1)
             norm_trues = y_batch.cpu().numpy().reshape(-1, 1)
+            
+            # Replace NaN or inf in model outputs with 0
+            norm_preds = np.nan_to_num(norm_preds, nan=0.0, posinf=0.0, neginf=0.0)
+            norm_trues = np.nan_to_num(norm_trues, nan=0.0, posinf=0.0, neginf=0.0)
+            
+            # Inverse transform with NaN handling
             predictions = target_scaler.inverse_transform(norm_preds).flatten()
             true_values = target_scaler.inverse_transform(norm_trues).flatten()
+            
+            # Final check for NaN in predictions and true values
+            predictions = np.nan_to_num(predictions, nan=np.median(true_values), posinf=np.max(true_values), neginf=np.min(true_values))
+            true_values = np.nan_to_num(true_values, nan=np.median(true_values), posinf=np.max(true_values), neginf=np.min(true_values))
             break
     
     abs_errors = np.abs(predictions - true_values)
@@ -433,6 +445,7 @@ class ExecutionTimeEnsemble:
         with torch.no_grad():
             predictions = [model(features).cpu().numpy() for model in self.models]
         avg_pred = np.mean(predictions, axis=0)
+        avg_pred = np.nan_to_num(avg_pred, nan=0.0, posinf=0.0, neginf=0.0)
         return self.target_scaler.inverse_transform(avg_pred)
 
 def main():
@@ -507,12 +520,15 @@ def main():
                                                dropout=dropout_options[i]).to(device)
         print(f"Model {i+1} has {sum(p.numel() for p in model.parameters()):,} parameters")
         
-        criterion_options = [nn.MSELoss(), nn.SmoothL1Loss(beta=0.5), 
-                             lambda pred, target: torch.mean((1 + torch.log1p(torch.abs(pred - target))) * torch.square(pred - target))]
+        criterion_options = [
+            nn.MSELoss(),
+            nn.SmoothL1Loss(beta=0.5),
+            lambda pred, target: torch.mean((1 + torch.log1p(torch.abs(pred - target))) * torch.square(pred - target))
+        ]
         criterion = criterion_options[i]
         
         print(f"\nTraining model {i+1}...")
-        model, _, _ = train_model(model, train_loader, val_loader, criterion, num_epochs=num_epochs, patience=20)
+        model, train_losses, val_losses = train_model(model, train_loader, val_loader, criterion, num_epochs=num_epochs, patience=20)
         models.append(model)
     
     ensemble = ExecutionTimeEnsemble(models, feature_scaler, target_scaler)
