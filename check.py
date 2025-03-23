@@ -23,7 +23,6 @@ def flatten_json(data, parent_key='', sep='_'):
             new_key = f"{parent_key}{sep}{i}"
             items.extend(flatten_json(value, new_key, sep=sep))
     else:
-        # Convert value to float if possible, otherwise encode as categorical
         try:
             value = float(data)
         except (ValueError, TypeError):
@@ -67,11 +66,17 @@ class ScheduleDataset(Dataset):
         target = self.targets[idx]
         return sequences, target
 
-# Define Recursive LSTM Model with Embedding
+# Custom collate function for variable-length sequences
+def custom_collate_fn(batch):
+    sequences_list = [item[0] for item in batch]  # List of sequence lists
+    targets = torch.stack([item[1] for item in batch])  # Stack targets
+    return sequences_list, targets
+
+# Define Recursive LSTM Model
 class RecursiveLSTM(nn.Module):
     def __init__(self, input_size, embedding_dim, hidden_size, num_layers, output_size, vocab_size=1000):
         super(RecursiveLSTM, self).__init__()
-        self.embedding = nn.Embedding(vocab_size, embedding_dim)  # For categorical data
+        self.embedding = nn.Embedding(vocab_size, embedding_dim)
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         self.lstm = nn.LSTM(input_size + embedding_dim, hidden_size, num_layers, batch_first=True)
@@ -83,20 +88,24 @@ class RecursiveLSTM(nn.Module):
             c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(device)
             hidden = (h0, c0)
         
-        # Assuming x contains both numerical and categorical data; split not implemented here
-        # For simplicity, treat all as numerical here and skip embedding
+        # Simplified: Treat all as numerical data (no embedding split here)
         out, hidden = self.lstm(x, hidden)
         out = self.fc(out[:, -1, :])  # Take the last output
         return out, hidden
 
-    def process_recursive(self, sequences):
-        outputs = []
-        hidden = None
-        for seq in sequences:
-            seq = seq.unsqueeze(0).to(device)  # [1, seq_len, input_size]
-            out, hidden = self.forward(seq, hidden)
-            outputs.append(out)
-        return torch.mean(torch.stack(outputs), dim=0), hidden  # Average outputs
+    def process_recursive(self, sequences_list):
+        batch_outputs = []
+        for sequences in sequences_list:  # Iterate over batch
+            outputs = []
+            hidden = None
+            for seq in sequences:  # Iterate over sequences in one sample
+                seq = seq.unsqueeze(0).to(device)  # [1, seq_len, input_size]
+                out, hidden = self.forward(seq, hidden)
+                outputs.append(out)
+            # Average outputs for this sample
+            sample_output = torch.mean(torch.stack(outputs), dim=0)
+            batch_outputs.append(sample_output)
+        return torch.stack(batch_outputs), hidden  # Stack batch outputs
 
 # Load and preprocess all data
 def load_synthetic_data(folder_path):
@@ -134,10 +143,10 @@ def train_model(model, train_loader, val_loader, num_epochs=10):
     for epoch in range(num_epochs):
         model.train()
         train_loss = 0
-        for sequences, target in train_loader:
+        for sequences_list, targets in train_loader:
             optimizer.zero_grad()
-            output, _ = model.process_recursive(sequences)
-            loss = criterion(output.squeeze(), target)
+            output, _ = model.process_recursive(sequences_list)
+            loss = criterion(output.squeeze(), targets)
             loss.backward()
             optimizer.step()
             train_loss += loss.item()
@@ -145,9 +154,9 @@ def train_model(model, train_loader, val_loader, num_epochs=10):
         model.eval()
         val_loss = 0
         with torch.no_grad():
-            for sequences, target in val_loader:
-                output, _ = model.process_recursive(sequences)
-                loss = criterion(output.squeeze(), target)
+            for sequences_list, targets in val_loader:
+                output, _ = model.process_recursive(sequences_list)
+                loss = criterion(output.squeeze(), targets)
                 val_loss += loss.item()
         
         print(f"Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss/len(train_loader):.4f}, Val Loss: {val_loss/len(val_loader):.4f}")
@@ -158,7 +167,7 @@ def predict_and_evaluate(model, sequences_list, true_targets, num_samples=10):
     predictions = []
     with torch.no_grad():
         for sequences in sequences_list[:num_samples]:
-            output, _ = model.process_recursive(sequences)
+            output, _ = model.process_recursive([sequences])  # Wrap in list for batch-like processing
             predictions.append(output.item())
     
     true_targets = true_targets[:num_samples]
@@ -190,11 +199,11 @@ def main():
         all_sequences, all_targets, test_size=0.2, random_state=42
     )
     
-    # Create datasets and loaders
+    # Create datasets and loaders with custom collate function
     train_dataset = ScheduleDataset(train_seqs, train_targets)
     test_dataset = ScheduleDataset(test_seqs, test_targets)
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=custom_collate_fn)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=custom_collate_fn)
     
     # Initialize model
     model = RecursiveLSTM(input_size, embedding_dim, hidden_size, num_layers, output_size).to(device)
