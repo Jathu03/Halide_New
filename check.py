@@ -131,21 +131,6 @@ def process_halide_programs(root_dir="synthetic_data"):
     df = pd.DataFrame(dataset)
     return df
 
-def print_dataset_summary(df):
-    """
-    Print summary of the processed dataset.
-    
-    Args:
-        df (DataFrame): Processed dataset
-    """
-    print(f"Total samples: {len(df)}")
-    print(f"Unique programs: {df['program_name'].nunique()}")
-    print(f"Features extracted: {len(df.columns)}")
-    print("\nFeature columns:")
-    print(list(df.columns))
-    print("\nSample data:")
-    print(df.head())
-
 def main():
     try:
         # Process the Halide programs
@@ -155,22 +140,15 @@ def main():
             print("No data processed. Check your synthetic_data folder structure.")
             return
         
-        # Print summary
-        print_dataset_summary(df)
+        # Print basic info
+        print(f"Dataset size: {len(df)} rows, {len(df.columns)} columns")
+        print(f"Total samples: {len(df)}")
+        print(f"Unique programs: {df['program_name'].nunique()}")
         
         # Save to CSV
         output_file = "halide_execution_dataset.csv"
         df.to_csv(output_file, index=False)
-        print(f"\nDataset saved to '{output_file}'")
-        
-        # Basic statistical analysis
-        print("\nExecution time statistics:")
-        print(df['execution_time_ms'].describe())
-        
-        # Correlation with execution time
-        correlations = df.select_dtypes(include=[np.number]).corr()['execution_time_ms'].sort_values(ascending=False)
-        print("\nTop 10 features correlated with execution time:")
-        print(correlations.head(10))
+        print(f"Dataset saved to '{output_file}'")
         
     except Exception as e:
         print(f"Error in main processing: {str(e)}")
