@@ -570,7 +570,7 @@ def main(main_dir):
 
 if __name__ == "__main__":
     # Main directory containing subfolders for each program
-    main_dir = "Output_Programs"
+    main_dir = "synthetic_data"
     
     # Set random seed for reproducibility
     random.seed(42)
