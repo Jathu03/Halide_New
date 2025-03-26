@@ -7,7 +7,6 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 
-# Custom Dataset class
 class HalideDataset(Dataset):
     def __init__(self, X, y):
         self.X = torch.FloatTensor(X)
@@ -19,41 +18,51 @@ class HalideDataset(Dataset):
     def __getitem__(self, idx):
         return self.X[idx], self.y[idx]
 
-# Load and preprocess the dataset
 def load_and_preprocess_data(file_path="halide_execution_dataset.csv"):
-    df = pd.read_csv(file_path)
+    try:
+        df = pd.read_csv(file_path)
+        
+        # Check if execution_time_ms exists and handle missing values
+        if 'execution_time_ms' not in df.columns:
+            raise KeyError("execution_time_ms column not found in CSV")
+        
+        # Remove rows with NaN in execution_time_ms
+        initial_rows = len(df)
+        df = df.dropna(subset=['execution_time_ms'])
+        if len(df) < initial_rows:
+            print(f"Dropped {initial_rows - len(df)} rows due to missing execution time")
+        
+        if len(df) == 0:
+            raise ValueError("No valid data remaining after dropping NaN values")
+            
+        target = df['execution_time_ms'].values
+        features = df.drop(columns=['execution_time_ms', 'file_path'])
+        
+        # Encode categorical variables
+        label_encoders = {}
+        for column in ['program_name', 'schedule_name']:
+            le = LabelEncoder()
+            features[column] = le.fit_transform(features[column])
+            label_encoders[column] = le
+        
+        numerical_features = features.drop(columns=['program_name', 'schedule_name'])
+        scaler = StandardScaler()
+        scaled_numerical = scaler.fit_transform(numerical_features)
+        
+        sequences = []
+        for i in range(len(features)):
+            seq = [
+                features['program_name'].iloc[i],
+                features['schedule_name'].iloc[i]
+            ] + scaled_numerical[i].tolist()
+            sequences.append(seq)
+        
+        X = np.array(sequences, dtype=np.float32)
+        return X, target, label_encoders, scaler, len(sequences[0]), numerical_features.columns
     
-    # Target is already correctly extracted in the first script
-    target = df['execution_time_ms']
-    features = df.drop(columns=['execution_time_ms', 'file_path'])
-    
-    # Encode categorical variables
-    label_encoders = {}
-    for column in ['program_name', 'schedule_name']:
-        le = LabelEncoder()
-        features[column] = le.fit_transform(features[column])
-        label_encoders[column] = le
-    
-    # Numerical features
-    numerical_features = features.drop(columns=['program_name', 'schedule_name'])
-    
-    # Scale numerical features
-    scaler = StandardScaler()
-    scaled_numerical = scaler.fit_transform(numerical_features)
-    
-    # Create sequences
-    sequences = []
-    for i in range(len(features)):
-        seq = [
-            features['program_name'].iloc[i],
-            features['schedule_name'].iloc[i]
-        ] + scaled_numerical[i].tolist()
-        sequences.append(seq)
-    
-    X = np.array(sequences, dtype=np.float32)
-    return X, target.values, label_encoders, scaler, len(sequences[0]), numerical_features.columns
+    except Exception as e:
+        raise Exception(f"Error in data preprocessing: {str(e)}")
 
-# LSTM Model
 class LSTMModel(nn.Module):
     def __init__(self, input_size, vocab_size=100, embedding_dim=32, hidden_size1=64, hidden_size2=32):
         super(LSTMModel, self).__init__()
@@ -65,28 +74,18 @@ class LSTMModel(nn.Module):
         self.relu = nn.ReLU()
         
     def forward(self, x):
-        # Split input into categorical and numerical parts
-        cat_part = x[:, :2].long()  # program_name and schedule_name
+        cat_part = x[:, :2].long()
         num_part = x[:, 2:].float()
-        
-        # Embedding for categorical features
-        embedded = self.embedding(cat_part)  # [batch, 2, embedding_dim]
-        
-        # Combine with numerical features
-        num_part = num_part.unsqueeze(1).expand(-1, 2, -1)  # [batch, 2, num_features]
-        x = torch.cat([embedded, num_part], dim=2)  # [batch, 2, embedding_dim + num_features]
-        
-        # LSTM layers
+        embedded = self.embedding(cat_part)
+        num_part = num_part.unsqueeze(1).expand(-1, 2, -1)
+        x = torch.cat([embedded, num_part], dim=2)
         out, _ = self.lstm1(x)
         out, _ = self.lstm2(out)
-        out = out[:, -1, :]  # Take last output
-        
-        # Dense layers
+        out = out[:, -1, :]
         out = self.relu(self.fc1(out))
         out = self.fc2(out)
         return out
 
-# Calculate error percentage
 def calculate_error_percentage(y_true, y_pred):
     return np.abs((y_true - y_pred) / y_true) * 100
 
@@ -112,7 +111,6 @@ def train_model(model, train_loader, val_loader, epochs=50):
             train_loss += loss.item()
             train_mae += torch.mean(torch.abs(outputs - y_batch)).item()
         
-        # Validation
         model.eval()
         val_loss = 0
         val_mae = 0
@@ -129,20 +127,16 @@ def train_model(model, train_loader, val_loader, epochs=50):
 
 def main():
     try:
-        # Load and preprocess data
         X, y, label_encoders, scaler, input_size, _ = load_and_preprocess_data()
         
-        # Split data
         X_train, X_test, y_train, y_test = train_test_split(
             X, y, test_size=0.2, random_state=42
         )
         
-        # Create validation split from training data
         X_train, X_val, y_train, y_val = train_test_split(
             X_train, y_train, test_size=0.2, random_state=42
         )
         
-        # Create data loaders
         train_dataset = HalideDataset(X_train, y_train)
         val_dataset = HalideDataset(X_val, y_val)
         test_dataset = HalideDataset(X_test, y_test)
@@ -151,18 +145,15 @@ def main():
         val_loader = DataLoader(val_dataset, batch_size=32)
         test_loader = DataLoader(test_dataset, batch_size=32)
         
-        # Initialize model
         vocab_size = max(
             len(label_encoders['program_name'].classes_),
             len(label_encoders['schedule_name'].classes_)
         ) + 1
-        input_size = 32 + (input_size - 2)  # embedding_dim + numerical features
+        input_size = 32 + (input_size - 2)
         model = LSTMModel(input_size, vocab_size)
         
-        # Train model
         train_model(model, train_loader, val_loader)
         
-        # Evaluate on test set
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         model.eval()
         test_mae = 0
@@ -176,12 +167,11 @@ def main():
         
         print(f"\nTest MAE: {test_mae/len(test_loader):.2f} ms")
         
-        # Calculate error percentages for 10 random test samples
         y_pred = np.array(y_pred)
-        indices = np.random.choice(len(y_test), 10, replace=False)
+        indices = np.random.choice(len(y_test), min(10, len(y_test)), replace=False)
         sample_errors = []
         
-        print("\nError percentages for 10 random test samples:")
+        print("\nError percentages for test samples:")
         for idx in indices:
             true_time = y_test[idx]
             pred_time = y_pred[idx]
@@ -192,13 +182,11 @@ def main():
             print(f"  Predicted: {pred_time:.2f} ms")
             print(f"  Error percentage: {error_pct:.2f}%")
         
-        # Overall statistics
         mean_error_pct = np.mean(sample_errors)
         median_error_pct = np.median(sample_errors)
         print(f"\nMean error percentage: {mean_error_pct:.2f}%")
         print(f"Median error percentage: {median_error_pct:.2f}%")
         
-        # Save model
         torch.save(model.state_dict(), 'halide_execution_time_model.pt')
         print("Model saved to 'halide_execution_time_model.pt'")
         
