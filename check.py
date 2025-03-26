@@ -16,11 +16,15 @@ def extract_features_from_json(json_data):
     """
     features = {}
     
-    # Extract execution time
-    for item in json_data['programming_details'].get('Scheduling', []):
-        if item.get('name') == 'total_execution_time_ms':
-            features['execution_time_ms'] = item['value']
+    # Extract execution time from programming_details
+    scheduling_data = json_data['programming_details'].get('Scheduling', [])
+    for item in scheduling_data:
+        if isinstance(item, dict) and item.get('name') == 'total_execution_time_ms':
+            features['execution_time_ms'] = item.get('value', 0.0)
             break
+    # If not found, set default value
+    if 'execution_time_ms' not in features:
+        features['execution_time_ms'] = 0.0
     
     # Extract Edge features
     edges = json_data['programming_details']['Edges']
