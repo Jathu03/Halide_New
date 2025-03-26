@@ -549,6 +549,6 @@ def main(main_dir):
     return model, y_scaler, y_test_actual, y_pred_actual
 
 if __name__ == "__main__":
-    main_dir = "Output_Programs"
+    main_dir = "synthetic_data"
     random.seed(42)
     model, y_scaler, y_test_actual, y_pred_actual = main(main_dir)
