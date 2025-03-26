@@ -23,6 +23,7 @@ class HalideDataset(Dataset):
 def load_and_preprocess_data(file_path="halide_execution_dataset.csv"):
     df = pd.read_csv(file_path)
     
+    # Target is already correctly extracted in the first script
     target = df['execution_time_ms']
     features = df.drop(columns=['execution_time_ms', 'file_path'])
     
