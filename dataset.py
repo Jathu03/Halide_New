@@ -46,13 +46,10 @@ def extract_features(file_path: str) -> Dict:
     exec_time = None
     sched_features = []
     
-    # Check if 'Scheduling' exists and extract data
     if 'Scheduling' in data['programming_details']:
         for sched in data['programming_details']['Scheduling']:
-            # Look for execution time
             if isinstance(sched, dict) and sched.get('name') == 'total_execution_time_ms':
                 exec_time = sched['value']
-            # Look for scheduling features
             elif isinstance(sched, dict) and 'Details' in sched and 'scheduling_feature' in sched['Details']:
                 feat = sched['Details']['scheduling_feature']
                 sched_vec = [
@@ -66,7 +63,6 @@ def extract_features(file_path: str) -> Dict:
                 ]
                 sched_features.append(np.array(sched_vec))
     else:
-        # If 'Scheduling' is missing, log this and search elsewhere in the JSON
         print(f"Warning: 'Scheduling' not found in {file_path}. Searching entire JSON for execution time.")
         def search_dict(d, key):
             if isinstance(d, dict):
@@ -165,5 +161,12 @@ try:
 
     train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
+
+    # Print the size of the dataloaders
+    print(f"Train DataLoader size (number of batches): {len(train_loader)}")
+    print(f"Test DataLoader size (number of batches): {len(test_loader)}")
+    print(f"Total dataset size (number of samples): {len(dataset)}")
+    print(f"Train dataset size: {train_size}, Test dataset size: {test_size}")
+
 except Exception as e:
     print(f"Error creating dataset: {e}")
