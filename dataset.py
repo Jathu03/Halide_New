@@ -5,6 +5,7 @@ from typing import Dict, List
 import re
 from torch.utils.data import Dataset, DataLoader
 import torch
+import tqdm  # For progress bar
 
 def extract_features(file_path: str, debug=False) -> Dict:
     with open(file_path, 'r') as f:
@@ -46,10 +47,13 @@ def extract_features(file_path: str, debug=False) -> Dict:
     exec_time = None
     sched_features = []
     
+    # Check 'Scheduling' section first
     if 'Scheduling' in data['programming_details']:
         for sched in data['programming_details']['Scheduling']:
             if isinstance(sched, dict) and sched.get('name') == 'total_execution_time_ms':
                 exec_time = sched['value']
+                if debug:
+                    print(f"Found execution time {exec_time} in 'Scheduling' for {file_path}")
             elif isinstance(sched, dict) and 'Details' in sched and 'scheduling_feature' in sched['Details']:
                 feat = sched['Details']['scheduling_feature']
                 sched_vec = [
@@ -62,7 +66,9 @@ def extract_features(file_path: str, debug=False) -> Dict:
                     feat.get('working_set_at_root', 0.0)
                 ]
                 sched_features.append(np.array(sched_vec))
-    else:
+    
+    # If not found in 'Scheduling', search entire JSON
+    if exec_time is None:
         def search_dict(d, key):
             if isinstance(d, dict):
                 for k, v in d.items():
@@ -79,6 +85,8 @@ def extract_features(file_path: str, debug=False) -> Dict:
             return None
         
         exec_time = search_dict(data, 'total_execution_time_ms')
+        if exec_time is not None and debug:
+            print(f"Found execution time {exec_time} via recursive search in {file_path}")
     
     if exec_time is None:
         error_msg = f"No 'total_execution_time_ms' found in {file_path}"
@@ -96,7 +104,8 @@ def extract_features(file_path: str, debug=False) -> Dict:
 class HalideDataset(Dataset):
     def __init__(self, data_dir: str, debug=False):
         self.data = []
-        for program in os.listdir(data_dir):
+        programs = os.listdir(data_dir)
+        for program in tqdm.tqdm(programs, desc="Processing programs"):
             program_path = os.path.join(data_dir, program)
             if os.path.isdir(program_path):
                 for schedule_file in os.listdir(program_path):
@@ -155,7 +164,7 @@ class HalideDataset(Dataset):
 # Create dataset and dataloader
 data_dir = "synthetic_data"
 try:
-    # Set debug=True to see raw data, False to only see concise messages
+    # Set debug=True to see where execution time is found or get raw data for failures
     dataset = HalideDataset(data_dir, debug=False)
     train_size = int(0.8 * len(dataset))
     test_size = len(dataset) - train_size
