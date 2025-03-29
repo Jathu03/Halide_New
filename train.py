@@ -2,679 +2,683 @@ import os
 import json
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import RobustScaler, QuantileTransformer
+from sklearn.preprocessing import StandardScaler, PowerTransformer
+from sklearn.feature_selection import SelectKBest, f_regression
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
-from torch.nn.utils.rnn import pad_sequence
-from torch.optim.lr_scheduler import OneCycleLR
+from torch.optim.lr_scheduler import ReduceLROnPlateau, CosineAnnealingLR
 import random
-from sklearn.ensemble import IsolationForest
-from torch.nn import TransformerEncoder, TransformerEncoderLayer
+from collections import defaultdict
+import time
+import warnings
+warnings.filterwarnings('ignore')
 
-# Define important metrics for scheduling sequence
-important_metrics = [
-    'bytes_at_production', 'bytes_at_realization', 'bytes_at_root', 'bytes_at_task',
-    'inner_parallelism', 'outer_parallelism', 'num_productions', 'num_realizations',
-    'num_scalars', 'num_vectors', 'points_computed_total', 'working_set'
-]
+# Set random seeds for reproducibility
+random.seed(42)
+np.random.seed(42)
+torch.manual_seed(42)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(42)
 
-def get_execution_time(file_path):
-    try:
-        with open(file_path, 'rb') as f:
-            raw_content = f.read()
-            content = raw_content.decode('utf-8', errors='replace').replace('\0', '')
-            data = json.loads(content)
-        
-        if 'programming_details' not in data:
-            print(f"Error: 'programming_details' key not found in {file_path}")
+class FeatureExtractor:
+    """Enhanced feature extraction with better error handling and more comprehensive features"""
+    
+    @staticmethod
+    def get_execution_time(file_path):
+        """Extract execution time with robust error handling"""
+        try:
+            with open(file_path, 'rb') as f:
+                raw_content = f.read()
+                content = raw_content.decode('utf-8', errors='replace').replace('\0', '')
+                data = json.loads(content)
+            
+            if 'programming_details' not in data:
+                print(f"Warning: 'programming_details' key not found in {file_path}")
+                return None
+            
+            # Try multiple ways to find execution time
+            execution_time = None
+            
+            # Method 1: Check scheduling_data
+            if 'scheduling_data' in data:
+                for item in data["scheduling_data"]:
+                    if isinstance(item, dict) and item.get('name') == 'total_execution_time_ms':
+                        execution_time = item.get('value')
+                        if execution_time is not None:
+                            return float(execution_time)
+            
+            # Method 2: Check last item in schedules
+            if 'Schedules' in data.get('programming_details', {}):
+                schedules = data['programming_details']['Schedules']
+                if schedules and isinstance(schedules[-1], dict):
+                    execution_time = schedules[-1].get('value')
+                    if execution_time is not None:
+                        return float(execution_time)
+            
+            # Method 3: Check for benchmark results
+            if 'benchmark_results' in data:
+                if isinstance(data['benchmark_results'], list) and data['benchmark_results']:
+                    return float(data['benchmark_results'][0].get('time', 0))
+            
+            print(f"Warning: Could not find execution time in {file_path}")
             return None
-        
-        schedules = data["scheduling_data"]
-        for item in schedules:
-            if isinstance(item, dict) and item.get('name') == 'total_execution_time_ms':
-                execution_time = item.get('value')
-                if execution_time is not None:
-                    return float(execution_time)
-        
-        print(f"Warning: 'total_execution_time_ms' not found in 'Schedules' of {file_path}")
-        return schedules[len(schedules)-1]["value"]
-    
-    except Exception as e:
-        print(f"Error processing {file_path}: {str(e)}")
-        return None
+            
+        except Exception as e:
+            print(f"Error processing {file_path}: {str(e)}")
+            return None
 
-def extract_features_from_file(file_path):
-    with open(file_path, 'r') as f:
-        data = json.load(f)
-    
-    execution_time = get_execution_time(file_path)
-    if execution_time is None or not np.isfinite(execution_time):
-        print(f"Warning: Invalid execution time in {file_path}")
-        return None
-    
-    nodes_features = []
-    edges_features = []
-    programming_details = data.get("programming_details", None)
-    
-    if programming_details:
-        if 'Nodes' in programming_details:
-            for node in programming_details['Nodes']:
-                node_feature = {'Name': node.get('Name', '')}
-                if 'Details' in node:
-                    details = node['Details']
-                    if 'Op histogram' in details:
-                        op_hist = details['Op histogram']
-                        for op_line in op_hist:
-                            parts = op_line.strip().split(':')
-                            if len(parts) == 2:
-                                op_name = parts[0].strip()
-                                op_count = int(parts[1].strip())
-                                node_feature[f'op_{op_name.lower()}'] = op_count
-                    for key, value in details.items():
-                        if key != 'Op histogram' and isinstance(value, (int, float, str)):
-                            node_feature[f'detail_{key.lower().replace(" ", "_")}'] = value
-                nodes_features.append(node_feature)
+    @staticmethod
+    def extract_operation_features(nodes):
+        """Extract detailed operation features from nodes"""
+        op_counts = defaultdict(int)
+        op_types = set()
+        compute_intensity = 0
+        memory_ops = 0
+        control_ops = 0
         
-        if 'Edges' in programming_details:
-            for edge in programming_details['Edges']:
-                edge_feature = {
-                    'From': edge.get('From', ''),
-                    'To': edge.get('To', ''),
-                    'Name': edge.get('Name', '')
-                }
-                if 'Details' in edge:
-                    for key, value in edge['Details'].items():
-                        if isinstance(value, (int, float, str)):
-                            edge_feature[f'edge_{key.lower().replace(" ", "_")}'] = value
-                edges_features.append(edge_feature)
-    
-    scheduling_features = []
-    scheduling_data = data.get("scheduling_data", None)
-    if not scheduling_data and programming_details and 'Schedules' in programming_details:
-        scheduling_data = programming_details['Schedules']
-    
-    if scheduling_data:
+        for node in nodes:
+            if 'Details' not in node or 'Op histogram' not in node['Details']:
+                continue
+                
+            for op_line in node['Details']['Op histogram']:
+                parts = op_line.strip().split(':')
+                if len(parts) == 2:
+                    op_name = parts[0].strip().lower()
+                    op_count = int(parts[1].strip())
+                    
+                    op_counts[op_name] += op_count
+                    op_types.add(op_name)
+                    
+                    # Categorize operations
+                    if 'load' in op_name or 'store' in op_name:
+                        memory_ops += op_count
+                    elif 'if' in op_name or 'select' in op_name:
+                        control_ops += op_count
+                    else:
+                        compute_intensity += op_count
+        
+        return {
+            'op_counts': dict(op_counts),
+            'unique_op_types': len(op_types),
+            'compute_intensity': compute_intensity,
+            'memory_ops': memory_ops,
+            'control_ops': control_ops,
+            'compute_to_memory_ratio': compute_intensity / (memory_ops + 1e-8)
+        }
+
+    @staticmethod
+    def extract_scheduling_features(scheduling_data):
+        """Extract comprehensive scheduling features"""
+        if not scheduling_data:
+            return {}
+            
+        features = {
+            'total_bytes': 0,
+            'total_vectors': 0,
+            'total_parallelism': 0,
+            'total_working_set': 0,
+            'num_productions': 0,
+            'num_realizations': 0,
+            'scheduling_stages': len(scheduling_data)
+        }
+        
+        # Initialize lists to track distributions
+        bytes_list = []
+        parallelism_list = []
+        working_set_list = []
+        
         for sched in scheduling_data:
-            sched_feature = {'Name': sched.get('Name', '')}
-            if 'Details' in sched:
-                if 'scheduling_feature' in sched['Details']:
-                    sf = sched['Details']['scheduling_feature']
-                    sched_feature.update(sf)
-                for key, value in sched['Details'].items():
-                    if key != 'scheduling_feature' and isinstance(value, (int, float, str)):
-                        sched_feature[f'sched_{key.lower().replace(" ", "_")}'] = value
-            scheduling_features.append(sched_feature)
-    
-    scheduling_sequence = []
-    for sf in scheduling_features:
-        seq_vector = [float(sf.get(metric, 0.0)) for metric in important_metrics]
-        bytes_prod = sf.get('bytes_at_production', 0.0)
-        bytes_real = sf.get('bytes_at_realization', 0.0)
-        bytes_root = sf.get('bytes_at_root', 0.0)
-        bytes_task = sf.get('bytes_at_task', 0.0)
-        num_vec = sf.get('num_vectors', 0.0)
-        num_scalars = sf.get('num_scalars', 0.0)
-        points_total = sf.get('points_computed_total', 0.0)
-        working_set = sf.get('working_set', 0.0)
-        inner_para = sf.get('inner_parallelism', 0.0)
-        outer_para = sf.get('outer_parallelism', 0.0)
-        num_prod = sf.get('num_productions', 0.0)
-        num_real = sf.get('num_realizations', 0.0)
+            if not isinstance(sched, dict):
+                continue
+                
+            # Sum features
+            features['total_bytes'] += sched.get('bytes_at_production', 0)
+            features['total_vectors'] += sched.get('num_vectors', 0)
+            features['total_parallelism'] += sched.get('inner_parallelism', 0) * sched.get('outer_parallelism', 1)
+            features['total_working_set'] += sched.get('working_set', 0)
+            features['num_productions'] += sched.get('num_productions', 0)
+            features['num_realizations'] += sched.get('num_realizations', 0)
+            
+            # Track distributions
+            bytes_list.append(sched.get('bytes_at_production', 0))
+            parallelism_list.append(sched.get('inner_parallelism', 0) * sched.get('outer_parallelism', 1))
+            working_set_list.append(sched.get('working_set', 0))
         
-        safe_div = lambda x, y: np.clip(x / max(abs(y), 1e-6), -1e4, 1e4) if y != 0 else 0.0
-        
-        seq_vector.append(safe_div(bytes_prod, bytes_real))
-        seq_vector.append(safe_div(bytes_prod, num_vec))
-        seq_vector.append(safe_div(points_total, num_vec))
-        seq_vector.append(safe_div(working_set, bytes_prod))
-        seq_vector.append(safe_div(bytes_prod, bytes_task))
-        seq_vector.append(safe_div(bytes_root, bytes_real))
-        seq_vector.append(safe_div(num_vec, num_scalars))
-        seq_vector.append(safe_div(num_prod, num_real))
-        seq_vector.append(safe_div(working_set, points_total))
-        seq_vector.append(inner_para * outer_para)
-        seq_vector.append(safe_div(bytes_prod, inner_para))
-        seq_vector.append(safe_div(points_total, outer_para))
-        seq_vector.append(np.log1p(bytes_prod))
-        seq_vector.append(np.log1p(points_total))
-        seq_vector.append(np.log1p(working_set))
-        
-        scheduling_sequence.append(seq_vector)
-    
-    if not scheduling_sequence:
-        scheduling_sequence = [[0.0] * (len(important_metrics) + 15)]
-    
-    seq_array = np.array(scheduling_sequence)
-    seq_median = np.median(seq_array, axis=0, keepdims=True)
-    seq_iqr = np.percentile(seq_array, 75, axis=0, keepdims=True) - np.percentile(seq_array, 25, axis=0, keepdims=True)
-    seq_iqr = np.maximum(seq_iqr, 1e-6)
-    scheduling_sequence = (seq_array - seq_median) / seq_iqr
-    scheduling_sequence = np.nan_to_num(scheduling_sequence, nan=0.0).tolist()
-    
-    op_counts = {}
-    for node in nodes_features:
-        for key, value in node.items():
-            if key.startswith('op_'):
-                op_counts[key] = op_counts.get(key, 0) + value
-    
-    total_ops = sum(op_counts.values())
-    num_nodes = max(len(nodes_features), 1)
-    num_edges = len(edges_features)
-    
-    node_connections = {}
-    for edge in edges_features:
-        from_node = edge.get('From', '')
-        to_node = edge.get('To', '')
-        if from_node not in node_connections:
-            node_connections[from_node] = []
-        node_connections[from_node].append(to_node)
-    
-    max_degree = 0
-    avg_degree = 0
-    if node_connections:
-        degrees = [len(connections) for node, connections in node_connections.items()]
-        max_degree = max(degrees) if degrees else 0
-        avg_degree = sum(degrees) / len(degrees) if degrees else 0
-    
-    scalar_features = {
-        'nodes_count': num_nodes,
-        'edges_count': num_edges,
-        'node_edge_ratio': num_nodes / max(num_edges, 1),
-        'total_ops': total_ops,
-        'op_diversity': len(op_counts) / max(num_nodes, 1),
-        'avg_ops_per_node': total_ops / max(num_nodes, 1),
-        'edge_density': num_edges / max(num_nodes * max(num_nodes - 1, 1), 1),
-        'max_node_degree': max_degree,
-        'avg_node_degree': avg_degree,
-        'graph_complexity': num_edges * total_ops / max(num_nodes, 1),
-        'total_parallelism': sum(sf.get('inner_parallelism', 0) * sf.get('outer_parallelism', 1) for sf in scheduling_features),
-        'max_working_set': max([sf.get('working_set', 0.0) for sf in scheduling_features], default=0.0),
-        'avg_points_computed': np.mean([sf.get('points_computed_total', 0.0) for sf in scheduling_features]) if scheduling_features else 0.0,
-        'max_bytes_production': max([sf.get('bytes_at_production', 0.0) for sf in scheduling_features], default=0.0),
-        'scheduling_sequence_length': len(scheduling_sequence)
-    }
-    
-    scalar_features.update(op_counts)
-    
-    for key in ['nodes_count', 'edges_count', 'total_ops', 'max_working_set', 'max_bytes_production']:
-        if key in scalar_features and scalar_features[key] > 0:
-            scalar_features[f'log_{key}'] = np.log(scalar_features[key])
-        else:
-            scalar_features[f'log_{key}'] = 0.0
-    
-    for key in scalar_features:
-        if not np.isfinite(scalar_features[key]):
-            scalar_features[key] = 0.0
-    
-    return {
-        'scheduling_sequence': scheduling_sequence,
-        'scalar_features': scalar_features,
-        'execution_time': execution_time
-    }
+        # Add distribution statistics
+        if bytes_list:
+            features['bytes_mean'] = np.mean(bytes_list)
+            features['bytes_std'] = np.std(bytes_list)
+            features['bytes_max'] = max(bytes_list)
+            
+        if parallelism_list:
+            features['parallelism_mean'] = np.mean(parallelism_list)
+            features['parallelism_std'] = np.std(parallelism_list)
+            features['parallelism_max'] = max(parallelism_list)
+            
+        if working_set_list:
+            features['working_set_mean'] = np.mean(working_set_list)
+            features['working_set_std'] = np.std(working_set_list)
+            
+        # Add derived features
+        if features['total_bytes'] > 0:
+            features['bytes_per_vector'] = features['total_bytes'] / (features['total_vectors'] + 1e-8)
+            features['memory_pressure'] = features['total_working_set'] / (features['total_bytes'] + 1e-8)
+            features['parallelism_per_byte'] = features['total_parallelism'] / (features['total_bytes'] + 1e-8)
+            
+        return features
 
-def process_directory(directory_path):
-    all_features = []
-    file_names = []
-    json_files = sorted([f for f in os.listdir(directory_path) if f.endswith('.json')])
-    
-    for filename in json_files:
-        file_path = os.path.join(directory_path, filename)
-        features = extract_features_from_file(file_path)
-        if features is not None:
-            all_features.append(features)
-            file_names.append(filename)
-    
-    return all_features, file_names
+    @staticmethod
+    def extract_features_from_file(file_path):
+        """Main feature extraction method"""
+        try:
+            with open(file_path, 'r') as f:
+                data = json.load(f)
+            
+            execution_time = FeatureExtractor.get_execution_time(file_path)
+            if execution_time is None or execution_time <= 0:
+                return None
+                
+            programming_details = data.get('programming_details', {})
+            nodes = programming_details.get('Nodes', [])
+            edges = programming_details.get('Edges', [])
+            scheduling_data = data.get('scheduling_data', programming_details.get('Schedules', []))
+            
+            # Extract operation features
+            op_features = FeatureExtractor.extract_operation_features(nodes)
+            
+            # Extract scheduling features
+            sched_features = FeatureExtractor.extract_scheduling_features(scheduling_data)
+            
+            # Build final feature set
+            features = {
+                'execution_time': execution_time,
+                'nodes_count': len(nodes),
+                'edges_count': len(edges),
+                'node_edge_ratio': len(nodes) / (len(edges) + 1e-8),
+                **op_features,
+                **sched_features
+            }
+            
+            # Add operation counts as individual features
+            for op, count in op_features['op_counts'].items():
+                features[f'op_{op}'] = count
+                
+            return features
+            
+        except Exception as e:
+            print(f"Error extracting features from {file_path}: {str(e)}")
+            return None
 
-def process_main_directory(main_dir):
-    all_features = []
-    all_file_names = []
-    subdirs = sorted([d for d in os.listdir(main_dir) if os.path.isdir(os.path.join(main_dir, d))])
+class DataProcessor:
+    """Handles data loading, preprocessing, and feature engineering"""
     
-    if len(subdirs) < 1:
-        raise ValueError(f"Expected at least 1 subdirectory in {main_dir}, found {len(subdirs)}")
-    
-    for subdir in subdirs:
-        subdir_path = os.path.join(main_dir, subdir)
-        features, file_names = process_directory(subdir_path)
-        if not features:
-            print(f"Skipping {subdir} due to no valid data")
-            continue
-        all_features.extend(features)
-        all_file_names.extend([os.path.join(subdir, fname) for fname in file_names])
-        print(f"Processed subdir {subdir}: {len(features)} files")
-    
-    total_files = len(all_features)
-    if total_files < 50:
-        raise ValueError(f"Expected at least 50 files total, found {total_files}")
-    
-    print("Performing outlier detection...")
-    exec_times = np.array([f['execution_time'] for f in all_features]).reshape(-1, 1)
-    iso_forest = IsolationForest(contamination=0.05, random_state=42)
-    outlier_labels = iso_forest.fit_predict(np.log1p(exec_times))
-    
-    filtered_features = []
-    filtered_file_names = []
-    for i, (feat, fname, label) in enumerate(zip(all_features, all_file_names, outlier_labels)):
-        if label == 1:
-            filtered_features.append(feat)
-            filtered_file_names.append(fname)
-        else:
-            print(f"Outlier detected: {fname} with execution time {feat['execution_time']}")
-    
-    print(f"Removed {len(all_features) - len(filtered_features)} outliers")
-    
-    combined = list(zip(filtered_features, filtered_file_names))
-    random.shuffle(combined)
-    all_features, all_file_names = zip(*combined)
-    
-    test_size = 50
-    train_features = all_features[:-test_size]
-    test_features = all_features[-test_size:]
-    train_file_names = all_file_names[:-test_size]
-    test_file_names = all_file_names[-test_size:]
-    
-    print(f"Total files after outlier removal: {len(filtered_features)}")
-    print(f"Training files: {len(train_features)}")
-    print(f"Testing files: {len(test_features)}")
-    
-    return train_features, test_features, list(test_file_names)
+    @staticmethod
+    def process_directory(directory_path):
+        """Process all JSON files in a directory"""
+        all_features = []
+        file_names = []
+        
+        for filename in sorted(os.listdir(directory_path)):
+            if not filename.endswith('.json'):
+                continue
+                
+            file_path = os.path.join(directory_path, filename)
+            features = FeatureExtractor.extract_features_from_file(file_path)
+            
+            if features is not None:
+                all_features.append(features)
+                file_names.append(filename)
+                
+        return all_features, file_names
 
-def prepare_data_for_model(train_features, test_features):
-    train_sequences = [torch.FloatTensor(f['scheduling_sequence']) for f in train_features]
-    test_sequences = [torch.FloatTensor(f['scheduling_sequence']) for f in test_features]
-    
-    train_sequences_padded = pad_sequence(train_sequences, batch_first=True)
-    test_sequences_padded = pad_sequence(test_sequences, batch_first=True)
-    
-    # Create mask based on non-zero values, ensuring shape (batch_size, sequence_length)
-    train_mask = (train_sequences_padded != 0).any(dim=-1).float()
-    test_mask = (test_sequences_padded != 0).any(dim=-1).float()
-    
-    train_scalar_df = pd.DataFrame([f['scalar_features'] for f in train_features])
-    test_scalar_df = pd.DataFrame([f['scalar_features'] for f in test_features])
-    
-    train_scalar_df = train_scalar_df.fillna(0)
-    test_scalar_df = test_scalar_df.fillna(0)
-    
-    for col in train_scalar_df.columns:
-        if col not in test_scalar_df.columns:
-            test_scalar_df[col] = 0
-    
-    test_scalar_df = test_scalar_df[train_scalar_df.columns]
-    
-    y_train = np.log1p(np.array([f['execution_time'] for f in train_features])).reshape(-1, 1)
-    y_test = np.log1p(np.array([f['execution_time'] for f in test_features])).reshape(-1, 1)
-    
-    scaler_X_scalar = QuantileTransformer(output_distribution='normal')
-    scaler_y = RobustScaler()
-    
-    train_scalar_scaled = scaler_X_scalar.fit_transform(train_scalar_df)
-    test_scalar_scaled = scaler_X_scalar.transform(test_scalar_df)
-    y_train_scaled = scaler_y.fit_transform(y_train)
-    y_test_scaled = scaler_y.transform(y_test)
-    
-    train_scalar_scaled = np.nan_to_num(train_scalar_scaled, nan=0.0)
-    test_scalar_scaled = np.nan_to_num(test_scalar_scaled, nan=0.0)
-    y_train_scaled = np.nan_to_num(y_train_scaled, nan=0.0)
-    y_test_scaled = np.nan_to_num(y_test_scaled, nan=0.0)
-    
-    train_scalar_tensor = torch.FloatTensor(train_scalar_scaled)
-    test_scalar_tensor = torch.FloatTensor(test_scalar_scaled)
-    y_train_tensor = torch.FloatTensor(y_train_scaled)
-    y_test_tensor = torch.FloatTensor(y_test_scaled)
-    
-    print(f"Sequence input size: {train_sequences_padded.shape[2]}")
-    print(f"Scalar input size: {train_scalar_tensor.shape[1]}")
-    
-    return (train_sequences_padded, train_mask, train_scalar_tensor, y_train_tensor,
-            test_sequences_padded, test_mask, test_scalar_tensor, y_test_tensor,
-            scaler_y, train_sequences_padded.shape[2], train_scalar_tensor.shape[1])
+    @staticmethod
+    def process_main_directory(main_dir, test_size=50, min_samples=100):
+        """Process all subdirectories in main directory"""
+        all_features = []
+        all_file_names = []
+        
+        subdirs = sorted([d for d in os.listdir(main_dir) 
+                         if os.path.isdir(os.path.join(main_dir, d))])
+        
+        if not subdirs:
+            raise ValueError(f"No subdirectories found in {main_dir}")
+            
+        for subdir in subdirs:
+            subdir_path = os.path.join(main_dir, subdir)
+            features, file_names = DataProcessor.process_directory(subdir_path)
+            
+            if not features:
+                print(f"Skipping {subdir} - no valid data")
+                continue
+                
+            all_features.extend(features)
+            all_file_names.extend([os.path.join(subdir, f) for f in file_names])
+            print(f"Processed {subdir}: {len(features)} files")
+            
+        if len(all_features) < min_samples:
+            raise ValueError(f"Insufficient data: {len(all_features)} samples (need at least {min_samples})")
+            
+        # Shuffle while maintaining reproducibility
+        combined = list(zip(all_features, all_file_names))
+        random.Random(42).shuffle(combined)
+        all_features, all_file_names = zip(*combined)
+        
+        # Split data
+        train_features = all_features[:-test_size]
+        test_features = all_features[-test_size:]
+        train_file_names = all_file_names[:-test_size]
+        test_file_names = all_file_names[-test_size:]
+        
+        print(f"\nData Summary:")
+        print(f"Total files: {len(all_features)}")
+        print(f"Training files: {len(train_features)}")
+        print(f"Testing files: {len(test_features)}")
+        
+        return train_features, test_features, list(test_file_names)
 
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_len=5000):
-        super(PositionalEncoding, self).__init__()
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-np.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0)
-        self.register_buffer('pe', pe)
+    @staticmethod
+    def clean_and_transform_features(train_features, test_features):
+        """Clean, transform, and select features"""
+        # Convert to DataFrame
+        train_df = pd.DataFrame(train_features)
+        test_df = pd.DataFrame(test_features)
         
-    def forward(self, x):
-        return x + self.pe[:, :x.size(1), :]
+        # Drop constant features
+        constant_cols = [col for col in train_df.columns 
+                        if col != 'execution_time' and train_df[col].nunique() == 1]
+        train_df = train_df.drop(columns=constant_cols)
+        test_df = test_df.drop(columns=constant_cols)
+        
+        # Drop highly correlated features
+        corr_matrix = train_df.corr().abs()
+        upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool)
+        to_drop = [column for column in upper.columns if any(upper[column] > 0.95)]
+        train_df = train_df.drop(columns=to_drop)
+        test_df = test_df.drop(columns=to_drop)
+        
+        # Log transform execution time and add as target
+        train_df['log_execution_time'] = np.log1p(train_df['execution_time'])
+        test_df['log_execution_time'] = np.log1p(test_df['execution_time'])
+        
+        # Select numeric features only
+        numeric_cols = train_df.select_dtypes(include=['number']).columns.tolist()
+        train_df = train_df[numeric_cols]
+        test_df = test_df[numeric_cols]
+        
+        # Feature selection using SelectKBest
+        X_train = train_df.drop(['execution_time', 'log_execution_time'], axis=1)
+        y_train = train_df['log_execution_time']
+        
+        selector = SelectKBest(f_regression, k=min(30, X_train.shape[1]))
+        selector.fit(X_train, y_train)
+        selected_cols = X_train.columns[selector.get_support()]
+        
+        # Apply selection
+        X_train = X_train[selected_cols]
+        X_test = test_df[selected_cols]
+        y_train = train_df['log_execution_time']
+        y_test = test_df['log_execution_time']
+        
+        # Power transform for heavy-tailed features
+        pt = PowerTransformer()
+        X_train_transformed = pt.fit_transform(X_train)
+        X_test_transformed = pt.transform(X_test)
+        
+        # Scale features
+        scaler_X = StandardScaler()
+        X_train_scaled = scaler_X.fit_transform(X_train_transformed)
+        X_test_scaled = scaler_X.transform(X_test_transformed)
+        
+        # Scale target
+        scaler_y = StandardScaler()
+        y_train_scaled = scaler_y.fit_transform(y_train.values.reshape(-1, 1))
+        y_test_scaled = scaler_y.transform(y_test.values.reshape(-1, 1))
+        
+        # Convert to tensors
+        X_train_tensor = torch.FloatTensor(X_train_scaled).unsqueeze(1)
+        y_train_tensor = torch.FloatTensor(y_train_scaled)
+        X_test_tensor = torch.FloatTensor(X_test_scaled).unsqueeze(1)
+        y_test_tensor = torch.FloatTensor(y_test_scaled)
+        
+        print(f"\nFeature Engineering Summary:")
+        print(f"Selected {len(selected_cols)} features:")
+        print(selected_cols.tolist())
+        print(f"Input feature dimension: {X_train_scaled.shape[1]}")
+        
+        return (X_train_tensor, y_train_tensor, X_test_tensor, y_test_tensor, 
+                scaler_y, X_train_scaled.shape[1], True)
 
-class EnhancedTransformerModel(nn.Module):
-    def __init__(self, seq_input_size, scalar_input_size, hidden_size=256, nhead=8, 
-                 num_encoder_layers=4, dim_feedforward=512, dropout=0.2, output_size=1):
-        super(EnhancedTransformerModel, self).__init__()
+class HierarchicalAttentionModel(nn.Module):
+    """Enhanced model with hierarchical attention and residual connections"""
+    
+    def __init__(self, input_size, hidden_sizes=[256, 128, 64], output_size=1, 
+                 dropout_rate=0.4, num_heads=4):
+        super(HierarchicalAttentionModel, self).__init__()
         
-        self.seq_embedding = nn.Linear(seq_input_size, hidden_size)
-        self.pos_encoder = PositionalEncoding(hidden_size)
-        
-        encoder_layers = TransformerEncoderLayer(d_model=hidden_size, nhead=nhead, 
-                                                 dim_feedforward=dim_feedforward, dropout=dropout)
-        self.transformer_encoder = TransformerEncoder(encoder_layers, num_encoder_layers)
-        
-        self.scalar_embedding = nn.Sequential(
-            nn.Linear(scalar_input_size, hidden_size),
-            nn.LayerNorm(hidden_size),
-            nn.ReLU(),
-            nn.Dropout(dropout)
+        # Feature-level attention
+        self.feature_attention = nn.Sequential(
+            nn.Linear(input_size, hidden_sizes[0]),
+            nn.Tanh(),
+            nn.Linear(hidden_sizes[0], input_size),
+            nn.Softmax(dim=-1)
         )
         
-        self.query_proj = nn.Linear(hidden_size, hidden_size)
-        self.key_proj = nn.Linear(hidden_size, hidden_size)
-        self.value_proj = nn.Linear(hidden_size, hidden_size)
+        # LSTM layers with skip connections
+        self.lstm_layers = nn.ModuleList()
+        self.lstm_norms = nn.ModuleList()
         
-        self.fc1 = nn.Linear(hidden_size * 2, hidden_size)
-        self.ln1 = nn.LayerNorm(hidden_size)
-        self.dropout1 = nn.Dropout(dropout)
+        for i in range(len(hidden_sizes)):
+            input_dim = input_size if i == 0 else hidden_sizes[i-1]
+            self.lstm_layers.append(
+                nn.LSTM(input_dim, hidden_sizes[i], batch_first=True, bidirectional=True)
+            )
+            self.lstm_norms.append(nn.LayerNorm(hidden_sizes[i] * 2))
         
-        self.fc2 = nn.Linear(hidden_size, hidden_size // 2)
-        self.ln2 = nn.LayerNorm(hidden_size // 2)
-        self.dropout2 = nn.Dropout(dropout)
+        # Multi-head attention
+        self.attention = nn.MultiheadAttention(
+            embed_dim=hidden_sizes[-1] * 2, 
+            num_heads=num_heads,
+            dropout=dropout_rate
+        )
         
-        self.fc3 = nn.Linear(hidden_size // 2, output_size)
+        # Feed-forward network
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_sizes[-1] * 2, hidden_sizes[-1] * 4),
+            nn.GELU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(hidden_sizes[-1] * 4, hidden_sizes[-1] * 2),
+            nn.Dropout(dropout_rate)
+        )
         
-        self.relu = nn.ReLU()
-        self.selu = nn.SELU()
-    
-    def forward(self, seq_input, seq_mask, scalar_input):
-        batch_size, seq_len, _ = seq_input.size()
+        # Output layers
+        self.output_layers = nn.Sequential(
+            nn.Linear(hidden_sizes[-1] * 2, hidden_sizes[-1]),
+            nn.GELU(),
+            nn.Linear(hidden_sizes[-1], output_size)
+        )
         
-        seq_embedded = self.seq_embedding(seq_input)
-        seq_embedded = self.pos_encoder(seq_embedded)
+        # Regularization
+        self.dropout = nn.Dropout(dropout_rate)
         
-        # Transformer expects src_key_padding_mask of shape (batch_size, seq_len)
-        # seq_mask is (batch_size, seq_len) where 1 indicates valid positions, 0 indicates padding
-        # Convert to (batch_size, seq_len) where True indicates padding (opposite of seq_mask)
-        pad_mask = (seq_mask == 0)  # Shape: (batch_size, seq_len)
+    def forward(self, x):
+        # Feature attention
+        attn_weights = self.feature_attention(x.squeeze(1))
+        x = x * attn_weights.unsqueeze(1)
         
-        # Debugging shape
-        assert pad_mask.shape == (batch_size, seq_len), f"Expected pad_mask shape ({batch_size}, {seq_len}), got {pad_mask.shape}"
+        # LSTM processing with skip connections
+        lstm_out = x
+        for i, (lstm, norm) in enumerate(zip(self.lstm_layers, self.lstm_norms)):
+            residual = lstm_out
+            lstm_out, _ = lstm(lstm_out)
+            lstm_out = norm(lstm_out)
+            
+            # Skip connection if dimensions match
+            if i > 0 and residual.size(-1) == lstm_out.size(-1):
+                lstm_out = lstm_out + residual
+                
+            lstm_out = self.dropout(lstm_out)
         
-        transformer_out = self.transformer_encoder(seq_embedded, src_key_padding_mask=pad_mask)
+        # Permute for attention (seq_len, batch_size, embed_dim)
+        lstm_out = lstm_out.permute(1, 0, 2)
         
-        # Use seq_mask to mask padded positions for averaging
-        masked_transformer_out = transformer_out * seq_mask.unsqueeze(-1)
-        seq_lengths = torch.sum(seq_mask, dim=1, keepdim=True)
-        seq_lengths = torch.clamp(seq_lengths, min=1.0)
-        seq_repr = torch.sum(masked_transformer_out, dim=1) / seq_lengths
+        # Multi-head attention
+        attn_output, _ = self.attention(lstm_out, lstm_out, lstm_out)
+        attn_output = self.dropout(attn_output)
         
-        scalar_repr = self.scalar_embedding(scalar_input)
+        # Feed-forward network with residual
+        ffn_output = self.ffn(attn_output)
+        ffn_output = ffn_output + attn_output  # Residual connection
         
-        query = self.query_proj(scalar_repr).unsqueeze(1)
-        key = self.key_proj(transformer_out)
-        value = self.value_proj(transformer_out)
+        # Average over sequence dimension
+        pooled = torch.mean(ffn_output, dim=0)
         
-        attention_scores = torch.matmul(query, key.transpose(-2, -1)) / (key.size(-1) ** 0.5)
-        attention_scores = attention_scores.masked_fill(pad_mask.unsqueeze(1), -1e9)
-        attention_weights = torch.softmax(attention_scores, dim=-1)
-        context_vector = torch.matmul(attention_weights, value).squeeze(1)
-        
-        combined = torch.cat([context_vector, scalar_repr], dim=1)
-        
-        x = self.fc1(combined)
-        x = self.ln1(x)
-        x = self.relu(x)
-        x = self.dropout1(x)
-        
-        x = self.fc2(x)
-        x = self.ln2(x)
-        x = self.selu(x)
-        x = self.dropout2(x)
-        
-        output = self.fc3(x)
+        # Final output
+        output = self.output_layers(pooled)
         
         return output
 
-class MultiTaskLoss(nn.Module):
-    def __init__(self, mse_weight=1.0, huber_weight=0.5, l1_weight=0.3, quantile_weight=0.2, delta=1.0):
-        super(MultiTaskLoss, self).__init__()
-        self.mse_weight = mse_weight
-        self.huber_weight = huber_weight
-        self.l1_weight = l1_weight
-        self.quantile_weight = quantile_weight
-        self.delta = delta
-        self.mse = nn.MSELoss()
-        self.huber = nn.HuberLoss(delta=delta)
-        self.l1 = nn.L1Loss()
+class ModelTrainer:
+    """Handles model training and evaluation"""
     
-    def forward(self, outputs, targets):
-        mse_loss = self.mse(outputs, targets)
-        huber_loss = self.huber(outputs, targets)
-        l1_loss = self.l1(outputs, targets)
+    @staticmethod
+    def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=32):
+        train_dataset = TensorDataset(X_train, y_train)
+        test_dataset = TensorDataset(X_test, y_test)
         
-        errors = targets - outputs
-        quantile_loss = torch.mean(torch.max(0.8 * errors, 0.2 * errors))
+        train_loader = DataLoader(
+            train_dataset, 
+            batch_size=batch_size, 
+            shuffle=True,
+            pin_memory=True,
+            num_workers=4
+        )
+        test_loader = DataLoader(
+            test_dataset, 
+            batch_size=batch_size, 
+            shuffle=False,
+            pin_memory=True,
+            num_workers=4
+        )
         
-        return (self.mse_weight * mse_loss + 
-                self.huber_weight * huber_loss + 
-                self.l1_weight * l1_loss + 
-                self.quantile_weight * quantile_loss)
-
-def create_data_loaders(train_sequences, train_mask, train_scalar, y_train, 
-                       test_sequences, test_mask, test_scalar, y_test, batch_size=16):
-    train_dataset = TensorDataset(train_sequences, train_mask, train_scalar, y_train)
-    test_dataset = TensorDataset(test_sequences, test_mask, test_scalar, y_test)
+        return train_loader, test_loader
     
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-    
-    return train_loader, test_loader
-
-def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=300, patience=40, accumulation_steps=4, scheduler=None):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
-    model.to(device)
-    
-    best_val_loss = float('inf')
-    epochs_no_improve = 0
-    best_model_state = None
-    train_losses = []
-    val_losses = []
-    
-    for epoch in range(num_epochs):
-        model.train()
-        running_loss = 0.0
-        optimizer.zero_grad()
+    @staticmethod
+    def train_model(model, train_loader, test_loader, criterion, optimizer, 
+                   num_epochs=200, patience=25):
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f"\nTraining on {device}")
+        model.to(device)
         
-        for i, (seq_inputs, seq_mask, scalar_inputs, targets) in enumerate(train_loader):
-            seq_inputs = seq_inputs.to(device)
-            seq_mask = seq_mask.to(device)
-            scalar_inputs = scalar_inputs.to(device)
-            targets = targets.to(device)
+        # Mixed precision training
+        scaler = torch.cuda.amp.GradScaler(enabled=torch.cuda.is_available())
+        
+        # Learning rate schedulers
+        lr_scheduler = ReduceLROnPlateau(
+            optimizer, mode='min', factor=0.5, patience=5, verbose=True
+        )
+        cos_scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs//4, eta_min=1e-6)
+        
+        best_val_loss = float('inf')
+        epochs_no_improve = 0
+        best_model_state = None
+        history = {'train_loss': [], 'val_loss': []}
+        
+        for epoch in range(num_epochs):
+            start_time = time.time()
+            model.train()
+            train_loss = 0.0
             
-            outputs = model(seq_inputs, seq_mask, scalar_inputs)
-            loss = criterion(outputs, targets)
-            
-            if torch.isnan(loss):
-                print(f"NaN loss detected at epoch {epoch+1}, batch {i+1}")
-                continue
-            
-            loss = loss / accumulation_steps
-            loss.backward()
-            
-            if (i + 1) % accumulation_steps == 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
+            for inputs, targets in train_loader:
+                inputs, targets = inputs.to(device), targets.to(device)
+                
                 optimizer.zero_grad()
+                
+                with torch.cuda.amp.autocast():
+                    outputs = model(inputs)
+                    loss = criterion(outputs, targets)
+                
+                scaler.scale(loss).backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                
+                train_loss += loss.item() * inputs.size(0)
             
-            running_loss += loss.item() * accumulation_steps * seq_inputs.size(0)
+            # Validation phase
+            val_loss = ModelTrainer.evaluate_model(model, test_loader, criterion, device)
+            
+            # Update learning rate
+            lr_scheduler.step(val_loss)
+            cos_scheduler.step()
+            
+            # Record history
+            train_loss /= len(train_loader.dataset)
+            history['train_loss'].append(train_loss)
+            history['val_loss'].append(val_loss)
+            
+            # Early stopping check
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                epochs_no_improve = 0
+                best_model_state = model.state_dict().copy()
+            else:
+                epochs_no_improve += 1
+                if epochs_no_improve >= patience:
+                    print(f"\nEarly stopping at epoch {epoch+1}")
+                    model.load_state_dict(best_model_state)
+                    break
+            
+            # Print progress
+            epoch_time = time.time() - start_time
+            print(f"Epoch {epoch+1}/{num_epochs} - {epoch_time:.1f}s")
+            print(f"  Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
+            print(f"  LR: {optimizer.param_groups[0]['lr']:.2e}")
         
-        if len(train_loader) % accumulation_steps != 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-            optimizer.zero_grad()
-        
-        train_loss = running_loss / len(train_loader.dataset)
-        train_losses.append(train_loss)
-        
+        return history
+    
+    @staticmethod
+    def evaluate_model(model, data_loader, criterion, device):
         model.eval()
         val_loss = 0.0
+        
         with torch.no_grad():
-            for seq_inputs, seq_mask, scalar_inputs, targets in test_loader:
-                seq_inputs = seq_inputs.to(device)
-                seq_mask = seq_mask.to(device)
-                scalar_inputs = scalar_inputs.to(device)
-                targets = targets.to(device)
+            for inputs, targets in data_loader:
+                inputs, targets = inputs.to(device), targets.to(device)
                 
-                outputs = model(seq_inputs, seq_mask, scalar_inputs)
-                loss = criterion(outputs, targets)
-                val_loss += loss.item() * seq_inputs.size(0)
+                with torch.cuda.amp.autocast():
+                    outputs = model(inputs)
+                    loss = criterion(outputs, targets)
+                
+                val_loss += loss.item() * inputs.size(0)
         
-        val_loss /= len(test_loader.dataset)
-        val_losses.append(val_loss)
-        
-        if scheduler is not None:
-            if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                scheduler.step(val_loss)
-            else:
-                scheduler.step()
-        
-        print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
-        
-        if val_loss < best_val_loss and not np.isnan(val_loss):
-            best_val_loss = val_loss
-            epochs_no_improve = 0
-            best_model_state = model.state_dict().copy()
-            print(f"New best model saved with validation loss: {val_loss:.4f}")
-        else:
-            epochs_no_improve += 1
-        
-        if epochs_no_improve >= patience:
-            print(f'Early stopping after {epoch+1} epochs')
-            break
+        return val_loss / len(data_loader.dataset)
     
-    if best_model_state is not None:
-        model.load_state_dict(best_model_state)
-        print("Loaded best model state")
-    
-    return train_losses, val_losses
+    @staticmethod
+    def evaluate_predictions(model, X_test, y_test, y_scaler, file_names_test):
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        model.to(device)
+        model.eval()
+        
+        X_test = X_test.to(device)
+        with torch.no_grad():
+            y_pred_scaled = model(X_test)
+        
+        # Inverse scaling
+        y_pred = y_scaler.inverse_transform(y_pred_scaled.cpu().numpy())
+        y_test = y_scaler.inverse_transform(y_test.cpu().numpy())
+        
+        # Convert from log scale to original
+        y_pred_actual = np.expm1(y_pred)
+        y_test_actual = np.expm1(y_test)
+        
+        # Calculate errors
+        errors = np.abs(y_test_actual - y_pred_actual)
+        relative_errors = errors / (y_test_actual + 1e-8)
+        
+        # Group by subfolder
+        results = defaultdict(list)
+        for i, file_path in enumerate(file_names_test):
+            subfolder = file_path.split('/')[0]
+            results[subfolder].append({
+                'file': file_path,
+                'actual': y_test_actual[i][0],
+                'predicted': y_pred_actual[i][0],
+                'error': errors[i][0],
+                'relative_error': relative_errors[i][0]
+            })
+        
+        # Print detailed results
+        for subfolder, sub_results in results.items():
+            print(f"\nResults for {subfolder}:")
+            avg_error = np.mean([r['relative_error'] for r in sub_results])
+            print(f"  Average relative error: {avg_error:.1%}")
+            
+            for r in sub_results[:3]:  # Print first 3 examples
+                print(f"  {r['file']}")
+                print(f"    Actual: {r['actual']:.2f} ms")
+                print(f"    Predicted: {r['predicted']:.2f} ms")
+                print(f"    Error: {r['error']:.2f} ms ({r['relative_error']:.1%})")
+        
+        # Calculate overall metrics
+        mse = np.mean(errors**2)
+        rmse = np.sqrt(mse)
+        mae = np.mean(errors)
+        mape = np.mean(relative_errors) * 100
+        
+        print("\nOverall Model Performance:")
+        print(f"MSE: {mse:.2f}")
+        print(f"RMSE: {rmse:.2f}")
+        print(f"MAE: {mae:.2f}")
+        print(f"MAPE: {mape:.2f}%")
+        
+        return y_test_actual, y_pred_actual
 
-def evaluate_model(model, X_test_seq, X_test_mask, X_test_scalar, y_test, y_scaler, file_names_test):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model.to(device)
-    model.eval()
+def main(main_dir="synthetic_data"):
+    print("Starting Halide Cost Model Training")
+    print("=" * 50)
     
-    X_test_seq = X_test_seq.to(device)
-    X_test_mask = X_test_mask.to(device)
-    X_test_scalar = X_test_scalar.to(device)
+    # Step 1: Data Processing
+    print("\nProcessing data...")
+    train_features, test_features, test_file_names = DataProcessor.process_main_directory(main_dir)
     
-    with torch.no_grad():
-        y_pred_scaled = model(X_test_seq, X_test_mask, X_test_scalar)
-    
-    y_pred_scaled = y_pred_scaled.cpu().numpy()
-    y_test = y_test.cpu().numpy()
-    
-    y_test_transformed = y_scaler.inverse_transform(y_test)
-    y_pred_transformed = y_scaler.inverse_transform(y_pred_scaled)
-    
-    y_test_actual = np.expm1(y_test_transformed)
-    y_pred_actual = np.expm1(y_pred_transformed)
-    
-    results_by_subfolder = {}
-    for i, file_path in enumerate(file_names_test):
-        subfolder = file_path.split('/')[0]
-        if subfolder not in results_by_subfolder:
-            results_by_subfolder[subfolder] = []
-        
-        pred = max(y_pred_actual[i][0], 0)
-        actual = y_test_actual[i][0]
-        error_percentage = abs(actual - pred) / actual * 100 if actual > 0 else 0
-        
-        results_by_subfolder[subfolder].append({
-            'file': file_path,
-            'actual': actual,
-            'predicted': pred,
-            'error_percentage': error_percentage
-        })
-    
-    for subfolder, results in results_by_subfolder.items():
-        print(f"\nResults for {subfolder}:")
-        for result in results:
-            print(f"File: {result['file']}")
-            print(f"  Actual execution time: {result['actual']:.2f} ms")
-            print(f"  Predicted execution time: {result['predicted']:.2f} ms")
-            print(f"  Error percentage: {result['error_percentage']:.2f}%")
-    
-    mse = np.mean((y_test_actual - y_pred_actual) ** 2)
-    rmse = np.sqrt(mse)
-    mae = np.mean(np.abs(y_test_actual - y_pred_actual))
-    mape = np.mean(np.abs((y_test_actual - y_pred_actual) / (y_test_actual + 1e-8))) * 100
-    
-    print("\nOverall Model Performance:")
-    print(f"MSE: {mse:.2f}")
-    print(f"RMSE: {rmse:.2f}")
-    print(f"MAE: {mae:.2f}")
-    print(f"MAPE: {mape:.2f}%")
-    
-    return y_test_actual, y_pred_actual
-
-def main(main_dir):
-    print(f"Processing main directory: {main_dir}")
-    train_features, test_features, test_file_names = process_main_directory(main_dir)
-    
-    print(f"Total training samples: {len(train_features)} (randomly selected)")
-    print(f"Total test samples: {len(test_features)} (50 randomly selected)")
-    
-    if len(train_features) == 0 or len(test_features) == 0:
-        print("Error: No valid training or test data found")
-        return None
-    
-    (train_sequences, train_mask, train_scalar, y_train,
-     test_sequences, test_mask, test_scalar, y_test,
-     y_scaler, seq_input_size, scalar_input_size) = prepare_data_for_model(train_features, test_features)
-    
-    train_loader, test_loader = create_data_loaders(
-        train_sequences, train_mask, train_scalar, y_train,
-        test_sequences, test_mask, test_scalar, y_test,
-        batch_size=16
+    # Step 2: Feature Engineering
+    print("\nEngineering features...")
+    (X_train, y_train, X_test, y_test, 
+     y_scaler, input_size, _) = DataProcessor.clean_and_transform_features(
+        train_features, test_features
     )
     
-    model = EnhancedTransformerModel(
-        seq_input_size=seq_input_size,
-        scalar_input_size=scalar_input_size,
-        hidden_size=256,
-        nhead=8,
-        num_encoder_layers=4,
-        dim_feedforward=512,
-        dropout=0.2,
-        output_size=1
+    # Step 3: Create Data Loaders
+    print("\nCreating data loaders...")
+    train_loader, test_loader = ModelTrainer.create_data_loaders(
+        X_train, y_train, X_test, y_test, batch_size=32
     )
     
-    optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-4)
-    criterion = MultiTaskLoss(mse_weight=1.0, huber_weight=0.5, l1_weight=0.3, quantile_weight=0.2, delta=1.0)
+    # Step 4: Initialize Model
+    print("\nInitializing model...")
+    model = HierarchicalAttentionModel(
+        input_size=input_size,
+        hidden_sizes=[256, 128, 64],
+        dropout_rate=0.3,
+        num_heads=4
+    )
+    print(model)
     
-    total_steps = len(train_loader) * 300
-    scheduler = OneCycleLR(optimizer, max_lr=0.001, total_steps=total_steps, pct_start=0.3)
+    # Step 5: Training Setup
+    criterion = nn.HuberLoss(delta=1.0)
+    optimizer = optim.AdamW(
+        model.parameters(), 
+        lr=1e-3, 
+        weight_decay=1e-4,
+        betas=(0.9, 0.999)
     
-    print("Building and training Enhanced Transformer model...")
-    train_losses, val_losses = train_model(
-        model, train_loader, test_loader,
-        criterion, optimizer,
-        num_epochs=300, patience=40, accumulation_steps=4, scheduler=scheduler
+    # Step 6: Train Model
+    print("\nTraining model...")
+    history = ModelTrainer.train_model(
+        model, train_loader, test_loader, criterion, optimizer,
+        num_epochs=200, patience=25
     )
     
-    if train_losses is None or val_losses is None:
-        print("Training failed due to NaN values")
-        return None
-    
-    print("\nEvaluating model:")
-    y_test_actual, y_pred_actual = evaluate_model(
-        model, test_sequences, test_mask, test_scalar, y_test,
-        y_scaler, test_file_names
+    # Step 7: Evaluate Model
+    print("\nEvaluating model...")
+    y_test_actual, y_pred_actual = ModelTrainer.evaluate_predictions(
+        model, X_test, y_test, y_scaler, test_file_names
     )
+    
+    # Step 8: Save Model
+    print("\nSaving model...")
+    try:
+        # Trace with example input
+        example_input = torch.randn(1, 1, input_size).to(next(model.parameters()).device)
+        traced_model = torch.jit.trace(model, example_input)
+        traced_model.save("halide_cost_model.pt")
+        print("Model saved as 'halide_cost_model.pt'")
+    except Exception as e:
+        print(f"Error saving model: {str(e)}")
     
     return model, y_scaler, y_test_actual, y_pred_actual
 
 if __name__ == "__main__":
-    main_dir = "synthetic_data"
-    random.seed(42)
-    torch.manual_seed(42)
-    np.random.seed(42)
-    model, y_scaler, y_test_actual, y_pred_actual = main(main_dir)
+    main()
