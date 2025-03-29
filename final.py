@@ -112,13 +112,11 @@ def extract_features_from_file(file_path):
         'scheduling_count': len(scheduling_features)
     }
     
-    # Add node to edge ratio feature
     if len(nodes_features) > 0 and len(edges_features) > 0:
         features['node_edge_ratio'] = len(nodes_features) / len(edges_features)
     else:
         features['node_edge_ratio'] = 0
     
-    # Parse op counts with improved handling
     op_counts = {}
     for node in nodes_features:
         for key, value in node.items():
@@ -126,7 +124,6 @@ def extract_features_from_file(file_path):
                 op_counts[key] = op_counts.get(key, 0) + value
     features.update(op_counts)
     
-    # Extract more detailed scheduling metrics
     if scheduling_features:
         important_metrics = [
             'bytes_at_production', 'bytes_at_realization', 'bytes_at_root', 'bytes_at_task',
@@ -138,7 +135,6 @@ def extract_features_from_file(file_path):
                 if metric in scheduling_features[0]:
                     features[f'sched_{metric}'] = scheduling_features[0][metric]
         
-        # Calculate aggregated metrics
         total_bytes_at_production = sum(sf.get('bytes_at_production', 0) for sf in scheduling_features if isinstance(sf, dict))
         total_vectors = sum(sf.get('num_vectors', 0) for sf in scheduling_features if isinstance(sf, dict))
         total_parallelism = sum(sf.get('inner_parallelism', 0) * sf.get('outer_parallelism', 1) for sf in scheduling_features if isinstance(sf, dict))
@@ -147,15 +143,12 @@ def extract_features_from_file(file_path):
         features['total_vectors'] = total_vectors
         features['total_parallelism'] = total_parallelism
         
-        # Add derived features
         if total_vectors > 0:
             features['bytes_per_vector'] = total_bytes_at_production / total_vectors if total_vectors > 0 else 0
         
-        # Add memory pressure indicator
         if 'working_set' in scheduling_features[0] and 'bytes_at_production' in scheduling_features[0]:
             features['memory_pressure'] = scheduling_features[0]['working_set'] / scheduling_features[0]['bytes_at_production'] if scheduling_features[0]['bytes_at_production'] > 0 else 0
     
-    # Add node complexity indicators
     if len(nodes_features) > 0:
         op_types = sum(1 for k in op_counts.keys())
         features['avg_ops_per_node'] = sum(op_counts.values()) / len(nodes_features)
@@ -164,14 +157,11 @@ def extract_features_from_file(file_path):
     return features
 
 def process_directory(directory_path):
-    """Process all JSON files in a directory and return all features without splitting."""
     all_features = []
     file_names = []
     
-    # Get all JSON files in the directory
     json_files = sorted([f for f in os.listdir(directory_path) if f.endswith('.json')])
     
-    # Process each file and extract features
     for filename in json_files:
         file_path = os.path.join(directory_path, filename)
         features = extract_features_from_file(file_path)
@@ -182,17 +172,14 @@ def process_directory(directory_path):
     return all_features, file_names
 
 def process_main_directory(main_dir):
-    """Process all subdirectories and collect all features, then randomly split into train/test."""
     all_features = []
     all_file_names = []
     
-    # Get all subdirectories
     subdirs = sorted([d for d in os.listdir(main_dir) if os.path.isdir(os.path.join(main_dir, d))])
     
     if len(subdirs) < 1:
         raise ValueError(f"Expected at least 1 subdirectory in {main_dir}, found {len(subdirs)}")
     
-    # Process each subdirectory
     for subdir in subdirs:
         subdir_path = os.path.join(main_dir, subdir)
         features, file_names = process_directory(subdir_path)
@@ -205,17 +192,14 @@ def process_main_directory(main_dir):
         all_file_names.extend([os.path.join(subdir, fname) for fname in file_names])
         print(f"Processed subdir {subdir}: {len(features)} files")
     
-    # Check if we have enough files
     total_files = len(all_features)
     if total_files < 50:
         raise ValueError(f"Expected at least 50 files total, found {total_files}")
     
-    # Randomly shuffle and split into training and testing
     combined = list(zip(all_features, all_file_names))
     random.shuffle(combined)
     all_features, all_file_names = zip(*combined)
     
-    # Take 50 files for testing, rest for training
     test_size = 50
     train_features = all_features[:-test_size]
     test_features = all_features[-test_size:]
@@ -229,31 +213,24 @@ def process_main_directory(main_dir):
     return train_features, test_features, list(test_file_names)
 
 def clean_and_transform_features(train_features, test_features):
-    """Clean, transform, and augment features for improved model performance"""
     all_features_df = pd.DataFrame(train_features + test_features)
     
-    # Handle missing values
     all_features_df = all_features_df.fillna(0)
     
-    # Drop columns with constant values
     constant_columns = [col for col in all_features_df.columns 
                        if col != 'execution_time' and all_features_df[col].nunique() == 1]
     all_features_df = all_features_df.drop(columns=constant_columns)
     print(f"Dropped {len(constant_columns)} constant columns")
     
-    # Log transform the target variable to handle skewness
     if 'execution_time' in all_features_df.columns:
         all_features_df['execution_time_log'] = np.log1p(all_features_df['execution_time'])
     
-    # Create ratio features for potentially important metrics
     if 'total_vectors' in all_features_df.columns and all_features_df['total_vectors'].max() > 0:
         all_features_df['bytes_per_vector'] = all_features_df['total_bytes_at_production'] / (all_features_df['total_vectors'] + 1e-8)
     
-    # Feature selection - keep only numeric columns
     numeric_cols = all_features_df.select_dtypes(include=['number']).columns
     all_features_df = all_features_df[numeric_cols]
     
-    # Split back into train and test
     train_size = len(train_features)
     train_df = all_features_df.iloc[:train_size]
     test_df = all_features_df.iloc[train_size:]
@@ -261,11 +238,8 @@ def clean_and_transform_features(train_features, test_features):
     return train_df, test_df
 
 def prepare_data_for_model(train_features, test_features):
-    """Prepare the training and testing data for the model."""
-    # Clean and transform features
     train_df, test_df = clean_and_transform_features(train_features, test_features)
     
-    # Use log-transformed target if available
     if 'execution_time_log' in train_df.columns:
         y_train = train_df['execution_time_log'].values.reshape(-1, 1)
         y_test = test_df['execution_time_log'].values.reshape(-1, 1)
@@ -277,7 +251,6 @@ def prepare_data_for_model(train_features, test_features):
         train_df = train_df.drop('execution_time', axis=1)
         test_df = test_df.drop('execution_time', axis=1)
     
-    # Normalize features
     scaler_X = StandardScaler()
     scaler_y = StandardScaler()
     
@@ -286,7 +259,6 @@ def prepare_data_for_model(train_features, test_features):
     X_test_scaled = scaler_X.transform(test_df)
     y_test_scaled = scaler_y.transform(y_test)
     
-    # Create tensors
     X_train_tensor = torch.FloatTensor(X_train_scaled).unsqueeze(1)
     y_train_tensor = torch.FloatTensor(y_train_scaled)
     X_test_tensor = torch.FloatTensor(X_test_scaled).unsqueeze(1)
@@ -301,42 +273,32 @@ class EnhancedLSTMModel(nn.Module):
     def __init__(self, input_size, hidden_sizes=[128, 64, 32], output_size=1, dropout_rate=0.3):
         super(EnhancedLSTMModel, self).__init__()
         
-        # LSTM layers with increasing complexity
         self.lstm_layers = nn.ModuleList()
         self.dropout_layers = nn.ModuleList()
         
-        # First LSTM layer
         self.lstm_layers.append(nn.LSTM(input_size, hidden_sizes[0], batch_first=True))
         self.dropout_layers.append(nn.Dropout(dropout_rate))
         
-        # Additional LSTM layers
         for i in range(1, len(hidden_sizes)):
             self.lstm_layers.append(nn.LSTM(hidden_sizes[i-1], hidden_sizes[i], batch_first=True))
             self.dropout_layers.append(nn.Dropout(dropout_rate))
         
-        # Attention mechanism
         self.attention = nn.Linear(hidden_sizes[-1], 1)
         
-        # Fully connected layers with batch normalization
         self.fc_layers = nn.ModuleList()
         self.bn_layers = nn.ModuleList()
         
-        # First FC layer after LSTM
         self.fc_layers.append(nn.Linear(hidden_sizes[-1], hidden_sizes[-1] // 2))
         self.bn_layers.append(nn.BatchNorm1d(hidden_sizes[-1] // 2))
         
-        # Second FC layer
         self.fc_layers.append(nn.Linear(hidden_sizes[-1] // 2, hidden_sizes[-1] // 4))
         self.bn_layers.append(nn.BatchNorm1d(hidden_sizes[-1] // 4))
         
-        # Output layer
         self.output_layer = nn.Linear(hidden_sizes[-1] // 4, output_size)
         
-        # Activation functions
         self.relu = nn.ReLU()
         self.leaky_relu = nn.LeakyReLU(0.1)
         
-        # Residual connections
         self.has_residual = (hidden_sizes[-1] // 4 == hidden_sizes[-1] // 2)
         if not self.has_residual:
             self.residual_adapter = nn.Linear(hidden_sizes[-1] // 2, hidden_sizes[-1] // 4)
@@ -348,35 +310,28 @@ class EnhancedLSTMModel(nn.Module):
         return context
         
     def forward(self, x):
-        # Process through LSTM layers
         lstm_out = x
         for i, (lstm, dropout) in enumerate(zip(self.lstm_layers, self.dropout_layers)):
             lstm_out, _ = lstm(lstm_out)
-            if i < len(self.lstm_layers) - 1:  # Apply dropout except for the last layer
+            if i < len(self.lstm_layers) - 1:
                 lstm_out = dropout(lstm_out)
         
-        # Apply attention
         attn_output = self.attention_net(lstm_out)
         
-        # First FC layer
         fc_out = self.fc_layers[0](attn_output)
         fc_out = self.bn_layers[0](fc_out)
         fc_out = self.leaky_relu(fc_out)
         
-        # Save for residual connection
         residual = fc_out
         if not self.has_residual:
             residual = self.residual_adapter(residual)
         
-        # Second FC layer
         fc_out = self.fc_layers[1](fc_out)
         fc_out = self.bn_layers[1](fc_out)
         fc_out = self.leaky_relu(fc_out)
         
-        # Add residual connection
         fc_out = fc_out + residual
         
-        # Output layer
         output = self.output_layer(fc_out)
         
         return output
@@ -395,7 +350,6 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
     print(f"Using device: {device}")
     model.to(device)
     
-    # Learning rate scheduler
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
     
     best_val_loss = float('inf')
@@ -405,7 +359,6 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
     val_losses = []
     
     for epoch in range(num_epochs):
-        # Training phase
         model.train()
         running_loss = 0.0
         for inputs, targets in train_loader:
@@ -415,7 +368,6 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
             loss = criterion(outputs, targets)
             loss.backward()
             
-            # Gradient clipping to prevent exploding gradients
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             
             optimizer.step()
@@ -424,7 +376,6 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
         train_loss = running_loss / len(train_loader.dataset)
         train_losses.append(train_loss)
         
-        # Validation phase
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
@@ -437,12 +388,10 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
         val_loss /= len(test_loader.dataset)
         val_losses.append(val_loss)
         
-        # Update learning rate
         scheduler.step(val_loss)
         
         print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
         
-        # Early stopping check
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             epochs_no_improve = 0
@@ -472,11 +421,9 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_tran
     y_pred_scaled = y_pred_scaled.cpu().numpy()
     y_test = y_test.cpu().numpy()
     
-    # Inverse transform the predictions
     y_test_transformed = y_scaler.inverse_transform(y_test)
     y_pred_transformed = y_scaler.inverse_transform(y_pred_scaled)
     
-    # If log-transformed, convert back to original scale
     if is_log_transformed:
         y_test_actual = np.expm1(y_test_transformed)
         y_pred_actual = np.expm1(y_pred_transformed)
@@ -484,7 +431,6 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_tran
         y_test_actual = y_test_transformed
         y_pred_actual = y_pred_transformed
     
-    # Group results by subfolder
     results_by_subfolder = {}
     for i, file_path in enumerate(file_names_test):
         subfolder = file_path.split('/')[0]
@@ -498,7 +444,6 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_tran
             'error_percentage': abs(y_test_actual[i][0] - y_pred_actual[i][0]) / y_test_actual[i][0] * 100 if y_test_actual[i][0] > 0 else 0
         })
     
-    # Print results for each subfolder
     for subfolder, results in results_by_subfolder.items():
         print(f"\nResults for {subfolder}:")
         for result in results:
@@ -507,7 +452,6 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_tran
             print(f"  Predicted execution time: {result['predicted']:.2f} ms")
             print(f"  Error percentage: {result['error_percentage']:.2f}%")
     
-    # Calculate overall metrics
     mse = np.mean((y_test_actual - y_pred_actual) ** 2)
     rmse = np.sqrt(mse)
     mae = np.mean(np.abs(y_test_actual - y_pred_actual))
@@ -566,6 +510,22 @@ def main(main_dir):
     print("\nEvaluating model:")
     y_test_actual, y_pred_actual = evaluate_model(model, X_test, y_test, y_scaler, test_file_names, is_log_transformed)
     
+    # Save the trained model as a .pt file using TorchScript
+    print("\nSaving the trained model as 'lstm_model.pt'...")
+    model.eval()  # Set the model to evaluation mode
+    try:
+        # Example input for tracing (use a sample input tensor matching your data)
+        sample_input = torch.randn(1, 1, input_size)  # [batch_size, sequence_length, input_size]
+        
+        # Trace the model with the sample input
+        traced_model = torch.jit.trace(model, sample_input)
+        
+        # Save the traced model to a .pt file
+        traced_model.save("lstm_model.pt")
+        print("Model successfully saved as 'lstm_model.pt'")
+    except Exception as e:
+        print(f"Error saving the model: {str(e)}")
+    
     return model, y_scaler, y_test_actual, y_pred_actual
 
 if __name__ == "__main__":
@@ -577,23 +537,3 @@ if __name__ == "__main__":
     
     # Run the main function to train and test
     model, y_scaler, y_test_actual, y_pred_actual = main(main_dir)
-    # After training and evaluation
-if model is not None:
-    # Set model to evaluation mode
-    model.eval()
-    
-    # Create a sample input tensor matching your training data shape
-    sample_input = torch.FloatTensor(torch.randn(1, 1, input_size))  # [batch_size, sequence_length, input_size]
-    
-    # Trace the model with the sample input
-    traced_model = torch.jit.trace(model, sample_input)
-    
-    # Save the traced model to a file
-    traced_model.save("enhanced_lstm_model.pt")
-    print("Model saved as 'enhanced_lstm_model.pt'")
-    
-    # Optionally save the scaler for later use
-    import pickle
-    with open("y_scaler.pkl", "wb") as f:
-        pickle.dump(y_scaler, f)
-    print("Scaler saved as 'y_scaler.pkl'")
