@@ -615,4 +615,172 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
     return train_losses, val_losses
 
 def evaluate_model(model, X_test_seq, X_test_mask, X_test_scalar, y_test, y_scaler, file_names_test):
-    device = torch.device('cuda' if torch.cuda.is_available() else  this is a incomplete code for the above task. give the completed code
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model.to(device)
+    model.eval()
+    
+    test_dataset = TensorDataset(X_test_seq, X_test_mask, X_test_scalar, y_test)
+    test_loader = DataLoader(test_dataset, batch_size=16, shuffle=False)
+    
+    predictions = []
+    actuals = []
+    
+    with torch.no_grad():
+        for seq_inputs, seq_mask, scalar_inputs, targets in test_loader:
+            seq_inputs = seq_inputs.to(device)
+            seq_mask = seq_mask.to(device)
+            scalar_inputs = scalar_inputs.to(device)
+            
+            outputs = model(seq_inputs, seq_mask, scalar_inputs)
+            
+            # Move predictions back to CPU for numpy processing
+            pred_cpu = outputs.cpu().numpy()
+            targets_cpu = targets.cpu().numpy()
+            
+            predictions.extend(pred_cpu)
+            actuals.extend(targets_cpu)
+    
+    # Convert to numpy arrays
+    predictions = np.array(predictions)
+    actuals = np.array(actuals)
+    
+    # Inverse transform the scaled values
+    predictions_orig = np.expm1(y_scaler.inverse_transform(predictions))
+    actuals_orig = np.expm1(y_scaler.inverse_transform(actuals))
+    
+    # Calculate metrics
+    mae = np.mean(np.abs(predictions_orig - actuals_orig))
+    mape = 100 * np.mean(np.abs((predictions_orig - actuals_orig) / actuals_orig))
+    rmse = np.sqrt(np.mean((predictions_orig - actuals_orig) ** 2))
+    
+    print(f"Mean Absolute Error: {mae:.2f}")
+    print(f"Mean Absolute Percentage Error: {mape:.2f}%")
+    print(f"Root Mean Squared Error: {rmse:.2f}")
+    
+    # Create detailed results for each file
+    results = []
+    for i in range(len(predictions_orig)):
+        results.append({
+            'file_name': file_names_test[i],
+            'actual': float(actuals_orig[i][0]),
+            'predicted': float(predictions_orig[i][0]),
+            'error': float(predictions_orig[i][0] - actuals_orig[i][0]),
+            'error_percentage': float(100 * (predictions_orig[i][0] - actuals_orig[i][0]) / actuals_orig[i][0])
+        })
+    
+    return {
+        'metrics': {
+            'mae': mae,
+            'mape': mape,
+            'rmse': rmse
+        },
+        'predictions': results
+    }
+
+def save_model_and_results(model, train_history, evaluation_results, output_dir="model_output"):
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Save model
+    torch.save(model.state_dict(), os.path.join(output_dir, "model.pth"))
+    
+    # Save training history
+    with open(os.path.join(output_dir, "training_history.json"), 'w') as f:
+        json.dump(train_history, f)
+    
+    # Save evaluation results
+    with open(os.path.join(output_dir, "evaluation_results.json"), 'w') as f:
+        json.dump(evaluation_results, f)
+    
+    print(f"Model and results saved to {output_dir}")
+
+def main(data_dir, output_dir="model_output"):
+    # Process data
+    print("Processing data...")
+    train_features, test_features, test_file_names = process_main_directory(data_dir)
+    
+    # Prepare data for model
+    print("Preparing data for model...")
+    (train_sequences, train_mask, train_scalar, y_train,
+     test_sequences, test_mask, test_scalar, y_test,
+     y_scaler, seq_input_size, scalar_input_size) = prepare_data_for_model(train_features, test_features)
+    
+    # Create model
+    print("Creating model...")
+    model = EnhancedTransformerModel(
+        seq_input_size=seq_input_size,
+        scalar_input_size=scalar_input_size,
+        hidden_size=256,
+        nhead=8,
+        num_encoder_layers=4,
+        dim_feedforward=512,
+        dropout=0.2
+    )
+    
+    # Create data loaders
+    print("Creating data loaders...")
+    train_loader, test_loader = create_data_loaders(
+        train_sequences, train_mask, train_scalar, y_train,
+        test_sequences, test_mask, test_scalar, y_test,
+        batch_size=16
+    )
+    
+    # Set up loss, optimizer, and scheduler
+    criterion = MultiTaskLoss(mse_weight=1.0, huber_weight=0.5, l1_weight=0.3, quantile_weight=0.2)
+    optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-4)
+    
+    # One cycle learning rate scheduler
+    scheduler = OneCycleLR(
+        optimizer, 
+        max_lr=0.005,
+        steps_per_epoch=len(train_loader),
+        epochs=300,
+        pct_start=0.3,
+        div_factor=25.0,
+        final_div_factor=1000.0
+    )
+    
+    # Train model
+    print("Training model...")
+    train_losses, val_losses = train_model(
+        model, 
+        train_loader, 
+        test_loader, 
+        criterion, 
+        optimizer, 
+        num_epochs=300, 
+        patience=40,
+        scheduler=scheduler
+    )
+    
+    # Evaluate model
+    print("Evaluating model...")
+    evaluation_results = evaluate_model(
+        model,
+        test_sequences,
+        test_mask,
+        test_scalar,
+        y_test,
+        y_scaler,
+        test_file_names
+    )
+    
+    # Save model and results
+    train_history = {
+        'train_losses': train_losses,
+        'val_losses': val_losses
+    }
+    save_model_and_results(model, train_history, evaluation_results, output_dir)
+    
+    print("Done!")
+    return evaluation_results
+
+if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Train and evaluate execution time prediction model')
+    parser.add_argument('--data_dir', type=str, required=True, help='Directory containing data subdirectories')
+    parser.add_argument('--output_dir', type=str, default='model_output', help='Directory to save model and results')
+    
+    args = parser.parse_args()
+    
+    main(args.data_dir, args.output_dir)
