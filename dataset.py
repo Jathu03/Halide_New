@@ -6,7 +6,7 @@ import re
 from torch.utils.data import Dataset, DataLoader
 import torch
 
-def extract_features(file_path: str) -> Dict:
+def extract_features(file_path: str, debug=False) -> Dict:
     with open(file_path, 'r') as f:
         data = json.load(f)
     
@@ -63,7 +63,6 @@ def extract_features(file_path: str) -> Dict:
                 ]
                 sched_features.append(np.array(sched_vec))
     else:
-        print(f"Warning: 'Scheduling' not found in {file_path}. Searching entire JSON for execution time.")
         def search_dict(d, key):
             if isinstance(d, dict):
                 for k, v in d.items():
@@ -82,17 +81,20 @@ def extract_features(file_path: str) -> Dict:
         exec_time = search_dict(data, 'total_execution_time_ms')
     
     if exec_time is None:
-        raise ValueError(f"No 'total_execution_time_ms' found in {file_path}. Data structure: {json.dumps(data['programming_details'], indent=2)}")
+        error_msg = f"No 'total_execution_time_ms' found in {file_path}"
+        if debug:
+            error_msg += f". Data structure: {json.dumps(data['programming_details'], indent=2)}"
+        raise ValueError(error_msg)
     
     return {
         'edge_seq': np.array(edge_features),
         'node_seq': np.array(node_features),
         'sched_context': np.mean(sched_features, axis=0) if sched_features else np.zeros(7),
-        'exec_time': exec_time  # This is our y_label
+        'exec_time': exec_time
     }
 
 class HalideDataset(Dataset):
-    def __init__(self, data_dir: str):
+    def __init__(self, data_dir: str, debug=False):
         self.data = []
         for program in os.listdir(data_dir):
             program_path = os.path.join(data_dir, program)
@@ -100,7 +102,7 @@ class HalideDataset(Dataset):
                 for schedule_file in os.listdir(program_path):
                     file_path = os.path.join(program_path, schedule_file)
                     try:
-                        features = extract_features(file_path)
+                        features = extract_features(file_path, debug=debug)
                         self.data.append(features)
                     except ValueError as e:
                         print(f"Skipping {file_path}: {e}")
@@ -112,7 +114,6 @@ class HalideDataset(Dataset):
         if not self.data:
             raise ValueError("No valid data found in dataset")
         
-        # Normalize features
         self._normalize_features()
     
     def _normalize_features(self):
@@ -137,7 +138,7 @@ class HalideDataset(Dataset):
             else:
                 item['node_seq'] = np.zeros((self.max_node_len, node_dim))
             
-            item['exec_time'] = np.log1p(item['exec_time'])  # Normalize y_label
+            item['exec_time'] = np.log1p(item['exec_time'])
     
     def __len__(self):
         return len(self.data)
@@ -148,13 +149,14 @@ class HalideDataset(Dataset):
             'edge_seq': torch.FloatTensor(item['edge_seq']),
             'node_seq': torch.FloatTensor(item['node_seq']),
             'sched_context': torch.FloatTensor(item['sched_context']),
-            'exec_time': torch.FloatTensor([item['exec_time']])  # y_label
+            'exec_time': torch.FloatTensor([item['exec_time']])
         }
 
 # Create dataset and dataloader
 data_dir = "synthetic_data"
 try:
-    dataset = HalideDataset(data_dir)
+    # Set debug=True to see raw data, False to only see concise messages
+    dataset = HalideDataset(data_dir, debug=False)
     train_size = int(0.8 * len(dataset))
     test_size = len(dataset) - train_size
     train_dataset, test_dataset = torch.utils.data.random_split(dataset, [train_size, test_size])
@@ -162,7 +164,6 @@ try:
     train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
 
-    # Print the size of the dataloaders
     print(f"Train DataLoader size (number of batches): {len(train_loader)}")
     print(f"Test DataLoader size (number of batches): {len(test_loader)}")
     print(f"Total dataset size (number of samples): {len(dataset)}")
