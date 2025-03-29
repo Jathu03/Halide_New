@@ -5,7 +5,7 @@ from typing import Dict, List
 import re
 from torch.utils.data import Dataset, DataLoader
 import torch
-import tqdm  # For progress bar
+import tqdm
 
 def extract_features(file_path: str, debug=False) -> Dict:
     with open(file_path, 'r') as f:
@@ -47,33 +47,39 @@ def extract_features(file_path: str, debug=False) -> Dict:
     exec_time = None
     sched_features = []
     
-    # Check 'Scheduling' section first
+    # Check 'Scheduling' section explicitly for the provided structure
     if 'Scheduling' in data['programming_details']:
-        for sched in data['programming_details']['Scheduling']:
-            if isinstance(sched, dict) and sched.get('name') == 'total_execution_time_ms':
-                exec_time = sched['value']
-                if debug:
-                    print(f"Found execution time {exec_time} in 'Scheduling' for {file_path}")
-            elif isinstance(sched, dict) and 'Details' in sched and 'scheduling_feature' in sched['Details']:
-                feat = sched['Details']['scheduling_feature']
-                sched_vec = [
-                    feat.get('bytes_at_production', 0.0),
-                    feat.get('bytes_at_realization', 0.0),
-                    feat.get('points_computed_total', 0.0),
-                    feat.get('num_vectors', 0.0),
-                    feat.get('vector_loads_per_vector', 0.0),
-                    feat.get('scalar_loads_per_scalar', 0.0),
-                    feat.get('working_set_at_root', 0.0)
-                ]
-                sched_features.append(np.array(sched_vec))
+        scheduling = data['programming_details']['Scheduling']
+        if isinstance(scheduling, list):
+            for entry in scheduling:
+                if isinstance(entry, dict) and 'name' in entry and 'value' in entry:
+                    if entry['name'] == 'total_execution_time_ms':
+                        exec_time = float(entry['value'])  # Ensure it's a float
+                        if debug:
+                            print(f"Found execution time {exec_time} in 'Scheduling' for {file_path}")
+                    elif 'Details' in entry and 'scheduling_feature' in entry['Details']:
+                        feat = entry['Details']['scheduling_feature']
+                        sched_vec = [
+                            feat.get('bytes_at_production', 0.0),
+                            feat.get('bytes_at_realization', 0.0),
+                            feat.get('points_computed_total', 0.0),
+                            feat.get('num_vectors', 0.0),
+                            feat.get('vector_loads_per_vector', 0.0),
+                            feat.get('scalar_loads_per_scalar', 0.0),
+                            feat.get('working_set_at_root', 0.0)
+                        ]
+                        sched_features.append(np.array(sched_vec))
+        else:
+            if debug:
+                print(f"'Scheduling' is not a list in {file_path}: {scheduling}")
     
-    # If not found in 'Scheduling', search entire JSON
+    # Fallback recursive search if not found in 'Scheduling'
     if exec_time is None:
         def search_dict(d, key):
             if isinstance(d, dict):
                 for k, v in d.items():
                     if k == key and isinstance(v, (int, float)):
-                        return v
+                        return float(v)
                     result = search_dict(v, key)
                     if result is not None:
                         return result
@@ -164,7 +170,7 @@ class HalideDataset(Dataset):
 # Create dataset and dataloader
 data_dir = "synthetic_data"
 try:
-    # Set debug=True to see where execution time is found or get raw data for failures
+    # Set debug=True to see extraction details, False for normal operation
     dataset = HalideDataset(data_dir, debug=False)
     train_size = int(0.8 * len(dataset))
     test_size = len(dataset) - train_size
