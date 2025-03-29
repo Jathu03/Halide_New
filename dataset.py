@@ -1,110 +1,74 @@
 import json
 import os
 import numpy as np
-from typing import Dict, List
-import re
-from torch.utils.data import Dataset, DataLoader
-import torch
+from typing import Dict
+from torch.utils.data import Dataset
 import tqdm
 
 def extract_features(file_path: str, debug=False) -> Dict:
+    """Extract features including 'total_execution_time_ms' from a JSON file."""
     with open(file_path, 'r') as f:
         data = json.load(f)
     
-    # Extract edge features
-    edge_features = []
-    for edge in data['programming_details']['Edges']:
-        footprint_raw = edge['Details']['Footprint']
-        footprint = []
-        for f in footprint_raw:
-            nums = re.findall(r'[+-]?\d*\.?\d+', f)
-            if nums:
-                footprint.append(float(nums[-1]))
-            else:
-                footprint.append(0.0)
-        
-        jacobian_raw = ' '.join(edge['Details']['Load Jacobians']).split()
-        jacobian = []
-        for x in jacobian_raw:
-            try:
-                if x not in ['_', '0']:
-                    jacobian.append(float(x))
-            except ValueError:
-                jacobian.append(0.0)
-        
-        edge_features.append(np.array(footprint + jacobian))
-    
-    # Extract node features
-    node_features = []
-    for node in data['programming_details']['Nodes']:
-        if 'Memory access patterns' in node['Details']:
-            mem_patterns = [int(x) for pattern in node['Details']['Memory access patterns'] 
-                          for x in pattern.split() if x.isdigit()]
-            op_hist = [int(x.split()[-1]) for x in node['Details']['Op histogram']]
-            node_features.append(np.array(mem_patterns + op_hist))
-    
-    # Extract execution time and scheduling features
+    # Initialize execution time
     exec_time = None
-    sched_features = []
     
-    # Check 'scheduling_data' section for execution time
-    if 'scheduling_data' in data['programming_details']:
+    # Primary check: Look in 'programming_details'['scheduling_data']
+    if 'programming_details' in data and 'scheduling_data' in data['programming_details']:
         scheduling_data = data['programming_details']['scheduling_data']
         if isinstance(scheduling_data, list):
             for entry in scheduling_data:
                 if isinstance(entry, dict) and entry.get('name') == 'total_execution_time_ms':
-                    exec_time = float(entry['value'])
-                    if debug:
-                        print(f"Found execution time {exec_time} in 'scheduling_data' for {file_path}")
-                elif isinstance(entry, dict) and 'Details' in entry and 'scheduling_feature' in entry['Details']:
-                    feat = entry['Details']['scheduling_feature']
-                    sched_vec = [
-                        feat.get('bytes_at_production', 0.0),
-                        feat.get('bytes_at_realization', 0.0),
-                        feat.get('points_computed_total', 0.0),
-                        feat.get('num_vectors', 0.0),
-                        feat.get('vector_loads_per_vector', 0.0),
-                        feat.get('scalar_loads_per_scalar', 0.0),
-                        feat.get('working_set_at_root', 0.0)
-                    ]
-                    sched_features.append(np.array(sched_vec))
+                    try:
+                        exec_time = float(entry['value'])
+                        if debug:
+                            print(f"Found 'total_execution_time_ms' = {exec_time} in 'scheduling_data' for {file_path}")
+                        break
+                    except (KeyError, ValueError) as e:
+                        if debug:
+                            print(f"Error accessing 'value' in {file_path}: {entry}, Error: {e}")
         else:
             if debug:
                 print(f"'scheduling_data' is not a list in {file_path}: {scheduling_data}")
-    
-    # Fallback recursive search if not found in 'scheduling_data'
+    else:
+        if debug:
+            missing_key = "'programming_details'" if 'programming_details' not in data else "'scheduling_data'"
+            print(f"{missing_key} not found in {file_path}")
+
+    # Fallback: Recursive search for 'total_execution_time_ms'
     if exec_time is None:
-        def search_dict(d, key):
+        def search_dict(d, target_key):
             if isinstance(d, dict):
                 for k, v in d.items():
-                    if k == key and isinstance(v, (int, float)):
+                    if k == target_key and isinstance(v, (int, float)):
                         return float(v)
-                    result = search_dict(v, key)
+                    result = search_dict(v, target_key)
                     if result is not None:
                         return result
             elif isinstance(d, list):
                 for item in d:
-                    result = search_dict(item, key)
+                    result = search_dict(item, target_key)
                     if result is not None:
                         return result
             return None
         
         exec_time = search_dict(data, 'total_execution_time_ms')
         if exec_time is not None and debug:
-            print(f"Found execution time {exec_time} via recursive search in {file_path}")
+            print(f"Found 'total_execution_time_ms' = {exec_time} via recursive search in {file_path}")
     
+    # If still not found, raise an error with detailed info
     if exec_time is None:
         error_msg = f"No 'total_execution_time_ms' found in {file_path}"
         if debug:
-            error_msg += f". Data structure: {json.dumps(data['programming_details'], indent=2)}"
+            error_msg += f"\nKeys in data: {list(data.keys())}"
+            if 'programming_details' in data:
+                error_msg += f"\nKeys in 'programming_details': {list(data['programming_details'].keys())}"
+                if 'scheduling_data' in data['programming_details']:
+                    error_msg += f"\n'scheduling_data' structure: {json.dumps(data['programming_details']['scheduling_data'], indent=2)}"
         raise ValueError(error_msg)
     
-    return {
-        'edge_seq': np.array(edge_features),
-        'node_seq': np.array(node_features),
-        'sched_context': np.mean(sched_features, axis=0) if sched_features else np.zeros(7),
-        'exec_time': exec_time
-    }
+    # Placeholder for other features (simplified for focus on exec_time)
+    return {'exec_time': exec_time}
 
 class HalideDataset(Dataset):
     def __init__(self, data_dir: str, debug=False):
@@ -124,64 +88,19 @@ class HalideDataset(Dataset):
                     except Exception as e:
                         print(f"Error processing {file_path}: {e}")
                         continue
-        
         if not self.data:
             raise ValueError("No valid data found in dataset")
-        
-        self._normalize_features()
-    
-    def _normalize_features(self):
-        edge_lens = [len(d['edge_seq']) for d in self.data]
-        node_lens = [len(d['node_seq']) for d in self.data]
-        self.max_edge_len = max(edge_lens)
-        self.max_node_len = max(node_lens)
-        
-        edge_dim = self.data[0]['edge_seq'].shape[1] if self.data[0]['edge_seq'].size > 0 else 1
-        node_dim = self.data[0]['node_seq'].shape[1] if self.data[0]['node_seq'].size > 0 else 1
-        
-        for item in self.data:
-            if item['edge_seq'].size > 0:
-                edge_pad = np.zeros((self.max_edge_len - len(item['edge_seq']), edge_dim))
-                item['edge_seq'] = np.vstack([item['edge_seq'], edge_pad])
-            else:
-                item['edge_seq'] = np.zeros((self.max_edge_len, edge_dim))
-            
-            if item['node_seq'].size > 0:
-                node_pad = np.zeros((self.max_node_len - len(item['node_seq']), node_dim))
-                item['node_seq'] = np.vstack([item['node_seq'], node_pad])
-            else:
-                item['node_seq'] = np.zeros((self.max_node_len, node_dim))
-            
-            item['exec_time'] = np.log1p(item['exec_time'])
     
     def __len__(self):
         return len(self.data)
     
     def __getitem__(self, idx):
-        item = self.data[idx]
-        return {
-            'edge_seq': torch.FloatTensor(item['edge_seq']),
-            'node_seq': torch.FloatTensor(item['node_seq']),
-            'sched_context': torch.FloatTensor(item['sched_context']),
-            'exec_time': torch.FloatTensor([item['exec_time']])
-        }
+        return self.data[idx]
 
-# Create dataset and dataloader
+# Run the dataset creation
 data_dir = "synthetic_data"
 try:
-    # Set debug=True to see extraction details, False for normal operation
-    dataset = HalideDataset(data_dir, debug=False)
-    train_size = int(0.8 * len(dataset))
-    test_size = len(dataset) - train_size
-    train_dataset, test_dataset = torch.utils.data.random_split(dataset, [train_size, test_size])
-
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
-
-    print(f"Train DataLoader size (number of batches): {len(train_loader)}")
-    print(f"Test DataLoader size (number of batches): {len(test_loader)}")
-    print(f"Total dataset size (number of samples): {len(dataset)}")
-    print(f"Train dataset size: {train_size}, Test dataset size: {test_size}")
-
+    dataset = HalideDataset(data_dir, debug=True)
+    print(f"Total dataset size: {len(dataset)}")
 except Exception as e:
     print(f"Error creating dataset: {e}")
