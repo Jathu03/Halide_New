@@ -39,17 +39,8 @@ def get_execution_time(file_path):
         print(f"Warning: 'total_execution_time_ms' not found in 'Schedules' of {file_path}")
         return schedules[len(schedules)-1]["value"]
     
-    except FileNotFoundError:
-        print(f"Error: File {file_path} not found")
-        return None
-    except json.JSONDecodeError as e:
-        print(f"Error: Invalid JSON format in {file_path}: {str(e)}")
-        return None
-    except UnicodeDecodeError as e:
-        print(f"Error: Encoding issue in {file_path}: {str(e)}")
-        return None
     except Exception as e:
-        print(f"Error: An unexpected error occurred while processing {file_path}: {str(e)}")
+        print(f"Error processing {file_path}: {str(e)}")
         return None
 
 def extract_features_from_file(file_path):
@@ -57,8 +48,8 @@ def extract_features_from_file(file_path):
         data = json.load(f)
     
     execution_time = get_execution_time(file_path)
-    if execution_time is None:
-        print(f"Warning: No execution time found in {file_path}")
+    if execution_time is None or not np.isfinite(execution_time):
+        print(f"Warning: Invalid execution time in {file_path}")
         return None
     
     nodes_features = []
@@ -101,19 +92,23 @@ def extract_features_from_file(file_path):
                 sched_feature.update(sf)
             scheduling_features.append(sched_feature)
     
-    # Create scheduling sequence with derived features
+    # Create scheduling sequence with safer division
     scheduling_sequence = []
     for sf in scheduling_features:
         seq_vector = [float(sf.get(metric, 0.0)) for metric in important_metrics]
-        # Add derived features to sequence
         bytes_prod = sf.get('bytes_at_production', 0.0)
         bytes_real = sf.get('bytes_at_realization', 0.0)
         num_vec = sf.get('num_vectors', 0.0)
-        seq_vector.append(bytes_prod / (bytes_real + 1e-8))  # Bytes production-to-realization ratio
-        seq_vector.append(bytes_prod / (num_vec + 1e-8))     # Bytes per vector
+        # Use safe division with larger epsilon and clamping
+        ratio_prod_real = bytes_prod / max(abs(bytes_real), 1e-4) if bytes_real != 0 else 0.0
+        bytes_per_vec = bytes_prod / max(abs(num_vec), 1e-4) if num_vec != 0 else 0.0
+        seq_vector.extend([np.clip(ratio_prod_real, -1e4, 1e4), np.clip(bytes_per_vec, -1e4, 1e4)])
         scheduling_sequence.append(seq_vector)
     if not scheduling_sequence:
         scheduling_sequence = [[0.0] * (len(important_metrics) + 2)]
+    
+    # Check for NaN in sequence
+    scheduling_sequence = [[0.0 if not np.isfinite(x) else x for x in vec] for vec in scheduling_sequence]
     
     # Calculate operation counts for scalar features
     op_counts = {}
@@ -122,17 +117,22 @@ def extract_features_from_file(file_path):
             if key.startswith('op_'):
                 op_counts[key] = op_counts.get(key, 0) + value
     
-    # Enhanced scalar features
+    # Enhanced scalar features with safeguards
     scalar_features = {
         'nodes_count': len(nodes_features),
         'edges_count': len(edges_features),
-        'node_edge_ratio': len(nodes_features) / len(edges_features) if len(edges_features) > 0 else 0,
+        'node_edge_ratio': len(nodes_features) / max(len(edges_features), 1),
         'total_ops': sum(op_counts.values()),
-        'op_diversity': len(op_counts) / len(nodes_features) if len(nodes_features) > 0 else 0,
-        'avg_ops_per_node': sum(op_counts.values()) / len(nodes_features) if len(nodes_features) > 0 else 0,
-        'edge_density': len(edges_features) / (len(nodes_features) * (len(nodes_features) - 1) + 1e-8)
+        'op_diversity': len(op_counts) / max(len(nodes_features), 1),
+        'avg_ops_per_node': sum(op_counts.values()) / max(len(nodes_features), 1),
+        'edge_density': len(edges_features) / max(len(nodes_features) * max(len(nodes_features) - 1, 1), 1)
     }
-    scalar_features.update(op_counts)  # Add individual operation counts
+    scalar_features.update(op_counts)
+    
+    # Check for NaN in scalar features
+    for key in scalar_features:
+        if not np.isfinite(scalar_features[key]):
+            scalar_features[key] = 0.0
     
     return {
         'scheduling_sequence': scheduling_sequence,
@@ -205,7 +205,11 @@ def prepare_data_for_model(train_features, test_features):
     train_scalar_df = pd.DataFrame([f['scalar_features'] for f in train_features])
     test_scalar_df = pd.DataFrame([f['scalar_features'] for f in test_features])
     
-    # Extract execution times (log-transformed for better scale)
+    # Replace NaN in scalar features with 0
+    train_scalar_df = train_scalar_df.fillna(0)
+    test_scalar_df = test_scalar_df.fillna(0)
+    
+    # Extract execution times (log-transformed)
     y_train = np.log1p(np.array([f['execution_time'] for f in train_features])).reshape(-1, 1)
     y_test = np.log1p(np.array([f['execution_time'] for f in test_features])).reshape(-1, 1)
     
@@ -217,6 +221,12 @@ def prepare_data_for_model(train_features, test_features):
     test_scalar_scaled = scaler_X_scalar.transform(test_scalar_df)
     y_train_scaled = scaler_y.fit_transform(y_train)
     y_test_scaled = scaler_y.transform(y_test)
+    
+    # Replace any remaining NaN after scaling
+    train_scalar_scaled = np.nan_to_num(train_scalar_scaled, nan=0.0)
+    test_scalar_scaled = np.nan_to_num(test_scalar_scaled, nan=0.0)
+    y_train_scaled = np.nan_to_num(y_train_scaled, nan=0.0)
+    y_test_scaled = np.nan_to_num(y_test_scaled, nan=0.0)
     
     # Create tensors
     train_scalar_tensor = torch.FloatTensor(train_scalar_scaled)
@@ -232,20 +242,17 @@ def prepare_data_for_model(train_features, test_features):
             scaler_y, train_sequences_padded.shape[2], train_scalar_tensor.shape[1])
 
 class RecursiveLSTMModel(nn.Module):
-    def __init__(self, seq_input_size, scalar_input_size, hidden_sizes=[256, 128, 64], output_size=1, dropout_rate=0.4):
+    def __init__(self, seq_input_size, scalar_input_size, hidden_sizes=[128, 64], output_size=1, dropout_rate=0.3):
         super(RecursiveLSTMModel, self).__init__()
         
-        # Multiple LSTM layers for sequence processing
+        # Multiple LSTM layers
         self.lstm1 = nn.LSTM(seq_input_size, hidden_sizes[0], batch_first=True)
         self.lstm2 = nn.LSTM(hidden_sizes[0], hidden_sizes[1], batch_first=True)
         
-        # Attention mechanism
-        self.attention = nn.Linear(hidden_sizes[1], 1)
-        
         # Fully connected layers
-        self.fc1 = nn.Linear(hidden_sizes[1] + scalar_input_size, hidden_sizes[2])
-        self.bn1 = nn.BatchNorm1d(hidden_sizes[2])
-        self.fc2 = nn.Linear(hidden_sizes[2], 32)
+        self.fc1 = nn.Linear(hidden_sizes[1] + scalar_input_size, 64)
+        self.bn1 = nn.BatchNorm1d(64)
+        self.fc2 = nn.Linear(64, 32)
         self.bn2 = nn.BatchNorm1d(32)
         self.output_layer = nn.Linear(32, output_size)
         
@@ -253,14 +260,13 @@ class RecursiveLSTMModel(nn.Module):
         self.dropout = nn.Dropout(dropout_rate)
     
     def forward(self, seq_input, scalar_input):
-        # Process sequence with multiple LSTM layers
+        # Process sequence with LSTM layers
         lstm_out, _ = self.lstm1(seq_input)
         lstm_out = self.dropout(lstm_out)
         lstm_out, _ = self.lstm2(lstm_out)
         
-        # Apply attention
-        attn_weights = torch.softmax(self.attention(lstm_out), dim=1)
-        context = torch.sum(attn_weights * lstm_out, dim=1)
+        # Use last hidden state
+        context = lstm_out[:, -1, :]
         
         # Concatenate with scalar features
         combined = torch.cat((context, scalar_input), dim=1)
@@ -308,8 +314,11 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
             optimizer.zero_grad()
             outputs = model(seq_inputs, scalar_inputs)
             loss = criterion(outputs, targets)
+            if torch.isnan(loss):
+                print(f"NaN loss detected at epoch {epoch+1}")
+                return None, None  # Early exit on NaN
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)  # Increased max_norm
             optimizer.step()
             running_loss += loss.item() * seq_inputs.size(0)
         
@@ -332,7 +341,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
         
         print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
         
-        if val_loss < best_val_loss:
+        if val_loss < best_val_loss and not np.isnan(val_loss):
             best_val_loss = val_loss
             epochs_no_improve = 0
             best_model_state = model.state_dict().copy()
@@ -361,11 +370,9 @@ def evaluate_model(model, X_test_seq, X_test_scalar, y_test, y_scaler, file_name
     y_pred_scaled = y_pred_scaled.cpu().numpy()
     y_test = y_test.cpu().numpy()
     
-    # Inverse transform predictions and targets
     y_test_transformed = y_scaler.inverse_transform(y_test)
     y_pred_transformed = y_scaler.inverse_transform(y_pred_scaled)
     
-    # Convert back from log scale
     y_test_actual = np.expm1(y_test_transformed)
     y_pred_actual = np.expm1(y_pred_transformed)
     
@@ -375,11 +382,12 @@ def evaluate_model(model, X_test_seq, X_test_scalar, y_test, y_scaler, file_name
         if subfolder not in results_by_subfolder:
             results_by_subfolder[subfolder] = []
         
+        pred = max(y_pred_actual[i][0], 0)  # Ensure non-negative
         results_by_subfolder[subfolder].append({
             'file': file_path,
             'actual': y_test_actual[i][0],
-            'predicted': max(y_pred_actual[i][0], 0),  # Ensure non-negative predictions
-            'error_percentage': abs(y_test_actual[i][0] - y_pred_actual[i][0]) / y_test_actual[i][0] * 100 if y_test_actual[i][0] > 0 else 0
+            'predicted': pred,
+            'error_percentage': abs(y_test_actual[i][0] - pred) / y_test_actual[i][0] * 100 if y_test_actual[i][0] > 0 else 0
         })
     
     for subfolder, results in results_by_subfolder.items():
@@ -430,13 +438,13 @@ def main(main_dir):
     model = RecursiveLSTMModel(
         seq_input_size=seq_input_size,
         scalar_input_size=scalar_input_size,
-        hidden_sizes=[256, 128, 64],
+        hidden_sizes=[128, 64],
         output_size=1,
-        dropout_rate=0.4
+        dropout_rate=0.3
     )
     
     # Define loss and optimizer
-    criterion = nn.HuberLoss(delta=1.0)  # Robust to outliers
+    criterion = nn.HuberLoss(delta=1.0)
     optimizer = optim.Adam(model.parameters(), lr=0.0005, weight_decay=1e-4)
     
     # Train model
@@ -446,6 +454,10 @@ def main(main_dir):
         criterion, optimizer,
         num_epochs=200, patience=30
     )
+    
+    if train_losses is None or val_losses is None:
+        print("Training failed due to NaN values")
+        return None
     
     # Evaluate model
     print("\nEvaluating model:")
