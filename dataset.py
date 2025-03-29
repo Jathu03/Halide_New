@@ -2,19 +2,35 @@ import json
 import os
 import numpy as np
 from typing import Dict, List
+import re
 
 def extract_features(file_path: str, debug=False) -> Dict:
     """Extract features from a JSON file, including edge, node, scheduling, and execution time."""
     with open(file_path, 'r') as f:
         data = json.load(f)
     
-    # Extract edge features
+    # Extract edge features with robust handling of symbolic expressions
     edge_features = []
     for edge in data['programming_details']['Edges']:
-        footprint = [float(f.split()[-1].replace('(', '').replace(')', '')) 
-                    for f in edge['Details']['Footprint'] if f.strip()]
-        jacobian = [float(x) for x in ' '.join(edge['Details']['Load Jacobians']).split() 
-                   if x.strip() and x not in ['_', '0']]
+        footprint_raw = edge['Details']['Footprint']
+        footprint = []
+        for f in footprint_raw:
+            if f.strip():
+                # Extract the last numeric value using regex, default to 0.0 if non-numeric
+                last_token = f.split()[-1].replace('(', '').replace(')', '')
+                numeric_values = re.findall(r'[+-]?\d*\.?\d+', last_token)
+                footprint.append(float(numeric_values[-1]) if numeric_values else 0.0)
+            else:
+                footprint.append(0.0)
+        
+        jacobian = []
+        for x in ' '.join(edge['Details']['Load Jacobians']).split():
+            if x.strip() and x not in ['_', '0']:
+                try:
+                    jacobian.append(float(x))
+                except ValueError:
+                    jacobian.append(0.0)  # Handle non-numeric Jacobian values
+        
         edge_features.append(np.array(footprint + jacobian))
     
     # Extract node features
@@ -22,11 +38,11 @@ def extract_features(file_path: str, debug=False) -> Dict:
     for node in data['programming_details']['Nodes']:
         if 'Memory access patterns' in node['Details']:
             mem_patterns = [int(x) for pattern in node['Details']['Memory access patterns'] 
-                          for x in pattern.split() if x.isdigit()]
+                           for x in pattern.split() if x.isdigit()]
             op_hist = [int(x.split()[-1]) for x in node['Details']['Op histogram']]
             node_features.append(np.array(mem_patterns + op_hist))
     
-    # Extract scheduling features
+    # Extract scheduling features and execution time
     sched_features = []
     exec_time = None
     if 'Scheduling' in data['programming_details']:
