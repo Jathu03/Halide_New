@@ -693,7 +693,7 @@ def save_model_and_results(model, train_history, evaluation_results, output_dir=
     
     print(f"Model and results saved to {output_dir}")
 
-def main(data_dir="synthetic_data", output_dir="model_output"):
+def main(data_dir, output_dir="model_output"):
     # Process data
     print("Processing data...")
     train_features, test_features, test_file_names = process_main_directory(data_dir)
