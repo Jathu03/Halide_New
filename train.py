@@ -279,76 +279,76 @@ class DataProcessor:
         return train_features, test_features, list(test_file_names)
 
     @staticmethod
-    def clean_and_transform_features(train_features, test_features):
-        """Clean, transform, and select features"""
-        # Convert to DataFrame
-        train_df = pd.DataFrame(train_features)
-        test_df = pd.DataFrame(test_features)
-        
-        # Drop constant features
-        constant_cols = [col for col in train_df.columns 
-                        if col != 'execution_time' and train_df[col].nunique() == 1]
-        train_df = train_df.drop(columns=constant_cols)
-        test_df = test_df.drop(columns=constant_cols)
-        
-        # Drop highly correlated features
-        corr_matrix = train_df.corr().abs()
-        upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool)
-        to_drop = [column for column in upper.columns if any(upper[column] > 0.95)]
-        train_df = train_df.drop(columns=to_drop)
-        test_df = test_df.drop(columns=to_drop)
-        
-        # Log transform execution time and add as target
-        train_df['log_execution_time'] = np.log1p(train_df['execution_time'])
-        test_df['log_execution_time'] = np.log1p(test_df['execution_time'])
-        
-        # Select numeric features only
-        numeric_cols = train_df.select_dtypes(include=['number']).columns.tolist()
-        train_df = train_df[numeric_cols]
-        test_df = test_df[numeric_cols]
-        
-        # Feature selection using SelectKBest
-        X_train = train_df.drop(['execution_time', 'log_execution_time'], axis=1)
-        y_train = train_df['log_execution_time']
-        
-        selector = SelectKBest(f_regression, k=min(30, X_train.shape[1]))
-        selector.fit(X_train, y_train)
-        selected_cols = X_train.columns[selector.get_support()]
-        
-        # Apply selection
-        X_train = X_train[selected_cols]
-        X_test = test_df[selected_cols]
-        y_train = train_df['log_execution_time']
-        y_test = test_df['log_execution_time']
-        
-        # Power transform for heavy-tailed features
-        pt = PowerTransformer()
-        X_train_transformed = pt.fit_transform(X_train)
-        X_test_transformed = pt.transform(X_test)
-        
-        # Scale features
-        scaler_X = StandardScaler()
-        X_train_scaled = scaler_X.fit_transform(X_train_transformed)
-        X_test_scaled = scaler_X.transform(X_test_transformed)
-        
-        # Scale target
-        scaler_y = StandardScaler()
-        y_train_scaled = scaler_y.fit_transform(y_train.values.reshape(-1, 1))
-        y_test_scaled = scaler_y.transform(y_test.values.reshape(-1, 1))
-        
-        # Convert to tensors
-        X_train_tensor = torch.FloatTensor(X_train_scaled).unsqueeze(1)
-        y_train_tensor = torch.FloatTensor(y_train_scaled)
-        X_test_tensor = torch.FloatTensor(X_test_scaled).unsqueeze(1)
-        y_test_tensor = torch.FloatTensor(y_test_scaled)
-        
-        print(f"\nFeature Engineering Summary:")
-        print(f"Selected {len(selected_cols)} features:")
-        print(selected_cols.tolist())
-        print(f"Input feature dimension: {X_train_scaled.shape[1]}")
-        
-        return (X_train_tensor, y_train_tensor, X_test_tensor, y_test_tensor, 
-                scaler_y, X_train_scaled.shape[1], True)
+def clean_and_transform_features(train_features, test_features):
+    """Clean, transform, and select features"""
+    # Convert to DataFrame
+    train_df = pd.DataFrame(train_features)
+    test_df = pd.DataFrame(test_features)
+    
+    # Drop constant features
+    constant_cols = [col for col in train_df.columns 
+                    if col != 'execution_time' and train_df[col].nunique() == 1]
+    train_df = train_df.drop(columns=constant_cols)
+    test_df = test_df.drop(columns=constant_cols)
+    
+    # Drop highly correlated features
+    corr_matrix = train_df.corr().abs()
+    upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool)
+    to_drop = [column for column in upper.columns if any(upper[column] > 0.95)]
+    train_df = train_df.drop(columns=to_drop)
+    test_df = test_df.drop(columns=to_drop)
+    
+    # Rest of the method remains the same...
+    train_df['log_execution_time'] = np.log1p(train_df['execution_time'])
+    test_df['log_execution_time'] = np.log1p(test_df['execution_time'])
+    
+    # Select numeric features only
+    numeric_cols = train_df.select_dtypes(include=['number']).columns.tolist()
+    train_df = train_df[numeric_cols]
+    test_df = test_df[numeric_cols]
+    
+    # Feature selection using SelectKBest
+    X_train = train_df.drop(['execution_time', 'log_execution_time'], axis=1)
+    y_train = train_df['log_execution_time']
+    
+    selector = SelectKBest(f_regression, k=min(30, X_train.shape[1]))
+    selector.fit(X_train, y_train)
+    selected_cols = X_train.columns[selector.get_support()]
+    
+    # Apply selection
+    X_train = X_train[selected_cols]
+    X_test = test_df[selected_cols]
+    y_train = train_df['log_execution_time']
+    y_test = test_df['log_execution_time']
+    
+    # Power transform for heavy-tailed features
+    pt = PowerTransformer()
+    X_train_transformed = pt.fit_transform(X_train)
+    X_test_transformed = pt.transform(X_test)
+    
+    # Scale features
+    scaler_X = StandardScaler()
+    X_train_scaled = scaler_X.fit_transform(X_train_transformed)
+    X_test_scaled = scaler_X.transform(X_test_transformed)
+    
+    # Scale target
+    scaler_y = StandardScaler()
+    y_train_scaled = scaler_y.fit_transform(y_train.values.reshape(-1, 1))
+    y_test_scaled = scaler_y.transform(y_test.values.reshape(-1, 1))
+    
+    # Convert to tensors
+    X_train_tensor = torch.FloatTensor(X_train_scaled).unsqueeze(1)
+    y_train_tensor = torch.FloatTensor(y_train_scaled)
+    X_test_tensor = torch.FloatTensor(X_test_scaled).unsqueeze(1)
+    y_test_tensor = torch.FloatTensor(y_test_scaled)
+    
+    print(f"\nFeature Engineering Summary:")
+    print(f"Selected {len(selected_cols)} features:")
+    print(selected_cols.tolist())
+    print(f"Input feature dimension: {X_train_scaled.shape[1]}")
+    
+    return (X_train_tensor, y_train_tensor, X_test_tensor, y_test_tensor, 
+            scaler_y, X_train_scaled.shape[1], True)
 
 class HierarchicalAttentionModel(nn.Module):
     """Enhanced model with hierarchical attention and residual connections"""
