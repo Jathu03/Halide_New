@@ -223,21 +223,18 @@ def prepare_data_for_model(train_features, test_features):
             scaler_y, train_sequences_padded.shape[2], train_scalar_tensor.shape[1])
 
 class RecursiveLSTMModel(nn.Module):
-    def __init__(self, seq_input_size, scalar_input_size, hidden_sizes=[128, 64, 32], output_size=1, dropout_rate=0.3):
+    def __init__(self, seq_input_size, scalar_input_size, hidden_size=128, output_size=1, dropout_rate=0.5):
         super(RecursiveLSTMModel, self).__init__()
         
         # LSTM for processing scheduling sequence
-        self.lstm = nn.LSTM(seq_input_size, hidden_sizes[0], batch_first=True)
-        
-        # Attention mechanism
-        self.attention = nn.Linear(hidden_sizes[0], 1)
+        self.lstm = nn.LSTM(seq_input_size, hidden_size, batch_first=True)
         
         # Fully connected layers after concatenation
-        self.fc1 = nn.Linear(hidden_sizes[0] + scalar_input_size, hidden_sizes[1])
-        self.bn1 = nn.BatchNorm1d(hidden_sizes[1])
-        self.fc2 = nn.Linear(hidden_sizes[1], hidden_sizes[2])
-        self.bn2 = nn.BatchNorm1d(hidden_sizes[2])
-        self.output_layer = nn.Linear(hidden_sizes[2], output_size)
+        self.fc1 = nn.Linear(hidden_size + scalar_input_size, 64)
+        self.bn1 = nn.BatchNorm1d(64)
+        self.fc2 = nn.Linear(64, 32)
+        self.bn2 = nn.BatchNorm1d(32)
+        self.output_layer = nn.Linear(32, output_size)
         
         self.relu = nn.ReLU()
         self.dropout = nn.Dropout(dropout_rate)
@@ -245,13 +242,10 @@ class RecursiveLSTMModel(nn.Module):
     def forward(self, seq_input, scalar_input):
         # Process sequence with LSTM
         lstm_out, _ = self.lstm(seq_input)
-        
-        # Apply attention to get fixed-size representation
-        attn_weights = torch.softmax(self.attention(lstm_out), dim=1)
-        context = torch.sum(attn_weights * lstm_out, dim=1)
+        lstm_out = lstm_out[:, -1, :]  # Use the last hidden state
         
         # Concatenate with scalar features
-        combined = torch.cat((context, scalar_input), dim=1)
+        combined = torch.cat((lstm_out, scalar_input), dim=1)
         
         # Fully connected layers
         x = self.fc1(combined)
@@ -266,7 +260,7 @@ class RecursiveLSTMModel(nn.Module):
         
         return output
 
-def create_data_loaders(train_sequences, train_scalar, y_train, test_sequences, test_scalar, y_test, batch_size=32):
+def create_data_loaders(train_sequences, train_scalar, y_train, test_sequences, test_scalar, y_test, batch_size=64):
     train_dataset = TensorDataset(train_sequences, train_scalar, y_train)
     test_dataset = TensorDataset(test_sequences, test_scalar, y_test)
     
@@ -406,21 +400,21 @@ def main(main_dir):
     train_loader, test_loader = create_data_loaders(
         train_sequences, train_scalar, y_train,
         test_sequences, test_scalar, y_test,
-        batch_size=16
+        batch_size=64
     )
     
     # Initialize model
     model = RecursiveLSTMModel(
         seq_input_size=seq_input_size,
         scalar_input_size=scalar_input_size,
-        hidden_sizes=[128, 64, 32],
+        hidden_size=128,
         output_size=1,
-        dropout_rate=0.3
+        dropout_rate=0.5
     )
     
     # Define loss and optimizer
-    criterion = nn.HuberLoss(delta=1.0)
-    optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-5)
+    criterion = nn.MSELoss()
+    optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
     
     # Train model
     print("Building and training Recursive LSTM model...")
