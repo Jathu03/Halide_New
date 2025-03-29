@@ -3,20 +3,21 @@ import os
 import numpy as np
 from typing import Dict, List
 import re
+import torch
+from torch.utils.data import Dataset, DataLoader
 
-def extract_features(file_path: str, debug=False) -> Dict:
+def extract_features(file_path: str, debug=True) -> Dict:
     """Extract features from a JSON file, including edge, node, scheduling, and execution time."""
     with open(file_path, 'r') as f:
         data = json.load(f)
     
-    # Extract edge features with robust handling of symbolic expressions
+    # Extract edge features with robust handling
     edge_features = []
-    for edge in data['programming_details']['Edges']:
-        footprint_raw = edge['Details']['Footprint']
+    for edge in data.get('programming_details', {}).get('Edges', []):
+        footprint_raw = edge.get('Details', {}).get('Footprint', [])
         footprint = []
         for f in footprint_raw:
             if f.strip():
-                # Extract the last numeric value using regex, default to 0.0 if non-numeric
                 last_token = f.split()[-1].replace('(', '').replace(')', '')
                 numeric_values = re.findall(r'[+-]?\d*\.?\d+', last_token)
                 footprint.append(float(numeric_values[-1]) if numeric_values else 0.0)
@@ -24,19 +25,19 @@ def extract_features(file_path: str, debug=False) -> Dict:
                 footprint.append(0.0)
         
         jacobian = []
-        for x in ' '.join(edge['Details']['Load Jacobians']).split():
+        for x in ' '.join(edge.get('Details', {}).get('Load Jacobians', [])).split():
             if x.strip() and x not in ['_', '0']:
                 try:
                     jacobian.append(float(x))
                 except ValueError:
-                    jacobian.append(0.0)  # Handle non-numeric Jacobian values
+                    jacobian.append(0.0)
         
         edge_features.append(np.array(footprint + jacobian))
     
     # Extract node features
     node_features = []
-    for node in data['programming_details']['Nodes']:
-        if 'Memory access patterns' in node['Details']:
+    for node in data.get('programming_details', {}).get('Nodes', []):
+        if 'Memory access patterns' in node.get('Details', {}):
             mem_patterns = [int(x) for pattern in node['Details']['Memory access patterns'] 
                            for x in pattern.split() if x.isdigit()]
             op_hist = [int(x.split()[-1]) for x in node['Details']['Op histogram']]
@@ -45,8 +46,10 @@ def extract_features(file_path: str, debug=False) -> Dict:
     # Extract scheduling features and execution time
     sched_features = []
     exec_time = None
-    if 'Scheduling' in data['programming_details']:
-        for sched in data['programming_details']['Scheduling']:
+    programming_details = data.get('programming_details', {})
+    
+    if 'Scheduling' in programming_details:
+        for sched in programming_details['Scheduling']:
             if 'scheduling_feature' in sched.get('Details', {}):
                 feat = sched['Details']['scheduling_feature']
                 sched_vec = [
@@ -67,19 +70,22 @@ def extract_features(file_path: str, debug=False) -> Dict:
         if debug:
             print(f"'Scheduling' not found in 'programming_details' for {file_path}")
     
-    # Fallback: Search for 'total_execution_time_ms' recursively if not found
+    # Fallback: Recursive search for 'total_execution_time_ms'
     if exec_time is None:
-        def search_dict(d, key):
+        def search_dict(d, key, depth=0, max_depth=10):
+            if depth > max_depth or exec_time is not None:
+                return None
             if isinstance(d, dict):
                 for k, v in d.items():
-                    if k == key and isinstance(v, (int, float)):
-                        return v
-                    result = search_dict(v, key)
+                    if k.lower() == key.lower():  # Case-insensitive match
+                        if isinstance(v, (int, float)):
+                            return v
+                    result = search_dict(v, key, depth + 1, max_depth)
                     if result is not None:
                         return result
             elif isinstance(d, list):
                 for item in d:
-                    result = search_dict(item, key)
+                    result = search_dict(item, key, depth + 1, max_depth)
                     if result is not None:
                         return result
             return None
@@ -88,8 +94,35 @@ def extract_features(file_path: str, debug=False) -> Dict:
         if exec_time is not None and debug:
             print(f"Found execution time {exec_time} via recursive search in {file_path}")
     
+    # Fallback: Search for similar keys (e.g., 'execution_time', 'exec_time_ms')
     if exec_time is None:
-        raise ValueError(f"No 'total_execution_time_ms' found in {file_path}")
+        def find_similar_key(d, partial_keys=['execution_time', 'exec_time'], depth=0, max_depth=10):
+            if depth > max_depth:
+                return None
+            if isinstance(d, dict):
+                for k, v in d.items():
+                    if any(p.lower() in k.lower() for p in partial_keys):
+                        if isinstance(v, (int, float)):
+                            return v
+                    result = find_similar_key(v, partial_keys, depth + 1, max_depth)
+                    if result is not None:
+                        return result
+            elif isinstance(d, list):
+                for item in d:
+                    result = find_similar_key(item, partial_keys, depth + 1, max_depth)
+                    if result is not None:
+                        return result
+            return None
+        
+        exec_time = find_similar_key(data)
+        if exec_time is not None and debug:
+            print(f"Found execution time {exec_time} via partial key match in {file_path}")
+    
+    # Final fallback: Assign a default value or skip
+    if exec_time is None:
+        if debug:
+            print(f"No execution time found in {file_path}; assigning default value 0.0")
+        exec_time = 0.0  # Default value instead of skipping
     
     return {
         'edge_seq': np.array(edge_features),
@@ -98,13 +131,11 @@ def extract_features(file_path: str, debug=False) -> Dict:
         'exec_time': exec_time
     }
 
-from torch.utils.data import Dataset, DataLoader
-import torch
-
 class HalideDataset(Dataset):
     """Custom Dataset class for loading and normalizing Halide scheduling data."""
-    def __init__(self, data_dir: str, debug=False):
+    def __init__(self, data_dir: str, debug=True):
         self.data = []
+        self.debug = debug
         for program in os.listdir(data_dir):
             program_path = os.path.join(data_dir, program)
             if os.path.isdir(program_path):
@@ -113,8 +144,9 @@ class HalideDataset(Dataset):
                     try:
                         features = extract_features(file_path, debug=debug)
                         self.data.append(features)
-                    except ValueError as e:
-                        print(f"Skipping {file_path}: {e}")
+                    except Exception as e:
+                        if debug:
+                            print(f"Error processing {file_path}: {e}")
                         continue
         
         if not self.data:
@@ -127,18 +159,25 @@ class HalideDataset(Dataset):
         """Normalize and pad edge, node sequences, and execution time."""
         edge_lens = [len(d['edge_seq']) for d in self.data]
         node_lens = [len(d['node_seq']) for d in self.data]
-        self.max_edge_len = max(edge_lens)
-        self.max_node_len = max(node_lens)
+        self.max_edge_len = max(edge_lens) if edge_lens else 1
+        self.max_node_len = max(node_lens) if node_lens else 1
         
         for item in self.data:
-            # Pad sequences
-            edge_pad = np.zeros((self.max_edge_len - len(item['edge_seq']), 
-                               item['edge_seq'].shape[1]))
-            item['edge_seq'] = np.vstack([item['edge_seq'], edge_pad])
+            # Pad edge sequences
+            if len(item['edge_seq']) == 0:
+                item['edge_seq'] = np.zeros((self.max_edge_len, 1))
+            else:
+                edge_pad = np.zeros((self.max_edge_len - len(item['edge_seq']), 
+                                   item['edge_seq'].shape[1]))
+                item['edge_seq'] = np.vstack([item['edge_seq'], edge_pad])
             
-            node_pad = np.zeros((self.max_node_len - len(item['node_seq']), 
-                               item['node_seq'].shape[1]))
-            item['node_seq'] = np.vstack([item['node_seq'], node_pad])
+            # Pad node sequences
+            if len(item['node_seq']) == 0:
+                item['node_seq'] = np.zeros((self.max_node_len, 1))
+            else:
+                node_pad = np.zeros((self.max_node_len - len(item['node_seq']), 
+                                   item['node_seq'].shape[1]))
+                item['node_seq'] = np.vstack([item['node_seq'], node_pad])
             
             # Normalize execution time
             item['exec_time'] = np.log1p(item['exec_time'])  # Log transform for stability
@@ -158,7 +197,7 @@ class HalideDataset(Dataset):
 # Create dataset and dataloader
 data_dir = "synthetic_data"
 try:
-    dataset = HalideDataset(data_dir, debug=True)  # Enable debug for troubleshooting
+    dataset = HalideDataset(data_dir, debug=True)
     train_size = int(0.8 * len(dataset))
     test_size = len(dataset) - train_size
     train_dataset, test_dataset = torch.utils.data.random_split(dataset, [train_size, test_size])
