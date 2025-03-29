@@ -13,18 +13,15 @@ def extract_features(file_path: str) -> Dict:
     # Extract edge features
     edge_features = []
     for edge in data['programming_details']['Edges']:
-        # Handle footprint: extract numerical values when present, otherwise use placeholder
         footprint_raw = edge['Details']['Footprint']
         footprint = []
         for f in footprint_raw:
-            # Extract numbers from expressions using regex
             nums = re.findall(r'[+-]?\d*\.?\d+', f)
             if nums:
-                footprint.append(float(nums[-1]))  # Take the last number found
+                footprint.append(float(nums[-1]))
             else:
-                footprint.append(0.0)  # Use 0 as placeholder for pure symbolic terms
+                footprint.append(0.0)
         
-        # Handle Load Jacobians: convert to float where possible
         jacobian_raw = ' '.join(edge['Details']['Load Jacobians']).split()
         jacobian = []
         for x in jacobian_raw:
@@ -32,7 +29,7 @@ def extract_features(file_path: str) -> Dict:
                 if x not in ['_', '0']:
                     jacobian.append(float(x))
             except ValueError:
-                jacobian.append(0.0)  # Placeholder for non-numeric entries
+                jacobian.append(0.0)
         
         edge_features.append(np.array(footprint + jacobian))
     
@@ -45,16 +42,18 @@ def extract_features(file_path: str) -> Dict:
             op_hist = [int(x.split()[-1]) for x in node['Details']['Op histogram']]
             node_features.append(np.array(mem_patterns + op_hist))
     
-    # Extract scheduling features (optional)
-    sched_features = []
+    # Extract execution time and scheduling features
     exec_time = None
+    sched_features = []
+    
+    # Check if 'Scheduling' exists and extract data
     if 'Scheduling' in data['programming_details']:
         for sched in data['programming_details']['Scheduling']:
-            # Extract execution time (required)
-            if sched.get('name') == 'total_execution_time_ms':
+            # Look for execution time
+            if isinstance(sched, dict) and sched.get('name') == 'total_execution_time_ms':
                 exec_time = sched['value']
-            # Extract other scheduling features (optional)
-            elif 'scheduling_feature' in sched['Details']:
+            # Look for scheduling features
+            elif isinstance(sched, dict) and 'Details' in sched and 'scheduling_feature' in sched['Details']:
                 feat = sched['Details']['scheduling_feature']
                 sched_vec = [
                     feat.get('bytes_at_production', 0.0),
@@ -66,9 +65,28 @@ def extract_features(file_path: str) -> Dict:
                     feat.get('working_set_at_root', 0.0)
                 ]
                 sched_features.append(np.array(sched_vec))
+    else:
+        # If 'Scheduling' is missing, log this and search elsewhere in the JSON
+        print(f"Warning: 'Scheduling' not found in {file_path}. Searching entire JSON for execution time.")
+        def search_dict(d, key):
+            if isinstance(d, dict):
+                for k, v in d.items():
+                    if k == key and isinstance(v, (int, float)):
+                        return v
+                    result = search_dict(v, key)
+                    if result is not None:
+                        return result
+            elif isinstance(d, list):
+                for item in d:
+                    result = search_dict(item, key)
+                    if result is not None:
+                        return result
+            return None
+        
+        exec_time = search_dict(data, 'total_execution_time_ms')
     
     if exec_time is None:
-        raise ValueError(f"No 'total_execution_time_ms' found in {file_path}")
+        raise ValueError(f"No 'total_execution_time_ms' found in {file_path}. Data structure: {json.dumps(data['programming_details'], indent=2)}")
     
     return {
         'edge_seq': np.array(edge_features),
@@ -107,12 +125,10 @@ class HalideDataset(Dataset):
         self.max_edge_len = max(edge_lens)
         self.max_node_len = max(node_lens)
         
-        # Determine feature dimensions from first valid entry
         edge_dim = self.data[0]['edge_seq'].shape[1] if self.data[0]['edge_seq'].size > 0 else 1
         node_dim = self.data[0]['node_seq'].shape[1] if self.data[0]['node_seq'].size > 0 else 1
         
         for item in self.data:
-            # Pad sequences
             if item['edge_seq'].size > 0:
                 edge_pad = np.zeros((self.max_edge_len - len(item['edge_seq']), edge_dim))
                 item['edge_seq'] = np.vstack([item['edge_seq'], edge_pad])
@@ -125,8 +141,7 @@ class HalideDataset(Dataset):
             else:
                 item['node_seq'] = np.zeros((self.max_node_len, node_dim))
             
-            # Normalize execution time (y_label)
-            item['exec_time'] = np.log1p(item['exec_time'])  # Log transform for stability
+            item['exec_time'] = np.log1p(item['exec_time'])  # Normalize y_label
     
     def __len__(self):
         return len(self.data)
