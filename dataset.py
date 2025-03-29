@@ -13,27 +13,43 @@ def extract_features(file_path: str, debug=False) -> Dict:
     # Initialize execution time
     exec_time = None
     
-    # Primary check: Look in 'programming_details'['scheduling_data']
-    if 'programming_details' in data and 'scheduling_data' in data['programming_details']:
-        scheduling_data = data['programming_details']['scheduling_data']
+    # Check for 'scheduling_data' at the top level
+    if 'scheduling_data' in data:
+        scheduling_data = data['scheduling_data']
+        if debug:
+            print(f"'scheduling_data' found in {file_path}: {json.dumps(scheduling_data, indent=2)}")
+        
+        # Case 1: 'scheduling_data' is a list of dictionaries
         if isinstance(scheduling_data, list):
             for entry in scheduling_data:
                 if isinstance(entry, dict) and entry.get('name') == 'total_execution_time_ms':
                     try:
                         exec_time = float(entry['value'])
                         if debug:
-                            print(f"Found 'total_execution_time_ms' = {exec_time} in 'scheduling_data' for {file_path}")
+                            print(f"Found 'total_execution_time_ms' = {exec_time} in 'scheduling_data' list for {file_path}")
                         break
                     except (KeyError, ValueError) as e:
                         if debug:
                             print(f"Error accessing 'value' in {file_path}: {entry}, Error: {e}")
+        
+        # Case 2: 'scheduling_data' is a dictionary
+        elif isinstance(scheduling_data, dict):
+            if 'total_execution_time_ms' in scheduling_data:
+                try:
+                    exec_time = float(scheduling_data['total_execution_time_ms'])
+                    if debug:
+                        print(f"Found 'total_execution_time_ms' = {exec_time} in 'scheduling_data' dict for {file_path}")
+                except ValueError as e:
+                    if debug:
+                        print(f"Error converting 'total_execution_time_ms' to float in {file_path}: {e}")
+        
         else:
             if debug:
-                print(f"'scheduling_data' is not a list in {file_path}: {scheduling_data}")
+                print(f"'scheduling_data' is neither a list nor a dict in {file_path}: {scheduling_data}")
+    
     else:
         if debug:
-            missing_key = "'programming_details'" if 'programming_details' not in data else "'scheduling_data'"
-            print(f"{missing_key} not found in {file_path}")
+            print(f"'scheduling_data' key not found in {file_path}. Keys available: {list(data.keys())}")
 
     # Fallback: Recursive search for 'total_execution_time_ms'
     if exec_time is None:
@@ -61,13 +77,11 @@ def extract_features(file_path: str, debug=False) -> Dict:
         error_msg = f"No 'total_execution_time_ms' found in {file_path}"
         if debug:
             error_msg += f"\nKeys in data: {list(data.keys())}"
-            if 'programming_details' in data:
-                error_msg += f"\nKeys in 'programming_details': {list(data['programming_details'].keys())}"
-                if 'scheduling_data' in data['programming_details']:
-                    error_msg += f"\n'scheduling_data' structure: {json.dumps(data['programming_details']['scheduling_data'], indent=2)}"
+            if 'scheduling_data' in data:
+                error_msg += f"\n'scheduling_data' structure: {json.dumps(data['scheduling_data'], indent=2)}"
         raise ValueError(error_msg)
     
-    # Placeholder for other features (simplified for focus on exec_time)
+    # Return features (simplified to focus on exec_time)
     return {'exec_time': exec_time}
 
 class HalideDataset(Dataset):
