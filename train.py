@@ -13,7 +13,7 @@ import random
 from sklearn.ensemble import IsolationForest
 from torch.nn import TransformerEncoder, TransformerEncoderLayer
 
-# Define important metrics for scheduling sequence with additional metrics
+# Define important metrics for scheduling sequence
 important_metrics = [
     'bytes_at_production', 'bytes_at_realization', 'bytes_at_root', 'bytes_at_task',
     'inner_parallelism', 'outer_parallelism', 'num_productions', 'num_realizations',
@@ -58,12 +58,10 @@ def extract_features_from_file(file_path):
     edges_features = []
     programming_details = data.get("programming_details", None)
     
-    # Enhanced extraction of node features
     if programming_details:
         if 'Nodes' in programming_details:
             for node in programming_details['Nodes']:
                 node_feature = {'Name': node.get('Name', '')}
-                
                 if 'Details' in node:
                     details = node['Details']
                     if 'Op histogram' in details:
@@ -74,11 +72,9 @@ def extract_features_from_file(file_path):
                                 op_name = parts[0].strip()
                                 op_count = int(parts[1].strip())
                                 node_feature[f'op_{op_name.lower()}'] = op_count
-                    
                     for key, value in details.items():
                         if key != 'Op histogram' and isinstance(value, (int, float, str)):
                             node_feature[f'detail_{key.lower().replace(" ", "_")}'] = value
-                
                 nodes_features.append(node_feature)
         
         if 'Edges' in programming_details:
@@ -92,10 +88,8 @@ def extract_features_from_file(file_path):
                     for key, value in edge['Details'].items():
                         if isinstance(value, (int, float, str)):
                             edge_feature[f'edge_{key.lower().replace(" ", "_")}'] = value
-                
                 edges_features.append(edge_feature)
     
-    # Enhanced scheduling feature extraction
     scheduling_features = []
     scheduling_data = data.get("scheduling_data", None)
     if not scheduling_data and programming_details and 'Schedules' in programming_details:
@@ -113,11 +107,9 @@ def extract_features_from_file(file_path):
                         sched_feature[f'sched_{key.lower().replace(" ", "_")}'] = value
             scheduling_features.append(sched_feature)
     
-    # Enhanced scheduling sequence with expanded derived features
     scheduling_sequence = []
     for sf in scheduling_features:
         seq_vector = [float(sf.get(metric, 0.0)) for metric in important_metrics]
-        
         bytes_prod = sf.get('bytes_at_production', 0.0)
         bytes_real = sf.get('bytes_at_realization', 0.0)
         bytes_root = sf.get('bytes_at_root', 0.0)
@@ -137,7 +129,6 @@ def extract_features_from_file(file_path):
         seq_vector.append(safe_div(bytes_prod, num_vec))
         seq_vector.append(safe_div(points_total, num_vec))
         seq_vector.append(safe_div(working_set, bytes_prod))
-        
         seq_vector.append(safe_div(bytes_prod, bytes_task))
         seq_vector.append(safe_div(bytes_root, bytes_real))
         seq_vector.append(safe_div(num_vec, num_scalars))
@@ -146,7 +137,6 @@ def extract_features_from_file(file_path):
         seq_vector.append(inner_para * outer_para)
         seq_vector.append(safe_div(bytes_prod, inner_para))
         seq_vector.append(safe_div(points_total, outer_para))
-        
         seq_vector.append(np.log1p(bytes_prod))
         seq_vector.append(np.log1p(points_total))
         seq_vector.append(np.log1p(working_set))
@@ -156,7 +146,6 @@ def extract_features_from_file(file_path):
     if not scheduling_sequence:
         scheduling_sequence = [[0.0] * (len(important_metrics) + 15)]
     
-    # Per-sample normalization with robust statistics
     seq_array = np.array(scheduling_sequence)
     seq_median = np.median(seq_array, axis=0, keepdims=True)
     seq_iqr = np.percentile(seq_array, 75, axis=0, keepdims=True) - np.percentile(seq_array, 25, axis=0, keepdims=True)
@@ -164,7 +153,6 @@ def extract_features_from_file(file_path):
     scheduling_sequence = (seq_array - seq_median) / seq_iqr
     scheduling_sequence = np.nan_to_num(scheduling_sequence, nan=0.0).tolist()
     
-    # Enhanced scalar features with graph topology metrics
     op_counts = {}
     for node in nodes_features:
         for key, value in node.items():
@@ -301,14 +289,8 @@ def prepare_data_for_model(train_features, test_features):
     train_sequences_padded = pad_sequence(train_sequences, batch_first=True)
     test_sequences_padded = pad_sequence(test_sequences, batch_first=True)
     
-    train_mask = torch.ones((train_sequences_padded.size(0), train_sequences_padded.size(1)))
-    test_mask = torch.ones((test_sequences_padded.size(0), test_sequences_padded.size(1)))
-    
-    for i, seq in enumerate(train_sequences):
-        train_mask[i, seq.size(0):] = 0
-    
-    for i, seq in enumerate(test_sequences):
-        test_mask[i, seq.size(0):] = 0
+    train_mask = (train_sequences_padded != 0).any(dim=-1).float()
+    test_mask = (test_sequences_padded != 0).any(dim=-1).float()
     
     train_scalar_df = pd.DataFrame([f['scalar_features'] for f in train_features])
     test_scalar_df = pd.DataFrame([f['scalar_features'] for f in test_features])
@@ -401,10 +383,14 @@ class EnhancedTransformerModel(nn.Module):
         self.selu = nn.SELU()
     
     def forward(self, seq_input, seq_mask, scalar_input):
+        batch_size, seq_len, _ = seq_input.size()
+        
         seq_embedded = self.seq_embedding(seq_input)
         seq_embedded = self.pos_encoder(seq_embedded)
         
+        # Ensure pad_mask has shape (batch_size, seq_len)
         pad_mask = (seq_mask == 0)
+        assert pad_mask.shape == (batch_size, seq_len), f"Expected pad_mask shape ({batch_size}, {seq_len}), got {pad_mask.shape}"
         
         transformer_out = self.transformer_encoder(seq_embedded, src_key_padding_mask=pad_mask)
         
@@ -591,7 +577,7 @@ def evaluate_model(model, X_test_seq, X_test_mask, X_test_scalar, y_test, y_scal
         if subfolder not in results_by_subfolder:
             results_by_subfolder[subfolder] = []
         
-        pred = max(y_pred_actual[i][0], 0)  # Ensure non-negative predictions
+        pred = max(y_pred_actual[i][0], 0)
         actual = y_test_actual[i][0]
         error_percentage = abs(actual - pred) / actual * 100 if actual > 0 else 0
         
@@ -658,7 +644,7 @@ def main(main_dir):
     optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-4)
     criterion = MultiTaskLoss(mse_weight=1.0, huber_weight=0.5, l1_weight=0.3, quantile_weight=0.2, delta=1.0)
     
-    total_steps = len(train_loader) * 300  # num_epochs * batches per epoch
+    total_steps = len(train_loader) * 300
     scheduler = OneCycleLR(optimizer, max_lr=0.001, total_steps=total_steps, pct_start=0.3)
     
     print("Building and training Enhanced Transformer model...")
