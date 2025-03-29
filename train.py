@@ -652,7 +652,7 @@ def main(main_dir="synthetic_data"):
         model.parameters(), 
         lr=1e-3, 
         weight_decay=1e-4,
-        betas=(0.9, 0.999)
+        betas=(0.9, 0.999))
     
     # Step 6: Train Model
     print("\nTraining model...")
