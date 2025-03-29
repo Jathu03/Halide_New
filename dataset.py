@@ -2,13 +2,13 @@ import os
 import json
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import RobustScaler
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
 from torch.nn.utils.rnn import pad_sequence
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.optim.lr_scheduler import CosineAnnealingLR
 import random
 
 # Define important metrics for scheduling sequence
@@ -92,44 +92,54 @@ def extract_features_from_file(file_path):
                 sched_feature.update(sf)
             scheduling_features.append(sched_feature)
     
-    # Create scheduling sequence with safer division
+    # Enhanced scheduling sequence
     scheduling_sequence = []
     for sf in scheduling_features:
         seq_vector = [float(sf.get(metric, 0.0)) for metric in important_metrics]
         bytes_prod = sf.get('bytes_at_production', 0.0)
         bytes_real = sf.get('bytes_at_realization', 0.0)
         num_vec = sf.get('num_vectors', 0.0)
-        # Use safe division with larger epsilon and clamping
-        ratio_prod_real = bytes_prod / max(abs(bytes_real), 1e-4) if bytes_real != 0 else 0.0
-        bytes_per_vec = bytes_prod / max(abs(num_vec), 1e-4) if num_vec != 0 else 0.0
-        seq_vector.extend([np.clip(ratio_prod_real, -1e4, 1e4), np.clip(bytes_per_vec, -1e4, 1e4)])
+        points_total = sf.get('points_computed_total', 0.0)
+        working_set = sf.get('working_set', 0.0)
+        # Derived features
+        seq_vector.append(np.clip(bytes_prod / max(abs(bytes_real), 1e-4), -1e4, 1e4) if bytes_real != 0 else 0.0)
+        seq_vector.append(np.clip(bytes_prod / max(abs(num_vec), 1e-4), -1e4, 1e4) if num_vec != 0 else 0.0)
+        seq_vector.append(np.clip(points_total / max(abs(num_vec), 1e-4), -1e4, 1e4) if num_vec != 0 else 0.0)
+        seq_vector.append(np.clip(working_set / max(abs(bytes_prod), 1e-4), -1e4, 1e4) if bytes_prod != 0 else 0.0)
         scheduling_sequence.append(seq_vector)
     if not scheduling_sequence:
-        scheduling_sequence = [[0.0] * (len(important_metrics) + 2)]
+        scheduling_sequence = [[0.0] * (len(important_metrics) + 4)]
     
-    # Check for NaN in sequence
-    scheduling_sequence = [[0.0 if not np.isfinite(x) else x for x in vec] for vec in scheduling_sequence]
+    # Normalize sequence per sample
+    seq_array = np.array(scheduling_sequence)
+    seq_mean = np.mean(seq_array, axis=0, keepdims=True)
+    seq_std = np.std(seq_array, axis=0, keepdims=True) + 1e-6
+    scheduling_sequence = (seq_array - seq_mean) / seq_std
+    scheduling_sequence = np.nan_to_num(scheduling_sequence, nan=0.0).tolist()
     
-    # Calculate operation counts for scalar features
+    # Enhanced scalar features
     op_counts = {}
     for node in nodes_features:
         for key, value in node.items():
             if key.startswith('op_'):
                 op_counts[key] = op_counts.get(key, 0) + value
     
-    # Enhanced scalar features with safeguards
+    total_ops = sum(op_counts.values())
+    num_nodes = max(len(nodes_features), 1)
+    num_edges = len(edges_features)
     scalar_features = {
-        'nodes_count': len(nodes_features),
-        'edges_count': len(edges_features),
-        'node_edge_ratio': len(nodes_features) / max(len(edges_features), 1),
-        'total_ops': sum(op_counts.values()),
-        'op_diversity': len(op_counts) / max(len(nodes_features), 1),
-        'avg_ops_per_node': sum(op_counts.values()) / max(len(nodes_features), 1),
-        'edge_density': len(edges_features) / max(len(nodes_features) * max(len(nodes_features) - 1, 1), 1)
+        'nodes_count': num_nodes,
+        'edges_count': num_edges,
+        'node_edge_ratio': num_nodes / max(num_edges, 1),
+        'total_ops': total_ops,
+        'op_diversity': len(op_counts) / num_nodes,
+        'avg_ops_per_node': total_ops / num_nodes,
+        'edge_density': num_edges / max(num_nodes * max(num_nodes - 1, 1), 1),
+        'total_parallelism': sum(sf.get('inner_parallelism', 0) * sf.get('outer_parallelism', 1) for sf in scheduling_features)
     }
     scalar_features.update(op_counts)
     
-    # Check for NaN in scalar features
+    # Replace NaN in scalar features
     for key in scalar_features:
         if not np.isfinite(scalar_features[key]):
             scalar_features[key] = 0.0
@@ -193,42 +203,34 @@ def process_main_directory(main_dir):
     return train_features, test_features, list(test_file_names)
 
 def prepare_data_for_model(train_features, test_features):
-    # Extract sequences
     train_sequences = [torch.FloatTensor(f['scheduling_sequence']) for f in train_features]
     test_sequences = [torch.FloatTensor(f['scheduling_sequence']) for f in test_features]
     
-    # Pad sequences
     train_sequences_padded = pad_sequence(train_sequences, batch_first=True)
     test_sequences_padded = pad_sequence(test_sequences, batch_first=True)
     
-    # Extract scalar features
     train_scalar_df = pd.DataFrame([f['scalar_features'] for f in train_features])
     test_scalar_df = pd.DataFrame([f['scalar_features'] for f in test_features])
     
-    # Replace NaN in scalar features with 0
     train_scalar_df = train_scalar_df.fillna(0)
     test_scalar_df = test_scalar_df.fillna(0)
     
-    # Extract execution times (log-transformed)
     y_train = np.log1p(np.array([f['execution_time'] for f in train_features])).reshape(-1, 1)
     y_test = np.log1p(np.array([f['execution_time'] for f in test_features])).reshape(-1, 1)
     
-    # Normalize scalar features and targets
-    scaler_X_scalar = StandardScaler()
-    scaler_y = StandardScaler()
+    scaler_X_scalar = RobustScaler()
+    scaler_y = RobustScaler()
     
     train_scalar_scaled = scaler_X_scalar.fit_transform(train_scalar_df)
     test_scalar_scaled = scaler_X_scalar.transform(test_scalar_df)
     y_train_scaled = scaler_y.fit_transform(y_train)
     y_test_scaled = scaler_y.transform(y_test)
     
-    # Replace any remaining NaN after scaling
     train_scalar_scaled = np.nan_to_num(train_scalar_scaled, nan=0.0)
     test_scalar_scaled = np.nan_to_num(test_scalar_scaled, nan=0.0)
     y_train_scaled = np.nan_to_num(y_train_scaled, nan=0.0)
     y_test_scaled = np.nan_to_num(y_test_scaled, nan=0.0)
     
-    # Create tensors
     train_scalar_tensor = torch.FloatTensor(train_scalar_scaled)
     test_scalar_tensor = torch.FloatTensor(test_scalar_scaled)
     y_train_tensor = torch.FloatTensor(y_train_scaled)
@@ -241,32 +243,64 @@ def prepare_data_for_model(train_features, test_features):
             test_sequences_padded, test_scalar_tensor, y_test_tensor,
             scaler_y, train_sequences_padded.shape[2], train_scalar_tensor.shape[1])
 
-class RecursiveLSTMModel(nn.Module):
-    def __init__(self, seq_input_size, scalar_input_size, hidden_sizes=[128, 64], output_size=1, dropout_rate=0.3):
-        super(RecursiveLSTMModel, self).__init__()
+class MultiHeadAttention(nn.Module):
+    def __init__(self, hidden_size, num_heads):
+        super(MultiHeadAttention, self).__init__()
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
         
-        # Multiple LSTM layers
-        self.lstm1 = nn.LSTM(seq_input_size, hidden_sizes[0], batch_first=True)
-        self.lstm2 = nn.LSTM(hidden_sizes[0], hidden_sizes[1], batch_first=True)
+        self.query = nn.Linear(hidden_size, hidden_size)
+        self.key = nn.Linear(hidden_size, hidden_size)
+        self.value = nn.Linear(hidden_size, hidden_size)
+        self.fc_out = nn.Linear(hidden_size, hidden_size)
+        self.scale = torch.sqrt(torch.FloatTensor([self.head_dim]))
+    
+    def forward(self, x):
+        batch_size = x.shape[0]
+        
+        Q = self.query(x).view(batch_size, -1, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        K = self.key(x).view(batch_size, -1, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        V = self.value(x).view(batch_size, -1, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        
+        energy = torch.matmul(Q, K.transpose(-1, -2)) / self.scale.to(x.device)
+        attention = torch.softmax(energy, dim=-1)
+        out = torch.matmul(attention, V).permute(0, 2, 1, 3).contiguous()
+        out = out.view(batch_size, -1, self.hidden_size)
+        out = self.fc_out(out)
+        
+        return out
+
+class EnhancedRecursiveLSTMModel(nn.Module):
+    def __init__(self, seq_input_size, scalar_input_size, hidden_sizes=[256, 128], output_size=1, dropout_rate=0.3, num_heads=4):
+        super(EnhancedRecursiveLSTMModel, self).__init__()
+        
+        # Bidirectional LSTM layers
+        self.lstm1 = nn.LSTM(seq_input_size, hidden_sizes[0], batch_first=True, bidirectional=True)
+        self.lstm2 = nn.LSTM(hidden_sizes[0] * 2, hidden_sizes[1], batch_first=True, bidirectional=True)
+        
+        # Multi-head attention
+        self.attention = MultiHeadAttention(hidden_sizes[1] * 2, num_heads)
         
         # Fully connected layers
-        self.fc1 = nn.Linear(hidden_sizes[1] + scalar_input_size, 64)
-        self.bn1 = nn.BatchNorm1d(64)
-        self.fc2 = nn.Linear(64, 32)
-        self.bn2 = nn.BatchNorm1d(32)
-        self.output_layer = nn.Linear(32, output_size)
+        self.fc1 = nn.Linear(hidden_sizes[1] * 2 + scalar_input_size, 128)
+        self.bn1 = nn.BatchNorm1d(128)
+        self.fc2 = nn.Linear(128, 64)
+        self.bn2 = nn.BatchNorm1d(64)
+        self.output_layer = nn.Linear(64, output_size)
         
         self.relu = nn.ReLU()
         self.dropout = nn.Dropout(dropout_rate)
     
     def forward(self, seq_input, scalar_input):
-        # Process sequence with LSTM layers
+        # LSTM layers
         lstm_out, _ = self.lstm1(seq_input)
         lstm_out = self.dropout(lstm_out)
         lstm_out, _ = self.lstm2(lstm_out)
         
-        # Use last hidden state
-        context = lstm_out[:, -1, :]
+        # Multi-head attention
+        attn_out = self.attention(lstm_out)
+        context = attn_out[:, -1, :]  # Use last time step after attention
         
         # Concatenate with scalar features
         combined = torch.cat((context, scalar_input), dim=1)
@@ -284,6 +318,11 @@ class RecursiveLSTMModel(nn.Module):
         
         return output
 
+def custom_loss(outputs, targets, huber_delta=1.0, mae_weight=0.5):
+    huber = nn.HuberLoss(delta=huber_delta)(outputs, targets)
+    mae = torch.mean(torch.abs(outputs - targets))
+    return huber + mae_weight * mae
+
 def create_data_loaders(train_sequences, train_scalar, y_train, test_sequences, test_scalar, y_test, batch_size=32):
     train_dataset = TensorDataset(train_sequences, train_scalar, y_train)
     test_dataset = TensorDataset(test_sequences, test_scalar, y_test)
@@ -293,12 +332,12 @@ def create_data_loaders(train_sequences, train_scalar, y_train, test_sequences, 
     
     return train_loader, test_loader
 
-def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=200, patience=30):
+def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=200, patience=30, accumulation_steps=2):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     model.to(device)
     
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10, verbose=True)
+    scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
     
     best_val_loss = float('inf')
     epochs_no_improve = 0
@@ -309,18 +348,32 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
     for epoch in range(num_epochs):
         model.train()
         running_loss = 0.0
-        for seq_inputs, scalar_inputs, targets in train_loader:
+        optimizer.zero_grad()
+        
+        for i, (seq_inputs, scalar_inputs, targets) in enumerate(train_loader):
             seq_inputs, scalar_inputs, targets = seq_inputs.to(device), scalar_inputs.to(device), targets.to(device)
-            optimizer.zero_grad()
             outputs = model(seq_inputs, scalar_inputs)
             loss = criterion(outputs, targets)
+            
             if torch.isnan(loss):
-                print(f"NaN loss detected at epoch {epoch+1}")
-                return None, None  # Early exit on NaN
+                print(f"NaN loss detected at epoch {epoch+1}, batch {i+1}")
+                return None, None
+            
+            loss = loss / accumulation_steps
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)  # Increased max_norm
+            
+            if (i + 1) % accumulation_steps == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+                optimizer.step()
+                optimizer.zero_grad()
+            
+            running_loss += loss.item() * accumulation_steps * seq_inputs.size(0)
+        
+        # Step optimizer if remaining batches
+        if len(train_loader) % accumulation_steps != 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             optimizer.step()
-            running_loss += loss.item() * seq_inputs.size(0)
+            optimizer.zero_grad()
         
         train_loss = running_loss / len(train_loader.dataset)
         train_losses.append(train_loss)
@@ -337,7 +390,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
         val_loss /= len(test_loader.dataset)
         val_losses.append(val_loss)
         
-        scheduler.step(val_loss)
+        scheduler.step()
         
         print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
         
@@ -382,7 +435,7 @@ def evaluate_model(model, X_test_seq, X_test_scalar, y_test, y_scaler, file_name
         if subfolder not in results_by_subfolder:
             results_by_subfolder[subfolder] = []
         
-        pred = max(y_pred_actual[i][0], 0)  # Ensure non-negative
+        pred = max(y_pred_actual[i][0], 0)
         results_by_subfolder[subfolder].append({
             'file': file_path,
             'actual': y_test_actual[i][0],
@@ -422,44 +475,38 @@ def main(main_dir):
         print("Error: No valid training or test data found")
         return None
     
-    # Prepare data
     (train_sequences, train_scalar, y_train,
      test_sequences, test_scalar, y_test,
      y_scaler, seq_input_size, scalar_input_size) = prepare_data_for_model(train_features, test_features)
     
-    # Create data loaders
     train_loader, test_loader = create_data_loaders(
         train_sequences, train_scalar, y_train,
         test_sequences, test_scalar, y_test,
         batch_size=32
     )
     
-    # Initialize model
-    model = RecursiveLSTMModel(
+    model = EnhancedRecursiveLSTMModel(
         seq_input_size=seq_input_size,
         scalar_input_size=scalar_input_size,
-        hidden_sizes=[128, 64],
+        hidden_sizes=[256, 128],
         output_size=1,
-        dropout_rate=0.3
+        dropout_rate=0.3,
+        num_heads=4
     )
     
-    # Define loss and optimizer
-    criterion = nn.HuberLoss(delta=1.0)
     optimizer = optim.Adam(model.parameters(), lr=0.0005, weight_decay=1e-4)
     
-    # Train model
     print("Building and training Enhanced Recursive LSTM model...")
     train_losses, val_losses = train_model(
         model, train_loader, test_loader,
-        criterion, optimizer,
-        num_epochs=200, patience=30
+        custom_loss, optimizer,
+        num_epochs=200, patience=30, accumulation_steps=2
     )
     
     if train_losses is None or val_losses is None:
         print("Training failed due to NaN values")
         return None
     
-    # Evaluate model
     print("\nEvaluating model:")
     y_test_actual, y_pred_actual = evaluate_model(
         model, test_sequences, test_scalar, y_test,
