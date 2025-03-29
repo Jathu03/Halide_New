@@ -443,10 +443,25 @@ class EnhancedTransformerModel(nn.Module):
         seq_embedded = self.pos_encoder(seq_embedded)
         
         # Create padding mask for transformer
+        # In PyTorch, the src_key_padding_mask should be of shape [N, S] 
+        # where N is batch size and S is sequence length
+        # A value of True indicates that the corresponding key value will be ignored
         pad_mask = (seq_mask == 0)
         
+        # Debug information (uncomment if needed)
+        # print(f"seq_input shape: {seq_input.shape}")
+        # print(f"seq_mask shape: {seq_mask.shape}")
+        # print(f"pad_mask shape: {pad_mask.shape}")
+        
         # Apply transformer
-        transformer_out = self.transformer_encoder(seq_embedded, src_key_padding_mask=pad_mask)
+        # For PyTorch versions where key_padding_mask expects shape [S, N], transpose the mask
+        # Check your PyTorch version and adjust accordingly
+        try:
+            # First try with the mask as is (newer PyTorch versions)
+            transformer_out = self.transformer_encoder(seq_embedded, src_key_padding_mask=pad_mask)
+        except AssertionError:
+            # If that fails, try with transposed mask (older PyTorch versions)
+            transformer_out = self.transformer_encoder(seq_embedded, src_key_padding_mask=pad_mask.transpose(0, 1))
         
         # Global sequence representation (averaging non-padded elements)
         masked_transformer_out = transformer_out * seq_mask.unsqueeze(-1)
