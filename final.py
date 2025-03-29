@@ -513,9 +513,14 @@ def main(main_dir):
     # Save the trained model as a .pt file using TorchScript
     print("\nSaving the trained model as 'lstm_model.pt'...")
     model.eval()  # Set the model to evaluation mode
+    
+    # Determine the device the model is on
+    device = next(model.parameters()).device
+    print(f"Model is on device: {device}")
+    
     try:
-        # Example input for tracing (use a sample input tensor matching your data)
-        sample_input = torch.randn(1, 1, input_size)  # [batch_size, sequence_length, input_size]
+        # Create sample input and move it to the same device as the model
+        sample_input = torch.randn(1, 1, input_size).to(device)  # [batch_size, sequence_length, input_size]
         
         # Trace the model with the sample input
         traced_model = torch.jit.trace(model, sample_input)
