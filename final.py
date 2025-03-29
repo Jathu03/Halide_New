@@ -577,3 +577,23 @@ if __name__ == "__main__":
     
     # Run the main function to train and test
     model, y_scaler, y_test_actual, y_pred_actual = main(main_dir)
+    # After training and evaluation
+if model is not None:
+    # Set model to evaluation mode
+    model.eval()
+    
+    # Create a sample input tensor matching your training data shape
+    sample_input = torch.FloatTensor(torch.randn(1, 1, input_size))  # [batch_size, sequence_length, input_size]
+    
+    # Trace the model with the sample input
+    traced_model = torch.jit.trace(model, sample_input)
+    
+    # Save the traced model to a file
+    traced_model.save("enhanced_lstm_model.pt")
+    print("Model saved as 'enhanced_lstm_model.pt'")
+    
+    # Optionally save the scaler for later use
+    import pickle
+    with open("y_scaler.pkl", "wb") as f:
+        pickle.dump(y_scaler, f)
+    print("Scaler saved as 'y_scaler.pkl'")
