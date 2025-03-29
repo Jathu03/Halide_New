@@ -45,22 +45,33 @@ def extract_features(file_path: str) -> Dict:
             op_hist = [int(x.split()[-1]) for x in node['Details']['Op histogram']]
             node_features.append(np.array(mem_patterns + op_hist))
     
-    # Extract scheduling features
+    # Extract scheduling features (optional)
     sched_features = []
-    for sched in data['programming_details']['Scheduling']:
-        if 'scheduling_feature' in sched['Details']:
-            feat = sched['Details']['scheduling_feature']
-            sched_vec = [
-                feat['bytes_at_production'], feat['bytes_at_realization'],
-                feat['points_computed_total'], feat['num_vectors'],
-                feat['vector_loads_per_vector'], feat['scalar_loads_per_scalar'],
-                feat['working_set_at_root']
-            ]
-            sched_features.append(np.array(sched_vec))
+    if 'Scheduling' in data['programming_details']:
+        for sched in data['programming_details']['Scheduling']:
+            if 'scheduling_feature' in sched['Details']:
+                feat = sched['Details']['scheduling_feature']
+                sched_vec = [
+                    feat.get('bytes_at_production', 0.0),
+                    feat.get('bytes_at_realization', 0.0),
+                    feat.get('points_computed_total', 0.0),
+                    feat.get('num_vectors', 0.0),
+                    feat.get('vector_loads_per_vector', 0.0),
+                    feat.get('scalar_loads_per_scalar', 0.0),
+                    feat.get('working_set_at_root', 0.0)
+                ]
+                sched_features.append(np.array(sched_vec))
     
-    # Target execution time
-    exec_time = next(item['value'] for item in data['programming_details']['Scheduling'] 
-                    if item.get('name') == 'total_execution_time_ms')
+    # Target execution time (required)
+    exec_time = None
+    if 'Scheduling' in data['programming_details']:
+        for item in data['programming_details']['Scheduling']:
+            if item.get('name') == 'total_execution_time_ms':
+                exec_time = item['value']
+                break
+    
+    if exec_time is None:
+        raise ValueError(f"No execution time found in {file_path}")
     
     return {
         'edge_seq': np.array(edge_features),
@@ -80,17 +91,20 @@ class HalideDataset(Dataset):
                     try:
                         features = extract_features(file_path)
                         self.data.append(features)
+                    except ValueError as e:
+                        print(f"Skipping {file_path}: {e}")
+                        continue
                     except Exception as e:
                         print(f"Error processing {file_path}: {e}")
                         continue
+        
+        if not self.data:
+            raise ValueError("No valid data found in dataset")
         
         # Normalize features
         self._normalize_features()
     
     def _normalize_features(self):
-        if not self.data:
-            raise ValueError("No valid data found in dataset")
-        
         edge_lens = [len(d['edge_seq']) for d in self.data]
         node_lens = [len(d['node_seq']) for d in self.data]
         self.max_edge_len = max(edge_lens)
