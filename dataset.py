@@ -47,9 +47,14 @@ def extract_features(file_path: str) -> Dict:
     
     # Extract scheduling features (optional)
     sched_features = []
+    exec_time = None
     if 'Scheduling' in data['programming_details']:
         for sched in data['programming_details']['Scheduling']:
-            if 'scheduling_feature' in sched['Details']:
+            # Extract execution time (required)
+            if sched.get('name') == 'total_execution_time_ms':
+                exec_time = sched['value']
+            # Extract other scheduling features (optional)
+            elif 'scheduling_feature' in sched['Details']:
                 feat = sched['Details']['scheduling_feature']
                 sched_vec = [
                     feat.get('bytes_at_production', 0.0),
@@ -62,22 +67,14 @@ def extract_features(file_path: str) -> Dict:
                 ]
                 sched_features.append(np.array(sched_vec))
     
-    # Target execution time (required)
-    exec_time = None
-    if 'Scheduling' in data['programming_details']:
-        for item in data['programming_details']['Scheduling']:
-            if item.get('name') == 'total_execution_time_ms':
-                exec_time = item['value']
-                break
-    
     if exec_time is None:
-        raise ValueError(f"No execution time found in {file_path}")
+        raise ValueError(f"No 'total_execution_time_ms' found in {file_path}")
     
     return {
         'edge_seq': np.array(edge_features),
         'node_seq': np.array(node_features),
         'sched_context': np.mean(sched_features, axis=0) if sched_features else np.zeros(7),
-        'exec_time': exec_time
+        'exec_time': exec_time  # This is our y_label
     }
 
 class HalideDataset(Dataset):
@@ -128,7 +125,7 @@ class HalideDataset(Dataset):
             else:
                 item['node_seq'] = np.zeros((self.max_node_len, node_dim))
             
-            # Normalize execution time
+            # Normalize execution time (y_label)
             item['exec_time'] = np.log1p(item['exec_time'])  # Log transform for stability
     
     def __len__(self):
@@ -140,7 +137,7 @@ class HalideDataset(Dataset):
             'edge_seq': torch.FloatTensor(item['edge_seq']),
             'node_seq': torch.FloatTensor(item['node_seq']),
             'sched_context': torch.FloatTensor(item['sched_context']),
-            'exec_time': torch.FloatTensor([item['exec_time']])
+            'exec_time': torch.FloatTensor([item['exec_time']])  # y_label
         }
 
 # Create dataset and dataloader
