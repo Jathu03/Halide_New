@@ -289,6 +289,7 @@ def prepare_data_for_model(train_features, test_features):
     train_sequences_padded = pad_sequence(train_sequences, batch_first=True)
     test_sequences_padded = pad_sequence(test_sequences, batch_first=True)
     
+    # Create mask based on non-zero values, ensuring shape (batch_size, sequence_length)
     train_mask = (train_sequences_padded != 0).any(dim=-1).float()
     test_mask = (test_sequences_padded != 0).any(dim=-1).float()
     
@@ -388,12 +389,17 @@ class EnhancedTransformerModel(nn.Module):
         seq_embedded = self.seq_embedding(seq_input)
         seq_embedded = self.pos_encoder(seq_embedded)
         
-        # Ensure pad_mask has shape (batch_size, seq_len)
-        pad_mask = (seq_mask == 0)
+        # Transformer expects src_key_padding_mask of shape (batch_size, seq_len)
+        # seq_mask is (batch_size, seq_len) where 1 indicates valid positions, 0 indicates padding
+        # Convert to (batch_size, seq_len) where True indicates padding (opposite of seq_mask)
+        pad_mask = (seq_mask == 0)  # Shape: (batch_size, seq_len)
+        
+        # Debugging shape
         assert pad_mask.shape == (batch_size, seq_len), f"Expected pad_mask shape ({batch_size}, {seq_len}), got {pad_mask.shape}"
         
         transformer_out = self.transformer_encoder(seq_embedded, src_key_padding_mask=pad_mask)
         
+        # Use seq_mask to mask padded positions for averaging
         masked_transformer_out = transformer_out * seq_mask.unsqueeze(-1)
         seq_lengths = torch.sum(seq_mask, dim=1, keepdim=True)
         seq_lengths = torch.clamp(seq_lengths, min=1.0)
