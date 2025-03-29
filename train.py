@@ -293,7 +293,7 @@ class DataProcessor:
         
         # Drop highly correlated features
         corr_matrix = train_df.corr().abs()
-        upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool)
+        upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
         to_drop = [column for column in upper.columns if any(upper[column] > 0.95)]
         train_df = train_df.drop(columns=to_drop)
         test_df = test_df.drop(columns=to_drop)
