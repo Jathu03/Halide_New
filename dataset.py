@@ -101,13 +101,19 @@ def extract_features_from_file(file_path):
                 sched_feature.update(sf)
             scheduling_features.append(sched_feature)
     
-    # Create scheduling sequence
+    # Create scheduling sequence with derived features
     scheduling_sequence = []
     for sf in scheduling_features:
         seq_vector = [float(sf.get(metric, 0.0)) for metric in important_metrics]
+        # Add derived features to sequence
+        bytes_prod = sf.get('bytes_at_production', 0.0)
+        bytes_real = sf.get('bytes_at_realization', 0.0)
+        num_vec = sf.get('num_vectors', 0.0)
+        seq_vector.append(bytes_prod / (bytes_real + 1e-8))  # Bytes production-to-realization ratio
+        seq_vector.append(bytes_prod / (num_vec + 1e-8))     # Bytes per vector
         scheduling_sequence.append(seq_vector)
-    if not scheduling_sequence:  # Ensure at least one time step
-        scheduling_sequence = [[0.0] * len(important_metrics)]
+    if not scheduling_sequence:
+        scheduling_sequence = [[0.0] * (len(important_metrics) + 2)]
     
     # Calculate operation counts for scalar features
     op_counts = {}
@@ -116,14 +122,17 @@ def extract_features_from_file(file_path):
             if key.startswith('op_'):
                 op_counts[key] = op_counts.get(key, 0) + value
     
-    # Define scalar features
+    # Enhanced scalar features
     scalar_features = {
         'nodes_count': len(nodes_features),
         'edges_count': len(edges_features),
         'node_edge_ratio': len(nodes_features) / len(edges_features) if len(edges_features) > 0 else 0,
         'total_ops': sum(op_counts.values()),
-        'op_diversity': len(op_counts) / len(nodes_features) if len(nodes_features) > 0 else 0
+        'op_diversity': len(op_counts) / len(nodes_features) if len(nodes_features) > 0 else 0,
+        'avg_ops_per_node': sum(op_counts.values()) / len(nodes_features) if len(nodes_features) > 0 else 0,
+        'edge_density': len(edges_features) / (len(nodes_features) * (len(nodes_features) - 1) + 1e-8)
     }
+    scalar_features.update(op_counts)  # Add individual operation counts
     
     return {
         'scheduling_sequence': scheduling_sequence,
@@ -196,9 +205,9 @@ def prepare_data_for_model(train_features, test_features):
     train_scalar_df = pd.DataFrame([f['scalar_features'] for f in train_features])
     test_scalar_df = pd.DataFrame([f['scalar_features'] for f in test_features])
     
-    # Extract execution times
-    y_train = np.array([f['execution_time'] for f in train_features]).reshape(-1, 1)
-    y_test = np.array([f['execution_time'] for f in test_features]).reshape(-1, 1)
+    # Extract execution times (log-transformed for better scale)
+    y_train = np.log1p(np.array([f['execution_time'] for f in train_features])).reshape(-1, 1)
+    y_test = np.log1p(np.array([f['execution_time'] for f in test_features])).reshape(-1, 1)
     
     # Normalize scalar features and targets
     scaler_X_scalar = StandardScaler()
@@ -223,16 +232,20 @@ def prepare_data_for_model(train_features, test_features):
             scaler_y, train_sequences_padded.shape[2], train_scalar_tensor.shape[1])
 
 class RecursiveLSTMModel(nn.Module):
-    def __init__(self, seq_input_size, scalar_input_size, hidden_size=128, output_size=1, dropout_rate=0.5):
+    def __init__(self, seq_input_size, scalar_input_size, hidden_sizes=[256, 128, 64], output_size=1, dropout_rate=0.4):
         super(RecursiveLSTMModel, self).__init__()
         
-        # LSTM for processing scheduling sequence
-        self.lstm = nn.LSTM(seq_input_size, hidden_size, batch_first=True)
+        # Multiple LSTM layers for sequence processing
+        self.lstm1 = nn.LSTM(seq_input_size, hidden_sizes[0], batch_first=True)
+        self.lstm2 = nn.LSTM(hidden_sizes[0], hidden_sizes[1], batch_first=True)
         
-        # Fully connected layers after concatenation
-        self.fc1 = nn.Linear(hidden_size + scalar_input_size, 64)
-        self.bn1 = nn.BatchNorm1d(64)
-        self.fc2 = nn.Linear(64, 32)
+        # Attention mechanism
+        self.attention = nn.Linear(hidden_sizes[1], 1)
+        
+        # Fully connected layers
+        self.fc1 = nn.Linear(hidden_sizes[1] + scalar_input_size, hidden_sizes[2])
+        self.bn1 = nn.BatchNorm1d(hidden_sizes[2])
+        self.fc2 = nn.Linear(hidden_sizes[2], 32)
         self.bn2 = nn.BatchNorm1d(32)
         self.output_layer = nn.Linear(32, output_size)
         
@@ -240,12 +253,17 @@ class RecursiveLSTMModel(nn.Module):
         self.dropout = nn.Dropout(dropout_rate)
     
     def forward(self, seq_input, scalar_input):
-        # Process sequence with LSTM
-        lstm_out, _ = self.lstm(seq_input)
-        lstm_out = lstm_out[:, -1, :]  # Use the last hidden state
+        # Process sequence with multiple LSTM layers
+        lstm_out, _ = self.lstm1(seq_input)
+        lstm_out = self.dropout(lstm_out)
+        lstm_out, _ = self.lstm2(lstm_out)
+        
+        # Apply attention
+        attn_weights = torch.softmax(self.attention(lstm_out), dim=1)
+        context = torch.sum(attn_weights * lstm_out, dim=1)
         
         # Concatenate with scalar features
-        combined = torch.cat((lstm_out, scalar_input), dim=1)
+        combined = torch.cat((context, scalar_input), dim=1)
         
         # Fully connected layers
         x = self.fc1(combined)
@@ -260,7 +278,7 @@ class RecursiveLSTMModel(nn.Module):
         
         return output
 
-def create_data_loaders(train_sequences, train_scalar, y_train, test_sequences, test_scalar, y_test, batch_size=64):
+def create_data_loaders(train_sequences, train_scalar, y_train, test_sequences, test_scalar, y_test, batch_size=32):
     train_dataset = TensorDataset(train_sequences, train_scalar, y_train)
     test_dataset = TensorDataset(test_sequences, test_scalar, y_test)
     
@@ -269,12 +287,12 @@ def create_data_loaders(train_sequences, train_scalar, y_train, test_sequences, 
     
     return train_loader, test_loader
 
-def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=150, patience=20):
+def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=200, patience=30):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     model.to(device)
     
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10, verbose=True)
     
     best_val_loss = float('inf')
     epochs_no_improve = 0
@@ -343,8 +361,13 @@ def evaluate_model(model, X_test_seq, X_test_scalar, y_test, y_scaler, file_name
     y_pred_scaled = y_pred_scaled.cpu().numpy()
     y_test = y_test.cpu().numpy()
     
+    # Inverse transform predictions and targets
     y_test_transformed = y_scaler.inverse_transform(y_test)
     y_pred_transformed = y_scaler.inverse_transform(y_pred_scaled)
+    
+    # Convert back from log scale
+    y_test_actual = np.expm1(y_test_transformed)
+    y_pred_actual = np.expm1(y_pred_transformed)
     
     results_by_subfolder = {}
     for i, file_path in enumerate(file_names_test):
@@ -354,9 +377,9 @@ def evaluate_model(model, X_test_seq, X_test_scalar, y_test, y_scaler, file_name
         
         results_by_subfolder[subfolder].append({
             'file': file_path,
-            'actual': y_test_transformed[i][0],
-            'predicted': y_pred_transformed[i][0],
-            'error_percentage': abs(y_test_transformed[i][0] - y_pred_transformed[i][0]) / y_test_transformed[i][0] * 100 if y_test_transformed[i][0] > 0 else 0
+            'actual': y_test_actual[i][0],
+            'predicted': max(y_pred_actual[i][0], 0),  # Ensure non-negative predictions
+            'error_percentage': abs(y_test_actual[i][0] - y_pred_actual[i][0]) / y_test_actual[i][0] * 100 if y_test_actual[i][0] > 0 else 0
         })
     
     for subfolder, results in results_by_subfolder.items():
@@ -367,10 +390,10 @@ def evaluate_model(model, X_test_seq, X_test_scalar, y_test, y_scaler, file_name
             print(f"  Predicted execution time: {result['predicted']:.2f} ms")
             print(f"  Error percentage: {result['error_percentage']:.2f}%")
     
-    mse = np.mean((y_test_transformed - y_pred_transformed) ** 2)
+    mse = np.mean((y_test_actual - y_pred_actual) ** 2)
     rmse = np.sqrt(mse)
-    mae = np.mean(np.abs(y_test_transformed - y_pred_transformed))
-    mape = np.mean(np.abs((y_test_transformed - y_pred_transformed) / (y_test_transformed + 1e-8))) * 100
+    mae = np.mean(np.abs(y_test_actual - y_pred_actual))
+    mape = np.mean(np.abs((y_test_actual - y_pred_actual) / (y_test_actual + 1e-8))) * 100
     
     print("\nOverall Model Performance:")
     print(f"MSE: {mse:.2f}")
@@ -378,7 +401,7 @@ def evaluate_model(model, X_test_seq, X_test_scalar, y_test, y_scaler, file_name
     print(f"MAE: {mae:.2f}")
     print(f"MAPE: {mape:.2f}%")
     
-    return y_test_transformed, y_pred_transformed
+    return y_test_actual, y_pred_actual
 
 def main(main_dir):
     print(f"Processing main directory: {main_dir}")
@@ -400,28 +423,28 @@ def main(main_dir):
     train_loader, test_loader = create_data_loaders(
         train_sequences, train_scalar, y_train,
         test_sequences, test_scalar, y_test,
-        batch_size=64
+        batch_size=32
     )
     
     # Initialize model
     model = RecursiveLSTMModel(
         seq_input_size=seq_input_size,
         scalar_input_size=scalar_input_size,
-        hidden_size=128,
+        hidden_sizes=[256, 128, 64],
         output_size=1,
-        dropout_rate=0.5
+        dropout_rate=0.4
     )
     
     # Define loss and optimizer
-    criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
+    criterion = nn.HuberLoss(delta=1.0)  # Robust to outliers
+    optimizer = optim.Adam(model.parameters(), lr=0.0005, weight_decay=1e-4)
     
     # Train model
-    print("Building and training Recursive LSTM model...")
+    print("Building and training Enhanced Recursive LSTM model...")
     train_losses, val_losses = train_model(
         model, train_loader, test_loader,
         criterion, optimizer,
-        num_epochs=150, patience=20
+        num_epochs=200, patience=30
     )
     
     # Evaluate model
