@@ -47,33 +47,32 @@ def extract_features(file_path: str, debug=False) -> Dict:
     exec_time = None
     sched_features = []
     
-    # Check 'Scheduling' section explicitly for the provided structure
-    if 'Scheduling' in data['programming_details']:
-        scheduling = data['programming_details']['Scheduling']
-        if isinstance(scheduling, list):
-            for entry in scheduling:
-                if isinstance(entry, dict) and 'name' in entry and 'value' in entry:
-                    if entry['name'] == 'total_execution_time_ms':
-                        exec_time = float(entry['value'])  # Ensure it's a float
-                        if debug:
-                            print(f"Found execution time {exec_time} in 'Scheduling' for {file_path}")
-                    elif 'Details' in entry and 'scheduling_feature' in entry['Details']:
-                        feat = entry['Details']['scheduling_feature']
-                        sched_vec = [
-                            feat.get('bytes_at_production', 0.0),
-                            feat.get('bytes_at_realization', 0.0),
-                            feat.get('points_computed_total', 0.0),
-                            feat.get('num_vectors', 0.0),
-                            feat.get('vector_loads_per_vector', 0.0),
-                            feat.get('scalar_loads_per_scalar', 0.0),
-                            feat.get('working_set_at_root', 0.0)
-                        ]
-                        sched_features.append(np.array(sched_vec))
+    # Check 'scheduling_data' section for execution time
+    if 'scheduling_data' in data['programming_details']:
+        scheduling_data = data['programming_details']['scheduling_data']
+        if isinstance(scheduling_data, list):
+            for entry in scheduling_data:
+                if isinstance(entry, dict) and entry.get('name') == 'total_execution_time_ms':
+                    exec_time = float(entry['value'])
+                    if debug:
+                        print(f"Found execution time {exec_time} in 'scheduling_data' for {file_path}")
+                elif isinstance(entry, dict) and 'Details' in entry and 'scheduling_feature' in entry['Details']:
+                    feat = entry['Details']['scheduling_feature']
+                    sched_vec = [
+                        feat.get('bytes_at_production', 0.0),
+                        feat.get('bytes_at_realization', 0.0),
+                        feat.get('points_computed_total', 0.0),
+                        feat.get('num_vectors', 0.0),
+                        feat.get('vector_loads_per_vector', 0.0),
+                        feat.get('scalar_loads_per_scalar', 0.0),
+                        feat.get('working_set_at_root', 0.0)
+                    ]
+                    sched_features.append(np.array(sched_vec))
         else:
             if debug:
-                print(f"'Scheduling' is not a list in {file_path}: {scheduling}")
+                print(f"'scheduling_data' is not a list in {file_path}: {scheduling_data}")
     
-    # Fallback recursive search if not found in 'Scheduling'
+    # Fallback recursive search if not found in 'scheduling_data'
     if exec_time is None:
         def search_dict(d, key):
             if isinstance(d, dict):
