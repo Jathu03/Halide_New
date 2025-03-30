@@ -1,5 +1,6 @@
-#include <torch/script.h>
-#include <nlohmann/json.hpp>
+#include <torch/torch.h>          // Core tensor library (includes CUDA support)
+#include <torch/script.h>         // For JIT model loading
+#include <nlohmann/json.hpp>      // JSON parsing library
 #include <iostream>
 #include <fstream>
 #include <vector>
@@ -127,7 +128,7 @@ torch::Tensor features_to_tensor(const std::map<std::string, float>& features) {
         feature_vec.push_back(features.count(key) ? features.at(key) : 0.0f);
     }
 
-    // Simple normalization (replace with your actual mean and std if available)
+    // Simple normalization (replace with actual mean and std if available)
     float mean = 0.0f, std = 1.0f;
     for (auto& val : feature_vec) {
         val = (val - mean) / (std + 1e-6); // Avoid division by zero
