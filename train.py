@@ -2,7 +2,7 @@ import os
 import json
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -10,7 +10,7 @@ from torch.utils.data import TensorDataset, DataLoader
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 import random
 
-# [Existing get_execution_time and extract_features_from_file functions remain unchanged]
+# [Existing functions remain unchanged]
 def get_execution_time(file_path):
     try:
         with open(file_path, 'rb') as f:
@@ -157,7 +157,6 @@ def extract_features_from_file(file_path):
     
     return features
 
-# [Existing process_directory, process_main_directory, clean_and_transform_features remain unchanged]
 def process_directory(directory_path):
     all_features = []
     file_names = []
@@ -239,7 +238,6 @@ def clean_and_transform_features(train_features, test_features):
     
     return train_df, test_df
 
-# Modified prepare_data_for_model to save scaler parameters
 def prepare_data_for_model(train_features, test_features):
     train_df, test_df = clean_and_transform_features(train_features, test_features)
     
@@ -262,32 +260,6 @@ def prepare_data_for_model(train_features, test_features):
     X_test_scaled = scaler_X.transform(test_df)
     y_test_scaled = scaler_y.transform(y_test)
     
-    # Save feature scaler parameters
-    feature_names = list(train_df.columns)
-    means = scaler_X.mean_.tolist()
-    scales = scaler_X.scale_.tolist()
-    scaler_data = {
-        'feature_names': feature_names,
-        'means': means,
-        'scales': scales
-    }
-    with open('scaler_X.json', 'w') as f:
-        json.dump(scaler_data, f)
-    print("Saved feature scaler parameters to 'scaler_X.json'")
-    
-    # Save target scaler parameters
-    y_mean = scaler_y.mean_[0]
-    y_scale = scaler_y.scale_[0]
-    is_log_transformed = 'execution_time_log' in train_df.columns
-    y_scaler_data = {
-        'mean': y_mean,
-        'scale': y_scale,
-        'is_log_transformed': is_log_transformed
-    }
-    with open('scaler_y.json', 'w') as f:
-        json.dump(y_scaler_data, f)
-    print("Saved target scaler parameters to 'scaler_y.json'")
-    
     X_train_tensor = torch.FloatTensor(X_train_scaled).unsqueeze(1)
     y_train_tensor = torch.FloatTensor(y_train_scaled)
     X_test_tensor = torch.FloatTensor(X_test_scaled).unsqueeze(1)
@@ -296,84 +268,32 @@ def prepare_data_for_model(train_features, test_features):
     print(f"Input feature dimension: {X_train_scaled.shape[1]}")
     
     return (X_train_tensor, y_train_tensor, X_test_tensor, y_test_tensor, 
-            scaler_y, X_train_scaled.shape[1], is_log_transformed)
+            scaler_y, X_train_scaled.shape[1], 'execution_time_log' in train_df.columns)
 
-# New function to get the extracted representation of a single schedule
-def get_schedule_representation(file_path, scaler_X_json='scaler_X.json'):
-    """
-    Extract and scale the features for a single schedule from a JSON file.
-    
-    Args:
-        file_path (str): Path to the JSON file.
-        scaler_X_json (str): Path to the feature scaler JSON file.
-    
-    Returns:
-        dict: Scaled features as a dictionary, or None if extraction fails.
-    """
-    # Extract raw features
-    features = extract_features_from_file(file_path)
-    if features is None:
-        print(f"Failed to extract features from {file_path}")
-        return None
-    
-    # Convert to DataFrame
-    features_df = pd.DataFrame([features])
-    
-    # Clean and transform features (mimicking clean_and_transform_features)
-    features_df = features_df.fillna(0)
-    if 'execution_time' in features_df.columns:
-        features_df['execution_time_log'] = np.log1p(features_df['execution_time'])
-    if 'total_vectors' in features_df.columns and features_df['total_vectors'].max() > 0:
-        features_df['bytes_per_vector'] = features_df['total_bytes_at_production'] / (features_df['total_vectors'] + 1e-8)
-    numeric_cols = features_df.select_dtypes(include=['number']).columns
-    features_df = features_df[numeric_cols]
-    
-    # Drop execution time columns
-    if 'execution_time_log' in features_df.columns:
-        features_df = features_df.drop(['execution_time', 'execution_time_log'], axis=1)
-    else:
-        features_df = features_df.drop('execution_time', axis=1)
-    
-    # Load scaler parameters
-    with open(scaler_X_json, 'r') as f:
-        scaler_data = json.load(f)
-    feature_names = scaler_data['feature_names']
-    means = np.array(scaler_data['means'])
-    scales = np.array(scaler_data['scales'])
-    
-    # Ensure features match the trained model's feature set
-    aligned_features = pd.DataFrame(columns=feature_names)
-    for col in feature_names:
-        if col in features_df.columns:
-            aligned_features[col] = features_df[col]
-        else:
-            aligned_features[col] = 0
-    
-    # Scale the features
-    scaled_features = (aligned_features.values - means) / scales
-    
-    # Convert to dictionary
-    scaled_features_dict = dict(zip(feature_names, scaled_features[0]))
-    
-    return scaled_features_dict
-
-# [Existing EnhancedLSTMModel, create_data_loaders, train_model, evaluate_model remain unchanged]
+# Corrected EnhancedLSTMModel class
 class EnhancedLSTMModel(nn.Module):
     def __init__(self, input_size, hidden_sizes=[128, 64, 32], output_size=1, dropout_rate=0.3):
         super(EnhancedLSTMModel, self).__init__()
         
+        # Store hidden sizes for use in forward pass
+        self.hidden_sizes = hidden_sizes
+        
         self.lstm_layers = nn.ModuleList()
         self.dropout_layers = nn.ModuleList()
         
+        # First LSTM layer
         self.lstm_layers.append(nn.LSTM(input_size, hidden_sizes[0], batch_first=True))
         self.dropout_layers.append(nn.Dropout(dropout_rate))
         
+        # Subsequent LSTM layers
         for i in range(1, len(hidden_sizes)):
             self.lstm_layers.append(nn.LSTM(hidden_sizes[i-1], hidden_sizes[i], batch_first=True))
             self.dropout_layers.append(nn.Dropout(dropout_rate))
         
+        # Attention layer
         self.attention = nn.Linear(hidden_sizes[-1], 1)
         
+        # Fully connected layers
         self.fc_layers = nn.ModuleList()
         self.bn_layers = nn.ModuleList()
         
@@ -388,6 +308,7 @@ class EnhancedLSTMModel(nn.Module):
         self.relu = nn.ReLU()
         self.leaky_relu = nn.LeakyReLU(0.1)
         
+        # Residual connection check
         self.has_residual = (hidden_sizes[-1] // 4 == hidden_sizes[-1] // 2)
         if not self.has_residual:
             self.residual_adapter = nn.Linear(hidden_sizes[-1] // 2, hidden_sizes[-1] // 4)
@@ -399,14 +320,26 @@ class EnhancedLSTMModel(nn.Module):
         return context
         
     def forward(self, x):
+        batch_size = x.size(0)
         lstm_out = x
+        
+        # Process through each LSTM layer
         for i, (lstm, dropout) in enumerate(zip(self.lstm_layers, self.dropout_layers)):
-            lstm_out, _ = lstm(lstm_out)
+            # Initialize hidden state for this layer
+            hidden_size = self.hidden_sizes[i]
+            device = x.device
+            h_0 = torch.zeros(1, batch_size, hidden_size, device=device)
+            c_0 = torch.zeros(1, batch_size, hidden_size, device=device)
+            
+            # Forward pass through LSTM
+            lstm_out, _ = lstm(lstm_out, (h_0, c_0))
             if i < len(self.lstm_layers) - 1:
                 lstm_out = dropout(lstm_out)
         
+        # Apply attention
         attn_output = self.attention_net(lstm_out)
         
+        # Fully connected layers
         fc_out = self.fc_layers[0](attn_output)
         fc_out = self.bn_layers[0](fc_out)
         fc_out = self.leaky_relu(fc_out)
@@ -554,7 +487,6 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_tran
     
     return y_test_actual, y_pred_actual
 
-# Modified main function to demonstrate schedule representation extraction
 def main(main_dir):
     print(f"Processing main directory: {main_dir}")
     train_features, test_features, test_file_names = process_main_directory(main_dir)
@@ -602,29 +534,33 @@ def main(main_dir):
     
     # Save the trained model as a .pt file using TorchScript
     print("\nSaving the trained model as 'lstm_model.pt'...")
-    model.eval()
+    model.eval()  # Set the model to evaluation mode
+    
+    # Determine the device the model is on
     device = next(model.parameters()).device
     print(f"Model is on device: {device}")
+    
     try:
-        sample_input = torch.randn(1, 1, input_size).to(device)
+        # Create sample input and move it to the same device as the model
+        sample_input = torch.randn(1, 1, input_size).to(device)  # [batch_size, sequence_length, input_size]
+        
+        # Trace the model with the sample input
         traced_model = torch.jit.trace(model, sample_input)
+        
+        # Save the traced model to a .pt file
         traced_model.save("lstm_model.pt")
         print("Model successfully saved as 'lstm_model.pt'")
     except Exception as e:
         print(f"Error saving the model: {str(e)}")
     
-    # Example: Extract representation for a test schedule
-    example_file = os.path.join(main_dir, test_file_names[0])
-    print(f"\nExtracting representation for schedule: {example_file}")
-    representation = get_schedule_representation(example_file)
-    if representation:
-        print("Scaled features for the schedule:")
-        for feature, value in representation.items():
-            print(f"  {feature}: {value:.4f}")
-    
     return model, y_scaler, y_test_actual, y_pred_actual
 
 if __name__ == "__main__":
+    # Main directory containing subfolders for each program
     main_dir = "synthetic_data"
+    
+    # Set random seed for reproducibility
     random.seed(42)
+    
+    # Run the main function to train and test
     model, y_scaler, y_test_actual, y_pred_actual = main(main_dir)
