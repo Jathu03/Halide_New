@@ -57,7 +57,7 @@ torch::jit::script::Module load_model(const std::string& model_path, bool use_cu
         model = torch::jit::load(model_path);
 
         // Move to appropriate device
-        if (use_cuda && torch::cuda::is_available()) {
+        if (use_cuda) {
             model.to(torch::kCUDA);
             std::cout << "Model moved to CUDA" << std::endl;
         } else {
@@ -77,11 +77,15 @@ float predict_execution_time(torch::jit::script::Module& model,
                            const std::vector<float>& representation,
                            float y_mean, float y_scale, bool is_log_transformed) {
     try {
-        // Get the device the model is on
+        // Set default device to CPU
         torch::Device device = torch::kCPU;
-        for (const auto& param : model.parameters()) {
-            device = param.device();
-            break;
+        
+        // Get the device from parameters if available
+        if (!model.parameters().empty()) {
+            auto param_iter = model.parameters().begin();
+            if (param_iter != model.parameters().end()) {
+                device = (*param_iter).device();
+            }
         }
 
         // Convert representation to tensor and move to correct device
@@ -113,9 +117,11 @@ float predict_execution_time(torch::jit::script::Module& model,
 
 int main() {
     try {
-        // Check for CUDA availability
-        bool use_cuda = torch::cuda::is_available();
-        std::cout << "CUDA available: " << (use_cuda ? "YES" : "NO") << std::endl;
+        // Set CUDA flag based on your build configuration
+        // Since torch::cuda::is_available() doesn't work in your environment
+        bool use_cuda = false;  // Set to true if you want to use CUDA and know it's available
+        
+        std::cout << "CUDA enabled: " << (use_cuda ? "YES" : "NO") << std::endl;
 
         // Load model
         std::cout << "Loading model..." << std::endl;
