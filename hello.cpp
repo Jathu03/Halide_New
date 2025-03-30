@@ -58,10 +58,10 @@ torch::jit::script::Module load_model(const std::string& model_path, bool use_cu
 
         // Move to appropriate device
         if (use_cuda && torch::cuda::is_available()) {
-            model.to(torch::Device(torch::kCUDA));
+            model.to(torch::kCUDA);
             std::cout << "Model moved to CUDA" << std::endl;
         } else {
-            model.to(torch::Device(torch::kCPU));
+            model.to(torch::kCPU);
             std::cout << "Model moved to CPU" << std::endl;
         }
 
@@ -78,14 +78,18 @@ float predict_execution_time(torch::jit::script::Module& model,
                            float y_mean, float y_scale, bool is_log_transformed) {
     try {
         // Get the device the model is on
-        torch::Device device = model.parameters().begin()->device();
+        torch::Device device = torch::kCPU;
+        for (const auto& param : model.parameters()) {
+            device = param.device();
+            break;
+        }
 
         // Convert representation to tensor and move to correct device
         torch::Tensor input_tensor = torch::from_blob(
             (void*)representation.data(), 
             {1, static_cast<int64_t>(representation.size())}, 
             torch::kFloat32
-        ).unsqueeze(0).unsqueeze(0).to(device);
+        ).clone().unsqueeze(0).unsqueeze(0).to(device);
 
         // Create input vector
         std::vector<torch::jit::IValue> inputs;
