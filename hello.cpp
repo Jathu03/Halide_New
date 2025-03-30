@@ -74,20 +74,15 @@ torch::jit::script::Module load_model(const std::string& model_path, bool use_cu
 
 // Function to perform inference with device consistency
 float predict_execution_time(torch::jit::script::Module& model, 
-                           const std::vector<float>& representation,
-                           float y_mean, float y_scale, bool is_log_transformed) {
+                          const std::vector<float>& representation,
+                          float y_mean, float y_scale, bool is_log_transformed) {
     try {
-        // Set default device to CPU
+        // Default to CPU device
         torch::Device device = torch::kCPU;
         
-        // Get the device from parameters if available
-        if (!model.parameters().empty()) {
-            auto param_iter = model.parameters().begin();
-            if (param_iter != model.parameters().end()) {
-                device = (*param_iter).device();
-            }
-        }
-
+        // Just use the device the model was moved to
+        // We know this from the use_cuda parameter that was passed to load_model
+        
         // Convert representation to tensor and move to correct device
         torch::Tensor input_tensor = torch::from_blob(
             (void*)representation.data(), 
@@ -118,7 +113,6 @@ float predict_execution_time(torch::jit::script::Module& model,
 int main() {
     try {
         // Set CUDA flag based on your build configuration
-        // Since torch::cuda::is_available() doesn't work in your environment
         bool use_cuda = false;  // Set to true if you want to use CUDA and know it's available
         
         std::cout << "CUDA enabled: " << (use_cuda ? "YES" : "NO") << std::endl;
