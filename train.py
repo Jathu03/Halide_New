@@ -310,31 +310,25 @@ class EnhancedLSTMModel(nn.Module):
         return context
         
     def forward(self, x):
-        lstm_out = x
-        for i, (lstm, dropout) in enumerate(zip(self.lstm_layers, self.dropout_layers)):
-            lstm_out, _ = lstm(lstm_out)
-            if i < len(self.lstm_layers) - 1:
-                lstm_out = dropout(lstm_out)
+        # Get the device of the model
+        device = next(self.parameters()).device
         
-        attn_output = self.attention_net(lstm_out)
+        # Move input to the same device as the model
+        x = x.to(device)
+    
+        # Initialize hidden states on the same device (if needed by your LSTM)
+        hx = torch.zeros(self.hidden_size, device=device)
+        hx0 = torch.zeros(self.hidden_size, device=device)
+    
+        # Forward pass through the LSTM and subsequent layers
+        lstm_layers1 = self.lstm_layers
+        _02 = getattr(lstm_layers1, "0")
+        _3 = (_12).forward((_01).forward((_02).forward(x, hx, hx0), ), )  # Include hidden states if required
+        _4 = (_2).forward((_11).forward(_3, ), )
+        attn_weights = torch.squeeze((attention).forward(_4, ), 2)
         
-        fc_out = self.fc_layers[0](attn_output)
-        fc_out = self.bn_layers[0](fc_out)
-        fc_out = self.leaky_relu(fc_out)
-        
-        residual = fc_out
-        if not self.has_residual:
-            residual = self.residual_adapter(residual)
-        
-        fc_out = self.fc_layers[1](fc_out)
-        fc_out = self.bn_layers[1](fc_out)
-        fc_out = self.leaky_relu(fc_out)
-        
-        fc_out = fc_out + residual
-        
-        output = self.output_layer(fc_out)
-        
-        return output
+        # Return the output
+        return attn_weights  # Adjust based on your model's needs
 
 def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=32):
     train_dataset = TensorDataset(X_train, y_train)
