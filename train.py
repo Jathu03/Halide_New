@@ -548,6 +548,6 @@ if __name__ == "__main__":
     best_model.load_state_dict(torch.load("best_model.pth"))  # If saved earlier
     
     # Trace and save
-    example_input = torch.randn(1, 1, input_size)  # [batch, seq_len, features]
+    example_input = torch.randn(1, 1, 10)  # [batch, seq_len, features]
     traced_model = torch.jit.trace(best_model, example_input)
     traced_model.save("halide_lstm.pt")
