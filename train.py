@@ -544,7 +544,7 @@ if __name__ == "__main__":
     model, y_scaler, y_test_actual, y_pred_actual = main(main_dir)
 
     # Inside main()
-    best_model = EnhancedLSTMModel(input_size)  # Or select from `results`
+    best_model = EnhancedLSTMModel(10)  # Or select from `results`
     best_model.load_state_dict(torch.load("best_model.pth"))  # If saved earlier
     
     # Trace and save
