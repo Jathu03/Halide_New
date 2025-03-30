@@ -513,6 +513,86 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_tran
     print(f"MAPE: {mape:.2f}%")
     
     return y_test_actual, y_pred_actual
+def create_schedule_representation(model, schedule_features, feature_names, scaler_X_path='scaler_X.json', scaler_y_path='scaler_y.json'):
+    """
+    Create a schedule representation using the trained model.
+    
+    Args:
+        model: Trained PyTorch model
+        schedule_features: Dictionary containing the schedule features
+        feature_names: List of feature names expected by the model
+        scaler_X_path: Path to feature scaler parameters
+        scaler_y_path: Path to target scaler parameters
+    
+    Returns:
+        Dictionary containing the schedule representation and original features
+    """
+    # Load feature scaler parameters
+    with open(scaler_X_path, 'r') as f:
+        scaler_X_data = json.load(f)
+    
+    # Create DataFrame from input features
+    input_df = pd.DataFrame([schedule_features])
+    
+    # Ensure all expected features are present and fill missing with 0
+    for feature in scaler_X_data['feature_names']:
+        if feature not in input_df.columns:
+            input_df[feature] = 0
+    
+    # Reorder columns to match training data
+    input_df = input_df[scaler_X_data['feature_names']]
+    
+    # Apply same scaling as training data
+    means = np.array(scaler_X_data['means'])
+    scales = np.array(scaler_X_data['scales'])
+    X_scaled = (input_df.values - means) / scales
+    
+    # Convert to tensor and add batch dimension
+    X_tensor = torch.FloatTensor(X_scaled).unsqueeze(1)
+    
+    # Get model representation
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model.to(device)
+    model.eval()
+    
+    with torch.no_grad():
+        # Get the output of the last LSTM layer before attention
+        lstm_out = X_tensor.to(device)
+        
+        # Process through each LSTM layer
+        for i, (lstm, dropout) in enumerate(zip(model.lstm_layers, model.dropout_layers)):
+            batch_size = lstm_out.size(0)
+            hidden_size = model.hidden_sizes[i]
+            h_0 = torch.zeros(1, batch_size, hidden_size, device=device)
+            c_0 = torch.zeros(1, batch_size, hidden_size, device=device)
+            
+            lstm_out, _ = lstm(lstm_out, (h_0, c_0))
+            if i < len(model.lstm_layers) - 1:
+                lstm_out = dropout(lstm_out)
+        
+        # Get the attention weights
+        attn_weights = model.attention(lstm_out).squeeze(2)
+        soft_attn_weights = torch.softmax(attn_weights, 1)
+        
+        # Get the context vector
+        context = torch.bmm(soft_attn_weights.unsqueeze(1), lstm_out).squeeze(1)
+        
+        # Get the final representation before output layer
+        fc_out = model.fc_layers[0](context)
+        fc_out = model.bn_layers[0](fc_out)
+        fc_out = model.leaky_relu(fc_out)
+        
+        # Get the compressed representation (128-dim vector)
+        representation = fc_out.cpu().numpy().flatten()
+    
+    # Create output dictionary
+    output = {
+        'original_features': schedule_features,
+        'representation': representation.tolist(),
+        'attention_weights': soft_attn_weights.cpu().numpy().flatten().tolist()
+    }
+    
+    return output
 
 def main(main_dir):
     print(f"Processing main directory: {main_dir}")
@@ -579,6 +659,14 @@ def main(main_dir):
         print("Model successfully saved as 'lstm_model.pt'")
     except Exception as e:
         print(f"Error saving the model: {str(e)}")
+    
+    # Example: Create representation for one schedule
+    if len(test_features) > 0:
+        sample_schedule = test_features[0]
+        representation = create_schedule_representation(model, sample_schedule, list(train_df.columns))
+        with open('schedule_representation.json', 'w') as f:
+            json.dump(representation, f, indent=2)
+        print("\nSaved schedule representation to 'schedule_representation.json'")
     
     return model, y_scaler, y_test_actual, y_pred_actual
 
