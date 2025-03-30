@@ -58,9 +58,11 @@ torch::jit::script::Module load_model(const std::string& model_path, bool use_cu
 
         // Move to appropriate device
         if (use_cuda && torch::cuda::is_available()) {
-            model.to(torch::kCUDA);
+            model.to(torch::Device(torch::kCUDA));
+            std::cout << "Model moved to CUDA" << std::endl;
         } else {
-            model.to(torch::kCPU);
+            model.to(torch::Device(torch::kCPU));
+            std::cout << "Model moved to CPU" << std::endl;
         }
 
         model.eval();
@@ -76,14 +78,13 @@ float predict_execution_time(torch::jit::script::Module& model,
                            float y_mean, float y_scale, bool is_log_transformed) {
     try {
         // Get the device the model is on
-        auto device = model.parameters().begin()->device();
+        torch::Device device = model.parameters().begin()->device();
 
         // Convert representation to tensor and move to correct device
-        auto options = torch::TensorOptions().dtype(torch::kFloat32);
         torch::Tensor input_tensor = torch::from_blob(
             (void*)representation.data(), 
             {1, static_cast<int64_t>(representation.size())}, 
-            options
+            torch::kFloat32
         ).unsqueeze(0).unsqueeze(0).to(device);
 
         // Create input vector
@@ -115,8 +116,7 @@ int main() {
         // Load model
         std::cout << "Loading model..." << std::endl;
         auto model = load_model("lstm_model.pt", use_cuda);
-        std::cout << "Model loaded successfully on device: " 
-                  << model.parameters().begin()->device() << std::endl;
+        std::cout << "Model loaded successfully" << std::endl;
 
         // Load representation
         std::cout << "Loading representation..." << std::endl;
