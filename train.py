@@ -238,6 +238,7 @@ def clean_and_transform_features(train_features, test_features):
     
     return train_df, test_df
 
+# Inside prepare_data_for_model function
 def prepare_data_for_model(train_features, test_features):
     train_df, test_df = clean_and_transform_features(train_features, test_features)
     
@@ -259,6 +260,32 @@ def prepare_data_for_model(train_features, test_features):
     y_train_scaled = scaler_y.fit_transform(y_train)
     X_test_scaled = scaler_X.transform(test_df)
     y_test_scaled = scaler_y.transform(y_test)
+    
+    # Save feature scaler parameters
+    feature_names = list(train_df.columns)
+    means = scaler_X.mean_.tolist()
+    scales = scaler_X.scale_.tolist()
+    scaler_data = {
+        'feature_names': feature_names,
+        'means': means,
+        'scales': scales
+    }
+    with open('scaler_X.json', 'w') as f:
+        json.dump(scaler_data, f)
+    print("Saved feature scaler parameters to 'scaler_X.json'")
+    
+    # Save target scaler parameters
+    y_mean = scaler_y.mean_[0]
+    y_scale = scaler_y.scale_[0]
+    is_log_transformed = 'execution_time_log' in train_df.columns
+    y_scaler_data = {
+        'mean': y_mean,
+        'scale': y_scale,
+        'is_log_transformed': is_log_transformed
+    }
+    with open('scaler_y.json', 'w') as f:
+        json.dump(y_scaler_data, f)
+    print("Saved target scaler parameters to 'scaler_y.json'")
     
     X_train_tensor = torch.FloatTensor(X_train_scaled).unsqueeze(1)
     y_train_tensor = torch.FloatTensor(y_train_scaled)
