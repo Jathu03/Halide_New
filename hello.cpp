@@ -53,7 +53,6 @@ std::vector<float> load_schedule_representation(const std::string& file_path) {
 bool is_cuda_available() {
     // Since torch::cuda::is_available() doesn't work in your environment,
     // we'll return a hardcoded value based on your setup
-    // Change this based on your knowledge of the system
 #ifdef USE_CUDA
     return true;
 #else
@@ -71,7 +70,6 @@ torch::jit::script::Module load_model(const std::string& model_path, bool use_cu
         // Set model to evaluation mode
         model.eval();
         
-        // No need to explicitly move the model - it will stay on the device it was saved on
         std::cout << "Model loaded successfully" << std::endl;
         std::cout << "Model expecting inputs on " << (use_cuda ? "CUDA" : "CPU") << std::endl;
         
@@ -90,18 +88,35 @@ float predict_execution_time(torch::jit::script::Module& model,
         // Set device based on the use_cuda flag
         torch::Device device = use_cuda ? torch::kCUDA : torch::kCPU;
         
-        // Create input tensor from the representation vector
-        auto options = torch::TensorOptions().dtype(torch::kFloat32).device(device);
+        // The error suggests there's a shape mismatch
+        // Let's reshape the tensor properly based on the error message
+        // The model expects an input with size 19968
+        
+        if (representation.size() != 19968) {
+            std::cout << "Warning: Input size (" << representation.size() 
+                      << ") doesn't match expected size (19968)" << std::endl;
+        }
+        
+        // Create input tensor from the representation vector with the correct sequence length and batch size
+        // For LSTM models, the expected shape is [sequence_length, batch_size, input_size]
+        // Based on the error, we need to reshape to match the model's expectation
+        int seq_length = 1;  // Assuming single step prediction
+        int batch_size = 1;  // Single batch
+        int input_size = representation.size();  // Feature dimension
         
         // First create a CPU tensor
         torch::Tensor cpu_tensor = torch::from_blob(
             (void*)representation.data(), 
-            {1, static_cast<int64_t>(representation.size())}, 
+            {input_size}, 
             torch::kFloat32
         ).clone();
         
-        // Move to correct device and add the necessary dimensions
-        torch::Tensor input_tensor = cpu_tensor.to(device).unsqueeze(0).unsqueeze(0);
+        // Reshape and move to the correct device
+        // We're using the shape [batch_size, input_size] which is common for single time step
+        torch::Tensor input_tensor = cpu_tensor.to(device).reshape({batch_size, input_size});
+        
+        // Print tensor shape for debugging
+        std::cout << "Input tensor shape: " << input_tensor.sizes() << std::endl;
         
         // Create input vector
         std::vector<torch::jit::IValue> inputs;
@@ -119,6 +134,7 @@ float predict_execution_time(torch::jit::script::Module& model,
         
         return prediction;
     } catch (const std::exception& e) {
+        std::cerr << "Exception details: " << e.what() << std::endl;
         throw std::runtime_error("Error during prediction: " + std::string(e.what()));
     }
 }
@@ -126,7 +142,6 @@ float predict_execution_time(torch::jit::script::Module& model,
 int main() {
     try {
         // Determine if we should use CUDA
-        // Since your model was traced with CUDA tensors, we need to use CUDA for inference
         bool use_cuda = true;  // Set to true because your model expects CUDA tensors
         
         std::cout << "CUDA enabled: " << (use_cuda ? "YES" : "NO") << std::endl;
