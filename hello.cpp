@@ -8,7 +8,7 @@
 
 using json = nlohmann::json;
 
-// Function to mimic Python's get_execution_time
+// Function to get execution time from a JSON file
 float get_execution_time(const std::string& file_path) {
     std::ifstream file(file_path, std::ios::binary);
     if (!file.is_open()) {
@@ -19,8 +19,8 @@ float get_execution_time(const std::string& file_path) {
     std::string content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
     try {
         json data = json::parse(content);
-        if (!data.contains("programming_details")) {
-            std::cerr << "Error: 'programming_details' key not found in " << file_path << std::endl;
+        if (!data.contains("scheduling_data")) {
+            std::cerr << "Error: 'scheduling_data' key not found in " << file_path << std::endl;
             return -1.0f;
         }
 
@@ -33,14 +33,14 @@ float get_execution_time(const std::string& file_path) {
             }
         }
         std::cerr << "Warning: 'total_execution_time_ms' not found in " << file_path << std::endl;
-        return schedules.back()["value"].get<float>();
+        return -1.0f; // Return invalid time if not found
     } catch (const json::exception& e) {
         std::cerr << "Error: Invalid JSON in " << file_path << ": " << e.what() << std::endl;
         return -1.0f;
     }
 }
 
-// Function to extract features from JSON file
+// Function to extract features from a JSON file
 std::map<std::string, float> extract_features_from_file(const std::string& file_path) {
     std::ifstream file(file_path);
     if (!file.is_open()) {
@@ -58,67 +58,49 @@ std::map<std::string, float> extract_features_from_file(const std::string& file_
 
     float execution_time = get_execution_time(file_path);
     if (execution_time < 0) {
-        std::cerr << "Warning: No execution time found in " << file_path << std::endl;
+        std::cerr << "Warning: No valid execution time found in " << file_path << std::endl;
         return {};
     }
 
     std::vector<std::map<std::string, std::string>> nodes_features;
     std::vector<std::map<std::string, std::string>> edges_features;
-    json programming_details;
+    json programming_details = data.value("programming_details", json::object());
 
-    if (data.contains("programming_details")) {
-        programming_details = data["programming_details"];
-
-        if (programming_details.contains("Nodes")) {
-            for (const auto& node : programming_details["Nodes"]) {
-                std::map<std::string, std::string> node_feature;
-                node_feature["Name"] = node.value("Name", "");
-                if (node.contains("Details") && node["Details"].contains("Op histogram")) {
-                    for (const auto& op_line : node["Details"]["Op histogram"]) {
-                        std::string line = op_line.get<std::string>();
-                        size_t colon = line.find(':');
-                        if (colon != std::string::npos) {
-                            std::string op_name = line.substr(0, colon);
-                            int op_count = std::stoi(line.substr(colon + 1));
-                            node_feature["op_" + op_name] = std::to_string(op_count);
-                        }
+    if (programming_details.contains("Nodes")) {
+        for (const auto& node : programming_details["Nodes"]) {
+            std::map<std::string, std::string> node_feature;
+            node_feature["Name"] = node.value("Name", "");
+            if (node.contains("Details") && node["Details"].contains("Op histogram")) {
+                for (const auto& op_line : node["Details"]["Op histogram"]) {
+                    std::string line = op_line.get<std::string>();
+                    size_t colon = line.find(':');
+                    if (colon != std::string::npos) {
+                        std::string op_name = line.substr(0, colon);
+                        int op_count = std::stoi(line.substr(colon + 1));
+                        node_feature["op_" + op_name] = std::to_string(op_count);
                     }
                 }
-                nodes_features.push_back(node_feature);
             }
-        }
-
-        if (programming_details.contains("Edges")) {
-            for (const auto& edge : programming_details["Edges"]) {
-                std::map<std::string, std::string> edge_feature;
-                edge_feature["From"] = edge.value("From", "");
-                edge_feature["To"] = edge.value("To", "");
-                edge_feature["Name"] = edge.value("Name", "");
-                edges_features.push_back(edge_feature);
-            }
+            nodes_features.push_back(node_feature);
         }
     }
 
-    std::vector<std::map<std::string, float>> scheduling_features;
-    json scheduling_data = data.value("scheduling_data", programming_details.value("Schedules", json::array()));
-    for (const auto& sched : scheduling_data) {
-        std::map<std::string, float> sched_feature;
-        sched_feature["Name"] = sched.value("Name", 0.0f);
-        if (sched.contains("Details") && sched["Details"].contains("scheduling_feature")) {
-            for (const auto& [key, value] : sched["Details"]["scheduling_feature"].items()) {
-                sched_feature[key] = value.get<float>();
-            }
+    if (programming_details.contains("Edges")) {
+        for (const auto& edge : programming_details["Edges"]) {
+            std::map<std::string, std::string> edge_feature;
+            edge_feature["From"] = edge.value("From", "");
+            edge_feature["To"] = edge.value("To", "");
+            edge_feature["Name"] = edge.value("Name", "");
+            edges_features.push_back(edge_feature);
         }
-        scheduling_features.push_back(sched_feature);
     }
 
     std::map<std::string, float> features;
     features["execution_time"] = execution_time;
     features["nodes_count"] = static_cast<float>(nodes_features.size());
     features["edges_count"] = static_cast<float>(edges_features.size());
-    features["scheduling_count"] = static_cast<float>(scheduling_features.size());
-    features["node_edge_ratio"] = (nodes_features.size() > 0 && edges_features.size() > 0) ? 
-                                  nodes_features.size() / edges_features.size() : 0.0f;
+    features["node_edge_ratio"] = (edges_features.size() > 0) ? 
+                                  nodes_features.size() / static_cast<float>(edges_features.size()) : 0.0f;
 
     std::map<std::string, float> op_counts;
     for (const auto& node : nodes_features) {
@@ -130,62 +112,14 @@ std::map<std::string, float> extract_features_from_file(const std::string& file_
     }
     features.insert(op_counts.begin(), op_counts.end());
 
-    if (!scheduling_features.empty()) {
-        std::vector<std::string> important_metrics = {
-            "bytes_at_production", "bytes_at_realization", "bytes_at_root", "bytes_at_task",
-            "inner_parallelism", "outer_parallelism", "num_productions", "num_realizations",
-            "num_scalars", "num_vectors", "points_computed_total", "working_set"
-        };
-        for (const auto& metric : important_metrics) {
-            if (scheduling_features[0].count(metric)) {
-                features["sched_" + metric] = scheduling_features[0].at(metric);
-            }
-        }
-
-        float total_bytes_at_production = 0.0f, total_vectors = 0.0f, total_parallelism = 0.0f;
-        for (const auto& sf : scheduling_features) {
-            total_bytes_at_production += sf.count("bytes_at_production") ? sf.at("bytes_at_production") : 0.0f;
-            total_vectors += sf.count("num_vectors") ? sf.at("num_vectors") : 0.0f;
-            total_parallelism += (sf.count("inner_parallelism") ? sf.at("inner_parallelism") : 0.0f) *
-                                 (sf.count("outer_parallelism") ? sf.at("outer_parallelism") : 1.0f);
-        }
-        features["total_bytes_at_production"] = total_bytes_at_production;
-        features["total_vectors"] = total_vectors;
-        features["total_parallelism"] = total_parallelism;
-
-        if (total_vectors > 0) {
-            features["bytes_per_vector"] = total_bytes_at_production / total_vectors;
-        }
-        if (scheduling_features[0].count("working_set") && scheduling_features[0].count("bytes_at_production")) {
-            features["memory_pressure"] = scheduling_features[0].at("working_set") / 
-                                         (scheduling_features[0].at("bytes_at_production") > 0 ? 
-                                          scheduling_features[0].at("bytes_at_production") : 1.0f);
-        }
-    }
-
-    if (!nodes_features.empty()) {
-        float total_ops = 0.0f;
-        for (const auto& [key, value] : op_counts) {
-            total_ops += value;
-        }
-        features["avg_ops_per_node"] = total_ops / nodes_features.size();
-        features["op_diversity"] = static_cast<float>(op_counts.size()) / nodes_features.size();
-    }
-
     return features;
 }
 
-// Convert features to tensor
+// Function to convert features to a tensor
 torch::Tensor features_to_tensor(const std::map<std::string, float>& features) {
     std::vector<std::string> feature_order = {
-        "nodes_count", "edges_count", "scheduling_count", "node_edge_ratio",
-        "op_add", "op_mul", /* ... add all ops from your data ... */
-        "sched_bytes_at_production", "sched_bytes_at_realization", "sched_bytes_at_root",
-        "sched_bytes_at_task", "sched_inner_parallelism", "sched_outer_parallelism",
-        "sched_num_productions", "sched_num_realizations", "sched_num_scalars",
-        "sched_num_vectors", "sched_points_computed_total", "sched_working_set",
-        "total_bytes_at_production", "total_vectors", "total_parallelism",
-        "bytes_per_vector", "memory_pressure", "avg_ops_per_node", "op_diversity"
+        "nodes_count", "edges_count", "node_edge_ratio",
+        "op_add", "op_mul" // Add more ops as needed based on your data
     };
 
     std::vector<float> feature_vec;
@@ -193,24 +127,33 @@ torch::Tensor features_to_tensor(const std::map<std::string, float>& features) {
         feature_vec.push_back(features.count(key) ? features.at(key) : 0.0f);
     }
 
-    float mean = 5.0f, std = 2.0f; // Replace with actual values from your Python training
+    // Simple normalization (replace with your actual mean and std if available)
+    float mean = 0.0f, std = 1.0f;
     for (auto& val : feature_vec) {
-        val = (val - mean) / std;
+        val = (val - mean) / (std + 1e-6); // Avoid division by zero
     }
 
-    return torch::from_blob(feature_vec.data(), {1, 1, static_cast<long>(feature_vec.size())});
+    auto tensor = torch::from_blob(feature_vec.data(), {1, static_cast<long>(feature_vec.size())});
+    if (torch::cuda::is_available()) {
+        return tensor.to(torch::kCUDA);
+    }
+    return tensor;
 }
 
 int main() {
-    // Check if CUDA is available
-    bool cuda_available = torch::cuda::is_available();
-    std::cout << "CUDA available: " << (cuda_available ? "Yes" : "No") << std::endl;
+    // Check CUDA availability
+    if (torch::cuda::is_available()) {
+        std::cout << "CUDA is available! Using GPU." << std::endl;
+    } else {
+        std::cout << "CUDA not available. Using CPU." << std::endl;
+    }
 
+    // Load the model
     torch::jit::script::Module model;
     try {
         model = torch::jit::load("/home/kowrisaan/jathu/Halide_New/lstm_model.pt");
         model.eval();
-        if (cuda_available) {
+        if (torch::cuda::is_available()) {
             model.to(torch::kCUDA);
         }
     } catch (const c10::Error& e) {
@@ -218,6 +161,7 @@ int main() {
         return -1;
     }
 
+    // Process the JSON file
     std::string file_path = "/home/kowrisaan/jathu/Halide_New/synthetic_data/program_50001/0_0.json";
     std::cout << "Processing file: " << file_path << std::endl;
 
@@ -227,11 +171,8 @@ int main() {
         return -1;
     }
 
+    // Convert features to tensor and run inference
     torch::Tensor input = features_to_tensor(features);
-    if (cuda_available) {
-        input = input.to(torch::kCUDA);
-    }
-
     std::vector<torch::jit::IValue> inputs = {input};
     torch::Tensor output;
     try {
@@ -241,17 +182,9 @@ int main() {
         return -1;
     }
 
-    // Replace with actual values from your Python training
+    // Denormalize the predicted time (replace with your actual y_mean and y_std)
     float y_mean = 0.0f, y_std = 1.0f;
-    float predicted_time_scaled = output.item<float>();
-    float predicted_time = predicted_time_scaled * y_std + y_mean;
-    
-    // If log transformed (replace with actual value from your training)
-    bool is_log_transformed = true;
-    if (is_log_transformed) {
-        predicted_time = std::exp(predicted_time) - 1;
-    }
-    
+    float predicted_time = output.item<float>() * y_std + y_mean;
     std::cout << "Predicted execution time for " << file_path << ": " << predicted_time << " ms" << std::endl;
 
     return 0;
