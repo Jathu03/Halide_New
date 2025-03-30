@@ -144,15 +144,16 @@ std::map<std::string, float> extract_features_from_file(const std::string& file_
         };
         for (const auto& metric : important_metrics) {
             if (scheduling_features[0].count(metric)) {
-                features["sched_" + metric] = scheduling_features[0][metric];
+                features["sched_" + metric] = scheduling_features[0].at(metric);
             }
         }
 
         float total_bytes_at_production = 0.0f, total_vectors = 0.0f, total_parallelism = 0.0f;
         for (const auto& sf : scheduling_features) {
-            total_bytes_at_production += sf.value("bytes_at_production", 0.0f);
-            total_vectors += sf.value("num_vectors", 0.0f);
-            total_parallelism += sf.value("inner_parallelism", 0.0f) * sf.value("outer_parallelism", 1.0f);
+            total_bytes_at_production += sf.count("bytes_at_production") ? sf.at("bytes_at_production") : 0.0f;
+            total_vectors += sf.count("num_vectors") ? sf.at("num_vectors") : 0.0f;
+            total_parallelism += (sf.count("inner_parallelism") ? sf.at("inner_parallelism") : 0.0f) *
+                                 (sf.count("outer_parallelism") ? sf.at("outer_parallelism") : 1.0f);
         }
         features["total_bytes_at_production"] = total_bytes_at_production;
         features["total_vectors"] = total_vectors;
@@ -162,9 +163,9 @@ std::map<std::string, float> extract_features_from_file(const std::string& file_
             features["bytes_per_vector"] = total_bytes_at_production / total_vectors;
         }
         if (scheduling_features[0].count("working_set") && scheduling_features[0].count("bytes_at_production")) {
-            features["memory_pressure"] = scheduling_features[0]["working_set"] / 
-                                         (scheduling_features[0]["bytes_at_production"] > 0 ? 
-                                          scheduling_features[0]["bytes_at_production"] : 1.0f);
+            features["memory_pressure"] = scheduling_features[0].at("working_set") / 
+                                         (scheduling_features[0].at("bytes_at_production") > 0 ? 
+                                          scheduling_features[0].at("bytes_at_production") : 1.0f);
         }
     }
 
@@ -182,10 +183,8 @@ std::map<std::string, float> extract_features_from_file(const std::string& file_
 
 // Convert features to tensor (must match Python training order)
 torch::Tensor features_to_tensor(const std::map<std::string, float>& features) {
-    // Define the exact order of features as in Python training
     std::vector<std::string> feature_order = {
         "nodes_count", "edges_count", "scheduling_count", "node_edge_ratio",
-        // Add all op_ keys dynamically or explicitly list them based on your data
         "op_add", "op_mul", /* ... add all ops from your data ... */
         "sched_bytes_at_production", "sched_bytes_at_realization", "sched_bytes_at_root",
         "sched_bytes_at_task", "sched_inner_parallelism", "sched_outer_parallelism",
@@ -197,11 +196,10 @@ torch::Tensor features_to_tensor(const std::map<std::string, float>& features) {
 
     std::vector<float> feature_vec;
     for (const auto& key : feature_order) {
-        feature_vec.push_back(features.count(key) ? features.at(key) : 0.0f); // Default to 0 if missing
+        feature_vec.push_back(features.count(key) ? features.at(key) : 0.0f);
     }
 
-    // Normalize (example values; replace with actual mean/std from Python scaler)
-    float mean = 5.0f, std = 2.0f; // Placeholder; export from Python
+    float mean = 5.0f, std = 2.0f; // Replace with actual values
     for (auto& val : feature_vec) {
         val = (val - mean) / std;
     }
@@ -210,7 +208,6 @@ torch::Tensor features_to_tensor(const std::map<std::string, float>& features) {
 }
 
 int main() {
-    // Load the trained LSTM model
     torch::jit::script::Module model;
     try {
         model = torch::jit::load("lstm_model.pt");
@@ -220,21 +217,16 @@ int main() {
         return -1;
     }
 
-    // Specify the exact file path for inference
     std::string file_path = "synthetic_data/program_50001/0_0.json";
     std::cout << "Processing file: " << file_path << std::endl;
 
-    // Extract features from the specified JSON file
     auto features = extract_features_from_file(file_path);
     if (features.empty()) {
         std::cerr << "Failed to extract features from " << file_path << std::endl;
         return -1;
     }
 
-    // Convert features to tensor
     torch::Tensor input = features_to_tensor(features);
-
-    // Run inference
     std::vector<torch::jit::IValue> inputs = {input};
     torch::Tensor output;
     try {
@@ -244,11 +236,10 @@ int main() {
         return -1;
     }
 
-    // Denormalize output (replace with actual scaler values from Python)
-    float y_mean = 0.0f, y_std = 1.0f; // Placeholder; export from Python's y_scaler
+    float y_mean = 0.0f, y_std = 1.0f; // Replace with actual values
     float predicted_time_scaled = output.item<float>();
     float predicted_time = predicted_time_scaled * y_std + y_mean;
-    if (predicted_time < 0) { // Assuming log transformation was used in Python
+    if (predicted_time < 0) {
         predicted_time = std::exp(predicted_time) - 1;
     }
     std::cout << "Predicted execution time for " << file_path << ": " << predicted_time << " ms" << std::endl;
