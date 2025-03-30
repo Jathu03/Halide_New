@@ -49,23 +49,32 @@ std::vector<float> load_schedule_representation(const std::string& file_path) {
     return data["representation"].get<std::vector<float>>();
 }
 
+// Function to check if CUDA is available (manual implementation)
+bool is_cuda_available() {
+    // Since torch::cuda::is_available() doesn't work in your environment,
+    // we'll return a hardcoded value based on your setup
+    // Change this based on your knowledge of the system
+#ifdef USE_CUDA
+    return true;
+#else
+    return false;
+#endif
+}
+
 // Function to load the model with proper device handling
 torch::jit::script::Module load_model(const std::string& model_path, bool use_cuda) {
     torch::jit::script::Module model;
     try {
         // Deserialize the ScriptModule from a file
         model = torch::jit::load(model_path);
-
-        // Move to appropriate device
-        if (use_cuda) {
-            model.to(torch::kCUDA);
-            std::cout << "Model moved to CUDA" << std::endl;
-        } else {
-            model.to(torch::kCPU);
-            std::cout << "Model moved to CPU" << std::endl;
-        }
-
+        
+        // Set model to evaluation mode
         model.eval();
+        
+        // No need to explicitly move the model - it will stay on the device it was saved on
+        std::cout << "Model loaded successfully" << std::endl;
+        std::cout << "Model expecting inputs on " << (use_cuda ? "CUDA" : "CPU") << std::endl;
+        
         return model;
     } catch (const std::exception& e) {
         throw std::runtime_error("Error loading model: " + std::string(e.what()));
@@ -74,36 +83,40 @@ torch::jit::script::Module load_model(const std::string& model_path, bool use_cu
 
 // Function to perform inference with device consistency
 float predict_execution_time(torch::jit::script::Module& model, 
-                          const std::vector<float>& representation,
-                          float y_mean, float y_scale, bool is_log_transformed) {
+                           const std::vector<float>& representation,
+                           float y_mean, float y_scale, bool is_log_transformed,
+                           bool use_cuda) {
     try {
-        // Default to CPU device
-        torch::Device device = torch::kCPU;
+        // Set device based on the use_cuda flag
+        torch::Device device = use_cuda ? torch::kCUDA : torch::kCPU;
         
-        // Just use the device the model was moved to
-        // We know this from the use_cuda parameter that was passed to load_model
+        // Create input tensor from the representation vector
+        auto options = torch::TensorOptions().dtype(torch::kFloat32).device(device);
         
-        // Convert representation to tensor and move to correct device
-        torch::Tensor input_tensor = torch::from_blob(
+        // First create a CPU tensor
+        torch::Tensor cpu_tensor = torch::from_blob(
             (void*)representation.data(), 
             {1, static_cast<int64_t>(representation.size())}, 
             torch::kFloat32
-        ).clone().unsqueeze(0).unsqueeze(0).to(device);
-
+        ).clone();
+        
+        // Move to correct device and add the necessary dimensions
+        torch::Tensor input_tensor = cpu_tensor.to(device).unsqueeze(0).unsqueeze(0);
+        
         // Create input vector
         std::vector<torch::jit::IValue> inputs;
         inputs.push_back(input_tensor);
-
+        
         // Run inference
         torch::Tensor output = model.forward(inputs).toTensor();
-
+        
         // Inverse transform the prediction
         float prediction = output.item<float>() * y_scale + y_mean;
-
+        
         if (is_log_transformed) {
             prediction = exp(prediction) - 1.0f;
         }
-
+        
         return prediction;
     } catch (const std::exception& e) {
         throw std::runtime_error("Error during prediction: " + std::string(e.what()));
@@ -112,37 +125,42 @@ float predict_execution_time(torch::jit::script::Module& model,
 
 int main() {
     try {
-        // Set CUDA flag based on your build configuration
-        bool use_cuda = false;  // Set to true if you want to use CUDA and know it's available
+        // Determine if we should use CUDA
+        // Since your model was traced with CUDA tensors, we need to use CUDA for inference
+        bool use_cuda = true;  // Set to true because your model expects CUDA tensors
         
         std::cout << "CUDA enabled: " << (use_cuda ? "YES" : "NO") << std::endl;
-
+        
+        if (use_cuda && !is_cuda_available()) {
+            std::cerr << "WARNING: Model requires CUDA but CUDA is not available on this system." << std::endl;
+            std::cerr << "         This will likely cause errors during inference." << std::endl;
+        }
+        
         // Load model
         std::cout << "Loading model..." << std::endl;
         auto model = load_model("lstm_model.pt", use_cuda);
-        std::cout << "Model loaded successfully" << std::endl;
-
+        
         // Load representation
         std::cout << "Loading representation..." << std::endl;
         auto representation = load_schedule_representation("schedule_representation.json");
         std::cout << "Representation size: " << representation.size() << std::endl;
-
+        
         // Load scaler parameters
         std::cout << "Loading scaler parameters..." << std::endl;
         auto [y_mean, y_scale, is_log] = load_scaler_y("scaler_y.json");
         std::cout << "Scaler parameters loaded (mean=" << y_mean 
                   << ", scale=" << y_scale 
                   << ", log=" << is_log << ")" << std::endl;
-
+        
         // Perform prediction
         std::cout << "Running prediction..." << std::endl;
-        float predicted_time = predict_execution_time(model, representation, y_mean, y_scale, is_log);
+        float predicted_time = predict_execution_time(model, representation, y_mean, y_scale, is_log, use_cuda);
         std::cout << "\nPredicted execution time: " << predicted_time << " ms" << std::endl;
-
+        
     } catch (const std::exception& e) {
         std::cerr << "ERROR: " << e.what() << std::endl;
         return -1;
     }
-
+    
     return 0;
 }
