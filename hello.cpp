@@ -193,28 +193,25 @@ torch::Tensor features_to_tensor(const std::map<std::string, float>& features) {
         feature_vec.push_back(features.count(key) ? features.at(key) : 0.0f);
     }
 
-    float mean = 5.0f, std = 2.0f; // Replace with actual values
+    float mean = 5.0f, std = 2.0f; // Replace with actual values from your Python training
     for (auto& val : feature_vec) {
         val = (val - mean) / std;
     }
 
-    return torch::from_blob(feature_vec.data(), {1, 1, static_cast<long>(feature_vec.size())}).to(torch::kCUDA);
+    return torch::from_blob(feature_vec.data(), {1, 1, static_cast<long>(feature_vec.size())});
 }
 
 int main() {
     // Check if CUDA is available
-    if (torch::cuda::is_available()) {
-        std::cout << "CUDA is available! Using GPU." << std::endl;
-    } else {
-        std::cout << "CUDA not available. Using CPU." << std::endl;
-    }
+    bool cuda_available = torch::cuda::is_available();
+    std::cout << "CUDA available: " << (cuda_available ? "Yes" : "No") << std::endl;
 
     torch::jit::script::Module model;
     try {
         model = torch::jit::load("/home/kowrisaan/jathu/Halide_New/lstm_model.pt");
         model.eval();
-        if (torch::cuda::is_available()) {
-            model.to(torch::kCUDA); // Move model to CUDA
+        if (cuda_available) {
+            model.to(torch::kCUDA);
         }
     } catch (const c10::Error& e) {
         std::cerr << "Error loading model: " << e.what() << std::endl;
@@ -231,6 +228,10 @@ int main() {
     }
 
     torch::Tensor input = features_to_tensor(features);
+    if (cuda_available) {
+        input = input.to(torch::kCUDA);
+    }
+
     std::vector<torch::jit::IValue> inputs = {input};
     torch::Tensor output;
     try {
@@ -240,12 +241,17 @@ int main() {
         return -1;
     }
 
-    float y_mean = 0.0f, y_std = 1.0f; // Replace with actual values
+    // Replace with actual values from your Python training
+    float y_mean = 0.0f, y_std = 1.0f;
     float predicted_time_scaled = output.item<float>();
     float predicted_time = predicted_time_scaled * y_std + y_mean;
-    if (predicted_time < 0) {
+    
+    // If log transformed (replace with actual value from your training)
+    bool is_log_transformed = true;
+    if (is_log_transformed) {
         predicted_time = std::exp(predicted_time) - 1;
     }
+    
     std::cout << "Predicted execution time for " << file_path << ": " << predicted_time << " ms" << std::endl;
 
     return 0;
