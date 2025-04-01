@@ -1,6 +1,6 @@
 #include <torch/script.h>
 #include <torch/torch.h>
-#include <nlohmann/json.hpp> // For JSON parsing
+#include <nlohmann/json.hpp>
 #include <iostream>
 #include <fstream>
 #include <filesystem>
@@ -8,11 +8,9 @@
 #include <stdexcept>
 #include <cmath>
 
-// Using namespace for convenience
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 
-// Function to extract features from JSON (simplified version from Python)
 std::vector<float> extract_features_from_json(const std::string& file_path) {
     std::ifstream file(file_path);
     if (!file.is_open()) {
@@ -22,65 +20,71 @@ std::vector<float> extract_features_from_json(const std::string& file_path) {
     json data;
     file >> data;
 
-    // Extract execution time (for reference)
+    // Extract execution time
     float execution_time = 0.0;
-    if (data.contains("scheduling_data")) {
+    if (data.contains("scheduling_data") && data["scheduling_data"].is_array()) {
         for (const auto& item : data["scheduling_data"]) {
-            if (item.is_object() && item["name"] == "total_execution_time_ms") {
+            if (item.is_object() && item.contains("name") && item["name"] == "total_execution_time_ms" && item.contains("value")) {
                 execution_time = item["value"].get<float>();
                 break;
             }
         }
     }
 
-    // Extract features (mimicking Python's extract_features_from_file)
     std::vector<float> features;
     int nodes_count = 0, edges_count = 0, scheduling_count = 0;
     std::map<std::string, int> op_counts;
 
-    if (data.contains("programming_details")) {
+    // Process programming_details
+    if (data.contains("programming_details") && data["programming_details"].is_object()) {
         auto prog_details = data["programming_details"];
+
         // Nodes
-        if (prog_details.contains("Nodes")) {
+        if (prog_details.contains("Nodes") && prog_details["Nodes"].is_array()) {
             nodes_count = prog_details["Nodes"].size();
             for (const auto& node : prog_details["Nodes"]) {
-                if (node.contains("Details") && node["Details"].contains("Op histogram")) {
+                if (node.contains("Details") && node["Details"].contains("Op histogram") && node["Details"]["Op histogram"].is_array()) {
                     for (const auto& op_line : node["Details"]["Op histogram"]) {
-                        std::string line = op_line.get<std::string>();
-                        size_t pos = line.find(':');
-                        if (pos != std::string::npos) {
-                            std::string op_name = "op_" + line.substr(0, pos);
-                            int count = std::stoi(line.substr(pos + 1));
-                            op_counts[op_name] += count;
+                        if (op_line.is_string()) {
+                            std::string line = op_line.get<std::string>();
+                            size_t pos = line.find(':');
+                            if (pos != std::string::npos) {
+                                std::string op_name = "op_" + line.substr(0, pos);
+                                int count = std::stoi(line.substr(pos + 1));
+                                op_counts[op_name] += count;
+                            }
                         }
                     }
                 }
             }
         }
+
         // Edges
-        if (prog_details.contains("Edges")) {
+        if (prog_details.contains("Edges") && prog_details["Edges"].is_array()) {
             edges_count = prog_details["Edges"].size();
         }
     }
 
     // Scheduling data
-    if (data.contains("scheduling_data")) {
+    if (data.contains("scheduling_data") && data["scheduling_data"].is_array()) {
         scheduling_count = data["scheduling_data"].size();
-        auto sched = data["scheduling_data"][0];
-        if (sched.contains("Details") && sched["Details"].contains("scheduling_feature")) {
-            auto sf = sched["Details"]["scheduling_feature"];
-            features.push_back(sf.value("bytes_at_production", 0.0f));
-            features.push_back(sf.value("bytes_at_realization", 0.0f));
-            features.push_back(sf.value("bytes_at_root", 0.0f));
-            features.push_back(sf.value("bytes_at_task", 0.0f));
-            features.push_back(sf.value("inner_parallelism", 0.0f));
-            features.push_back(sf.value("outer_parallelism", 0.0f));
-            features.push_back(sf.value("num_productions", 0.0f));
-            features.push_back(sf.value("num_realizations", 0.0f));
-            features.push_back(sf.value("num_scalars", 0.0f));
-            features.push_back(sf.value("num_vectors", 0.0f));
-            features.push_back(sf.value("points_computed_total", 0.0f));
-            features.push_back(sf.value("working_set", 0.0f));
+        if (!data["scheduling_data"].empty()) {
+            auto sched = data["scheduling_data"][0];
+            if (sched.contains("Details") && sched["Details"].is_object() && sched["Details"].contains("scheduling_feature") && sched["Details"]["scheduling_feature"].is_object()) {
+                auto sf = sched["Details"]["scheduling_feature"];
+                features.push_back(sf.value("bytes_at_production", 0.0f));
+                features.push_back(sf.value("bytes_at_realization", 0.0f));
+                features.push_back(sf.value("bytes_at_root", 0.0f));
+                features.push_back(sf.value("bytes_at_task", 0.0f));
+                features.push_back(sf.value("inner_parallelism", 0.0f));
+                features.push_back(sf.value("outer_parallelism", 0.0f));
+                features.push_back(sf.value("num_productions", 0.0f));
+                features.push_back(sf.value("num_realizations", 0.0f));
+                features.push_back(sf.value("num_scalars", 0.0f));
+                features.push_back(sf.value("num_vectors", 0.0f));
+                features.push_back(sf.value("points_computed_total", 0.0f));
+                features.push_back(sf.value("working_set", 0.0f));
+            }
         }
     }
 
@@ -96,13 +100,13 @@ std::vector<float> extract_features_from_json(const std::string& file_path) {
     }
 
     // Additional features
-    float total_bytes = features[0]; // bytes_at_production
-    float total_vectors = features[9]; // num_vectors
+    float total_bytes = features.size() > 0 ? features[0] : 0.0f; // bytes_at_production
+    float total_vectors = features.size() > 9 ? features[9] : 0.0f; // num_vectors
     features.push_back(total_bytes);
     features.push_back(total_vectors);
-    features.push_back(features[4] * features[5]); // total_parallelism
+    features.push_back(features.size() > 5 ? features[4] * features[5] : 0.0f); // total_parallelism
     features.push_back(total_vectors > 0 ? total_bytes / total_vectors : 0.0f); // bytes_per_vector
-    features.push_back(features[11] / (total_bytes > 0 ? total_bytes : 1e-8f)); // memory_pressure
+    features.push_back(features.size() > 11 ? features[11] / (total_bytes > 0 ? total_bytes : 1e-8f) : 0.0f); // memory_pressure
 
     float total_ops = 0;
     for (size_t i = 16; i < features.size() - 5; ++i) total_ops += features[i];
@@ -123,7 +127,7 @@ int main() {
         std::cout << "Model loaded successfully" << std::endl;
 
         // Specify the file to test
-        std::string file_path = "0_0.json"; // Adjust based on your subfolder structure
+        std::string file_path = "synthetic_data/0/0_0.json";
         if (!fs::exists(file_path)) {
             throw std::runtime_error("File not found: " + file_path);
         }
@@ -131,7 +135,7 @@ int main() {
         // Extract features
         std::vector<float> features = extract_features_from_json(file_path);
 
-        // Convert to tensor (assuming features match model's input_size)
+        // Convert to tensor
         torch::Tensor input = torch::from_blob(features.data(), {1, 1, static_cast<long>(features.size())}).to(torch::kFloat32);
 
         // Move to CUDA if available
@@ -146,9 +150,6 @@ int main() {
         // Get prediction
         float pred_scaled = output.item<float>();
         std::cout << "Predicted execution time (scaled): " << pred_scaled << std::endl;
-
-        // Note: To get actual ms, you'd need to apply y_scaler's inverse transform
-        // This requires y_scaler mean and std, which could be hardcoded or loaded separately
 
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;
