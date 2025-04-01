@@ -11,6 +11,9 @@
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 
+// Hardcode expected input size from Python training (replace with actual value)
+const int EXPECTED_INPUT_SIZE = 47; // Update this based on Python's "Input feature dimension: X"
+
 std::vector<float> extract_features_from_json(const std::string& file_path) {
     std::ifstream file(file_path);
     if (!file.is_open()) {
@@ -20,7 +23,6 @@ std::vector<float> extract_features_from_json(const std::string& file_path) {
     json data;
     file >> data;
 
-    // Extract execution time
     float execution_time = 0.0;
     if (data.contains("scheduling_data") && data["scheduling_data"].is_array()) {
         for (const auto& item : data["scheduling_data"]) {
@@ -35,11 +37,8 @@ std::vector<float> extract_features_from_json(const std::string& file_path) {
     int nodes_count = 0, edges_count = 0, scheduling_count = 0;
     std::map<std::string, int> op_counts;
 
-    // Process programming_details
     if (data.contains("programming_details") && data["programming_details"].is_object()) {
         auto prog_details = data["programming_details"];
-
-        // Nodes
         if (prog_details.contains("Nodes") && prog_details["Nodes"].is_array()) {
             nodes_count = prog_details["Nodes"].size();
             for (const auto& node : prog_details["Nodes"]) {
@@ -58,14 +57,11 @@ std::vector<float> extract_features_from_json(const std::string& file_path) {
                 }
             }
         }
-
-        // Edges
         if (prog_details.contains("Edges") && prog_details["Edges"].is_array()) {
             edges_count = prog_details["Edges"].size();
         }
     }
 
-    // Scheduling data
     if (data.contains("scheduling_data") && data["scheduling_data"].is_array()) {
         scheduling_count = data["scheduling_data"].size();
         if (!data["scheduling_data"].empty()) {
@@ -88,33 +84,36 @@ std::vector<float> extract_features_from_json(const std::string& file_path) {
         }
     }
 
-    // Basic features
     features.push_back(static_cast<float>(nodes_count));
     features.push_back(static_cast<float>(edges_count));
     features.push_back(static_cast<float>(scheduling_count));
     features.push_back(nodes_count > 0 && edges_count > 0 ? static_cast<float>(nodes_count) / edges_count : 0.0f);
-
-    // Operation counts
     for (const auto& [op, count] : op_counts) {
         features.push_back(static_cast<float>(count));
     }
 
-    // Additional features
-    float total_bytes = features.size() > 0 ? features[0] : 0.0f; // bytes_at_production
-    float total_vectors = features.size() > 9 ? features[9] : 0.0f; // num_vectors
+    float total_bytes = features.size() > 0 ? features[0] : 0.0f;
+    float total_vectors = features.size() > 9 ? features[9] : 0.0f;
     features.push_back(total_bytes);
     features.push_back(total_vectors);
-    features.push_back(features.size() > 5 ? features[4] * features[5] : 0.0f); // total_parallelism
-    features.push_back(total_vectors > 0 ? total_bytes / total_vectors : 0.0f); // bytes_per_vector
-    features.push_back(features.size() > 11 ? features[11] / (total_bytes > 0 ? total_bytes : 1e-8f) : 0.0f); // memory_pressure
+    features.push_back(features.size() > 5 ? features[4] * features[5] : 0.0f);
+    features.push_back(total_vectors > 0 ? total_bytes / total_vectors : 0.0f);
+    features.push_back(features.size() > 11 ? features[11] / (total_bytes > 0 ? total_bytes : 1e-8f) : 0.0f);
 
     float total_ops = 0;
     for (size_t i = 16; i < features.size() - 5; ++i) total_ops += features[i];
-    features.push_back(nodes_count > 0 ? total_ops / nodes_count : 0.0f); // avg_ops_per_node
-    features.push_back(nodes_count > 0 ? static_cast<float>(op_counts.size()) / nodes_count : 0.0f); // op_diversity
+    features.push_back(nodes_count > 0 ? total_ops / nodes_count : 0.0f);
+    features.push_back(nodes_count > 0 ? static_cast<float>(op_counts.size()) / nodes_count : 0.0f);
 
     std::cout << "Extracted " << features.size() << " features from " << file_path << std::endl;
     std::cout << "Actual execution time: " << execution_time << " ms" << std::endl;
+
+    // Ensure feature count matches expected input size
+    if (features.size() != EXPECTED_INPUT_SIZE) {
+        throw std::runtime_error("Feature count (" + std::to_string(features.size()) + 
+                                 ") does not match expected input size (" + 
+                                 std::to_string(EXPECTED_INPUT_SIZE) + ")");
+    }
 
     return features;
 }
@@ -127,7 +126,7 @@ int main() {
         std::cout << "Model loaded successfully" << std::endl;
 
         // Specify the file to test
-        std::string file_path = "0_0.json";
+        std::string file_path = "synthetic_data/0/0_0.json";
         if (!fs::exists(file_path)) {
             throw std::runtime_error("File not found: " + file_path);
         }
@@ -136,7 +135,7 @@ int main() {
         std::vector<float> features = extract_features_from_json(file_path);
 
         // Convert to tensor
-        torch::Tensor input = torch::from_blob(features.data(), {1, 1, static_cast<long>(features.size())}).to(torch::kFloat32);
+        torch::Tensor input = torch::from_blob(features.data(), {1, 1, EXPECTED_INPUT_SIZE}).to(torch::kFloat32);
 
         // Move to CUDA if available
         torch::Device device(torch::cuda::is_available() ? torch::kCUDA : torch::kCPU);
