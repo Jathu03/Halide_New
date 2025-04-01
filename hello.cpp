@@ -127,7 +127,7 @@ int main() {
         std::cout << "Model loaded successfully" << std::endl;
 
         // Specify the file to test
-        std::string file_path = "synthetic_data/0/0_0.json";
+        std::string file_path = "0_0.json";
         if (!fs::exists(file_path)) {
             throw std::runtime_error("File not found: " + file_path);
         }
