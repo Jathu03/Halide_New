@@ -554,8 +554,50 @@ def create_schedule_representation(model, schedule_features, feature_names, scal
     return output
 
 def main(main_dir):
-    # ... [Previous code remains unchanged until model saving] ...
-
+    print(f"Processing main directory: {main_dir}")
+    train_features, test_features, test_file_names = process_main_directory(main_dir)
+    
+    print(f"Total training samples: {len(train_features)} (randomly selected)")
+    print(f"Total test samples: {len(test_features)} (50 randomly selected)")
+    
+    if len(train_features) == 0 or len(test_features) == 0:
+        print("Error: No valid training or test data found")
+        return None, None, None, None
+    
+    # Prepare data for model
+    X_train, y_train, X_test, y_test, y_scaler, input_size, is_log_transformed = prepare_data_for_model(train_features, test_features)
+    
+    # Create data loaders
+    train_loader, test_loader = create_data_loaders(X_train, y_train, X_test, y_test, batch_size=16)
+    
+    # Initialize enhanced model
+    model = EnhancedLSTMModel(
+        input_size=input_size,
+        hidden_sizes=[128, 64, 32],
+        output_size=1,
+        dropout_rate=0.3
+    )
+    
+    # Define loss function and optimizer
+    criterion = nn.HuberLoss(delta=1.0)
+    optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-5)
+    
+    # Build and train model
+    print("Building and training Enhanced LSTM model...")
+    train_losses, val_losses = train_model(
+        model, 
+        train_loader, 
+        test_loader, 
+        criterion, 
+        optimizer, 
+        num_epochs=150,
+        patience=20
+    )
+    
+    # Evaluate model
+    print("\nEvaluating model:")
+    y_test_actual, y_pred_actual = evaluate_model(model, X_test, y_test, y_scaler, test_file_names, is_log_transformed)
+    
     # Save the trained model as a .pt file using TorchScript
     print("\nSaving the trained model as 'lstm_model.pt'...")
     model.eval()  # Set the model to evaluation mode
@@ -575,18 +617,26 @@ def main(main_dir):
         traced_model.save("lstm_model.pt")
         print("Model successfully saved as 'lstm_model.pt'")
         
-        # Save the scaler for later use (needed for inverse transformation)
-        import joblib
+        # Save the scaler for later use
         joblib.dump(y_scaler, "y_scaler.pkl")
         print("Scaler saved as 'y_scaler.pkl'")
         
     except Exception as e:
         print(f"Error saving the model: {str(e)}")
-        return None
+        return None, None, None, None
     
     return model, y_scaler, y_test_actual, y_pred_actual
 
 if __name__ == "__main__":
+    # Main directory containing subfolders for each program
     main_dir = "synthetic_data"
+    
+    # Set random seed for reproducibility
     random.seed(42)
-    model, y_scaler, y_test_actual, y_pred_actual = main(main_dir)
+    
+    # Run the main function to train and test
+    result = main(main_dir)
+    if result is not None:
+        model, y_scaler, y_test_actual, y_pred_actual = result
+    else:
+        print("Main function failed to return valid results")
