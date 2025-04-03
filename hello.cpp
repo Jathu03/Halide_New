@@ -146,7 +146,16 @@ float inverse_transform_prediction(float scaled_prediction, const YScalerParams&
 float run_prediction(const std::vector<float>& scaled_features, const std::string& model_path) {
     // Force CPU usage
     torch::Device device(torch::kCPU);
-    std::cout << "Using device: CPU\n";
+    
+    // Load with CPU map location
+    torch::jit::script::Module model;
+    try {
+        model = torch::jit::load(model_path, device);
+        model.eval();
+    } catch (const c10::Error& e) {
+        std::cerr << "Error loading the model: " << e.what() << std::endl;
+        throw;
+    }
 
     // Create input tensor with the right shape on CPU
     torch::Tensor input_tensor = torch::from_blob(
