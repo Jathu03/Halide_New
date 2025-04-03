@@ -228,6 +228,74 @@ float inverse_transform_prediction(float scaled_prediction, const YScalerParams&
     return unscaled;
 }
 
+// This function runs prediction using a CPU-only approach with fake CUDA
+float run_prediction(const std::vector<float>& scaled_features, const std::string& model_path) {
+    // First, check if CUDA is available
+    bool cuda_available = torch::cuda::is_available();
+    
+    // Set device to CPU always for inference
+    torch::Device device(torch::kCPU);
+    
+    // Create input tensor with the right shape
+    torch::Tensor input_tensor = torch::from_blob(
+        const_cast<float*>(scaled_features.data()),
+        {1, 1, static_cast<int64_t>(scaled_features.size())},
+        torch::TensorOptions().dtype(torch::kFloat32)
+    ).clone().to(device);
+    
+    std::cout << "Input tensor created with shape: [" 
+              << input_tensor.size(0) << ", " 
+              << input_tensor.size(1) << ", " 
+              << input_tensor.size(2) << "]\n";
+
+    // Need to re-export the model with CPU device
+    std::cout << "Creating temporary CPU version of the model...\n";
+    
+    // This part is the workaround - we need to modify the model
+    // Create a command to run Python script that converts the model
+    std::string temp_model_path = "temp_cpu_model.pt";
+    std::string python_cmd = "python -c \"import torch; model = torch.jit.load('" + model_path + 
+                            "'); cpu_model = model.to('cpu'); torch.jit.save(cpu_model, '" + 
+                            temp_model_path + "')\"";
+    
+    std::cout << "Executing: " << python_cmd << std::endl;
+    int result = system(python_cmd.c_str());
+    
+    if (result != 0) {
+        throw std::runtime_error("Failed to convert model to CPU with Python script");
+    }
+    
+    // Now load the CPU model
+    std::cout << "Loading CPU model...\n";
+    torch::jit::script::Module model;
+    try {
+        model = torch::jit::load(temp_model_path);
+        model.eval();
+        std::cout << "Model loaded successfully to CPU.\n";
+    } catch (const c10::Error& e) {
+        std::cerr << "Error loading the model: " << e.what() << std::endl;
+        throw;
+    }
+    
+    // Run inference with gradient tracking disabled
+    std::cout << "Running inference...\n";
+    torch::NoGradGuard no_grad;
+    
+    std::vector<torch::jit::IValue> inputs;
+    inputs.push_back(input_tensor);
+    
+    // Forward pass 
+    auto output = model.forward(inputs).toTensor();
+    
+    // Get prediction value
+    float scaled_prediction = output[0][0].item<float>();
+    
+    // Clean up temporary model file
+    std::remove(temp_model_path.c_str());
+    
+    return scaled_prediction;
+}
+
 int main(int argc, const char* argv[]) {
     if (argc != 2) {
         std::cerr << "Usage: " << argv[0] << " <json_file.json>\n";
@@ -235,74 +303,34 @@ int main(int argc, const char* argv[]) {
     }
 
     try {
-        // 1. Set device (CPU only for this application)
-        torch::Device device(torch::kCPU);
-        std::cout << "Using CPU device for inference.\n";
+        std::string model_path = "lstm_model.pt";
         
-        // 2. Load model and explicitly move to CPU
-        std::cout << "Loading model...\n";
-        torch::jit::script::Module model;
-        try {
-            // Load the model and explicitly move it to CPU
-            model = torch::jit::load("lstm_model.pt", device);
-            std::cout << "Model loaded successfully and moved to CPU.\n";
-        } catch (const c10::Error& e) {
-            std::cerr << "Error loading the model: " << e.what() << std::endl;
-            return -1;
-        }
-
-        // 3. Process input data
+        // Process input data
         std::string input_file = argv[1];
         std::cout << "Processing input file: " << input_file << std::endl;
         json data = load_json(input_file);
         auto raw_features = extract_features(data);
         std::cout << "Extracted " << raw_features.size() << " features.\n";
 
-        // 4. Load scaler parameters
+        // Load scaler parameters
         std::cout << "Loading scaler parameters...\n";
         auto scaler_X = load_scaler_params("scaler_X.json");
         auto y_scaler = load_y_scaler_params("scaler_y.json");
 
-        // 5. Scale features
+        // Scale features
         auto scaled_features = scale_features(raw_features, scaler_X);
         std::cout << "Scaled " << scaled_features.size() << " features.\n";
 
-        // 6. Create input tensor on CPU
-        torch::Tensor input_tensor = torch::from_blob(
-            scaled_features.data(),
-            {1, 1, static_cast<int64_t>(scaled_features.size())},
-            torch::TensorOptions().dtype(torch::kFloat32).device(device)
-        ).clone();
-
-        std::cout << "Input tensor shape: [" 
-                  << input_tensor.size(0) << ", " 
-                  << input_tensor.size(1) << ", " 
-                  << input_tensor.size(2) << "] on "
-                  << (input_tensor.device().is_cuda() ? "CUDA" : "CPU") << "\n";
-
-        // 7. Run inference with gradient tracking disabled
-        std::cout << "Running inference...\n";
-        torch::NoGradGuard no_grad;
-        
-        std::vector<torch::jit::IValue> inputs;
-        inputs.push_back(input_tensor);
-        
-        // Make sure the model is in eval mode
-        model.eval();
-        
-        // Forward pass
-        auto output = model.forward(inputs).toTensor();
-        
-        // 8. Post-process the prediction
-        float scaled_prediction = output[0][0].item<float>();
+        // Run prediction
+        float scaled_prediction = run_prediction(scaled_features, model_path);
         float prediction = inverse_transform_prediction(scaled_prediction, y_scaler);
         
-        // 9. Print results
+        // Print results
         std::cout << "\nPrediction Results:\n";
         std::cout << "Scaled prediction: " << scaled_prediction << std::endl;
         std::cout << "Predicted execution time: " << prediction << " ms\n";
         
-        // 10. Compare to actual if available
+        // Compare to actual if available
         if (raw_features.count("execution_time")) {
             float actual = raw_features["execution_time"];
             float error_pct = std::abs(prediction - actual) / actual * 100;
@@ -310,7 +338,7 @@ int main(int argc, const char* argv[]) {
             std::cout << "Error: " << error_pct << "%\n";
         }
         
-        // 11. Save results to output JSON
+        // Save results to output JSON
         json result;
         result["input_file"] = input_file;
         result["predicted_execution_time_ms"] = prediction;
