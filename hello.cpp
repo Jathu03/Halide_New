@@ -144,10 +144,11 @@ float inverse_transform_prediction(float scaled_prediction, const YScalerParams&
 }
 
 float run_prediction(const std::vector<float>& scaled_features, const std::string& model_path) {
-    // Force CPU usage
-    torch::Device device(torch::kCPU);
-    
-    // Create input tensor with the right shape on CPU
+    // Check if CUDA is available
+    torch::Device device(torch::cuda::is_available() ? torch::kCUDA : torch::kCPU);
+    std::cout << "Using device: " << (device.is_cuda() ? "CUDA" : "CPU") << "\n";
+
+    // Create input tensor and move to the same device as model
     torch::Tensor input_tensor = torch::from_blob(
         const_cast<float*>(scaled_features.data()),
         {1, 1, static_cast<int64_t>(scaled_features.size())},
@@ -157,24 +158,25 @@ float run_prediction(const std::vector<float>& scaled_features, const std::strin
     std::cout << "Input tensor created with shape: ["
               << input_tensor.size(0) << ", "
               << input_tensor.size(1) << ", "
-              << input_tensor.size(2) << "]\n";
+              << input_tensor.size(2) << "] on "
+              << (input_tensor.device().is_cuda() ? "CUDA" : "CPU") << "\n";
 
-    // Load the model directly on CPU
-    std::cout << "Loading model on CPU...\n";
+    // Load the model
     torch::jit::script::Module model;
     try {
-        model = torch::jit::load(model_path, device);
+        // Load model and move to device
+        model = torch::jit::load(model_path);
+        model.to(device);
         model.eval();
-        std::cout << "Model loaded successfully.\n";
+        std::cout << "Model loaded successfully on "
+                  << (device.is_cuda() ? "CUDA" : "CPU") << "\n";
     } catch (const c10::Error& e) {
         std::cerr << "Error loading the model: " << e.what() << std::endl;
         throw;
     }
 
-    // Run inference with gradient tracking disabled
-    std::cout << "Running inference...\n";
+    // Run inference
     torch::NoGradGuard no_grad;
-
     std::vector<torch::jit::IValue> inputs;
     inputs.push_back(input_tensor);
 
