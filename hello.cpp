@@ -14,7 +14,6 @@ struct ScalerParams {
     std::vector<float> scales;
 };
 
-// Function to load JSON file
 json load_json(const std::string& file_path) {
     std::ifstream file(file_path);
     if (!file.is_open()) {
@@ -25,7 +24,6 @@ json load_json(const std::string& file_path) {
     return data;
 }
 
-// Function to extract features from JSON (matches Python implementation)
 std::map<std::string, float> extract_features(const json& data) {
     std::map<std::string, float> features;
     
@@ -151,7 +149,6 @@ std::map<std::string, float> extract_features(const json& data) {
     return features;
 }
 
-// Load scaler parameters from JSON
 ScalerParams load_scaler_params(const std::string& scaler_path) {
     json scaler_data = load_json(scaler_path);
     ScalerParams params;
@@ -161,7 +158,6 @@ ScalerParams load_scaler_params(const std::string& scaler_path) {
     return params;
 }
 
-// Scale features using pre-computed mean and std
 std::vector<float> scale_features(
     const std::map<std::string, float>& raw_features,
     const ScalerParams& scaler_params
