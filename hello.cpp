@@ -235,17 +235,17 @@ int main(int argc, const char* argv[]) {
     }
 
     try {
-        // 1. Always use CPU for compatibility
+        // 1. Set device (CPU only for this application)
         torch::Device device(torch::kCPU);
-        std::cout << "Using CPU device.\n";
+        std::cout << "Using CPU device for inference.\n";
         
-        // 2. Load model and move to device
+        // 2. Load model and explicitly move to CPU
         std::cout << "Loading model...\n";
         torch::jit::script::Module model;
         try {
-            model = torch::jit::load("lstm_model.pt");
-            model.to(device);
-            std::cout << "Model loaded successfully.\n";
+            // Load the model and explicitly move it to CPU
+            model = torch::jit::load("lstm_model.pt", device);
+            std::cout << "Model loaded successfully and moved to CPU.\n";
         } catch (const c10::Error& e) {
             std::cerr << "Error loading the model: " << e.what() << std::endl;
             return -1;
@@ -267,26 +267,31 @@ int main(int argc, const char* argv[]) {
         auto scaled_features = scale_features(raw_features, scaler_X);
         std::cout << "Scaled " << scaled_features.size() << " features.\n";
 
-        // 6. Create input tensor
+        // 6. Create input tensor on CPU
         torch::Tensor input_tensor = torch::from_blob(
             scaled_features.data(),
             {1, 1, static_cast<int64_t>(scaled_features.size())},
-            torch::TensorOptions().dtype(torch::kFloat32)
-        ).clone().to(device);
+            torch::TensorOptions().dtype(torch::kFloat32).device(device)
+        ).clone();
 
         std::cout << "Input tensor shape: [" 
                   << input_tensor.size(0) << ", " 
                   << input_tensor.size(1) << ", " 
-                  << input_tensor.size(2) << "]\n";
+                  << input_tensor.size(2) << "] on "
+                  << (input_tensor.device().is_cuda() ? "CUDA" : "CPU") << "\n";
 
-        // 7. Run inference
+        // 7. Run inference with gradient tracking disabled
         std::cout << "Running inference...\n";
         torch::NoGradGuard no_grad;
         
         std::vector<torch::jit::IValue> inputs;
         inputs.push_back(input_tensor);
         
-        auto output = model.forward(inputs).toTensor().cpu();
+        // Make sure the model is in eval mode
+        model.eval();
+        
+        // Forward pass
+        auto output = model.forward(inputs).toTensor();
         
         // 8. Post-process the prediction
         float scaled_prediction = output[0][0].item<float>();
