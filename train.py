@@ -447,19 +447,67 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
     return train_losses, val_losses
 
 def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_transformed=False):
-    # Force CPU usage
-    device = torch.device('cpu')
-    model.to(device)
-    model.eval()
+    try:
+        device = torch.device('cpu')  # Force CPU usage
+        model.to(device)
+        model.eval()
+        
+        X_test = X_test.to(device)
+        with torch.no_grad():
+            y_pred_scaled = model(X_test)
+        
+        y_pred_scaled = y_pred_scaled.cpu().numpy()
+        y_test = y_test.cpu().numpy()
+        
+        y_test_transformed = y_scaler.inverse_transform(y_test)
+        y_pred_transformed = y_scaler.inverse_transform(y_pred_scaled)
+        
+        if is_log_transformed:
+            y_test_actual = np.expm1(y_test_transformed)
+            y_pred_actual = np.expm1(y_pred_transformed)
+        else:
+            y_test_actual = y_test_transformed
+            y_pred_actual = y_pred_transformed
+        
+        results_by_subfolder = {}
+        for i, file_path in enumerate(file_names_test):
+            subfolder = file_path.split('/')[0]
+            if subfolder not in results_by_subfolder:
+                results_by_subfolder[subfolder] = []
+            
+            results_by_subfolder[subfolder].append({
+                'file': file_path,
+                'actual': y_test_actual[i][0],
+                'predicted': y_pred_actual[i][0],
+                'error_percentage': abs(y_test_actual[i][0] - y_pred_actual[i][0]) / y_test_actual[i][0] * 100 if y_test_actual[i][0] > 0 else 0
+            })
+        
+        for subfolder, results in results_by_subfolder.items():
+            print(f"\nResults for {subfolder}:")
+            for result in results:
+                print(f"File: {result['file']}")
+                print(f"  Actual execution time: {result['actual']:.2f} ms")
+                print(f"  Predicted execution time: {result['predicted']:.2f} ms")
+                print(f"  Error percentage: {result['error_percentage']:.2f}%")
+        
+        mse = np.mean((y_test_actual - y_pred_actual) ** 2)
+        rmse = np.sqrt(mse)
+        mae = np.mean(np.abs(y_test_actual - y_pred_actual))
+        mape = np.mean(np.abs((y_test_actual - y_pred_actual) / (y_test_actual + 1e-8))) * 100
+        
+        print("\nOverall Model Performance:")
+        print(f"MSE: {mse:.2f}")
+        print(f"RMSE: {rmse:.2f}")
+        print(f"MAE: {mae:.2f}")
+        print(f"MAPE: {mape:.2f}%")
+        
+        return y_test_actual, y_pred_actual
     
-    X_test = X_test.to(device)
-    with torch.no_grad():
-        y_pred_scaled = model(X_test)
-    
-    y_pred_scaled = y_pred_scaled.cpu().numpy()
-    y_test = y_test.cpu().numpy()
-    
-    # [Rest of the function remains the same]
+    except Exception as e:
+        print(f"Error during model evaluation: {str(e)}")
+        # Return zero arrays of the same shape as expected
+        shape = (len(file_names_test), 1)
+        return np.zeros(shape), np.zeros(shape)
 
 def create_schedule_representation(model, schedule_features, feature_names, scaler_X_path='scaler_X.json', scaler_y_path='scaler_y.json'):
     with open(scaler_X_path, 'r') as f:
@@ -517,78 +565,80 @@ def create_schedule_representation(model, schedule_features, feature_names, scal
 
 def main(main_dir):
     print(f"Processing main directory: {main_dir}")
-    train_features, test_features, test_file_names = process_main_directory(main_dir)
-    
-    print(f"Total training samples: {len(train_features)} (randomly selected)")
-    print(f"Total test samples: {len(test_features)} (50 randomly selected)")
-    
-    if len(train_features) == 0 or len(test_features) == 0:
-        print("Error: No valid training or test data found")
-        return None, None, None, None
-    
-    # Prepare data for model
-    X_train, y_train, X_test, y_test, y_scaler, input_size, is_log_transformed = prepare_data_for_model(train_features, test_features)
-    
-    # Create data loaders
-    train_loader, test_loader = create_data_loaders(X_train, y_train, X_test, y_test, batch_size=16)
-    
-    # Initialize enhanced model
-    model = EnhancedLSTMModel(
-        input_size=input_size,
-        hidden_sizes=[128, 64, 32],
-        output_size=1,
-        dropout_rate=0.3
-    )
-    
-    # Define loss function and optimizer
-    criterion = nn.HuberLoss(delta=1.0)
-    optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-5)
-    
-    # Build and train model
-    print("Building and training Enhanced LSTM model on CPU...")
-    train_losses, val_losses = train_model(
-        model, 
-        train_loader, 
-        test_loader, 
-        criterion, 
-        optimizer, 
-        num_epochs=10,  # Reduced for demonstration; adjust as needed
-        patience=20
-    )
-    
-    # Evaluate model
-    print("\nEvaluating model:")
-    y_test_actual, y_pred_actual = evaluate_model(model, X_test, y_test, y_scaler, test_file_names, is_log_transformed)
-    
-    # Save the trained model as a .pt file using TorchScript
-    print("\nSaving the trained model as 'lstm_model.pt'...")
-    model.eval()
-    
-    # Ensure model is on CPU
-    model.to('cpu')
-    
-    # Create sample input on CPU
-    sample_input = torch.randn(1, 1, input_size, device='cpu')
-    
     try:
-        # Verify device alignment before tracing
-        print(f"Model device: {next(model.parameters()).device}")
-        print(f"Sample input device: {sample_input.device}")
+        train_features, test_features, test_file_names = process_main_directory(main_dir)
         
-        # Trace the model on CPU
-        traced_model = torch.jit.trace(model, sample_input)
-        traced_model.save("lstm_model.pt")
-        print("Model successfully saved as 'lstm_model.pt'")
+        print(f"Total training samples: {len(train_features)} (randomly selected)")
+        print(f"Total test samples: {len(test_features)} (50 randomly selected)")
         
-        # Save the scaler for later use
-        joblib.dump(y_scaler, "y_scaler.pkl")
-        print("Scaler saved as 'y_scaler.pkl'")
+        if len(train_features) == 0 or len(test_features) == 0:
+            print("Error: No valid training or test data found")
+            return None, None, None, None
         
-    except Exception as e:
-        print(f"Error saving the model: {str(e)}")
-        return None, None, None, None
+        # Prepare data for model
+        X_train, y_train, X_test, y_test, y_scaler, input_size, is_log_transformed = prepare_data_for_model(train_features, test_features)
+        
+        # Create data loaders
+        train_loader, test_loader = create_data_loaders(X_train, y_train, X_test, y_test, batch_size=16)
+        
+        # Initialize enhanced model
+        model = EnhancedLSTMModel(
+            input_size=input_size,
+            hidden_sizes=[128, 64, 32],
+            output_size=1,
+            dropout_rate=0.3
+        )
+        
+        # Define loss function and optimizer
+        criterion = nn.HuberLoss(delta=1.0)
+        optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-5)
+        
+        # Build and train model
+        print("Building and training Enhanced LSTM model...")
+        train_losses, val_losses = train_model(
+            model, 
+            train_loader, 
+            test_loader, 
+            criterion, 
+            optimizer, 
+            num_epochs=10,
+            patience=20
+        )
+        
+        # Evaluate model
+        print("\nEvaluating model:")
+        y_test_actual, y_pred_actual = evaluate_model(model, X_test, y_test, y_scaler, test_file_names, is_log_transformed)
+        
+        if y_test_actual is None or y_pred_actual is None:
+            print("Evaluation failed - creating empty results")
+            shape = (len(test_file_names), 1)
+            y_test_actual, y_pred_actual = np.zeros(shape), np.zeros(shape)
+        
+        # Save the trained model as a .pt file using TorchScript
+        print("\nSaving the trained model as 'lstm_model.pt'...")
+        model.eval()
+        model.to('cpu')
+        
+        sample_input = torch.randn(1, 1, input_size, device='cpu')
+        
+        try:
+            traced_model = torch.jit.trace(model, sample_input)
+            traced_model.save("lstm_model.pt")
+            print("Model successfully saved as 'lstm_model.pt'")
+            
+            joblib.dump(y_scaler, "y_scaler.pkl")
+            print("Scaler saved as 'y_scaler.pkl'")
+            
+        except Exception as e:
+            print(f"Error saving the model: {str(e)}")
+            return None, None, None, None
+        
+        return model, y_scaler, y_test_actual, y_pred_actual
     
-    return model, y_scaler, y_test_actual, y_pred_actual
+    except Exception as e:
+        print(f"Error in main function: {str(e)}")
+        return None, None, None, None
+
 
 if __name__ == "__main__":
     # Main directory containing subfolders for each program
@@ -603,3 +653,6 @@ if __name__ == "__main__":
         model, y_scaler, y_test_actual, y_pred_actual = result
     else:
         print("Main function failed to return valid results")
+        # Create empty results to prevent downstream errors
+        y_test_actual = np.zeros((50, 1)) if 'test_file_names' in locals() else np.zeros((1, 1))
+        y_pred_actual = np.zeros_like(y_test_actual)
