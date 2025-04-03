@@ -14,6 +14,12 @@ struct ScalerParams {
     std::vector<float> scales;
 };
 
+struct YScalerParams {
+    float mean;
+    float scale;
+    bool is_log_transformed;
+};
+
 json load_json(const std::string& file_path) {
     std::ifstream file(file_path);
     if (!file.is_open()) {
@@ -36,7 +42,11 @@ std::map<std::string, float> extract_features(const json& data) {
             }
         }
         if (!features.count("execution_time")) {
-            features["execution_time"] = data["scheduling_data"].back()["value"].get<float>();
+            if (!data["scheduling_data"].empty()) {
+                features["execution_time"] = data["scheduling_data"].back()["value"].get<float>();
+            } else {
+                features["execution_time"] = 0.0f;
+            }
         }
     }
 
@@ -62,6 +72,8 @@ std::map<std::string, float> extract_features(const json& data) {
                         size_t colon_pos = line.find(':');
                         if (colon_pos != std::string::npos) {
                             std::string op_name = "op_" + line.substr(0, colon_pos);
+                            // Convert to lowercase
+                            for (auto& c : op_name) c = std::tolower(c);
                             int count = std::stoi(line.substr(colon_pos + 1));
                             op_counts[op_name] += count;
                         }
@@ -143,7 +155,33 @@ std::map<std::string, float> extract_features(const json& data) {
             } else {
                 features["bytes_per_vector"] = 0;
             }
+            
+            // Calculate memory pressure
+            if (features["scheduling_count"] > 0) {
+                if (total_bytes > 0) {
+                    float working_set = features["sched_working_set"];
+                    features["memory_pressure"] = working_set / total_bytes;
+                } else {
+                    features["memory_pressure"] = 0.0f;
+                }
+            }
         }
+    }
+
+    // Calculate avg_ops_per_node and op_diversity if we have nodes
+    if (features["nodes_count"] > 0) {
+        int total_ops = 0;
+        int op_types = 0;
+        
+        for (const auto& [key, value] : features) {
+            if (key.substr(0, 3) == "op_") {
+                total_ops += static_cast<int>(value);
+                op_types++;
+            }
+        }
+        
+        features["avg_ops_per_node"] = total_ops / features["nodes_count"];
+        features["op_diversity"] = op_types / features["nodes_count"];
     }
 
     return features;
@@ -155,6 +193,15 @@ ScalerParams load_scaler_params(const std::string& scaler_path) {
     params.feature_names = scaler_data["feature_names"].get<std::vector<std::string>>();
     params.means = scaler_data["means"].get<std::vector<float>>();
     params.scales = scaler_data["scales"].get<std::vector<float>>();
+    return params;
+}
+
+YScalerParams load_y_scaler_params(const std::string& scaler_path) {
+    json scaler_data = load_json(scaler_path);
+    YScalerParams params;
+    params.mean = scaler_data["mean"].get<float>();
+    params.scale = scaler_data["scale"].get<float>();
+    params.is_log_transformed = scaler_data["is_log_transformed"].get<bool>();
     return params;
 }
 
@@ -173,6 +220,14 @@ std::vector<float> scale_features(
     return scaled_features;
 }
 
+float inverse_transform_prediction(float scaled_prediction, const YScalerParams& y_scaler) {
+    float unscaled = scaled_prediction * y_scaler.scale + y_scaler.mean;
+    if (y_scaler.is_log_transformed) {
+        return std::exp(unscaled) - 1.0f;  // expm1
+    }
+    return unscaled;
+}
+
 int main(int argc, const char* argv[]) {
     if (argc != 2) {
         std::cerr << "Usage: " << argv[0] << " <path_to_json_file>\n";
@@ -182,42 +237,93 @@ int main(int argc, const char* argv[]) {
     try {
         // 1. Determine device
         torch::Device device(torch::kCPU);
-        if (torch::cuda::is_available()) {  // Now works with header
+        if (torch::cuda::is_available()) {
             std::cout << "CUDA available! Using GPU.\n";
             device = torch::Device(torch::kCUDA);
+        } else {
+            std::cout << "Using CPU device.\n";
         }
 
         // 2. Load model and move to device
+        std::cout << "Loading model...\n";
         torch::jit::script::Module model;
-        model = torch::jit::load("lstm_model.pt");
-        model.to(device);
+        try {
+            model = torch::jit::load("lstm_model.pt");
+            model.to(device);
+            std::cout << "Model loaded successfully.\n";
+        } catch (const c10::Error& e) {
+            std::cerr << "Error loading the model: " << e.what() << std::endl;
+            return -1;
+        }
 
         // 3. Process input data
         std::string input_file = argv[1];
+        std::cout << "Processing input file: " << input_file << std::endl;
         json data = load_json(input_file);
         auto raw_features = extract_features(data);
-        auto scaler_X = load_scaler_params("scaler_X.json");
-        auto scaled_features = scale_features(raw_features, scaler_X);
+        std::cout << "Extracted " << raw_features.size() << " features.\n";
 
-        // 4. Create input tensor on correct device
+        // 4. Load scaler parameters
+        std::cout << "Loading scaler parameters...\n";
+        auto scaler_X = load_scaler_params("scaler_X.json");
+        auto y_scaler = load_y_scaler_params("scaler_y.json");
+
+        // 5. Scale features
+        auto scaled_features = scale_features(raw_features, scaler_X);
+        std::cout << "Scaled " << scaled_features.size() << " features.\n";
+
+        // 6. Create input tensor
         torch::Tensor input_tensor = torch::from_blob(
             scaled_features.data(),
             {1, 1, static_cast<int64_t>(scaled_features.size())},
             torch::TensorOptions().dtype(torch::kFloat32)
         ).clone().to(device);
 
-        // 5. Verify device alignment
-        if (!model.parameters().empty()) {
-            if (model.parameters()[0].device() != input_tensor.device()) {
-                throw std::runtime_error("Device mismatch!");
-            }
-        }
+        std::cout << "Input tensor shape: [" 
+                  << input_tensor.size(0) << ", " 
+                  << input_tensor.size(1) << ", " 
+                  << input_tensor.size(2) << "]\n";
 
-        // 6. Run inference
+        // 7. Run inference
+        std::cout << "Running inference...\n";
         torch::NoGradGuard no_grad;
-        auto output = model.forward({input_tensor}).toTensor().cpu();
-
-        // [Rest of processing code unchanged]
+        
+        std::vector<torch::jit::IValue> inputs;
+        inputs.push_back(input_tensor);
+        
+        auto output = model.forward(inputs).toTensor().cpu();
+        
+        // 8. Post-process the prediction
+        float scaled_prediction = output[0][0].item<float>();
+        float prediction = inverse_transform_prediction(scaled_prediction, y_scaler);
+        
+        // 9. Print results
+        std::cout << "\nPrediction Results:\n";
+        std::cout << "Scaled prediction: " << scaled_prediction << std::endl;
+        std::cout << "Predicted execution time: " << prediction << " ms\n";
+        
+        // 10. Compare to actual if available
+        if (raw_features.count("execution_time")) {
+            float actual = raw_features["execution_time"];
+            float error_pct = std::abs(prediction - actual) / actual * 100;
+            std::cout << "Actual execution time: " << actual << " ms\n";
+            std::cout << "Error: " << error_pct << "%\n";
+        }
+        
+        // 11. Save results to output JSON
+        json result;
+        result["input_file"] = input_file;
+        result["predicted_execution_time_ms"] = prediction;
+        if (raw_features.count("execution_time")) {
+            result["actual_execution_time_ms"] = raw_features["execution_time"];
+            result["error_percentage"] = std::abs(prediction - raw_features["execution_time"]) 
+                                       / raw_features["execution_time"] * 100;
+        }
+        
+        std::string output_file = input_file + ".prediction.json";
+        std::ofstream out_file(output_file);
+        out_file << result.dump(4);
+        std::cout << "Prediction saved to: " << output_file << std::endl;
         
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;
