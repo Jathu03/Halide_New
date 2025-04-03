@@ -31,7 +31,74 @@ json load_json(const std::string& file_path) {
 }
 
 std::map<std::string, float> extract_features(const json& data) {
-    // [Same as original extract_features implementation]
+    std::map<std::string, float> features;
+    
+    // Extract execution time
+    if (data.contains("execution_time")) {
+        features["execution_time"] = data["execution_time"];
+    }
+
+    // Extract node and edge counts
+    if (data.contains("nodes_count")) {
+        features["nodes_count"] = data["nodes_count"];
+    }
+    if (data.contains("edges_count")) {
+        features["edges_count"] = data["edges_count"];
+    }
+    if (data.contains("node_edge_ratio")) {
+        features["node_edge_ratio"] = data["node_edge_ratio"];
+    }
+
+    // Extract operation counts (op_* features)
+    for (auto& [key, value] : data.items()) {
+        if (key.find("op_") == 0) {
+            features[key] = value;
+        }
+    }
+
+    // Extract scheduling features
+    if (data.contains("sched_bytes_at_production")) {
+        features["sched_bytes_at_production"] = data["sched_bytes_at_production"];
+    }
+    if (data.contains("sched_bytes_at_realization")) {
+        features["sched_bytes_at_realization"] = data["sched_bytes_at_realization"];
+    }
+    if (data.contains("sched_inner_parallelism")) {
+        features["sched_inner_parallelism"] = data["sched_inner_parallelism"];
+    }
+    if (data.contains("sched_outer_parallelism")) {
+        features["sched_outer_parallelism"] = data["sched_outer_parallelism"];
+    }
+    if (data.contains("sched_num_vectors")) {
+        features["sched_num_vectors"] = data["sched_num_vectors"];
+    }
+    if (data.contains("sched_working_set")) {
+        features["sched_working_set"] = data["sched_working_set"];
+    }
+
+    // Extract derived features
+    if (data.contains("total_bytes_at_production")) {
+        features["total_bytes_at_production"] = data["total_bytes_at_production"];
+    }
+    if (data.contains("total_vectors")) {
+        features["total_vectors"] = data["total_vectors"];
+    }
+    if (data.contains("total_parallelism")) {
+        features["total_parallelism"] = data["total_parallelism"];
+    }
+    if (data.contains("bytes_per_vector")) {
+        features["bytes_per_vector"] = data["bytes_per_vector"];
+    }
+    if (data.contains("memory_pressure")) {
+        features["memory_pressure"] = data["memory_pressure"];
+    }
+    if (data.contains("avg_ops_per_node")) {
+        features["avg_ops_per_node"] = data["avg_ops_per_node"];
+    }
+    if (data.contains("op_diversity")) {
+        features["op_diversity"] = data["op_diversity"];
+    }
+
     return features;
 }
 
@@ -76,11 +143,12 @@ float inverse_transform_prediction(float scaled_prediction, const YScalerParams&
     return unscaled;
 }
 
-float run_prediction(const std::vector<float>& scaled_features, const std::string& model_path, torch::Device device) {
-    // Use the specified device consistently
-    std::cout << "Using device: " << (device.is_cuda() ? "CUDA" : "CPU") << "\n";
+float run_prediction(const std::vector<float>& scaled_features, const std::string& model_path) {
+    // Force CPU usage
+    torch::Device device(torch::kCPU);
+    std::cout << "Using device: CPU\n";
 
-    // Create input tensor with the right shape on the specified device
+    // Create input tensor with the right shape on CPU
     torch::Tensor input_tensor = torch::from_blob(
         const_cast<float*>(scaled_features.data()),
         {1, 1, static_cast<int64_t>(scaled_features.size())},
@@ -92,8 +160,8 @@ float run_prediction(const std::vector<float>& scaled_features, const std::strin
               << input_tensor.size(1) << ", "
               << input_tensor.size(2) << "]\n";
 
-    // Load the model directly on the specified device
-    std::cout << "Loading model on " << (device.is_cuda() ? "CUDA" : "CPU") << "...\n";
+    // Load the model directly on CPU
+    std::cout << "Loading model on CPU...\n";
     torch::jit::script::Module model;
     try {
         model = torch::jit::load(model_path, device);
@@ -126,10 +194,6 @@ int main(int argc, const char* argv[]) {
         return -1;
     }
 
-    // Determine device at the start
-    torch::Device device(torch::cuda::is_available() ? torch::kCUDA : torch::kCPU);
-    std::cout << "Selected device: " << (device.is_cuda() ? "CUDA" : "CPU") << "\n";
-
     try {
         std::string model_path = "lstm_model.pt";
 
@@ -149,8 +213,8 @@ int main(int argc, const char* argv[]) {
         auto scaled_features = scale_features(raw_features, scaler_X);
         std::cout << "Scaled " << scaled_features.size() << " features.\n";
 
-        // Run prediction using the selected device
-        float scaled_prediction = run_prediction(scaled_features, model_path, device);
+        // Run prediction using CPU only
+        float scaled_prediction = run_prediction(scaled_features, model_path);
         float prediction = inverse_transform_prediction(scaled_prediction, y_scaler);
 
         // Print results
