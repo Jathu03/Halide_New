@@ -2,7 +2,7 @@ import os
 import json
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.preprocessing import StandardScaler
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -10,6 +10,10 @@ from torch.utils.data import TensorDataset, DataLoader
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 import random
 import joblib
+
+# Set device to CUDA if available, otherwise fall back to CPU
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
 
 def get_execution_time(file_path):
     try:
@@ -219,7 +223,7 @@ def clean_and_transform_features(train_features, test_features):
     all_features_df = all_features_df.fillna(0)
     
     constant_columns = [col for col in all_features_df.columns 
-                       if col != 'execution_time' and all_features_df[col].nunique() == 1]
+                        if col != 'execution_time' and all_features_df[col].nunique() == 1]
     all_features_df = all_features_df.drop(columns=constant_columns)
     print(f"Dropped {len(constant_columns)} constant columns")
     
@@ -286,10 +290,11 @@ def prepare_data_for_model(train_features, test_features):
         json.dump(y_scaler_data, f)
     print("Saved target scaler parameters to 'scaler_y.json'")
     
-    X_train_tensor = torch.FloatTensor(X_train_scaled).unsqueeze(1)
-    y_train_tensor = torch.FloatTensor(y_train_scaled)
-    X_test_tensor = torch.FloatTensor(X_test_scaled).unsqueeze(1)
-    y_test_tensor = torch.FloatTensor(y_test_scaled)
+    # Move tensors to CUDA
+    X_train_tensor = torch.FloatTensor(X_train_scaled).unsqueeze(1).to(device)
+    y_train_tensor = torch.FloatTensor(y_train_scaled).to(device)
+    X_test_tensor = torch.FloatTensor(X_test_scaled).unsqueeze(1).to(device)
+    y_test_tensor = torch.FloatTensor(y_test_scaled).to(device)
     
     print(f"Input feature dimension: {X_train_scaled.shape[1]}")
     
@@ -339,15 +344,14 @@ class EnhancedLSTMModel(nn.Module):
         return context
         
     def forward(self, x):
-        device = torch.device('cpu')  # Force CPU usage
         batch_size = x.size(0)
         lstm_out = x
         
         for i, (lstm, dropout) in enumerate(zip(self.lstm_layers, self.dropout_layers)):
             hidden_size = self.hidden_sizes[i]
-            # Explicitly create CPU tensors
-            h_0 = torch.zeros(1, batch_size, hidden_size, device=device)
-            c_0 = torch.zeros(1, batch_size, hidden_size, device=device)
+            # Ensure hidden states are on the same device as input
+            h_0 = torch.zeros(1, batch_size, hidden_size, device=x.device)
+            c_0 = torch.zeros(1, batch_size, hidden_size, device=x.device)
             
             lstm_out, _ = lstm(lstm_out, (h_0, c_0))
             if i < len(self.lstm_layers) - 1:
@@ -383,10 +387,8 @@ def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=32):
     return train_loader, test_loader
 
 def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=150, patience=20):
-    # Force CPU usage
-    device = torch.device('cpu')
-    print(f"Using device: {device} (CPU only)")
     model.to(device)
+    print(f"Using device: {device}")
     
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
     
@@ -449,7 +451,6 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
 
 def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_transformed=False):
     try:
-        device = torch.device('cpu')  # Force CPU usage
         model.to(device)
         model.eval()
         
@@ -457,6 +458,7 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_tran
         with torch.no_grad():
             y_pred_scaled = model(X_test)
         
+        # Move predictions and targets back to CPU for numpy conversion
         y_pred_scaled = y_pred_scaled.cpu().numpy()
         y_test = y_test.cpu().numpy()
         
@@ -464,7 +466,7 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_tran
         y_pred_transformed = y_scaler.inverse_transform(y_pred_scaled)
         
         if is_log_transformed:
-            y_test_actual = np.expm1(y_test_transformed)
+            y_test_actual = np.expm1(y_test_transform Wanted)
             y_pred_actual = np.expm1(y_pred_transformed)
         else:
             y_test_actual = y_test_transformed
@@ -506,7 +508,6 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_tran
     
     except Exception as e:
         print(f"Error during model evaluation: {str(e)}")
-        # Return zero arrays of the same shape as expected
         shape = (len(file_names_test), 1)
         return np.zeros(shape), np.zeros(shape)
 
@@ -526,15 +527,13 @@ def create_schedule_representation(model, schedule_features, feature_names, scal
     scales = np.array(scaler_X_data['scales'])
     X_scaled = (input_df.values - means) / scales
     
-    X_tensor = torch.FloatTensor(X_scaled).unsqueeze(1)
+    X_tensor = torch.FloatTensor(X_scaled).unsqueeze(1).to(device)
     
-    # Force CPU usage
-    device = torch.device('cpu')
     model.to(device)
     model.eval()
     
     with torch.no_grad():
-        lstm_out = X_tensor.to(device)
+        lstm_out = X_tensor
         
         for i, (lstm, dropout) in enumerate(zip(model.lstm_layers, model.dropout_layers)):
             batch_size = lstm_out.size(0)
@@ -554,7 +553,7 @@ def create_schedule_representation(model, schedule_features, feature_names, scal
         fc_out = model.bn_layers[0](fc_out)
         fc_out = model.leaky_relu(fc_out)
         
-        representation = fc_out.cpu().numpy().flatten()
+        representation = fc_out.cpu().numpy().flatten()  # Move to CPU for numpy conversion
     
     output = {
         'original_features': schedule_features,
@@ -588,7 +587,7 @@ def main(main_dir):
             hidden_sizes=[128, 64, 32],
             output_size=1,
             dropout_rate=0.3
-        )
+        ).to(device)
         
         # Define loss function and optimizer
         criterion = nn.HuberLoss(delta=1.0)
@@ -618,23 +617,14 @@ def main(main_dir):
         # Save the trained model as a .pt file using TorchScript
         print("\nSaving the trained model as 'lstm_model.pt'...")
         model.eval()
-        model.to('cpu')  # Ensure model is on CPU
         
-        # Create sample input on CPU
-        sample_input = torch.randn(1, 1, input_size, device='cpu')
+        # Create sample input on CUDA
+        sample_input = torch.randn(1, 1, input_size, device=device)
         
         try:
-            # Trace with strict=False to handle device mismatches
             traced_model = torch.jit.trace(model, sample_input, strict=False)
-            
-            # Save and reload to ensure CPU compatibility
-            temp_path = "temp_model.pt"
-            traced_model.save(temp_path)
-            
-            # Reload with map_location to CPU
-            traced_model = torch.jit.load(temp_path, map_location='cpu')
             traced_model.save("lstm_model.pt")
-            print("Model successfully saved as 'lstm_model.pt'")
+            print("Model successfully saved as 'lstm_model.pt' with CUDA support")
             
             joblib.dump(y_scaler, "y_scaler.pkl")
             print("Scaler saved as 'y_scaler.pkl'")
@@ -642,20 +632,20 @@ def main(main_dir):
         except Exception as e:
             print(f"Error saving the model: {str(e)}")
             return None, None, None, None
+        
+        return model, y_scaler, y_test_actual, y_pred_actual
+    
+    except Exception as e:
+        print(f"Error in main: {str(e)}")
+        return None, None, None, None
 
 if __name__ == "__main__":
-    # Main directory containing subfolders for each program
     main_dir = "synthetic_data"
-    
-    # Set random seed for reproducibility
     random.seed(42)
-    
-    # Run the main function to train and test
     result = main(main_dir)
     if result is not None:
         model, y_scaler, y_test_actual, y_pred_actual = result
     else:
         print("Main function failed to return valid results")
-        # Create empty results to prevent downstream errors
         y_test_actual = np.zeros((50, 1)) if 'test_file_names' in locals() else np.zeros((1, 1))
         y_pred_actual = np.zeros_like(y_test_actual)
