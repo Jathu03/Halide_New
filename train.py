@@ -341,10 +341,10 @@ class EnhancedLSTMModel(nn.Module):
     def forward(self, x):
         batch_size = x.size(0)
         lstm_out = x
+        device = x.device  # Ensure hidden states match input device
         
         for i, (lstm, dropout) in enumerate(zip(self.lstm_layers, self.dropout_layers)):
             hidden_size = self.hidden_sizes[i]
-            device = x.device
             h_0 = torch.zeros(1, batch_size, hidden_size, device=device)
             c_0 = torch.zeros(1, batch_size, hidden_size, device=device)
             
@@ -591,7 +591,7 @@ def main(main_dir):
         test_loader, 
         criterion, 
         optimizer, 
-        num_epochs=10,
+        num_epochs=10,  # Reduced for demonstration; adjust as needed
         patience=20
     )
     
@@ -601,25 +601,16 @@ def main(main_dir):
     
     # Save the trained model as a .pt file using TorchScript
     print("\nSaving the trained model as 'lstm_model.pt'...")
-    model.eval()  # Set the model to evaluation mode
+    model.eval()
+    model.to('cpu')  # Explicitly move to CPU for tracing
     
-    # Determine the device the model is on
-    device = next(model.parameters()).device
-    print(f"Model is on device: {device}")
+    # Create sample input matching the expected shape [batch_size, sequence_length, input_size]
+    sample_input = torch.randn(1, 1, input_size)  # Default to CPU
     
     try:
-        # Create sample input matching the expected shape [batch_size, sequence_length, input_size]
-        sample_input = torch.randn(1, 1, input_size).to(device)
-        
-        # Before saving the model in Python:
-        model.to('cpu')  # Move model to CPU
-        sample_input = sample_input.to('cpu')  # Move sample input to CPU
-        
-        # Trace on CPU
+        # Trace the model
         traced_model = torch.jit.trace(model, sample_input)
-        
-        # Save with _extra_files to include device info
-        traced_model.save("lstm_model.pt", _extra_files={'device': 'cpu'})
+        traced_model.save("lstm_model.pt")
         print("Model successfully saved as 'lstm_model.pt'")
         
         # Save the scaler for later use
