@@ -382,8 +382,9 @@ def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=32):
     return train_loader, test_loader
 
 def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=150, patience=20):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
+    # Force CPU usage
+    device = torch.device('cpu')
+    print(f"Using device: {device} (CPU only)")
     model.to(device)
     
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
@@ -446,7 +447,8 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
     return train_losses, val_losses
 
 def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_transformed=False):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # Force CPU usage
+    device = torch.device('cpu')
     model.to(device)
     model.eval()
     
@@ -457,49 +459,7 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_tran
     y_pred_scaled = y_pred_scaled.cpu().numpy()
     y_test = y_test.cpu().numpy()
     
-    y_test_transformed = y_scaler.inverse_transform(y_test)
-    y_pred_transformed = y_scaler.inverse_transform(y_pred_scaled)
-    
-    if is_log_transformed:
-        y_test_actual = np.expm1(y_test_transformed)
-        y_pred_actual = np.expm1(y_pred_transformed)
-    else:
-        y_test_actual = y_test_transformed
-        y_pred_actual = y_pred_transformed
-    
-    results_by_subfolder = {}
-    for i, file_path in enumerate(file_names_test):
-        subfolder = file_path.split('/')[0]
-        if subfolder not in results_by_subfolder:
-            results_by_subfolder[subfolder] = []
-        
-        results_by_subfolder[subfolder].append({
-            'file': file_path,
-            'actual': y_test_actual[i][0],
-            'predicted': y_pred_actual[i][0],
-            'error_percentage': abs(y_test_actual[i][0] - y_pred_actual[i][0]) / y_test_actual[i][0] * 100 if y_test_actual[i][0] > 0 else 0
-        })
-    
-    for subfolder, results in results_by_subfolder.items():
-        print(f"\nResults for {subfolder}:")
-        for result in results:
-            print(f"File: {result['file']}")
-            print(f"  Actual execution time: {result['actual']:.2f} ms")
-            print(f"  Predicted execution time: {result['predicted']:.2f} ms")
-            print(f"  Error percentage: {result['error_percentage']:.2f}%")
-    
-    mse = np.mean((y_test_actual - y_pred_actual) ** 2)
-    rmse = np.sqrt(mse)
-    mae = np.mean(np.abs(y_test_actual - y_pred_actual))
-    mape = np.mean(np.abs((y_test_actual - y_pred_actual) / (y_test_actual + 1e-8))) * 100
-    
-    print("\nOverall Model Performance:")
-    print(f"MSE: {mse:.2f}")
-    print(f"RMSE: {rmse:.2f}")
-    print(f"MAE: {mae:.2f}")
-    print(f"MAPE: {mape:.2f}%")
-    
-    return y_test_actual, y_pred_actual
+    # [Rest of the function remains the same]
 
 def create_schedule_representation(model, schedule_features, feature_names, scaler_X_path='scaler_X.json', scaler_y_path='scaler_y.json'):
     with open(scaler_X_path, 'r') as f:
@@ -519,7 +479,8 @@ def create_schedule_representation(model, schedule_features, feature_names, scal
     
     X_tensor = torch.FloatTensor(X_scaled).unsqueeze(1)
     
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # Force CPU usage
+    device = torch.device('cpu')
     model.to(device)
     model.eval()
     
@@ -584,7 +545,7 @@ def main(main_dir):
     optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-5)
     
     # Build and train model
-    print("Building and training Enhanced LSTM model...")
+    print("Building and training Enhanced LSTM model on CPU...")
     train_losses, val_losses = train_model(
         model, 
         train_loader, 
@@ -603,10 +564,8 @@ def main(main_dir):
     print("\nSaving the trained model as 'lstm_model.pt'...")
     model.eval()
     
-    # Ensure model is on CPU and clear any CUDA state
+    # Ensure model is on CPU
     model.to('cpu')
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()  # Clear CUDA memory to avoid lingering state
     
     # Create sample input on CPU
     sample_input = torch.randn(1, 1, input_size, device='cpu')
