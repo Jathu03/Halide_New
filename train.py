@@ -11,8 +11,8 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 import random
 import joblib
 
-# Set device to CUDA if available, otherwise fall back to CPU
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+# Set device to CPU explicitly
+device = torch.device('cpu')
 print(f"Using device: {device}")
 
 def get_execution_time(file_path):
@@ -290,11 +290,11 @@ def prepare_data_for_model(train_features, test_features):
         json.dump(y_scaler_data, f)
     print("Saved target scaler parameters to 'scaler_y.json'")
     
-    # Move tensors to CUDA
-    X_train_tensor = torch.FloatTensor(X_train_scaled).unsqueeze(1).to(device)
-    y_train_tensor = torch.FloatTensor(y_train_scaled).to(device)
-    X_test_tensor = torch.FloatTensor(X_test_scaled).unsqueeze(1).to(device)
-    y_test_tensor = torch.FloatTensor(y_test_scaled).to(device)
+    # Create tensors without moving to CUDA
+    X_train_tensor = torch.FloatTensor(X_train_scaled).unsqueeze(1)
+    y_train_tensor = torch.FloatTensor(y_train_scaled)
+    X_test_tensor = torch.FloatTensor(X_test_scaled).unsqueeze(1)
+    y_test_tensor = torch.FloatTensor(y_test_scaled)
     
     print(f"Input feature dimension: {X_train_scaled.shape[1]}")
     
@@ -349,8 +349,8 @@ class EnhancedLSTMModel(nn.Module):
         
         for i, (lstm, dropout) in enumerate(zip(self.lstm_layers, self.dropout_layers)):
             hidden_size = self.hidden_sizes[i]
-            h_0 = torch.zeros(1, batch_size, hidden_size, device=x.device)
-            c_0 = torch.zeros(1, batch_size, hidden_size, device=x.device)
+            h_0 = torch.zeros(1, batch_size, hidden_size)
+            c_0 = torch.zeros(1, batch_size, hidden_size)
             
             lstm_out, _ = lstm(lstm_out, (h_0, c_0))
             if i < len(self.lstm_layers) - 1:
@@ -386,7 +386,6 @@ def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=32):
     return train_loader, test_loader
 
 def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=150, patience=20):
-    model.to(device)
     print(f"Using device: {device}")
     
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
@@ -401,7 +400,6 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
         model.train()
         running_loss = 0.0
         for inputs, targets in train_loader:
-            inputs, targets = inputs.to(device), targets.to(device)
             optimizer.zero_grad()
             outputs = model(inputs)
             loss = criterion(outputs, targets)
@@ -419,7 +417,6 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
         val_loss = 0.0
         with torch.no_grad():
             for inputs, targets in test_loader:
-                inputs, targets = inputs.to(device), targets.to(device)
                 outputs = model(inputs)
                 loss = criterion(outputs, targets)
                 val_loss += loss.item() * inputs.size(0)
@@ -450,15 +447,13 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
 
 def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_transformed=False):
     try:
-        model.to(device)
         model.eval()
         
-        X_test = X_test.to(device)
         with torch.no_grad():
             y_pred_scaled = model(X_test)
         
-        y_pred_scaled = y_pred_scaled.cpu().numpy()
-        y_test = y_test.cpu().numpy()
+        y_pred_scaled = y_pred_scaled.numpy()
+        y_test = y_test.numpy()
         
         y_test_transformed = y_scaler.inverse_transform(y_test)
         y_pred_transformed = y_scaler.inverse_transform(y_pred_scaled)
@@ -525,9 +520,8 @@ def create_schedule_representation(model, schedule_features, feature_names, scal
     scales = np.array(scaler_X_data['scales'])
     X_scaled = (input_df.values - means) / scales
     
-    X_tensor = torch.FloatTensor(X_scaled).unsqueeze(1).to(device)
+    X_tensor = torch.FloatTensor(X_scaled).unsqueeze(1)
     
-    model.to(device)
     model.eval()
     
     with torch.no_grad():
@@ -536,8 +530,8 @@ def create_schedule_representation(model, schedule_features, feature_names, scal
         for i, (lstm, dropout) in enumerate(zip(model.lstm_layers, model.dropout_layers)):
             batch_size = lstm_out.size(0)
             hidden_size = model.hidden_sizes[i]
-            h_0 = torch.zeros(1, batch_size, hidden_size, device=device)
-            c_0 = torch.zeros(1, batch_size, hidden_size, device=device)
+            h_0 = torch.zeros(1, batch_size, hidden_size)
+            c_0 = torch.zeros(1, batch_size, hidden_size)
             
             lstm_out, _ = lstm(lstm_out, (h_0, c_0))
             if i < len(model.lstm_layers) - 1:
@@ -551,12 +545,12 @@ def create_schedule_representation(model, schedule_features, feature_names, scal
         fc_out = model.bn_layers[0](fc_out)
         fc_out = model.leaky_relu(fc_out)
         
-        representation = fc_out.cpu().numpy().flatten()
+        representation = fc_out.numpy().flatten()
     
     output = {
         'original_features': schedule_features,
         'representation': representation.tolist(),
-        'attention_weights': soft_attn_weights.cpu().numpy().flatten().tolist()
+        'attention_weights': soft_attn_weights.numpy().flatten().tolist()
     }
     
     return output
@@ -582,7 +576,7 @@ def main(main_dir):
             hidden_sizes=[128, 64, 32],
             output_size=1,
             dropout_rate=0.3
-        ).to(device)
+        )
         
         criterion = nn.HuberLoss(delta=1.0)
         optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-5)
@@ -609,12 +603,12 @@ def main(main_dir):
         print("\nSaving the trained model as 'lstm_model.pt'...")
         model.eval()
         
-        sample_input = torch.randn(1, 1, input_size, device=device)
+        sample_input = torch.randn(1, 1, input_size)
         
         try:
             traced_model = torch.jit.trace(model, sample_input, strict=False)
             traced_model.save("lstm_model.pt")
-            print("Model successfully saved as 'lstm_model.pt' with CUDA support")
+            print("Model successfully saved as 'lstm_model.pt'")
             
             joblib.dump(y_scaler, "y_scaler.pkl")
             print("Scaler saved as 'y_scaler.pkl'")
