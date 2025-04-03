@@ -349,7 +349,6 @@ class EnhancedLSTMModel(nn.Module):
         
         for i, (lstm, dropout) in enumerate(zip(self.lstm_layers, self.dropout_layers)):
             hidden_size = self.hidden_sizes[i]
-            # Ensure hidden states are on the same device as input
             h_0 = torch.zeros(1, batch_size, hidden_size, device=x.device)
             c_0 = torch.zeros(1, batch_size, hidden_size, device=x.device)
             
@@ -458,7 +457,6 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_tran
         with torch.no_grad():
             y_pred_scaled = model(X_test)
         
-        # Move predictions and targets back to CPU for numpy conversion
         y_pred_scaled = y_pred_scaled.cpu().numpy()
         y_test = y_test.cpu().numpy()
         
@@ -466,7 +464,7 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_tran
         y_pred_transformed = y_scaler.inverse_transform(y_pred_scaled)
         
         if is_log_transformed:
-            y_test_actual = np.expm1(y_test_transform Wanted)
+            y_test_actual = np.expm1(y_test_transformed)
             y_pred_actual = np.expm1(y_pred_transformed)
         else:
             y_test_actual = y_test_transformed
@@ -553,7 +551,7 @@ def create_schedule_representation(model, schedule_features, feature_names, scal
         fc_out = model.bn_layers[0](fc_out)
         fc_out = model.leaky_relu(fc_out)
         
-        representation = fc_out.cpu().numpy().flatten()  # Move to CPU for numpy conversion
+        representation = fc_out.cpu().numpy().flatten()
     
     output = {
         'original_features': schedule_features,
@@ -575,13 +573,10 @@ def main(main_dir):
             print("Error: No valid training or test data found")
             return None, None, None, None
         
-        # Prepare data for model
         X_train, y_train, X_test, y_test, y_scaler, input_size, is_log_transformed = prepare_data_for_model(train_features, test_features)
         
-        # Create data loaders
         train_loader, test_loader = create_data_loaders(X_train, y_train, X_test, y_test, batch_size=16)
         
-        # Initialize enhanced model
         model = EnhancedLSTMModel(
             input_size=input_size,
             hidden_sizes=[128, 64, 32],
@@ -589,11 +584,9 @@ def main(main_dir):
             dropout_rate=0.3
         ).to(device)
         
-        # Define loss function and optimizer
         criterion = nn.HuberLoss(delta=1.0)
         optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-5)
         
-        # Build and train model
         print("Building and training Enhanced LSTM model...")
         train_losses, val_losses = train_model(
             model, 
@@ -605,7 +598,6 @@ def main(main_dir):
             patience=20
         )
         
-        # Evaluate model
         print("\nEvaluating model:")
         y_test_actual, y_pred_actual = evaluate_model(model, X_test, y_test, y_scaler, test_file_names, is_log_transformed)
         
@@ -614,11 +606,9 @@ def main(main_dir):
             shape = (len(test_file_names), 1)
             y_test_actual, y_pred_actual = np.zeros(shape), np.zeros(shape)
         
-        # Save the trained model as a .pt file using TorchScript
         print("\nSaving the trained model as 'lstm_model.pt'...")
         model.eval()
         
-        # Create sample input on CUDA
         sample_input = torch.randn(1, 1, input_size, device=device)
         
         try:
