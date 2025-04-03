@@ -213,7 +213,7 @@ int main() {
         auto scaled_features = scale_features(raw_features, scaler_X);
         
         // 4. Create input tensor on CPU
-        auto options = torch::TensorOptions().dtype(torch::kFloat32);
+        auto options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
         torch::Tensor input_tensor = torch::from_blob(
             scaled_features.data(),
             {1, 1, static_cast<int64_t>(scaled_features.size())},
