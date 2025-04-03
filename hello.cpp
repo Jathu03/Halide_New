@@ -235,15 +235,10 @@ int main(int argc, const char* argv[]) {
     }
 
     try {
-        // 1. Determine device
+        // 1. Always use CPU for compatibility
         torch::Device device(torch::kCPU);
-        if (torch::cuda::is_available()) {
-            std::cout << "CUDA available! Using GPU.\n";
-            device = torch::Device(torch::kCUDA);
-        } else {
-            std::cout << "Using CPU device.\n";
-        }
-
+        std::cout << "Using CPU device.\n";
+        
         // 2. Load model and move to device
         std::cout << "Loading model...\n";
         torch::jit::script::Module model;
