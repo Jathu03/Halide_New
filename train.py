@@ -612,14 +612,14 @@ def main(main_dir):
         sample_input = torch.randn(1, 1, input_size).to(device)
         
         # Before saving the model in Python:
-    model.to('cpu')  # Move model to CPU
-    sample_input = sample_input.to('cpu')  # Move sample input to CPU
-    
-    # Trace on CPU
-    traced_model = torch.jit.trace(model, sample_input)
-    
-    # Save with _extra_files to include device info
-    traced_model.save("lstm_model.pt", _extra_files={'device': 'cpu'})
+        model.to('cpu')  # Move model to CPU
+        sample_input = sample_input.to('cpu')  # Move sample input to CPU
+        
+        # Trace on CPU
+        traced_model = torch.jit.trace(model, sample_input)
+        
+        # Save with _extra_files to include device info
+        traced_model.save("lstm_model.pt", _extra_files={'device': 'cpu'})
         print("Model successfully saved as 'lstm_model.pt'")
         
         # Save the scaler for later use
