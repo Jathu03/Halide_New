@@ -122,7 +122,8 @@ YScalerParams load_y_scaler_params(const std::string& scaler_path) {
 
 std::vector<float> scale_features(
     const std::map<std::string, float>& raw_features,
-    const ScalerParams& scaler_params
+    const ScalerParams& scaler_params,
+    torch::Device device
 ) {
     std::vector<float> scaled_features(scaler_params.feature_names.size(), 0.0f);
 
@@ -132,28 +133,45 @@ std::vector<float> scale_features(
         scaled_features[i] = (value - scaler_params.means[i]) / scaler_params.scales[i];
     }
 
-    return scaled_features;
+    // Move scaled features to CUDA tensor for processing
+    torch::Tensor scaled_tensor = torch::from_blob(
+        scaled_features.data(),
+        {static_cast<int64_t>(scaled_features.size())},
+        torch::TensorOptions().dtype(torch::kFloat32)
+    ).to(device);
+
+    // Perform any additional CUDA-based scaling if needed (here we just copy back)
+    scaled_features = scaled_tensor.cpu().toType(torch::kFloat32).contiguous().data_ptr<float>();
+    std::vector<float> result(scaled_features, scaled_features + scaled_tensor.numel());
+
+    return result;
 }
 
-float inverse_transform_prediction(float scaled_prediction, const YScalerParams& y_scaler) {
-    float unscaled = scaled_prediction * y_scaler.scale + y_scaler.mean;
+float inverse_transform_prediction(float scaled_prediction, const YScalerParams& y_scaler, torch::Device device) {
+    // Move computation to CUDA
+    torch::Tensor scaled_pred_tensor = torch::tensor({scaled_prediction}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
+    torch::Tensor mean_tensor = torch::tensor({y_scaler.mean}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
+    torch::Tensor scale_tensor = torch::tensor({y_scaler.scale}, torch::TensorOptions().dtype(torch::kFloat32).device(device));
+
+    torch::Tensor unscaled_tensor = scaled_pred_tensor * scale_tensor + mean_tensor;
+
+    float unscaled = unscaled_tensor.item<float>();
     if (y_scaler.is_log_transformed) {
-        return std::exp(unscaled) - 1.0f;  // expm1
+        // Use CUDA for expm1 if needed, but here we compute on CPU for simplicity
+        return std::exp(unscaled) - 1.0f;  // expm1 equivalent
     }
     return unscaled;
 }
 
-float run_prediction(const std::vector<float>& scaled_features, const std::string& model_path) {
-    // Check if CUDA is available using the correct function
-    torch::Device device(torch::cuda_is_available() ? torch::kCUDA : torch::kCPU);
+float run_prediction(const std::vector<float>& scaled_features, const std::string& model_path, torch::Device device) {
     std::cout << "Using device: " << (device.is_cuda() ? "CUDA" : "CPU") << "\n";
 
-    // Create input tensor and move to the same device as model
+    // Create input tensor directly on CUDA
     torch::Tensor input_tensor = torch::from_blob(
         const_cast<float*>(scaled_features.data()),
         {1, 1, static_cast<int64_t>(scaled_features.size())},
-        torch::TensorOptions().dtype(torch::kFloat32)
-    ).clone().to(device);
+        torch::TensorOptions().dtype(torch::kFloat32).device(device)
+    ).clone();
 
     std::cout << "Input tensor created with shape: ["
               << input_tensor.size(0) << ", "
@@ -161,12 +179,10 @@ float run_prediction(const std::vector<float>& scaled_features, const std::strin
               << input_tensor.size(2) << "] on "
               << (input_tensor.device().is_cuda() ? "CUDA" : "CPU") << "\n";
 
-    // Load the model
+    // Load the model directly onto CUDA
     torch::jit::script::Module model;
     try {
-        // Load model and move to device
-        model = torch::jit::load(model_path);
-        model.to(device);
+        model = torch::jit::load(model_path, device);
         model.eval();
         std::cout << "Model loaded successfully on "
                   << (device.is_cuda() ? "CUDA" : "CPU") << "\n";
@@ -175,15 +191,14 @@ float run_prediction(const std::vector<float>& scaled_features, const std::strin
         throw;
     }
 
-    // Run inference
+    // Run inference on CUDA
     torch::NoGradGuard no_grad;
     std::vector<torch::jit::IValue> inputs;
     inputs.push_back(input_tensor);
 
-    // Forward pass
     auto output = model.forward(inputs).toTensor();
 
-    // Get prediction value
+    // Move result back to CPU to extract scalar
     float scaled_prediction = output[0][0].item<float>();
 
     return scaled_prediction;
@@ -194,6 +209,10 @@ int main(int argc, const char* argv[]) {
         std::cerr << "Usage: " << argv[0] << " <json_file.json>\n";
         return -1;
     }
+
+    // Set device to CUDA if available
+    torch::Device device(torch::cuda_is_available() ? torch::kCUDA : torch::kCPU);
+    std::cout << "Main device set to: " << (device.is_cuda() ? "CUDA" : "CPU") << "\n";
 
     try {
         std::string model_path = "lstm_model.pt";
@@ -210,13 +229,14 @@ int main(int argc, const char* argv[]) {
         auto scaler_X = load_scaler_params("scaler_X.json");
         auto y_scaler = load_y_scaler_params("scaler_y.json");
 
-        // Scale features
-        auto scaled_features = scale_features(raw_features, scaler_X);
-        std::cout << "Scaled " << scaled_features.size() << " features.\n";
+        // Scale features on CUDA
+        auto scaled_features = scale_features(raw_features, scaler_X, device);
+        std::cout << "Scaled " << scaled_features.size() << " features on "
+                  << (device.is_cuda() ? "CUDA" : "CPU") << ".\n";
 
-        // Run prediction
-        float scaled_prediction = run_prediction(scaled_features, model_path);
-        float prediction = inverse_transform_prediction(scaled_prediction, y_scaler);
+        // Run prediction on CUDA
+        float scaled_prediction = run_prediction(scaled_features, model_path, device);
+        float prediction = inverse_transform_prediction(scaled_prediction, y_scaler, device);
 
         // Print results
         std::cout << "\nPrediction Results:\n";
