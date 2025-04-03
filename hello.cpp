@@ -147,16 +147,6 @@ float run_prediction(const std::vector<float>& scaled_features, const std::strin
     // Force CPU usage
     torch::Device device(torch::kCPU);
     
-    // Load with CPU map location
-    torch::jit::script::Module model;
-    try {
-        model = torch::jit::load(model_path, device);
-        model.eval();
-    } catch (const c10::Error& e) {
-        std::cerr << "Error loading the model: " << e.what() << std::endl;
-        throw;
-    }
-
     // Create input tensor with the right shape on CPU
     torch::Tensor input_tensor = torch::from_blob(
         const_cast<float*>(scaled_features.data()),
@@ -196,7 +186,6 @@ float run_prediction(const std::vector<float>& scaled_features, const std::strin
 
     return scaled_prediction;
 }
-
 int main(int argc, const char* argv[]) {
     if (argc != 2) {
         std::cerr << "Usage: " << argv[0] << " <json_file.json>\n";
