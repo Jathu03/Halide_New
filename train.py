@@ -602,13 +602,21 @@ def main(main_dir):
     # Save the trained model as a .pt file using TorchScript
     print("\nSaving the trained model as 'lstm_model.pt'...")
     model.eval()
-    model.to('cpu')  # Explicitly move to CPU for tracing
     
-    # Create sample input matching the expected shape [batch_size, sequence_length, input_size]
-    sample_input = torch.randn(1, 1, input_size)  # Default to CPU
+    # Ensure model is on CPU and clear any CUDA state
+    model.to('cpu')
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()  # Clear CUDA memory to avoid lingering state
+    
+    # Create sample input on CPU
+    sample_input = torch.randn(1, 1, input_size, device='cpu')
     
     try:
-        # Trace the model
+        # Verify device alignment before tracing
+        print(f"Model device: {next(model.parameters()).device}")
+        print(f"Sample input device: {sample_input.device}")
+        
+        # Trace the model on CPU
         traced_model = torch.jit.trace(model, sample_input)
         traced_model.save("lstm_model.pt")
         print("Model successfully saved as 'lstm_model.pt'")
