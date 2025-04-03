@@ -1,158 +1,248 @@
 #include <torch/script.h>
-#include <torch/torch.h>
 #include <nlohmann/json.hpp>
 #include <iostream>
 #include <fstream>
-#include <filesystem>
 #include <vector>
-#include <stdexcept>
+#include <map>
 #include <cmath>
 
 using json = nlohmann::json;
-namespace fs = std::filesystem;
 
-// Hardcode expected input size from Python training (replace with actual value)
-const int EXPECTED_INPUT_SIZE = 47; // Update this based on Python's "Input feature dimension: X"
+// Structure to hold feature scaler parameters
+struct ScalerParams {
+    std::vector<std::string> feature_names;
+    std::vector<float> means;
+    std::vector<float> scales;
+};
 
-std::vector<float> extract_features_from_json(const std::string& file_path) {
+// Load JSON from file
+json load_json(const std::string& file_path) {
     std::ifstream file(file_path);
     if (!file.is_open()) {
-        throw std::runtime_error("Unable to open file: " + file_path);
+        throw std::runtime_error("Could not open file: " + file_path);
     }
-
     json data;
     file >> data;
+    return data;
+}
 
-    float execution_time = 0.0;
-    if (data.contains("scheduling_data") && data["scheduling_data"].is_array()) {
-        for (const auto& item : data["scheduling_data"]) {
-            if (item.is_object() && item.contains("name") && item["name"] == "total_execution_time_ms" && item.contains("value")) {
-                execution_time = item["value"].get<float>();
-                break;
-            }
+// Extract execution time from JSON
+float get_execution_time(const json& data) {
+    if (!data.contains("scheduling_data")) {
+        throw std::runtime_error("'scheduling_data' not found in JSON");
+    }
+
+    for (const auto& item : data["scheduling_data"]) {
+        if (item.contains("name") && item["name"] == "total_execution_time_ms") {
+            return item["value"].get<float>();
         }
     }
 
-    std::vector<float> features;
-    int nodes_count = 0, edges_count = 0, scheduling_count = 0;
-    std::map<std::string, int> op_counts;
+    // Fallback to last item's value
+    return data["scheduling_data"].back()["value"].get<float>();
+}
 
-    if (data.contains("programming_details") && data["programming_details"].is_object()) {
-        auto prog_details = data["programming_details"];
-        if (prog_details.contains("Nodes") && prog_details["Nodes"].is_array()) {
-            nodes_count = prog_details["Nodes"].size();
-            for (const auto& node : prog_details["Nodes"]) {
-                if (node.contains("Details") && node["Details"].contains("Op histogram") && node["Details"]["Op histogram"].is_array()) {
+// Extract features from JSON (replicates Python's extract_features_from_file)
+std::map<std::string, float> extract_features(const json& data) {
+    std::map<std::string, float> features;
+
+    // Get execution time
+    features["execution_time"] = get_execution_time(data);
+
+    // Initialize counts
+    features["nodes_count"] = 0;
+    features["edges_count"] = 0;
+    features["scheduling_count"] = 0;
+    features["node_edge_ratio"] = 0;
+
+    // Process programming_details if exists
+    if (data.contains("programming_details")) {
+        const auto& pd = data["programming_details"];
+
+        // Count nodes and extract op histograms
+        if (pd.contains("Nodes")) {
+            features["nodes_count"] = pd["Nodes"].size();
+            std::map<std::string, int> op_counts;
+
+            for (const auto& node : pd["Nodes"]) {
+                if (node.contains("Details") && node["Details"].contains("Op histogram")) {
                     for (const auto& op_line : node["Details"]["Op histogram"]) {
-                        if (op_line.is_string()) {
-                            std::string line = op_line.get<std::string>();
-                            size_t pos = line.find(':');
-                            if (pos != std::string::npos) {
-                                std::string op_name = "op_" + line.substr(0, pos);
-                                int count = std::stoi(line.substr(pos + 1));
-                                op_counts[op_name] += count;
-                            }
+                        std::string line = op_line.get<std::string>();
+                        size_t colon_pos = line.find(':');
+                        if (colon_pos != std::string::npos) {
+                            std::string op_name = "op_" + line.substr(0, colon_pos);
+                            int count = std::stoi(line.substr(colon_pos + 1));
+                            op_counts[op_name] += count;
                         }
                     }
                 }
             }
-        }
-        if (prog_details.contains("Edges") && prog_details["Edges"].is_array()) {
-            edges_count = prog_details["Edges"].size();
-        }
-    }
 
-    if (data.contains("scheduling_data") && data["scheduling_data"].is_array()) {
-        scheduling_count = data["scheduling_data"].size();
-        if (!data["scheduling_data"].empty()) {
-            auto sched = data["scheduling_data"][0];
-            if (sched.contains("Details") && sched["Details"].is_object() && sched["Details"].contains("scheduling_feature") && sched["Details"]["scheduling_feature"].is_object()) {
-                auto sf = sched["Details"]["scheduling_feature"];
-                features.push_back(sf.value("bytes_at_production", 0.0f));
-                features.push_back(sf.value("bytes_at_realization", 0.0f));
-                features.push_back(sf.value("bytes_at_root", 0.0f));
-                features.push_back(sf.value("bytes_at_task", 0.0f));
-                features.push_back(sf.value("inner_parallelism", 0.0f));
-                features.push_back(sf.value("outer_parallelism", 0.0f));
-                features.push_back(sf.value("num_productions", 0.0f));
-                features.push_back(sf.value("num_realizations", 0.0f));
-                features.push_back(sf.value("num_scalars", 0.0f));
-                features.push_back(sf.value("num_vectors", 0.0f));
-                features.push_back(sf.value("points_computed_total", 0.0f));
-                features.push_back(sf.value("working_set", 0.0f));
+            // Add op counts to features
+            for (const auto& [op_name, count] : op_counts) {
+                features[op_name] = count;
             }
         }
-    }
 
-    features.push_back(static_cast<float>(nodes_count));
-    features.push_back(static_cast<float>(edges_count));
-    features.push_back(static_cast<float>(scheduling_count));
-    features.push_back(nodes_count > 0 && edges_count > 0 ? static_cast<float>(nodes_count) / edges_count : 0.0f);
-    for (const auto& [op, count] : op_counts) {
-        features.push_back(static_cast<float>(count));
-    }
+        // Count edges
+        if (pd.contains("Edges")) {
+            features["edges_count"] = pd["Edges"].size();
+        }
 
-    float total_bytes = features.size() > 0 ? features[0] : 0.0f;
-    float total_vectors = features.size() > 9 ? features[9] : 0.0f;
-    features.push_back(total_bytes);
-    features.push_back(total_vectors);
-    features.push_back(features.size() > 5 ? features[4] * features[5] : 0.0f);
-    features.push_back(total_vectors > 0 ? total_bytes / total_vectors : 0.0f);
-    features.push_back(features.size() > 11 ? features[11] / (total_bytes > 0 ? total_bytes : 1e-8f) : 0.0f);
+        // Calculate node-edge ratio
+        if (features["nodes_count"] > 0 && features["edges_count"] > 0) {
+            features["node_edge_ratio"] = features["nodes_count"] / features["edges_count"];
+        }
 
-    float total_ops = 0;
-    for (size_t i = 16; i < features.size() - 5; ++i) total_ops += features[i];
-    features.push_back(nodes_count > 0 ? total_ops / nodes_count : 0.0f);
-    features.push_back(nodes_count > 0 ? static_cast<float>(op_counts.size()) / nodes_count : 0.0f);
+        // Process scheduling features
+        std::vector<std::string> important_metrics = {
+            "bytes_at_production", "bytes_at_realization", "bytes_at_root", "bytes_at_task",
+            "inner_parallelism", "outer_parallelism", "num_productions", "num_realizations",
+            "num_scalars", "num_vectors", "points_computed_total", "working_set"
+        };
 
-    std::cout << "Extracted " << features.size() << " features from " << file_path << std::endl;
-    std::cout << "Actual execution time: " << execution_time << " ms" << std::endl;
+        const json* scheduling_data = nullptr;
+        if (data.contains("scheduling_data")) {
+            scheduling_data = &data["scheduling_data"];
+        } else if (pd.contains("Schedules")) {
+            scheduling_data = &pd["Schedules"];
+        }
 
-    // Ensure feature count matches expected input size
-    if (features.size() != EXPECTED_INPUT_SIZE) {
-        throw std::runtime_error("Feature count (" + std::to_string(features.size()) + 
-                                 ") does not match expected input size (" + 
-                                 std::to_string(EXPECTED_INPUT_SIZE) + ")");
+        if (scheduling_data != nullptr) {
+            features["scheduling_count"] = scheduling_data->size();
+            
+            // Initialize all important metrics to 0
+            for (const auto& metric : important_metrics) {
+                features["sched_" + metric] = 0;
+            }
+
+            float total_bytes = 0;
+            float total_vectors = 0;
+            float total_parallelism = 0;
+
+            for (const auto& sched : *scheduling_data) {
+                if (sched.contains("Details") && sched["Details"].contains("scheduling_feature")) {
+                    const auto& sf = sched["Details"]["scheduling_feature"];
+                    for (const auto& metric : important_metrics) {
+                        if (sf.contains(metric)) {
+                            features["sched_" + metric] += sf[metric].get<float>();
+                        }
+                    }
+
+                    // Sum totals for derived features
+                    if (sf.contains("bytes_at_production")) {
+                        total_bytes += sf["bytes_at_production"].get<float>();
+                    }
+                    if (sf.contains("num_vectors")) {
+                        total_vectors += sf["num_vectors"].get<float>();
+                    }
+                    if (sf.contains("inner_parallelism") && sf.contains("outer_parallelism")) {
+                        total_parallelism += sf["inner_parallelism"].get<float>() * sf["outer_parallelism"].get<float>();
+                    }
+                }
+            }
+
+            // Add derived features
+            features["total_bytes_at_production"] = total_bytes;
+            features["total_vectors"] = total_vectors;
+            features["total_parallelism"] = total_parallelism;
+            
+            if (total_vectors > 0) {
+                features["bytes_per_vector"] = total_bytes / total_vectors;
+            } else {
+                features["bytes_per_vector"] = 0;
+            }
+        }
     }
 
     return features;
 }
 
+// Load scaler parameters from JSON
+ScalerParams load_scaler_params(const std::string& scaler_path) {
+    json scaler_data = load_json(scaler_path);
+    ScalerParams params;
+    params.feature_names = scaler_data["feature_names"].get<std::vector<std::string>>();
+    params.means = scaler_data["means"].get<std::vector<float>>();
+    params.scales = scaler_data["scales"].get<std::vector<float>>();
+    return params;
+}
+
+// Scale features using pre-computed mean and std
+std::vector<float> scale_features(
+    const std::map<std::string, float>& raw_features,
+    const ScalerParams& scaler_params
+) {
+    std::vector<float> scaled_features(scaler_params.feature_names.size(), 0.0f);
+
+    for (size_t i = 0; i < scaler_params.feature_names.size(); ++i) {
+        const std::string& feature_name = scaler_params.feature_names[i];
+        float mean = scaler_params.means[i];
+        float scale = scaler_params.scales[i];
+
+        // Use 0 if feature not found in raw data
+        float value = raw_features.count(feature_name) ? raw_features.at(feature_name) : 0.0f;
+        scaled_features[i] = (value - mean) / scale;
+    }
+
+    return scaled_features;
+}
+
 int main() {
     try {
-        // Load the TorchScript model
-        torch::jit::script::Module module = torch::jit::load("lstm_model.pt");
-        module.eval();
-        std::cout << "Model loaded successfully" << std::endl;
+        // 1. Load and parse the input JSON file
+        std::string input_file = "0_0.json";
+        json data = load_json(input_file);
 
-        // Specify the file to test
-        std::string file_path = "0_0.json";
-        if (!fs::exists(file_path)) {
-            throw std::runtime_error("File not found: " + file_path);
+        // 2. Extract features (replicates Python's extract_features_from_file)
+        std::map<std::string, float> raw_features = extract_features(data);
+
+        // 3. Load feature scaler parameters
+        ScalerParams scaler_X = load_scaler_params("scaler_X.json");
+        
+        // 4. Scale the features
+        std::vector<float> scaled_features = scale_features(raw_features, scaler_X);
+
+        // 5. Create input tensor [batch=1, seq_len=1, features]
+        torch::Tensor input_tensor = torch::from_blob(
+            scaled_features.data(),
+            {1, 1, static_cast<int64_t>(scaled_features.size())},
+            torch::kFloat32
+        ).clone();
+
+        // 6. Load the traced model
+        torch::jit::script::Module model;
+        try {
+            model = torch::jit::load("lstm_model.pt");
+        } catch (const c10::Error& e) {
+            std::cerr << "Error loading the model: " << e.what() << std::endl;
+            return -1;
         }
 
-        // Extract features
-        std::vector<float> features = extract_features_from_json(file_path);
+        // 7. Run inference
+        std::vector<torch::jit::IValue> inputs;
+        inputs.push_back(input_tensor);
+        torch::Tensor output = model.forward(inputs).toTensor();
 
-        // Convert to tensor
-        torch::Tensor input = torch::from_blob(features.data(), {1, 1, EXPECTED_INPUT_SIZE}).to(torch::kFloat32);
+        // 8. Load target scaler parameters
+        json y_scaler = load_json("scaler_y.json");
+        float y_mean = y_scaler["mean"].get<float>();
+        float y_scale = y_scaler["scale"].get<float>();
+        bool is_log_transformed = y_scaler["is_log_transformed"].get<bool>();
 
-        // Move to CUDA if available
-        torch::Device device(torch::cuda::is_available() ? torch::kCUDA : torch::kCPU);
-        module.to(device);
-        input = input.to(device);
+        // 9. Inverse transform the prediction
+        float prediction = output.item<float>() * y_scale + y_mean;
+        if (is_log_transformed) {
+            prediction = std::expm1(prediction); // Reverse log-transform
+        }
 
-        // Perform inference
-        std::vector<torch::jit::IValue> inputs = {input};
-        torch::Tensor output = module.forward(inputs).toTensor();
-
-        // Get prediction
-        float pred_scaled = output.item<float>();
-        std::cout << "Predicted execution time (scaled): " << pred_scaled << std::endl;
+        // 10. Print results
+        std::cout << "Raw execution time: " << raw_features["execution_time"] << " ms\n";
+        std::cout << "Predicted execution time: " << prediction << " ms\n";
 
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;
-        return 1;
+        return -1;
     }
 
     return 0;
