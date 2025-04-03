@@ -339,12 +339,13 @@ class EnhancedLSTMModel(nn.Module):
         return context
         
     def forward(self, x):
+        device = torch.device('cpu')  # Force CPU usage
         batch_size = x.size(0)
         lstm_out = x
-        device = x.device  # Ensure hidden states match input device
         
         for i, (lstm, dropout) in enumerate(zip(self.lstm_layers, self.dropout_layers)):
             hidden_size = self.hidden_sizes[i]
+            # Explicitly create CPU tensors
             h_0 = torch.zeros(1, batch_size, hidden_size, device=device)
             c_0 = torch.zeros(1, batch_size, hidden_size, device=device)
             
@@ -617,12 +618,21 @@ def main(main_dir):
         # Save the trained model as a .pt file using TorchScript
         print("\nSaving the trained model as 'lstm_model.pt'...")
         model.eval()
-        model.to('cpu')
+        model.to('cpu')  # Ensure model is on CPU
         
+        # Create sample input on CPU
         sample_input = torch.randn(1, 1, input_size, device='cpu')
         
         try:
-            traced_model = torch.jit.trace(model, sample_input)
+            # Trace with strict=False to handle device mismatches
+            traced_model = torch.jit.trace(model, sample_input, strict=False)
+            
+            # Save and reload to ensure CPU compatibility
+            temp_path = "temp_model.pt"
+            traced_model.save(temp_path)
+            
+            # Reload with map_location to CPU
+            traced_model = torch.jit.load(temp_path, map_location='cpu')
             traced_model.save("lstm_model.pt")
             print("Model successfully saved as 'lstm_model.pt'")
             
@@ -632,13 +642,6 @@ def main(main_dir):
         except Exception as e:
             print(f"Error saving the model: {str(e)}")
             return None, None, None, None
-        
-        return model, y_scaler, y_test_actual, y_pred_actual
-    
-    except Exception as e:
-        print(f"Error in main function: {str(e)}")
-        return None, None, None, None
-
 
 if __name__ == "__main__":
     # Main directory containing subfolders for each program
