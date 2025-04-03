@@ -10,6 +10,9 @@ find_package(Torch REQUIRED)
 # Add nlohmann/json (assuming it's in 'Halide_New/json')
 include_directories(${CMAKE_SOURCE_DIR}/json)
 
+# Include LibTorch headers
+include_directories(${Torch_INCLUDE_DIRS})
+
 # Add executable
 add_executable(lstm_inference hello.cpp)
 target_link_libraries(lstm_inference ${Torch_LIBRARIES})
