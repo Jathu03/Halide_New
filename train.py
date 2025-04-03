@@ -1,3 +1,5 @@
+import os
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -6,38 +8,47 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 import random
 import joblib
 
-# Placeholder for data processing (same as above)
+# Placeholder for data processing functions (assumed unchanged)
 def prepare_data_for_model(train_features, test_features):
-    input_size = 10  # Adjust as needed
+    # Replace with your actual implementation
+    input_size = 10  # Example; adjust based on your features
     X_train = torch.randn(100, 1, input_size)
     y_train = torch.randn(100, 1)
     X_test = torch.randn(50, 1, input_size)
     y_test = torch.randn(50, 1)
-    y_scaler = MinMaxScaler().fit(y_train.numpy())
+    y_scaler = MinMaxScaler().fit(y_train.numpy())  # Example scaler
     return X_train, y_train, X_test, y_test, y_scaler, input_size, False
 
 class EnhancedLSTMModel(nn.Module):
     def __init__(self, input_size, hidden_sizes=[128, 64, 32], output_size=1, dropout_rate=0.3):
         super(EnhancedLSTMModel, self).__init__()
         self.hidden_sizes = hidden_sizes
-        # Same architecture as above...
+        
         self.lstm_layers = nn.ModuleList()
         self.dropout_layers = nn.ModuleList()
+        
         self.lstm_layers.append(nn.LSTM(input_size, hidden_sizes[0], batch_first=True))
         self.dropout_layers.append(nn.Dropout(dropout_rate))
+        
         for i in range(1, len(hidden_sizes)):
             self.lstm_layers.append(nn.LSTM(hidden_sizes[i-1], hidden_sizes[i], batch_first=True))
             self.dropout_layers.append(nn.Dropout(dropout_rate))
+        
         self.attention = nn.Linear(hidden_sizes[-1], 1)
         self.fc_layers = nn.ModuleList()
         self.bn_layers = nn.ModuleList()
+        
         self.fc_layers.append(nn.Linear(hidden_sizes[-1], hidden_sizes[-1] // 2))
         self.bn_layers.append(nn.BatchNorm1d(hidden_sizes[-1] // 2))
+        
         self.fc_layers.append(nn.Linear(hidden_sizes[-1] // 2, hidden_sizes[-1] // 4))
         self.bn_layers.append(nn.BatchNorm1d(hidden_sizes[-1] // 4))
+        
         self.output_layer = nn.Linear(hidden_sizes[-1] // 4, output_size)
+        
         self.relu = nn.ReLU()
         self.leaky_relu = nn.LeakyReLU(0.1)
+        
         self.has_residual = (hidden_sizes[-1] // 4 == hidden_sizes[-1] // 2)
         if not self.has_residual:
             self.residual_adapter = nn.Linear(hidden_sizes[-1] // 2, hidden_sizes[-1] // 4)
@@ -51,26 +62,31 @@ class EnhancedLSTMModel(nn.Module):
     def forward(self, x):
         batch_size = x.size(0)
         lstm_out = x
-        device = torch.device('cuda')  # Explicitly set to CUDA
+        device = torch.device('cpu')  # Explicitly set to CPU
         
         for i, (lstm, dropout) in enumerate(zip(self.lstm_layers, self.dropout_layers)):
             hidden_size = self.hidden_sizes[i]
             h_0 = torch.zeros(1, batch_size, hidden_size, device=device)
             c_0 = torch.zeros(1, batch_size, hidden_size, device=device)
+            
             lstm_out, _ = lstm(lstm_out, (h_0, c_0))
             if i < len(self.lstm_layers) - 1:
                 lstm_out = dropout(lstm_out)
         
         attn_output = self.attention_net(lstm_out)
+        
         fc_out = self.fc_layers[0](attn_output)
         fc_out = self.bn_layers[0](fc_out)
         fc_out = self.leaky_relu(fc_out)
+        
         residual = fc_out
         if not self.has_residual:
             residual = self.residual_adapter(residual)
+        
         fc_out = self.fc_layers[1](fc_out)
         fc_out = self.bn_layers[1](fc_out)
         fc_out = self.leaky_relu(fc_out)
+        
         fc_out = fc_out + residual
         output = self.output_layer(fc_out)
         return output
@@ -83,7 +99,7 @@ def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=32):
     return train_loader, test_loader
 
 def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=10, patience=20):
-    device = torch.device('cuda')  # Force CUDA
+    device = torch.device('cpu')  # Force CPU
     model.to(device)
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
     
@@ -137,31 +153,33 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
     return model
 
 def main():
+    # Load and prepare data (replace with your actual data loading logic)
     train_features, test_features = [], []  # Placeholder
     X_train, y_train, X_test, y_test, y_scaler, input_size, is_log_transformed = prepare_data_for_model(train_features, test_features)
     
     train_loader, test_loader = create_data_loaders(X_train, y_train, X_test, y_test, batch_size=16)
     
+    # Initialize model
     model = EnhancedLSTMModel(input_size=input_size, hidden_sizes=[128, 64, 32], output_size=1, dropout_rate=0.3)
     
     criterion = nn.HuberLoss(delta=1.0)
     optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-5)
     
-    # Train model on CUDA
-    print("Training on CUDA...")
+    # Train model on CPU
+    print("Training on CPU...")
     model = train_model(model, train_loader, test_loader, criterion, optimizer)
     
-    # Save model using TorchScript on CUDA
+    # Save model using TorchScript on CPU
     model.eval()
-    model.to('cuda')
-    sample_input = torch.randn(1, 1, input_size, device='cuda')
+    model.to('cpu')
+    sample_input = torch.randn(1, 1, input_size, device='cpu')
     
     print(f"Model device: {next(model.parameters()).device}")
     print(f"Sample input device: {sample_input.device}")
     
     traced_model = torch.jit.trace(model, sample_input)
     traced_model.save("lstm_model.pt")
-    print("Model saved as 'lstm_model.pt' on CUDA")
+    print("Model saved as 'lstm_model.pt' on CPU")
     
     joblib.dump(y_scaler, "y_scaler.pkl")
     print("Scaler saved as 'y_scaler.pkl'")
