@@ -230,7 +230,7 @@ float inverse_transform_prediction(float scaled_prediction, const YScalerParams&
 
 int main(int argc, const char* argv[]) {
     if (argc != 2) {
-        std::cerr << "Usage: " << argv[0] << " <path_to_json_file>\n";
+        std::cerr << "Usage: " << argv[0] << "0_0.json\n";
         return -1;
     }
 
