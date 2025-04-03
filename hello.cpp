@@ -8,14 +8,12 @@
 
 using json = nlohmann::json;
 
-// Structure to hold feature scaler parameters
 struct ScalerParams {
     std::vector<std::string> feature_names;
     std::vector<float> means;
     std::vector<float> scales;
 };
 
-// Load JSON from file
 json load_json(const std::string& file_path) {
     std::ifstream file(file_path);
     if (!file.is_open()) {
@@ -26,7 +24,6 @@ json load_json(const std::string& file_path) {
     return data;
 }
 
-// Extract execution time from JSON
 float get_execution_time(const json& data) {
     if (!data.contains("scheduling_data")) {
         throw std::runtime_error("'scheduling_data' not found in JSON");
@@ -37,29 +34,20 @@ float get_execution_time(const json& data) {
             return item["value"].get<float>();
         }
     }
-
-    // Fallback to last item's value
     return data["scheduling_data"].back()["value"].get<float>();
 }
 
-// Extract features from JSON (replicates Python's extract_features_from_file)
 std::map<std::string, float> extract_features(const json& data) {
     std::map<std::string, float> features;
-
-    // Get execution time
     features["execution_time"] = get_execution_time(data);
-
-    // Initialize counts
     features["nodes_count"] = 0;
     features["edges_count"] = 0;
     features["scheduling_count"] = 0;
     features["node_edge_ratio"] = 0;
 
-    // Process programming_details if exists
     if (data.contains("programming_details")) {
         const auto& pd = data["programming_details"];
 
-        // Count nodes and extract op histograms
         if (pd.contains("Nodes")) {
             features["nodes_count"] = pd["Nodes"].size();
             std::map<std::string, int> op_counts;
@@ -77,24 +65,19 @@ std::map<std::string, float> extract_features(const json& data) {
                     }
                 }
             }
-
-            // Add op counts to features
             for (const auto& [op_name, count] : op_counts) {
                 features[op_name] = count;
             }
         }
 
-        // Count edges
         if (pd.contains("Edges")) {
             features["edges_count"] = pd["Edges"].size();
         }
 
-        // Calculate node-edge ratio
         if (features["nodes_count"] > 0 && features["edges_count"] > 0) {
             features["node_edge_ratio"] = features["nodes_count"] / features["edges_count"];
         }
 
-        // Process scheduling features
         std::vector<std::string> important_metrics = {
             "bytes_at_production", "bytes_at_realization", "bytes_at_root", "bytes_at_task",
             "inner_parallelism", "outer_parallelism", "num_productions", "num_realizations",
@@ -111,7 +94,6 @@ std::map<std::string, float> extract_features(const json& data) {
         if (scheduling_data != nullptr) {
             features["scheduling_count"] = scheduling_data->size();
             
-            // Initialize all important metrics to 0
             for (const auto& metric : important_metrics) {
                 features["sched_" + metric] = 0;
             }
@@ -129,7 +111,6 @@ std::map<std::string, float> extract_features(const json& data) {
                         }
                     }
 
-                    // Sum totals for derived features
                     if (sf.contains("bytes_at_production")) {
                         total_bytes += sf["bytes_at_production"].get<float>();
                     }
@@ -142,23 +123,16 @@ std::map<std::string, float> extract_features(const json& data) {
                 }
             }
 
-            // Add derived features
             features["total_bytes_at_production"] = total_bytes;
             features["total_vectors"] = total_vectors;
             features["total_parallelism"] = total_parallelism;
             
-            if (total_vectors > 0) {
-                features["bytes_per_vector"] = total_bytes / total_vectors;
-            } else {
-                features["bytes_per_vector"] = 0;
-            }
+            features["bytes_per_vector"] = total_vectors > 0 ? total_bytes / total_vectors : 0;
         }
     }
-
     return features;
 }
 
-// Load scaler parameters from JSON
 ScalerParams load_scaler_params(const std::string& scaler_path) {
     json scaler_data = load_json(scaler_path);
     ScalerParams params;
@@ -168,82 +142,65 @@ ScalerParams load_scaler_params(const std::string& scaler_path) {
     return params;
 }
 
-// Scale features using pre-computed mean and std
 std::vector<float> scale_features(
     const std::map<std::string, float>& raw_features,
     const ScalerParams& scaler_params
 ) {
     std::vector<float> scaled_features(scaler_params.feature_names.size(), 0.0f);
-
     for (size_t i = 0; i < scaler_params.feature_names.size(); ++i) {
         const std::string& feature_name = scaler_params.feature_names[i];
-        float mean = scaler_params.means[i];
-        float scale = scaler_params.scales[i];
-
-        // Use 0 if feature not found in raw data
         float value = raw_features.count(feature_name) ? raw_features.at(feature_name) : 0.0f;
-        scaled_features[i] = (value - mean) / scale;
+        scaled_features[i] = (value - scaler_params.means[i]) / scaler_params.scales[i];
     }
-
     return scaled_features;
 }
 
 int main() {
     try {
-        // 1. Load and parse the input JSON file
-        std::string input_file = "0_0.json";
-        json data = load_json(input_file);
-
-        // 2. Extract features (replicates Python's extract_features_from_file)
-        std::map<std::string, float> raw_features = extract_features(data);
-
-        // 3. Load feature scaler parameters
-        ScalerParams scaler_X = load_scaler_params("scaler_X.json");
+        // 1. Load and parse input
+        json data = load_json("0_0.json");
         
-        // 4. Scale the features
-        std::vector<float> scaled_features = scale_features(raw_features, scaler_X);
-
-        // 5. Create input tensor [batch=1, seq_len=1, features]
+        // 2. Extract features
+        auto raw_features = extract_features(data);
+        
+        // 3. Load and scale features
+        auto scaler_X = load_scaler_params("scaler_X.json");
+        auto scaled_features = scale_features(raw_features, scaler_X);
+        
+        // 4. Create tensor on CPU
+        auto options = torch::TensorOptions().dtype(torch::kFloat32);
         torch::Tensor input_tensor = torch::from_blob(
             scaled_features.data(),
             {1, 1, static_cast<int64_t>(scaled_features.size())},
-            torch::kFloat32
+            options
         ).clone();
-
-        // 6. Load the traced model
+        
+        // 5. Load model and move to CPU
         torch::jit::script::Module model;
         try {
-            model = torch::jit::load("lstm_model.pt");
+            model = torch::jit::load("lstm_model.pt", torch::kCPU);
         } catch (const c10::Error& e) {
-            std::cerr << "Error loading the model: " << e.what() << std::endl;
+            std::cerr << "Error loading model: " << e.what() << std::endl;
             return -1;
         }
-
-        // 7. Run inference
-        std::vector<torch::jit::IValue> inputs;
-        inputs.push_back(input_tensor);
-        torch::Tensor output = model.forward(inputs).toTensor();
-
-        // 8. Load target scaler parameters
+        
+        // 6. Run inference
+        auto output = model.forward({input_tensor}).toTensor();
+        
+        // 7. Process output
         json y_scaler = load_json("scaler_y.json");
-        float y_mean = y_scaler["mean"].get<float>();
-        float y_scale = y_scaler["scale"].get<float>();
-        bool is_log_transformed = y_scaler["is_log_transformed"].get<bool>();
-
-        // 9. Inverse transform the prediction
-        float prediction = output.item<float>() * y_scale + y_mean;
-        if (is_log_transformed) {
-            prediction = std::expm1(prediction); // Reverse log-transform
+        float prediction = output.item<float>() * y_scaler["scale"].get<float>() + y_scaler["mean"].get<float>();
+        
+        if (y_scaler["is_log_transformed"].get<bool>()) {
+            prediction = std::expm1(prediction);
         }
-
-        // 10. Print results
-        std::cout << "Raw execution time: " << raw_features["execution_time"] << " ms\n";
+        
         std::cout << "Predicted execution time: " << prediction << " ms\n";
-
+        std::cout << "Actual execution time: " << raw_features["execution_time"] << " ms\n";
+        
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;
         return -1;
     }
-
     return 0;
 }
