@@ -529,7 +529,7 @@ def main(main_dir):
         test_loader, 
         criterion, 
         optimizer, 
-        num_epochs=15,
+        num_epochs=150,
         patience=20
     )
     
