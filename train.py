@@ -44,6 +44,25 @@ def get_execution_time(file_path):
         print(f"Error: An unexpected error occurred while processing {file_path}: {str(e)}")
         return None
 
+def save_scaler_params(scaler_X, scaler_y, is_log_transformed):
+    # Save scaler_X
+    scaler_X_data = {
+        "feature_names": list(scaler_X.feature_names_in_),
+        "means": scaler_X.mean_.tolist(),
+        "scales": scaler_X.scale_.tolist()
+    }
+    with open("scaler_X.json", "w") as f:
+        json.dump(scaler_X_data, f)
+
+    # Save scaler_y
+    scaler_y_data = {
+        "mean": float(scaler_y.mean_[0]),
+        "scale": float(scaler_y.scale_[0]),
+        "is_log_transformed": is_log_transformed
+    }
+    with open("scaler_y.json", "w") as f:
+        json.dump(scaler_y_data, f)
+
 def extract_features_from_file(file_path):
     with open(file_path, 'r') as f:
         data = json.load(f)
@@ -484,7 +503,8 @@ def main(main_dir):
     
     # Prepare data for model
     X_train, y_train, X_test, y_test, y_scaler, input_size, is_log_transformed = prepare_data_for_model(train_features, test_features)
-    
+
+    save_scaler_params(scaler_X, y_scaler, is_log_transformed)
     # Create data loaders
     train_loader, test_loader = create_data_loaders(X_train, y_train, X_test, y_test, batch_size=16)
     
