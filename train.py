@@ -285,7 +285,6 @@ def prepare_data_for_model(train_features, test_features):
     
     print(f"Input feature dimension: {X_train_scaled.shape[1]}")
     
-    # Modified to return scaler_X as well
     return (X_train_tensor, y_train_tensor, X_test_tensor, y_test_tensor, 
             scaler_X, scaler_y, X_train_scaled.shape[1], 'execution_time_log' in train_df.columns)
 
@@ -369,7 +368,8 @@ def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=32):
     return train_loader, test_loader
 
 def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=150, patience=20):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # Force CPU usage
+    device = torch.device('cpu')
     print(f"Using device: {device}")
     model.to(device)
     
@@ -433,7 +433,8 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
     return train_losses, val_losses
 
 def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_transformed=False):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # Force CPU usage
+    device = torch.device('cpu')
     model.to(device)
     model.eval()
     
@@ -500,7 +501,6 @@ def main(main_dir):
         return None
     
     # Prepare data for model
-    # Modified to receive scaler_X
     X_train, y_train, X_test, y_test, scaler_X, y_scaler, input_size, is_log_transformed = prepare_data_for_model(train_features, test_features)
 
     # Save scaler parameters
@@ -541,8 +541,9 @@ def main(main_dir):
     print("\nSaving the trained model as 'lstm_model.pt'...")
     model.eval()  # Set the model to evaluation mode
     
-    # Determine the device the model is on
-    device = next(model.parameters()).device
+    # Force CPU usage
+    device = torch.device("cpu")
+    model.to(device)
     print(f"Model is on device: {device}")
     
     try:
