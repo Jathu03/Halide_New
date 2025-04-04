@@ -269,6 +269,12 @@ def prepare_data_for_model(train_features, test_features):
     return (X_train_tensor, y_train_tensor, X_test_tensor, y_test_tensor, 
             scaler_y, X_train_scaled.shape[1], 'execution_time_log' in train_df.columns)
 
+# Set device to CPU
+device = torch.device("cpu")
+
+# Paste remaining model definition, training, and evaluation code here as needed
+
+
 class EnhancedLSTMModel(nn.Module):
     def __init__(self, input_size, hidden_sizes=[128, 64, 32], output_size=1, dropout_rate=0.3):
         super(EnhancedLSTMModel, self).__init__()
