@@ -285,14 +285,12 @@ def prepare_data_for_model(train_features, test_features):
     
     print(f"Input feature dimension: {X_train_scaled.shape[1]}")
     
+    # Modified to return scaler_X as well
     return (X_train_tensor, y_train_tensor, X_test_tensor, y_test_tensor, 
-            scaler_y, X_train_scaled.shape[1], 'execution_time_log' in train_df.columns)
+            scaler_X, scaler_y, X_train_scaled.shape[1], 'execution_time_log' in train_df.columns)
 
 # Set device to CPU
 device = torch.device("cpu")
-
-# Paste remaining model definition, training, and evaluation code here as needed
-
 
 class EnhancedLSTMModel(nn.Module):
     def __init__(self, input_size, hidden_sizes=[128, 64, 32], output_size=1, dropout_rate=0.3):
@@ -502,9 +500,12 @@ def main(main_dir):
         return None
     
     # Prepare data for model
-    X_train, y_train, X_test, y_test, y_scaler, input_size, is_log_transformed = prepare_data_for_model(train_features, test_features)
+    # Modified to receive scaler_X
+    X_train, y_train, X_test, y_test, scaler_X, y_scaler, input_size, is_log_transformed = prepare_data_for_model(train_features, test_features)
 
+    # Save scaler parameters
     save_scaler_params(scaler_X, y_scaler, is_log_transformed)
+
     # Create data loaders
     train_loader, test_loader = create_data_loaders(X_train, y_train, X_test, y_test, batch_size=16)
     
