@@ -1,262 +1,421 @@
+import os
 import json
 import numpy as np
+import pandas as pd
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split
 import torch
 import torch.nn as nn
-import torch.optim as optim
+import torch.nn.functional as F
 from torch.utils.data import TensorDataset, DataLoader
-import matplotlib.pyplot as plt
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+import random
+from tqdm import tqdm
 
-# Set random seed for reproducibility
-torch.manual_seed(42)
-np.random.seed(42)
-
-# The JSON document (replace with your document)
-document = '''
-<JSON_DOCUMENT_FROM_YOUR_INPUT>
-'''
-
-# Parse the JSON document
-data = json.loads(document)
-
-# Step 1: Extract execution time and scheduling features
-def extract_execution_details(data):
-    execution_details = {
-        "total_execution_time_ms": None,
-        "nodes": []
-    }
-    scheduling = data["programming_details"]["Scheduling"]
-    for entry in scheduling:
-        if "name" in entry and entry["name"] == "total_execution_time_ms":
-            execution_details["total_execution_time_ms"] = entry["value"]
-            continue
-        if "Details" in entry and "scheduling_feature" in entry["Details"]:
-            node_name = entry["Name"]
-            features = entry["Details"]["scheduling_feature"]
-            node_features = {
-                "name": node_name,
-                "points_computed_total": features.get("points_computed_total", 0.0),
-                "vector_loads_per_vector": features.get("vector_loads_per_vector", 0.0),
-                "scalar_loads_per_scalar": features.get("scalar_loads_per_scalar", 0.0),
-                "inner_parallelism": features.get("inner_parallelism", 0.0),
-                "outer_parallelism": features.get("outer_parallelism", 0.0),
-                "working_set": features.get("working_set", 0.0),
-                "working_set_at_realization": features.get("working_set_at_realization", 0.0),
-                "num_vectors": features.get("num_vectors", 0.0),
-                "num_scalars": features.get("num_scalars", 0.0),
-                "inlined_calls": features.get("inlined_calls", 0.0),
-                "bytes_at_realization": features.get("bytes_at_realization", 0.0),
-                "allocation_bytes_read_per_realization": features.get("allocation_bytes_read_per_realization", 0.0)
-            }
-            execution_details["nodes"].append(node_features)
-    return execution_details
-
-# Extract the details
-execution_details = extract_execution_details(data)
-
-# Feature keys to include in the model
-feature_keys = [
-    "points_computed_total", "vector_loads_per_vector", "scalar_loads_per_scalar",
-    "inner_parallelism", "outer_parallelism", "working_set", "working_set_at_realization",
-    "num_vectors", "num_scalars", "inlined_calls", "bytes_at_realization",
-    "allocation_bytes_read_per_realization"
+# Define operation types (modify according to your actual operations)
+OP_TYPES = [
+    'op_load', 'op_store', 'op_add', 'op_mul', 'op_div', 
+    'op_fma', 'op_sqrt', 'op_exp', 'op_log', 'op_sin',
+    'op_cos', 'op_tanh', 'op_conv', 'op_pool', 'op_matmul'
 ]
 
-# Step 2: Create a feature matrix
-def create_feature_matrix(nodes, feature_keys):
-    feature_matrix = []
-    for node in nodes:
-        feature_vector = [node[key] for key in feature_keys]
-        feature_matrix.append(feature_vector)
-    return np.array(feature_matrix)
+def get_execution_time(data):
+    """Extract execution time from JSON data"""
+    if 'scheduling_data' not in data:
+        return None
+    
+    schedules = data["scheduling_data"]
+    for item in schedules:
+        if isinstance(item, dict) and item.get('name') == 'total_execution_time_ms':
+            return float(item.get('value'))
+    
+    if schedules and isinstance(schedules[-1], dict) and 'value' in schedules[-1]:
+        return float(schedules[-1]['value'])
+    
+    return None
 
-# Extract the feature matrix and target
-X = create_feature_matrix(execution_details["nodes"], feature_keys)
-y = execution_details["total_execution_time_ms"]
+def process_nested_directory(root_dir):
+    """Process all JSON files in nested directory structure"""
+    all_features = []
+    file_paths = []
+    
+    # Walk through all subdirectories
+    for root, _, files in os.walk(root_dir):
+        for file in files:
+            if file.endswith('.json'):
+                file_path = os.path.join(root, file)
+                try:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                    
+                    execution_time = get_execution_time(data)
+                    if execution_time is None:
+                        continue
+                        
+                    # Extract features
+                    features = extract_features_from_json(data)
+                    features['execution_time'] = execution_time
+                    
+                    # Store relative path for identification
+                    rel_path = os.path.relpath(file_path, root_dir)
+                    all_features.append(features)
+                    file_paths.append(rel_path)
+                    
+                except Exception as e:
+                    print(f"Error processing {file_path}: {str(e)}")
+                    continue
+    
+    return all_features, file_paths
 
-# Normalize the features
-scaler = StandardScaler()
-X_normalized = scaler.fit_transform(X)
+def extract_features_from_json(data):
+    """Extract features from a single JSON file's data"""
+    features = {
+        'node_features': [],
+        'edge_features': [],
+        'schedule_features': []
+    }
+    
+    programming_details = data.get("programming_details", {})
+    
+    # Process nodes (operations)
+    for node in programming_details.get("Nodes", []):
+        node_feat = {'op_type_counts': {}}
+        if 'Details' in node and 'Op histogram' in node['Details']:
+            for op_line in node['Details']['Op histogram']:
+                parts = op_line.strip().split(':')
+                if len(parts) == 2:
+                    op_name = 'op_' + parts[0].strip().lower()
+                    op_count = int(parts[1].strip())
+                    node_feat['op_type_counts'][op_name] = op_count
+        features['node_features'].append(node_feat)
+    
+    # Process edges (data dependencies)
+    for edge in programming_details.get("Edges", []):
+        edge_feat = {
+            'data_size': edge.get('Size', 0),
+            'is_vector': int('vector' in edge.get('Name', '').lower())
+        }
+        features['edge_features'].append(edge_feat)
+    
+    # Process schedules
+    scheduling_data = data.get("scheduling_data", programming_details.get("Schedules", []))
+    for schedule in scheduling_data:
+        sched_feat = {
+            'bytes': schedule.get('bytes_at_production', 0),
+            'parallelism': schedule.get('inner_parallelism', 1) * schedule.get('outer_parallelism', 1),
+            'working_set': schedule.get('working_set', 0),
+            'vectors': schedule.get('num_vectors', 0)
+        }
+        features['schedule_features'].append(sched_feat)
+    
+    # Compute aggregated features
+    features['num_nodes'] = len(features['node_features'])
+    features['num_edges'] = len(features['edge_features'])
+    features['num_schedules'] = len(features['schedule_features'])
+    
+    # Node statistics
+    if features['node_features']:
+        op_counts = {}
+        for node in features['node_features']:
+            for op, count in node['op_type_counts'].items():
+                op_counts[op] = op_counts.get(op, 0) + count
+        
+        features['total_ops'] = sum(op_counts.values())
+        features['unique_ops'] = len(op_counts)
+        features['op_diversity'] = features['unique_ops'] / features['num_nodes'] if features['num_nodes'] > 0 else 0
+        
+        # Add top operation counts
+        for op, count in sorted(op_counts.items(), key=lambda x: x[1], reverse=True)[:5]:
+            features[op] = count
+    
+    # Edge statistics
+    if features['edge_features']:
+        features['total_data_size'] = sum(e['data_size'] for e in features['edge_features'])
+        features['vector_edges'] = sum(e['is_vector'] for e in features['edge_features'])
+    
+    # Schedule statistics
+    if features['schedule_features']:
+        features['total_bytes'] = sum(s['bytes'] for s in features['schedule_features'])
+        features['total_parallelism'] = sum(s['parallelism'] for s in features['schedule_features'])
+        features['total_working_set'] = sum(s['working_set'] for s in features['schedule_features'])
+        features['total_vectors'] = sum(s['vectors'] for s in features['schedule_features'])
+        
+        features['bytes_per_vector'] = features['total_bytes'] / (features['total_vectors'] + 1e-8)
+        features['memory_pressure'] = features['total_working_set'] / (features['total_bytes'] + 1e-8)
+    
+    return features
 
-# Reshape X for LSTM: [samples, timesteps, features]
-timesteps = X_normalized.shape[0]
-features = X_normalized.shape[1]
-X_lstm = X_normalized.reshape(1, timesteps, features)
+def create_sequential_representation(features, max_nodes=50, max_edges=100, max_schedules=20):
+    """Convert features into sequential format suitable for LSTM"""
+    seq_features = []
+    
+    # 1. Node features sequence
+    node_feats = []
+    for node in features['node_features'][:max_nodes]:
+        op_vector = [0] * len(OP_TYPES)
+        for op in node['op_type_counts']:
+            if op in OP_TYPES:
+                op_vector[OP_TYPES.index(op)] = 1
+        node_feats.append(op_vector)
+    
+    # Pad node sequence
+    while len(node_feats) < max_nodes:
+        node_feats.append([0] * len(OP_TYPES))
+    
+    # 2. Edge features sequence
+    edge_feats = []
+    for edge in features['edge_features'][:max_edges]:
+        edge_feats.append([edge['data_size'], edge['is_vector']])
+    
+    # Pad edge sequence
+    while len(edge_feats) < max_edges:
+        edge_feats.append([0, 0])
+    
+    # 3. Schedule features sequence
+    sched_feats = []
+    for sched in features['schedule_features'][:max_schedules]:
+        sched_feats.append([
+            sched['bytes'],
+            sched['parallelism'],
+            sched['working_set'],
+            sched['vectors']
+        ])
+    
+    # Pad schedule sequence
+    while len(sched_feats) < max_schedules:
+        sched_feats.append([0, 0, 0, 0])
+    
+    # Combine all sequences
+    seq_features.extend(node_feats)
+    seq_features.extend(edge_feats)
+    seq_features.extend(sched_feats)
+    
+    # Add aggregated features
+    seq_features.append([
+        features['num_nodes'] / max_nodes,
+        features['num_edges'] / max_edges,
+        features['num_schedules'] / max_schedules,
+        np.log1p(features['total_ops']),
+        features['unique_ops'] / len(OP_TYPES),
+        features['op_diversity'],
+        np.log1p(features['total_data_size']),
+        features['vector_edges'] / max_edges,
+        np.log1p(features['total_bytes']),
+        np.log1p(features['total_parallelism']),
+        np.log1p(features['total_working_set']),
+        np.log1p(features['total_vectors'] + 1),
+        np.log1p(features['bytes_per_vector'] + 1),
+        features['memory_pressure']
+    ])
+    
+    return np.array(seq_features, dtype=np.float32)
 
-# Simulate additional samples by perturbing the data
-num_simulated_samples = 100
-X_simulated = []
-y_simulated = []
+def prepare_data(all_features, test_size=0.2):
+    """Prepare train/test split and scale data"""
+    # Convert features to sequential format
+    X = np.array([create_sequential_representation(f) for f in all_features])
+    
+    # Get execution times and apply log transform
+    y = np.log1p(np.array([f['execution_time'] for f in all_features], dtype=np.float32))
+    
+    # Split data
+    split_idx = int(len(X) * (1 - test_size))
+    X_train, X_test = X[:split_idx], X[split_idx:]
+    y_train, y_test = y[:split_idx], y[split_idx:]
+    
+    # Reshape for scaling
+    X_train_flat = X_train.reshape(X_train.shape[0], -1)
+    X_test_flat = X_test.reshape(X_test.shape[0], -1)
+    
+    # Scale features
+    scaler_X = StandardScaler()
+    X_train_scaled = scaler_X.fit_transform(X_train_flat)
+    X_test_scaled = scaler_X.transform(X_test_flat)
+    
+    # Scale targets
+    scaler_y = StandardScaler()
+    y_train_scaled = scaler_y.fit_transform(y_train.reshape(-1, 1))
+    y_test_scaled = scaler_y.transform(y_test.reshape(-1, 1))
+    
+    # Convert to tensors
+    X_train_tensor = torch.FloatTensor(X_train_scaled).reshape(-1, 1, X_train_scaled.shape[1])
+    y_train_tensor = torch.FloatTensor(y_train_scaled)
+    X_test_tensor = torch.FloatTensor(X_test_scaled).reshape(-1, 1, X_test_scaled.shape[1])
+    y_test_tensor = torch.FloatTensor(y_test_scaled)
+    
+    return (X_train_tensor, y_train_tensor, X_test_tensor, y_test_tensor, 
+            scaler_X, scaler_y, X_train_scaled.shape[1])
 
-for _ in range(num_simulated_samples):
-    noise = np.random.uniform(0.9, 1.1, size=X.shape)
-    X_perturbed = X * noise
-    X_perturbed_normalized = scaler.transform(X_perturbed)
-    X_simulated.append(X_perturbed_normalized)
-    noise_y = np.random.uniform(0.9, 1.1)
-    y_perturbed = y * noise_y
-    y_simulated.append(y_perturbed)
-
-X_simulated = np.array(X_simulated)
-y_simulated = np.array(y_simulated)
-
-# Convert to PyTorch tensors
-X_tensor = torch.tensor(X_simulated, dtype=torch.float32)
-y_tensor = torch.tensor(y_simulated, dtype=torch.float32).unsqueeze(1)  # Shape: [num_samples, 1]
-
-# Split the data into training and testing sets
-X_train, X_test, y_train, y_test = train_test_split(X_tensor, y_tensor, test_size=0.2, random_state=42)
-
-# Create DataLoader for batch processing
-train_dataset = TensorDataset(X_train, y_train)
-test_dataset = TensorDataset(X_test, y_test)
-train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
-test_loader = DataLoader(test_dataset, batch_size=16, shuffle=False)
-
-# Step 3: Define the LSTM model using PyTorch
-class LSTMModel(nn.Module):
-    def __init__(self, input_size, hidden_size1, hidden_size2, output_size):
-        super(LSTMModel, self).__init__()
-        self.lstm1 = nn.LSTM(input_size, hidden_size1, batch_first=True)
-        self.dropout1 = nn.Dropout(0.2)
-        self.lstm2 = nn.LSTM(hidden_size1, hidden_size2, batch_first=True)
-        self.dropout2 = nn.Dropout(0.2)
-        self.fc1 = nn.Linear(hidden_size2, 16)
-        self.relu = nn.ReLU()
-        self.fc2 = nn.Linear(16, output_size)
-
+class ProgramExecutionPredictor(nn.Module):
+    def __init__(self, input_size, hidden_size=128, num_layers=3, dropout=0.3):
+        super(ProgramExecutionPredictor, self).__init__()
+        
+        self.lstm = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0
+        )
+        
+        self.attention = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.Tanh(),
+            nn.Linear(hidden_size, 1)
+        )
+        
+        self.node_head = nn.Linear(hidden_size, hidden_size//2)
+        self.edge_head = nn.Linear(hidden_size, hidden_size//2)
+        self.sched_head = nn.Linear(hidden_size, hidden_size//2)
+        
+        self.fc = nn.Sequential(
+            nn.Linear(hidden_size * 2, hidden_size),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, hidden_size//2),
+            nn.ReLU(),
+            nn.Linear(hidden_size//2, 1)
+        )
+        
     def forward(self, x):
-        # Initialize hidden states
-        batch_size = x.size(0)
-        h0 = torch.zeros(1, batch_size, 64).to(x.device)
-        c0 = torch.zeros(1, batch_size, 64).to(x.device)
+        lstm_out, _ = self.lstm(x)
         
-        # First LSTM layer
-        out, _ = self.lstm1(x, (h0, c0))
-        out = self.dropout1(out)
+        # Attention mechanism
+        attn_weights = F.softmax(self.attention(lstm_out), dim=1)
+        context = torch.sum(attn_weights * lstm_out, dim=1)
         
-        # Second LSTM layer
-        h1 = torch.zeros(1, batch_size, 32).to(x.device)
-        c1 = torch.zeros(1, batch_size, 32).to(x.device)
-        out, _ = self.lstm2(out, (h1, c1))
-        out = self.dropout2(out)
+        # Feature-specific processing
+        node_features = F.relu(self.node_head(context))
+        edge_features = F.relu(self.edge_head(context))
+        sched_features = F.relu(self.sched_head(context))
         
-        # Take the output of the last timestep
-        out = out[:, -1, :]
-        out = self.fc1(out)
-        out = self.relu(out)
-        out = self.fc2(out)
-        return out
+        # Combine features
+        combined = torch.cat([context, node_features, edge_features, sched_features], dim=1)
+        
+        return self.fc(combined)
 
-# Instantiate the model
-input_size = features  # Number of features per timestep
-hidden_size1 = 64
-hidden_size2 = 32
-output_size = 1  # Predicting a single value (execution time)
-model = LSTMModel(input_size, hidden_size1, hidden_size2, output_size)
-
-# Move model to GPU if available
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = model.to(device)
-
-# Define loss function and optimizer
-criterion = nn.MSELoss()
-optimizer = optim.Adam(model.parameters(), lr=0.001)
-
-# Training loop
-num_epochs = 50
-train_losses = []
-val_losses = []
-train_maes = []
-val_maes = []
-
-for epoch in range(num_epochs):
-    model.train()
-    train_loss = 0.0
-    train_mae = 0.0
-    for batch_X, batch_y in train_loader:
-        batch_X, batch_y = batch_X.to(device), batch_y.to(device)
-        
-        # Forward pass
-        outputs = model(batch_X)
-        loss = criterion(outputs, batch_y)
-        
-        # Backward pass and optimization
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        
-        train_loss += loss.item() * batch_X.size(0)
-        train_mae += torch.mean(torch.abs(outputs - batch_y)).item() * batch_X.size(0)
+def train_and_evaluate(X_train, y_train, X_test, y_test, input_size, epochs=150, patience=20):
+    device = torch.device('cpu')
     
-    train_loss /= len(train_loader.dataset)
-    train_mae /= len(train_loader.dataset)
-    train_losses.append(train_loss)
-    train_maes.append(train_mae)
+    # Create data loaders
+    train_dataset = TensorDataset(X_train, y_train)
+    test_dataset = TensorDataset(X_test, y_test)
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
     
-    # Validation
+    # Initialize model
+    model = ProgramExecutionPredictor(input_size=input_size).to(device)
+    
+    # Training setup
+    criterion = nn.HuberLoss()
+    optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-5)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
+    
+    best_val_loss = float('inf')
+    epochs_no_improve = 0
+    
+    # Training loop
+    for epoch in range(epochs):
+        model.train()
+        train_loss = 0.0
+        for inputs, targets in train_loader:
+            inputs, targets = inputs.to(device), targets.to(device)
+            
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            
+            train_loss += loss.item() * inputs.size(0)
+        
+        train_loss /= len(train_loader.dataset)
+        
+        # Validation
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for inputs, targets in test_loader:
+                inputs, targets = inputs.to(device), targets.to(device)
+                outputs = model(inputs)
+                val_loss += criterion(outputs, targets).item() * inputs.size(0)
+        
+        val_loss /= len(test_loader.dataset)
+        scheduler.step(val_loss)
+        
+        print(f'Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
+        
+        # Early stopping
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            epochs_no_improve = 0
+            torch.save(model.state_dict(), 'best_model.pt')
+        else:
+            epochs_no_improve += 1
+            if epochs_no_improve >= patience:
+                print(f'Early stopping at epoch {epoch+1}')
+                model.load_state_dict(torch.load('best_model.pt'))
+                break
+    
+    # Final evaluation
     model.eval()
-    val_loss = 0.0
-    val_mae = 0.0
     with torch.no_grad():
-        for batch_X, batch_y in test_loader:
-            batch_X, batch_y = batch_X.to(device), batch_y.to(device)
-            outputs = model(batch_X)
-            loss = criterion(outputs, batch_y)
-            val_loss += loss.item() * batch_X.size(0)
-            val_mae += torch.mean(torch.abs(outputs - batch_y)).item() * batch_X.size(0)
+        y_pred_scaled = model(X_test.to(device)).cpu().numpy()
     
-    val_loss /= len(test_loader.dataset)
-    val_mae /= len(test_loader.dataset)
-    val_losses.append(val_loss)
-    val_maes.append(val_mae)
+    return model, y_pred_scaled
+
+def main():
+    # Configuration
+    DATA_DIR = "synthetic_data"
+    RANDOM_SEED = 42
+    TEST_SIZE = 0.2
     
-    print(f"Epoch [{epoch+1}/{num_epochs}], Train Loss: {train_loss:.4f}, Train MAE: {train_mae:.4f}, "
-          f"Val Loss: {val_loss:.4f}, Val MAE: {val_mae:.4f}")
+    # Set random seed for reproducibility
+    random.seed(RANDOM_SEED)
+    torch.manual_seed(RANDOM_SEED)
+    np.random.seed(RANDOM_SEED)
+    
+    # Process all JSON files in nested directory structure
+    print("Processing JSON files...")
+    all_features, file_paths = process_nested_directory(DATA_DIR)
+    
+    if len(all_features) < 100:
+        raise ValueError(f"Insufficient data - only {len(all_features)} samples found (need at least 100)")
+    
+    print(f"\nSuccessfully processed {len(all_features)} program files")
+    print(f"Total features per sample: {len(create_sequential_representation(all_features[0]))}")
+    
+    # Prepare data
+    print("\nPreparing training data...")
+    X_train, y_train, X_test, y_test, scaler_X, scaler_y, input_size = prepare_data(all_features, TEST_SIZE)
+    
+    # Train and evaluate model
+    print("\nTraining model...")
+    model, y_pred_scaled = train_and_evaluate(X_train, y_train, X_test, y_test, input_size)
+    
+    # Inverse transform predictions
+    y_pred = np.expm1(scaler_y.inverse_transform(y_pred_scaled))
+    y_true = np.expm1(scaler_y.inverse_transform(y_test.numpy()))
+    
+    # Calculate metrics
+    mse = np.mean((y_true - y_pred) ** 2)
+    mae = np.mean(np.abs(y_true - y_pred))
+    mape = np.mean(np.abs((y_true - y_pred) / y_true)) * 100
+    
+    print("\nFinal Evaluation Results:")
+    print(f"MSE: {mse:.2f}")
+    print(f"MAE: {mae:.2f}")
+    print(f"MAPE: {mape:.2f}%")
+    
+    # Save model and scalers
+    torch.save(model.state_dict(), 'execution_predictor.pt')
+    print("\nSaved model to 'execution_predictor.pt'")
+    
+    # Save scalers for inference
+    import joblib
+    joblib.dump(scaler_X, 'scaler_X.pkl')
+    joblib.dump(scaler_y, 'scaler_y.pkl')
+    print("Saved scalers for inference")
 
-# Evaluate the model on the test set
-model.eval()
-test_loss = 0.0
-test_mae = 0.0
-with torch.no_grad():
-    for batch_X, batch_y in test_loader:
-        batch_X, batch_y = batch_X.to(device), batch_y.to(device)
-        outputs = model(batch_X)
-        loss = criterion(outputs, batch_y)
-        test_loss += loss.item() * batch_X.size(0)
-        test_mae += torch.mean(torch.abs(outputs - batch_y)).item() * batch_X.size(0)
-
-test_loss /= len(test_loader.dataset)
-test_mae /= len(test_loader.dataset)
-print(f"\nTest Loss (MSE): {test_loss:.4f}")
-print(f"Test MAE: {test_mae:.4f}")
-
-# Predict on the original data
-X_original = torch.tensor(X_lstm, dtype=torch.float32).to(device)
-model.eval()
-with torch.no_grad():
-    y_pred = model(X_original)
-y_pred = y_pred.cpu().numpy()
-print(f"\nPredicted Execution Time: {y_pred[0][0]:.4f} ms")
-print(f"Actual Execution Time: {y:.4f} ms")
-
-# Plot training and validation loss
-plt.figure(figsize=(10, 5))
-plt.plot(train_losses, label="Training Loss")
-plt.plot(val_losses, label="Validation Loss")
-plt.title("Training and Validation Loss Over Epochs")
-plt.xlabel("Epoch")
-plt.ylabel("Loss (MSE)")
-plt.legend()
-plt.show()
-
-# Plot training and validation MAE
-plt.figure(figsize=(10, 5))
-plt.plot(train_maes, label="Training MAE")
-plt.plot(val_maes, label="Validation MAE")
-plt.title("Training and Validation MAE Over Epochs")
-plt.xlabel("Epoch")
-plt.ylabel("MAE")
-plt.legend()
-plt.show()
+if __name__ == "__main__":
+    main()
