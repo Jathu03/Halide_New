@@ -18,6 +18,15 @@ OP_TYPES = [
     'op_cos', 'op_tanh', 'op_conv', 'op_pool', 'op_matmul'
 ]
 
+# Configuration constants
+MAX_NODES = 50
+MAX_EDGES = 100
+MAX_SCHEDULES = 20
+NODE_FEATURES = len(OP_TYPES)
+EDGE_FEATURES = 2  # data_size, is_vector
+SCHEDULE_FEATURES = 4  # bytes, parallelism, working_set, vectors
+AGG_FEATURES = 14  # Number of aggregated features
+
 def get_execution_time(data):
     """Extract execution time from JSON data"""
     if 'scheduling_data' not in data:
@@ -33,7 +42,7 @@ def get_execution_time(data):
     
     return None
 
-def process_nested_directory(root_dir):
+def process_nested_directory(root_dir, max_samples=None):
     """Process all JSON files in nested directory structure"""
     all_features = []
     file_paths = []
@@ -42,6 +51,9 @@ def process_nested_directory(root_dir):
     for root, _, files in os.walk(root_dir):
         for file in files:
             if file.endswith('.json'):
+                if max_samples and len(all_features) >= max_samples:
+                    break
+                    
                 file_path = os.path.join(root, file)
                 try:
                     with open(file_path, 'r', encoding='utf-8') as f:
@@ -107,129 +119,90 @@ def extract_features_from_json(data):
         }
         features['schedule_features'].append(sched_feat)
     
-    # Compute aggregated features
-    features['num_nodes'] = len(features['node_features'])
-    features['num_edges'] = len(features['edge_features'])
-    features['num_schedules'] = len(features['schedule_features'])
-    
-    # Node statistics
-    if features['node_features']:
-        op_counts = {}
-        for node in features['node_features']:
-            for op, count in node['op_type_counts'].items():
-                op_counts[op] = op_counts.get(op, 0) + count
-        
-        features['total_ops'] = sum(op_counts.values())
-        features['unique_ops'] = len(op_counts)
-        features['op_diversity'] = features['unique_ops'] / features['num_nodes'] if features['num_nodes'] > 0 else 0
-        
-        # Add top operation counts
-        for op, count in sorted(op_counts.items(), key=lambda x: x[1], reverse=True)[:5]:
-            features[op] = count
-    
-    # Edge statistics
-    if features['edge_features']:
-        features['total_data_size'] = sum(e['data_size'] for e in features['edge_features'])
-        features['vector_edges'] = sum(e['is_vector'] for e in features['edge_features'])
-    
-    # Schedule statistics
-    if features['schedule_features']:
-        features['total_bytes'] = sum(s['bytes'] for s in features['schedule_features'])
-        features['total_parallelism'] = sum(s['parallelism'] for s in features['schedule_features'])
-        features['total_working_set'] = sum(s['working_set'] for s in features['schedule_features'])
-        features['total_vectors'] = sum(s['vectors'] for s in features['schedule_features'])
-        
-        features['bytes_per_vector'] = features['total_bytes'] / (features['total_vectors'] + 1e-8)
-        features['memory_pressure'] = features['total_working_set'] / (features['total_bytes'] + 1e-8)
-    
     return features
 
-def create_sequential_representation(features, max_nodes=50, max_edges=100, max_schedules=20):
-    """Convert features into sequential format suitable for LSTM"""
-    seq_features = []
+def create_sequential_representation(features):
+    """Convert features into fixed-size sequential format"""
+    # Initialize empty arrays for each feature type
+    node_feats = np.zeros((MAX_NODES, NODE_FEATURES), dtype=np.float32)
+    edge_feats = np.zeros((MAX_EDGES, EDGE_FEATURES), dtype=np.float32)
+    sched_feats = np.zeros((MAX_SCHEDULES, SCHEDULE_FEATURES), dtype=np.float32)
     
-    # 1. Node features sequence
-    node_feats = []
-    for node in features['node_features'][:max_nodes]:
-        op_vector = [0] * len(OP_TYPES)
-        for op in node['op_type_counts']:
+    # Fill node features
+    for i, node in enumerate(features['node_features'][:MAX_NODES]):
+        for op, count in node['op_type_counts'].items():
             if op in OP_TYPES:
-                op_vector[OP_TYPES.index(op)] = 1
-        node_feats.append(op_vector)
+                node_feats[i, OP_TYPES.index(op)] = min(count, 1)  # Binary indicator
     
-    # Pad node sequence
-    while len(node_feats) < max_nodes:
-        node_feats.append([0] * len(OP_TYPES))
+    # Fill edge features
+    for i, edge in enumerate(features['edge_features'][:MAX_EDGES]):
+        edge_feats[i, 0] = np.log1p(edge['data_size'])
+        edge_feats[i, 1] = edge['is_vector']
     
-    # 2. Edge features sequence
-    edge_feats = []
-    for edge in features['edge_features'][:max_edges]:
-        edge_feats.append([edge['data_size'], edge['is_vector']])
+    # Fill schedule features
+    for i, sched in enumerate(features['schedule_features'][:MAX_SCHEDULES]):
+        sched_feats[i, 0] = np.log1p(sched['bytes'] + 1)
+        sched_feats[i, 1] = np.log1p(sched['parallelism'] + 1)
+        sched_feats[i, 2] = np.log1p(sched['working_set'] + 1)
+        sched_feats[i, 3] = np.log1p(sched['vectors'] + 1)
     
-    # Pad edge sequence
-    while len(edge_feats) < max_edges:
-        edge_feats.append([0, 0])
+    # Compute aggregated features
+    num_nodes = min(len(features['node_features']), MAX_NODES)
+    num_edges = min(len(features['edge_features']), MAX_EDGES)
+    num_schedules = min(len(features['schedule_features']), MAX_SCHEDULES)
     
-    # 3. Schedule features sequence
-    sched_feats = []
-    for sched in features['schedule_features'][:max_schedules]:
-        sched_feats.append([
-            sched['bytes'],
-            sched['parallelism'],
-            sched['working_set'],
-            sched['vectors']
-        ])
+    # Count operations
+    op_counts = {}
+    for node in features['node_features'][:MAX_NODES]:
+        for op, count in node['op_type_counts'].items():
+            op_counts[op] = op_counts.get(op, 0) + count
     
-    # Pad schedule sequence
-    while len(sched_feats) < max_schedules:
-        sched_feats.append([0, 0, 0, 0])
+    agg_feats = np.array([
+        num_nodes / MAX_NODES,
+        num_edges / MAX_EDGES,
+        num_schedules / MAX_SCHEDULES,
+        np.log1p(sum(op_counts.values())),
+        len(op_counts) / len(OP_TYPES),
+        len(op_counts) / (num_nodes + 1e-8),
+        np.log1p(sum(e['data_size'] for e in features['edge_features'][:MAX_EDGES]) + 1),
+        sum(e['is_vector'] for e in features['edge_features'][:MAX_EDGES]) / (num_edges + 1e-8),
+        np.log1p(sum(s['bytes'] for s in features['schedule_features'][:MAX_SCHEDULES]) + 1),
+        np.log1p(sum(s['parallelism'] for s in features['schedule_features'][:MAX_SCHEDULES]) + 1),
+        np.log1p(sum(s['working_set'] for s in features['schedule_features'][:MAX_SCHEDULES]) + 1),
+        np.log1p(sum(s['vectors'] for s in features['schedule_features'][:MAX_SCHEDULES]) + 1),
+        np.log1p((sum(s['bytes'] for s in features['schedule_features'][:MAX_SCHEDULES]) / 
+                (sum(s['vectors'] for s in features['schedule_features'][:MAX_SCHEDULES]) + 1e-8) + 1),
+        (sum(s['working_set'] for s in features['schedule_features'][:MAX_SCHEDULES]) / 
+         (sum(s['bytes'] for s in features['schedule_features'][:MAX_SCHEDULES]) + 1e-8)
+    ], dtype=np.float32)
     
-    # Combine all sequences
-    seq_features.extend(node_feats)
-    seq_features.extend(edge_feats)
-    seq_features.extend(sched_feats)
-    
-    # Add aggregated features
-    seq_features.append([
-        features['num_nodes'] / max_nodes,
-        features['num_edges'] / max_edges,
-        features['num_schedules'] / max_schedules,
-        np.log1p(features['total_ops']),
-        features['unique_ops'] / len(OP_TYPES),
-        features['op_diversity'],
-        np.log1p(features['total_data_size']),
-        features['vector_edges'] / max_edges,
-        np.log1p(features['total_bytes']),
-        np.log1p(features['total_parallelism']),
-        np.log1p(features['total_working_set']),
-        np.log1p(features['total_vectors'] + 1),
-        np.log1p(features['bytes_per_vector'] + 1),
-        features['memory_pressure']
+    # Combine all features into a single flat array
+    sequential_features = np.concatenate([
+        node_feats.flatten(),
+        edge_feats.flatten(),
+        sched_feats.flatten(),
+        agg_feats.flatten()
     ])
     
-    return np.array(seq_features, dtype=np.float32)
+    return sequential_features
 
-def prepare_data(all_features, test_size=0.2):
-    """Prepare train/test split and scale data"""
+def prepare_data(all_features, file_paths, test_size=10):
+    """Prepare data with fixed test size of 10 samples"""
     # Convert features to sequential format
     X = np.array([create_sequential_representation(f) for f in all_features])
     
     # Get execution times and apply log transform
     y = np.log1p(np.array([f['execution_time'] for f in all_features], dtype=np.float32))
     
-    # Split data
-    split_idx = int(len(X) * (1 - test_size))
-    X_train, X_test = X[:split_idx], X[split_idx:]
-    y_train, y_test = y[:split_idx], y[split_idx:]
-    
-    # Reshape for scaling
-    X_train_flat = X_train.reshape(X_train.shape[0], -1)
-    X_test_flat = X_test.reshape(X_test.shape[0], -1)
+    # Split data - last 10 samples for test
+    X_train, X_test = X[:-test_size], X[-test_size:]
+    y_train, y_test = y[:-test_size], y[-test_size:]
+    test_files = file_paths[-test_size:]
     
     # Scale features
     scaler_X = StandardScaler()
-    X_train_scaled = scaler_X.fit_transform(X_train_flat)
-    X_test_scaled = scaler_X.transform(X_test_flat)
+    X_train_scaled = scaler_X.fit_transform(X_train)
+    X_test_scaled = scaler_X.transform(X_test)
     
     # Scale targets
     scaler_y = StandardScaler()
@@ -243,7 +216,7 @@ def prepare_data(all_features, test_size=0.2):
     y_test_tensor = torch.FloatTensor(y_test_scaled)
     
     return (X_train_tensor, y_train_tensor, X_test_tensor, y_test_tensor, 
-            scaler_X, scaler_y, X_train_scaled.shape[1])
+            scaler_X, scaler_y, X_train_scaled.shape[1], test_files)
 
 class ProgramExecutionPredictor(nn.Module):
     def __init__(self, input_size, hidden_size=128, num_layers=3, dropout=0.3):
@@ -263,17 +236,13 @@ class ProgramExecutionPredictor(nn.Module):
             nn.Linear(hidden_size, 1)
         )
         
-        self.node_head = nn.Linear(hidden_size, hidden_size//2)
-        self.edge_head = nn.Linear(hidden_size, hidden_size//2)
-        self.sched_head = nn.Linear(hidden_size, hidden_size//2)
-        
         self.fc = nn.Sequential(
-            nn.Linear(hidden_size * 2, hidden_size),
-            nn.ReLU(),
-            nn.Dropout(dropout),
             nn.Linear(hidden_size, hidden_size//2),
             nn.ReLU(),
-            nn.Linear(hidden_size//2, 1)
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size//2, hidden_size//4),
+            nn.ReLU(),
+            nn.Linear(hidden_size//4, 1)
         )
         
     def forward(self, x):
@@ -283,17 +252,9 @@ class ProgramExecutionPredictor(nn.Module):
         attn_weights = F.softmax(self.attention(lstm_out), dim=1)
         context = torch.sum(attn_weights * lstm_out, dim=1)
         
-        # Feature-specific processing
-        node_features = F.relu(self.node_head(context))
-        edge_features = F.relu(self.edge_head(context))
-        sched_features = F.relu(self.sched_head(context))
-        
-        # Combine features
-        combined = torch.cat([context, node_features, edge_features, sched_features], dim=1)
-        
-        return self.fc(combined)
+        return self.fc(context)
 
-def train_and_evaluate(X_train, y_train, X_test, y_test, input_size, epochs=150, patience=20):
+def train_and_evaluate(X_train, y_train, X_test, y_test, input_size, test_files, epochs=50, patience=10):
     device = torch.device('cpu')
     
     # Create data loaders
@@ -357,41 +318,40 @@ def train_and_evaluate(X_train, y_train, X_test, y_test, input_size, epochs=150,
                 model.load_state_dict(torch.load('best_model.pt'))
                 break
     
-    # Final evaluation
+    # Final evaluation on test set
     model.eval()
     with torch.no_grad():
         y_pred_scaled = model(X_test.to(device)).cpu().numpy()
     
-    return model, y_pred_scaled
+    return y_pred_scaled
 
 def main():
     # Configuration
     DATA_DIR = "synthetic_data"
-    RANDOM_SEED = 42
-    TEST_SIZE = 0.2
+    TEST_SIZE = 10  # Test on exactly 10 samples
+    SAMPLE_LIMIT = 1000  # Limit total samples for faster testing
     
-    # Set random seed for reproducibility
-    random.seed(RANDOM_SEED)
-    torch.manual_seed(RANDOM_SEED)
-    np.random.seed(RANDOM_SEED)
+    # Process JSON files (limit to SAMPLE_LIMIT for testing)
+    print(f"Processing up to {SAMPLE_LIMIT} JSON files...")
+    all_features, file_paths = process_nested_directory(DATA_DIR, max_samples=SAMPLE_LIMIT)
     
-    # Process all JSON files in nested directory structure
-    print("Processing JSON files...")
-    all_features, file_paths = process_nested_directory(DATA_DIR)
-    
-    if len(all_features) < 100:
-        raise ValueError(f"Insufficient data - only {len(all_features)} samples found (need at least 100)")
+    if len(all_features) < TEST_SIZE + 10:  # Need at least TEST_SIZE + 10 for meaningful training
+        raise ValueError(f"Insufficient data - only {len(all_features)} samples found (need at least {TEST_SIZE + 10})")
     
     print(f"\nSuccessfully processed {len(all_features)} program files")
-    print(f"Total features per sample: {len(create_sequential_representation(all_features[0]))}")
     
-    # Prepare data
+    # Prepare data with fixed test size
     print("\nPreparing training data...")
-    X_train, y_train, X_test, y_test, scaler_X, scaler_y, input_size = prepare_data(all_features, TEST_SIZE)
+    X_train, y_train, X_test, y_test, scaler_X, scaler_y, input_size, test_files = prepare_data(
+        all_features, file_paths, test_size=TEST_SIZE
+    )
+    
+    print(f"\nTraining samples: {len(X_train)}, Test samples: {len(X_test)}")
+    print(f"Input feature dimension: {input_size}")
     
     # Train and evaluate model
     print("\nTraining model...")
-    model, y_pred_scaled = train_and_evaluate(X_train, y_train, X_test, y_test, input_size)
+    y_pred_scaled = train_and_evaluate(X_train, y_train, X_test, y_test, input_size, test_files)
     
     # Inverse transform predictions
     y_pred = np.expm1(scaler_y.inverse_transform(y_pred_scaled))
@@ -402,20 +362,27 @@ def main():
     mae = np.mean(np.abs(y_true - y_pred))
     mape = np.mean(np.abs((y_true - y_pred) / y_true)) * 100
     
-    print("\nFinal Evaluation Results:")
+    print("\nTest Set Evaluation Results:")
     print(f"MSE: {mse:.2f}")
     print(f"MAE: {mae:.2f}")
     print(f"MAPE: {mape:.2f}%")
     
-    # Save model and scalers
-    torch.save(model.state_dict(), 'execution_predictor.pt')
-    print("\nSaved model to 'execution_predictor.pt'")
+    # Print individual test results
+    print("\nDetailed Predictions for Test Samples:")
+    for i in range(len(test_files)):
+        print(f"\nFile: {test_files[i]}")
+        print(f"Actual: {y_true[i][0]:.2f} ms, Predicted: {y_pred[i][0]:.2f} ms")
+        print(f"Error: {abs(y_true[i][0] - y_pred[i][0]) / y_true[i][0] * 100:.2f}%")
     
-    # Save scalers for inference
-    import joblib
-    joblib.dump(scaler_X, 'scaler_X.pkl')
-    joblib.dump(scaler_y, 'scaler_y.pkl')
-    print("Saved scalers for inference")
+    # Save model and scalers
+    torch.save({
+        'model_state_dict': torch.load('best_model.pt'),
+        'scaler_X': scaler_X,
+        'scaler_y': scaler_y,
+        'op_types': OP_TYPES,
+        'input_size': input_size
+    }, 'execution_predictor.pth')
+    print("\nSaved model and scalers to 'execution_predictor.pth'")
 
 if __name__ == "__main__":
     main()
