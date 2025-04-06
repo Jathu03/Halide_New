@@ -105,7 +105,6 @@ def extract_features_from_file(file_path):
         working_set = sf.get('working_set', 0.0)
         inner_p = sf.get('inner_parallelism', 0.0)
         outer_p = sf.get('outer_parallelism', 0.0)
-        # Derived features with log scaling for stability
         seq_vector.append(np.log1p(abs(bytes_prod)) / np.log1p(max(abs(bytes_real), 1e-4)) if bytes_real != 0 else 0.0)
         seq_vector.append(np.log1p(bytes_prod) / np.log1p(max(num_vec, 1e-4)) if num_vec != 0 else 0.0)
         seq_vector.append(np.log1p(points_total) / np.log1p(max(num_vec, 1e-4)) if num_vec != 0 else 0.0)
@@ -157,7 +156,7 @@ def extract_features_from_file(file_path):
     return {
         'scheduling_sequence': scheduling_sequence,
         'scalar_features': scalar_features,
-        'execution、中央_time': execution_time
+        'execution_time': execution_time  # Corrected key
     }
 
 def process_directory(directory_path):
@@ -225,9 +224,9 @@ def prepare_data_for_model(train_features, test_features):
     train_scalar_df = train_scalar_df.fillna(0)
     test_scalar_df = test_scalar_df.fillna(0)
     
-    y_train_raw = np.array([f['execution_time'] for f in train_features])
-    y_test_raw = np.array([f['execution_time'] for f in test_features])
-    y_train_raw = np.clip(y_train_raw, 0, np.percentile(y_train_raw, 99))  # Cap at 99th percentile
+    y_train_raw = np.array([f['execution_time'] for f in train_features])  # Corrected key
+    y_test_raw = np.array([f['execution_time'] for f in test_features])    # Corrected key
+    y_train_raw = np.clip(y_train_raw, 0, np.percentile(y_train_raw, 99))
     y_test_raw = np.clip(y_test_raw, 0, np.percentile(y_test_raw, 99))
     
     y_train = np.log1p(y_train_raw).reshape(-1, 1)
@@ -292,7 +291,6 @@ class EnhancedRecursiveLSTMModel(nn.Module):
     def __init__(self, seq_input_size, scalar_input_size, hidden_sizes=[512, 256, 128], output_size=1, dropout_rate=0.2, num_heads=8):
         super(EnhancedRecursiveLSTMModel, self).__init__()
         
-        # Deeper Bidirectional LSTM with LayerNorm
         self.lstm_layers = nn.ModuleList()
         self.ln_layers = nn.ModuleList()
         self.lstm_layers.append(nn.LSTM(seq_input_size, hidden_sizes[0], batch_first=True, bidirectional=True))
@@ -301,10 +299,8 @@ class EnhancedRecursiveLSTMModel(nn.Module):
             self.lstm_layers.append(nn.LSTM(hidden_sizes[i-1] * 2, hidden_sizes[i], batch_first=True, bidirectional=True))
             self.ln_layers.append(nn.LayerNorm(hidden_sizes[i] * 2))
         
-        # Multi-head attention
         self.attention = MultiHeadAttention(hidden_sizes[-1] * 2, num_heads, dropout_rate)
         
-        # Fully connected layers with residual connections and LayerNorm
         combined_size = hidden_sizes[-1] * 2 + scalar_input_size
         self.fc1 = nn.Linear(combined_size, 256)
         self.bn1 = nn.BatchNorm1d(256)
@@ -446,7 +442,6 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
     if best_model_state is not None and epochs_no_improve > 0:
         model.load_state_dict(best_model_state)
     
-    # Plot training and validation losses
     plt.figure(figsize=(10, 6))
     plt.plot(range(1, len(train_losses) + 1), train_losses, label='Training Loss')
     plt.plot(range(1, len(val_losses) + 1), val_losses, label='Validation Loss')
@@ -478,9 +473,6 @@ def evaluate_model(model, X_test_seq, X_test_scalar, y_test, y_scaler, file_name
     y_test_actual = np.expm1(y_test_transformed)
     y_pred_actual = np.expm1(y_pred_transformed)
     
-    avg_actual = np.mean(y_test_actual)
-    avg_predicted = np.mean(y_pred_actual)
-    
     results_by_subfolder = {}
     for i, file_path in enumerate(file_names_test):
         subfolder = file_path.split('/')[0]
@@ -509,14 +501,12 @@ def evaluate_model(model, X_test_seq, X_test_scalar, y_test, y_scaler, file_name
     mape = np.mean(np.abs((y_test_actual - y_pred_actual) / (y_test_actual + 1e-8))) * 100
     
     print("\nOverall Model Performance:")
-    print(f"Average Actual Execution Time: {avg_actual:.2f} ms")
-    print(f"Average Predicted Execution Time: {avg_predicted:.2f} ms")
     print(f"MSE: {mse:.2f}")
     print(f"RMSE: {rmse:.2f}")
     print(f"MAE: {mae:.2f}")
     print(f"MAPE: {mape:.2f}%")
     
-    return y_test_actual, y_pred_actual, avg_actual, avg_predicted
+    return y_test_actual, y_pred_actual
 
 def main(main_dir):
     print(f"Processing main directory: {main_dir}")
@@ -539,7 +529,7 @@ def main(main_dir):
         batch_size=64
     )
     
-    global model  # Define model globally for custom_loss
+    global model
     model = EnhancedRecursiveLSTMModel(
         seq_input_size=seq_input_size,
         scalar_input_size=scalar_input_size,
@@ -563,21 +553,19 @@ def main(main_dir):
         return None
     
     print("\nEvaluating model:")
-    y_test_actual, y_pred_actual, avg_actual, avg_predicted = evaluate_model(
+    y_test_actual, y_pred_actual = evaluate_model(
         model, test_sequences, test_scalar, y_test,
         y_scaler, test_file_names
     )
     
     print(f"\nSummary for Comparison:")
     print(f"Model: EnhancedRecursiveLSTM")
-    print(f"Average Actual Execution Time: {avg_actual:.2f} ms")
-    print(f"Average Predicted Execution Time: {avg_predicted:.2f} ms")
     
-    return model, y_scaler, y_test_actual, y_pred_actual, avg_actual, avg_predicted
+    return model, y_scaler, y_test_actual, y_pred_actual
 
 if __name__ == "__main__":
     main_dir = "synthetic_data"
     random.seed(42)
     torch.manual_seed(42)
     np.random.seed(42)
-    model, y_scaler, y_test_actual, y_pred_actual, avg_actual, avg_predicted = main(main_dir)
+    model, y_scaler, y_test_actual, y_pred_actual = main(main_dir)s
