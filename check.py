@@ -94,7 +94,6 @@ def extract_features_from_file(file_path):
                 sched_feature.update(sf)
             scheduling_features.append(sched_feature)
     
-    # Enhanced scheduling sequence with additional derived features
     scheduling_sequence = []
     for sf in scheduling_features:
         seq_vector = [float(sf.get(metric, 0.0)) for metric in important_metrics]
@@ -115,13 +114,11 @@ def extract_features_from_file(file_path):
     if not scheduling_sequence:
         scheduling_sequence = [[0.0] * (len(important_metrics) + 6)]
     
-    # Robust scaling with per-sample normalization
     seq_array = np.array(scheduling_sequence)
     scaler_seq = RobustScaler()
     scheduling_sequence = scaler_seq.fit_transform(seq_array)
     scheduling_sequence = np.nan_to_num(scheduling_sequence, nan=0.0).tolist()
     
-    # Enhanced scalar features
     op_counts = {}
     for node in nodes_features:
         for key, value in node.items():
@@ -156,7 +153,7 @@ def extract_features_from_file(file_path):
     return {
         'scheduling_sequence': scheduling_sequence,
         'scalar_features': scalar_features,
-        'execution_time': execution_time  # Corrected key
+        'execution_time': execution_time
     }
 
 def process_directory(directory_path):
@@ -224,8 +221,8 @@ def prepare_data_for_model(train_features, test_features):
     train_scalar_df = train_scalar_df.fillna(0)
     test_scalar_df = test_scalar_df.fillna(0)
     
-    y_train_raw = np.array([f['execution_time'] for f in train_features])  # Corrected key
-    y_test_raw = np.array([f['execution_time'] for f in test_features])    # Corrected key
+    y_train_raw = np.array([f['execution_time'] for f in train_features])
+    y_test_raw = np.array([f['execution_time'] for f in test_features])
     y_train_raw = np.clip(y_train_raw, 0, np.percentile(y_train_raw, 99))
     y_test_raw = np.clip(y_test_raw, 0, np.percentile(y_test_raw, 99))
     
@@ -369,7 +366,17 @@ def create_data_loaders(train_sequences, train_scalar, y_train, test_sequences, 
 def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=500, patience=50, accumulation_steps=2):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
-    model.to(device)
+    
+    # Move model to device after initialization and ensure CUDA is ready
+    try:
+        model.to(device)
+        # Explicitly flatten parameters for LSTM to ensure cuDNN compatibility
+        for lstm in model.lstm_layers:
+            lstm.flatten_parameters()
+    except RuntimeError as e:
+        print(f"Error moving model to CUDA: {e}. Falling back to CPU.")
+        device = torch.device('cpu')
+        model.to(device)
     
     scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=50, T_mult=2, eta_min=1e-6)
     
@@ -509,6 +516,13 @@ def evaluate_model(model, X_test_seq, X_test_scalar, y_test, y_scaler, file_name
     return y_test_actual, y_pred_actual
 
 def main(main_dir):
+    # Ensure CUDA is initialized properly
+    if torch.cuda.is_available():
+        torch.cuda.init()
+        print(f"CUDA initialized. Using GPU: {torch.cuda.get_device_name(0)}")
+    else:
+        print("CUDA not available. Using CPU.")
+    
     print(f"Processing main directory: {main_dir}")
     train_features, test_features, test_file_names = process_main_directory(main_dir)
     
