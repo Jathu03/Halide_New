@@ -2,8 +2,7 @@ import os
 import json
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import RobustScaler
-from sklearn.metrics import r2_score
+from sklearn.preprocessing import StandardScaler
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -32,21 +31,30 @@ def get_execution_time(file_path):
         print(f"Warning: 'total_execution_time_ms' not found in 'Schedules' of {file_path}")
         return schedules[len(schedules)-1]["value"]
     
+    except FileNotFoundError:
+        print(f"Error: File {file_path} not found")
+        return None
+    except json.JSONDecodeError as e:
+        print(f"Error: Invalid JSON format in {file_path}: {str(e)}")
+        return None
+    except UnicodeDecodeError as e:
+        print(f"Error: Encoding issue in {file_path}: {str(e)}")
+        return None
     except Exception as e:
-        print(f"Error processing {file_path}: {str(e)}")
+        print(f"Error: An unexpected error occurred while processing {file_path}: {str(e)}")
         return None
 
 def save_scaler_params(scaler_X, scaler_y, is_log_transformed):
     scaler_X_data = {
         "feature_names": list(scaler_X.feature_names_in_),
-        "means": scaler_X.center_.tolist(),
+        "means": scaler_X.mean_.tolist(),
         "scales": scaler_X.scale_.tolist()
     }
     with open("scaler_X.json", "w") as f:
         json.dump(scaler_X_data, f)
 
     scaler_y_data = {
-        "mean": float(scaler_y.center_[0]),
+        "mean": float(scaler_y.mean_[0]),
         "scale": float(scaler_y.scale_[0]),
         "is_log_transformed": is_log_transformed
     }
@@ -58,34 +66,38 @@ def extract_features_from_file(file_path):
         data = json.load(f)
     
     execution_time = get_execution_time(file_path)
+    
     if execution_time is None:
+        print(f"Warning: No execution time found in {file_path}")
         return None
     
     nodes_features = []
     edges_features = []
-    programming_details = data.get("programming_details", {})
+    programming_details = data.get("programming_details")
     
-    if 'Nodes' in programming_details:
-        for node in programming_details['Nodes']:
-            node_feature = {'Name': node.get('Name', '')}
-            if 'Details' in node and 'Op histogram' in node['Details']:
-                op_hist = node['Details']['Op histogram']
-                for op_line in op_hist:
-                    parts = op_line.strip().split(':')
-                    if len(parts) == 2:
-                        op_name, op_count = parts[0].strip(), int(parts[1].strip())
-                        node_feature[f'op_{op_name.lower()}'] = op_count
-            nodes_features.append(node_feature)
-    
-    if 'Edges' in programming_details:
-        for edge in programming_details['Edges']:
-            edges_features.append({
-                'From': edge.get('From', ''),
-                'To': edge.get('To', ''),
-                'Name': edge.get('Name', '')
-            })
+    if programming_details:
+        if 'Nodes' in programming_details:
+            for node in programming_details['Nodes']:
+                node_feature = {'Name': node.get('Name', '')}
+                if 'Details' in node and 'Op histogram' in node['Details']:
+                    op_hist = node['Details']['Op histogram']
+                    for op_line in op_hist:
+                        parts = op_line.strip().split(':')
+                        if len(parts) == 2:
+                            op_name, op_count = parts[0].strip(), int(parts[1].strip())
+                            node_feature[f'op_{op_name.lower()}'] = op_count
+                nodes_features.append(node_feature)
+        
+        if 'Edges' in programming_details:
+            for edge in programming_details['Edges']:
+                edges_features.append({
+                    'From': edge.get('From', ''),
+                    'To': edge.get('To', ''),
+                    'Name': edge.get('Name', '')
+                })
     
     scheduling_features = data.get("scheduling_data", programming_details.get('Schedules', []))
+    
     sched_features = []
     for sched in scheduling_features:
         sched_feature = {'Name': sched.get('Name', '')}
@@ -94,13 +106,11 @@ def extract_features_from_file(file_path):
         sched_features.append(sched_feature)
     
     features = {
-        'execution_time': min(max(execution_time, 1e-3), 1e6),
+        'execution_time': execution_time,
         'nodes_count': len(nodes_features),
         'edges_count': len(edges_features),
         'scheduling_count': len(sched_features),
-        'node_edge_ratio': len(nodes_features) / len(edges_features) if len(edges_features) > 0 else 0,
-        'log_nodes_count': np.log1p(len(nodes_features)),
-        'log_edges_count': np.log1p(len(edges_features))
+        'node_edge_ratio': len(nodes_features) / len(edges_features) if len(edges_features) > 0 else 0
     }
     
     op_counts = {}
@@ -119,12 +129,11 @@ def extract_features_from_file(file_path):
         for metric in important_metrics:
             if metric in sched_features[0]:
                 features[f'sched_{metric}'] = sched_features[0][metric]
-                features[f'log_sched_{metric}'] = np.log1p(sched_features[0][metric])
         
         features['total_bytes_at_production'] = sum(sf.get('bytes_at_production', 0) for sf in sched_features)
         features['total_vectors'] = sum(sf.get('num_vectors', 0) for sf in sched_features)
         features['total_parallelism'] = sum(sf.get('inner_parallelism', 0) * sf.get('outer_parallelism', 1) for sf in sched_features)
-        features['bytes_per_vector'] = features['total_bytes_at_production'] / (features['total_vectors'] + 1e-8)
+        features['bytes_per_vector'] = features['total_bytes_at_production'] / features['total_vectors'] if features['total_vectors'] > 0 else 0
         features['memory_pressure'] = sched_features[0]['working_set'] / sched_features[0]['bytes_at_production'] if sched_features[0].get('bytes_at_production', 0) > 0 else 0
     
     if nodes_features:
@@ -177,7 +186,7 @@ def process_main_directory(main_dir):
 
 def clean_and_transform_features(train_features, test_features):
     df = pd.DataFrame(train_features + test_features).fillna(0)
-    constant_cols = [col for col in df.columns if col != 'execution_time' and df[col].nunique() <= 1]
+    constant_cols = [col for col in df.columns if col != 'execution_time' and df[col].nunique() == 1]
     df = df.drop(columns=constant_cols)
     print(f"Dropped {len(constant_cols)} constant columns")
     
@@ -198,13 +207,12 @@ def prepare_data_for_model(train_features, test_features):
     X_train = train_df.drop(['execution_time', 'execution_time_log'], axis=1)
     X_test = test_df.drop(['execution_time', 'execution_time_log'], axis=1)
     
-    scaler_X, scaler_y = RobustScaler(), RobustScaler()
+    scaler_X, scaler_y = StandardScaler(), StandardScaler()
     X_train_scaled = scaler_X.fit_transform(X_train)
     y_train_scaled = scaler_y.fit_transform(y_train)
     X_test_scaled = scaler_X.transform(X_test)
     y_test_scaled = scaler_y.transform(y_test)
     
-    print(f"X_train_scaled shape: {X_train_scaled.shape}, input_size: {X_train_scaled.shape[1]}")
     return (torch.FloatTensor(X_train_scaled).unsqueeze(1), torch.FloatTensor(y_train_scaled),
             torch.FloatTensor(X_test_scaled).unsqueeze(1), torch.FloatTensor(y_test_scaled),
             scaler_X, scaler_y, X_train_scaled.shape[1], True)
@@ -212,49 +220,64 @@ def prepare_data_for_model(train_features, test_features):
 device = torch.device("cpu")
 
 class EnhancedLSTMModel(nn.Module):
-    def __init__(self, input_size, hidden_sizes=[256, 128, 64], output_size=1, dropout_rate=0.2):
-        super().__init__()
-        self.input_size = input_size
+    def __init__(self, input_size: int, hidden_sizes: list = [128, 64, 32], output_size: int = 1, dropout_rate: float = 0.3):
+        super(EnhancedLSTMModel, self).__init__()
         self.hidden_sizes = hidden_sizes
+        self.dropout_rate = dropout_rate
+        
+        # LSTM layers
         self.lstm_layers = nn.ModuleList([
-            nn.LSTM(input_size if i == 0 else hidden_sizes[i-1] * 2, hs, batch_first=True, bidirectional=True)
-            for i, hs in enumerate(hidden_sizes)
+            nn.LSTM(input_size if i == 0 else hidden_sizes[i-1], hidden_sizes[i], batch_first=True)
+            for i in range(len(hidden_sizes))
         ])
         self.dropout_layers = nn.ModuleList([nn.Dropout(dropout_rate) for _ in hidden_sizes])
-        self.attention = nn.MultiheadAttention(hidden_sizes[-1] * 2, num_heads=4, batch_first=True)
-        self.fc_layers = nn.ModuleList([
-            nn.Linear(hidden_sizes[-1] * 2, hidden_sizes[-1]),
-            nn.Linear(hidden_sizes[-1], hidden_sizes[-1] // 2)
-        ])
-        self.ln_layers = nn.ModuleList([
-            nn.LayerNorm(hidden_sizes[-1]),
-            nn.LayerNorm(hidden_sizes[-1] // 2)
-        ])
-        self.output_layer = nn.Linear(hidden_sizes[-1] // 2, output_size)
+        
+        # Attention layer
+        self.attention = nn.Linear(hidden_sizes[-1], 1)
+        
+        # Fully connected layers
+        self.fc1 = nn.Linear(hidden_sizes[-1], hidden_sizes[-1] // 2)
+        self.bn1 = nn.BatchNorm1d(hidden_sizes[-1] // 2)
+        self.fc2 = nn.Linear(hidden_sizes[-1] // 2, hidden_sizes[-1] // 4)
+        self.bn2 = nn.BatchNorm1d(hidden_sizes[-1] // 4)
+        self.output_layer = nn.Linear(hidden_sizes[-1] // 4, output_size)
+        
+        # Activation functions
+        self.relu = nn.ReLU()
         self.leaky_relu = nn.LeakyReLU(0.1)
-        self.residual_adapter = nn.Linear(hidden_sizes[-1] * 2, hidden_sizes[-1] // 2) if hidden_sizes[-1] * 2 != hidden_sizes[-1] // 2 else None
+        
+        # Residual connection
+        self.has_residual = (hidden_sizes[-1] // 4 == hidden_sizes[-1] // 2)
+        if not self.has_residual:
+            self.residual_adapter = nn.Linear(hidden_sizes[-1] // 2, hidden_sizes[-1] // 4)
+
+    def attention_net(self, lstm_output: torch.Tensor) -> torch.Tensor:
+        attn_weights = torch.softmax(self.attention(lstm_output).squeeze(2), dim=1)
+        return torch.bmm(attn_weights.unsqueeze(1), lstm_output).squeeze(1)
     
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         for i, (lstm, dropout) in enumerate(zip(self.lstm_layers, self.dropout_layers)):
             x, _ = lstm(x)
             if i < len(self.lstm_layers) - 1:
                 x = dropout(x)
-        attn_output, _ = self.attention(x, x, x)
-        x = attn_output.squeeze(1)
-        residual = x if not self.residual_adapter else self.residual_adapter(x)
-        x = self.leaky_relu(self.ln_layers[0](self.fc_layers[0](x)))
-        x = self.leaky_relu(self.ln_layers[1](self.fc_layers[1](x)))
+        
+        x = self.attention_net(x)
+        x = self.leaky_relu(self.bn1(self.fc1(x)))
+        
+        residual = x if self.has_residual else self.residual_adapter(x)
+        x = self.leaky_relu(self.bn2(self.fc2(x)))
         x = x + residual
+        
         return self.output_layer(x)
 
-def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=32):
+def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=16):
     train_loader = DataLoader(TensorDataset(X_train, y_train), batch_size=batch_size, shuffle=True)
     test_loader = DataLoader(TensorDataset(X_test, y_test), batch_size=batch_size, shuffle=False)
     return train_loader, test_loader
 
-def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=200, patience=30):
+def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=150, patience=20):
     model.to(device)
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.3, patience=10, verbose=True)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
     best_val_loss, epochs_no_improve, best_model_state = float('inf'), 0, None
     train_losses, val_losses = [], []
     
@@ -287,7 +310,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
         scheduler.step(val_loss)
         print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
         
-        if val_loss < best_val_loss - 0.001:
+        if val_loss < best_val_loss:
             best_val_loss, epochs_no_improve = val_loss, 0
             best_model_state = model.state_dict().copy()
         else:
@@ -329,20 +352,7 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_tran
     rmse = float(np.sqrt(mse))
     mae = float(np.mean(np.abs(y_test_actual - y_pred_actual)))
     mape = float(np.mean(np.abs((y_test_actual - y_pred_actual) / np.maximum(y_test_actual, 1e-3))) * 100)
-    r2 = float(r2_score(y_test_actual, y_pred_actual))
-    avg_actual = float(np.mean(y_test_actual))
-    avg_predicted = float(np.mean(y_pred_actual))
-    
-    print(f"\nOverall Model Performance:\nMSE: {mse:.2f}\nRMSE: {rmse:.2f}\nMAE: {mae:.2f}\nMAPE: {mape:.2f}%\nR²: {r2:.4f}\nAvg Actual: {avg_actual:.2f} ms\nAvg Predicted: {avg_predicted:.2f} ms")
-    
-    performance_metrics = {
-        "mse": mse, "rmse": rmse, "mae": mae, "mape": mape, "r2": r2,
-        "avg_actual_execution_time_ms": avg_actual,
-        "avg_predicted_execution_time_ms": avg_predicted
-    }
-    with open("model_performance_metrics.json", "w") as f:
-        json.dump(performance_metrics, f, indent=4)
-    print("Performance metrics saved to 'model_performance_metrics.json'")
+    print(f"\nOverall Model Performance:\nMSE: {mse:.2f}\nRMSE: {rmse:.2f}\nMAE: {mae:.2f}\nMAPE: {mape:.2f}%")
     
     return y_test_actual, y_pred_actual
 
@@ -357,25 +367,26 @@ def main(main_dir):
     save_scaler_params(scaler_X, y_scaler, is_log_transformed)
     train_loader, test_loader = create_data_loaders(X_train, y_train, X_test, y_test)
     
-    model = EnhancedLSTMModel(input_size=input_size)  # Use input_size from data, not hidden size
-    criterion = nn.MSELoss()
-    optimizer = optim.AdamW(model.parameters(), lr=0.005, weight_decay=1e-4)
+    model = EnhancedLSTMModel(input_size=input_size)
+    criterion = nn.HuberLoss(delta=1.0)
+    optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-5)
     
-    print(f"Model input_size: {input_size}")
     print("Training Enhanced LSTM model...")
-    train_losses, val_losses = train_model(model, train_loader, test_loader, criterion, optimizer)
+    train_model(model, train_loader, test_loader, criterion, optimizer)
     
     print("\nEvaluating model:")
-    y_test_actual, y_pred_actual = evaluate_model(model, X_test, y_test, y_scaler, test_file_names)
+    y_test_actual, y_pred_actual = evaluate_model(model, X_test, y_test, y_scaler, test_file_names, is_log_transformed)
     
-    print("\nSaving model as 'lstm_model.pt'...")
+    print("\nSaving model as 'lstm_model.pt' using TorchScript...")
     model.eval().to(device)
     try:
-        traced_model = torch.jit.trace(model, torch.randn(1, 1, input_size).to(device))
-        traced_model.save("lstm_model.pt")
-        print("Model saved successfully")
+        # Script the model (no sample input required)
+        scripted_model = torch.jit.script(model)
+        # Save the scripted model to a .pt file
+        scripted_model.save("lstm_model.pt")
+        print("Model successfully saved as 'lstm_model.pt'")
     except Exception as e:
-        print(f"Error saving model: {str(e)}")
+        print(f"Error saving model with TorchScript: {str(e)}")
     
     return model, y_scaler, y_test_actual, y_pred_actual
 
