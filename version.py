@@ -2,7 +2,8 @@ import os
 import json
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import RobustScaler
+from sklearn.metrics import r2_score
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -31,30 +32,21 @@ def get_execution_time(file_path):
         print(f"Warning: 'total_execution_time_ms' not found in 'Schedules' of {file_path}")
         return schedules[len(schedules)-1]["value"]
     
-    except FileNotFoundError:
-        print(f"Error: File {file_path} not found")
-        return None
-    except json.JSONDecodeError as e:
-        print(f"Error: Invalid JSON format in {file_path}: {str(e)}")
-        return None
-    except UnicodeDecodeError as e:
-        print(f"Error: Encoding issue in {file_path}: {str(e)}")
-        return None
     except Exception as e:
-        print(f"Error: An unexpected error occurred while processing {file_path}: {str(e)}")
+        print(f"Error processing {file_path}: {str(e)}")
         return None
 
 def save_scaler_params(scaler_X, scaler_y, is_log_transformed):
     scaler_X_data = {
         "feature_names": list(scaler_X.feature_names_in_),
-        "means": scaler_X.mean_.tolist(),
+        "means": scaler_X.center_.tolist(),
         "scales": scaler_X.scale_.tolist()
     }
     with open("scaler_X.json", "w") as f:
         json.dump(scaler_X_data, f)
 
     scaler_y_data = {
-        "mean": float(scaler_y.mean_[0]),
+        "mean": float(scaler_y.center_[0]),
         "scale": float(scaler_y.scale_[0]),
         "is_log_transformed": is_log_transformed
     }
@@ -66,38 +58,34 @@ def extract_features_from_file(file_path):
         data = json.load(f)
     
     execution_time = get_execution_time(file_path)
-    
     if execution_time is None:
-        print(f"Warning: No execution time found in {file_path}")
         return None
     
     nodes_features = []
     edges_features = []
-    programming_details = data.get("programming_details")
+    programming_details = data.get("programming_details", {})
     
-    if programming_details:
-        if 'Nodes' in programming_details:
-            for node in programming_details['Nodes']:
-                node_feature = {'Name': node.get('Name', '')}
-                if 'Details' in node and 'Op histogram' in node['Details']:
-                    op_hist = node['Details']['Op histogram']
-                    for op_line in op_hist:
-                        parts = op_line.strip().split(':')
-                        if len(parts) == 2:
-                            op_name, op_count = parts[0].strip(), int(parts[1].strip())
-                            node_feature[f'op_{op_name.lower()}'] = op_count
-                nodes_features.append(node_feature)
-        
-        if 'Edges' in programming_details:
-            for edge in programming_details['Edges']:
-                edges_features.append({
-                    'From': edge.get('From', ''),
-                    'To': edge.get('To', ''),
-                    'Name': edge.get('Name', '')
-                })
+    if 'Nodes' in programming_details:
+        for node in programming_details['Nodes']:
+            node_feature = {'Name': node.get('Name', '')}
+            if 'Details' in node and 'Op histogram' in node['Details']:
+                op_hist = node['Details']['Op histogram']
+                for op_line in op_hist:
+                    parts = op_line.strip().split(':')
+                    if len(parts) == 2:
+                        op_name, op_count = parts[0].strip(), int(parts[1].strip())
+                        node_feature[f'op_{op_name.lower()}'] = op_count
+            nodes_features.append(node_feature)
+    
+    if 'Edges' in programming_details:
+        for edge in programming_details['Edges']:
+            edges_features.append({
+                'From': edge.get('From', ''),
+                'To': edge.get('To', ''),
+                'Name': edge.get('Name', '')
+            })
     
     scheduling_features = data.get("scheduling_data", programming_details.get('Schedules', []))
-    
     sched_features = []
     for sched in scheduling_features:
         sched_feature = {'Name': sched.get('Name', '')}
@@ -106,11 +94,13 @@ def extract_features_from_file(file_path):
         sched_features.append(sched_feature)
     
     features = {
-        'execution_time': execution_time,
+        'execution_time': min(max(execution_time, 1e-3), 1e6),  # Clip outliers
         'nodes_count': len(nodes_features),
         'edges_count': len(edges_features),
         'scheduling_count': len(sched_features),
-        'node_edge_ratio': len(nodes_features) / len(edges_features) if len(edges_features) > 0 else 0
+        'node_edge_ratio': len(nodes_features) / len(edges_features) if len(edges_features) > 0 else 0,
+        'log_nodes_count': np.log1p(len(nodes_features)),
+        'log_edges_count': np.log1p(len(edges_features))
     }
     
     op_counts = {}
@@ -129,11 +119,12 @@ def extract_features_from_file(file_path):
         for metric in important_metrics:
             if metric in sched_features[0]:
                 features[f'sched_{metric}'] = sched_features[0][metric]
+                features[f'log_sched_{metric}'] = np.log1p(sched_features[0][metric])
         
         features['total_bytes_at_production'] = sum(sf.get('bytes_at_production', 0) for sf in sched_features)
         features['total_vectors'] = sum(sf.get('num_vectors', 0) for sf in sched_features)
         features['total_parallelism'] = sum(sf.get('inner_parallelism', 0) * sf.get('outer_parallelism', 1) for sf in sched_features)
-        features['bytes_per_vector'] = features['total_bytes_at_production'] / features['total_vectors'] if features['total_vectors'] > 0 else 0
+        features['bytes_per_vector'] = features['total_bytes_at_production'] / (features['total_vectors'] + 1e-8)
         features['memory_pressure'] = sched_features[0]['working_set'] / sched_features[0]['bytes_at_production'] if sched_features[0].get('bytes_at_production', 0) > 0 else 0
     
     if nodes_features:
@@ -186,7 +177,7 @@ def process_main_directory(main_dir):
 
 def clean_and_transform_features(train_features, test_features):
     df = pd.DataFrame(train_features + test_features).fillna(0)
-    constant_cols = [col for col in df.columns if col != 'execution_time' and df[col].nunique() == 1]
+    constant_cols = [col for col in df.columns if col != 'execution_time' and df[col].nunique() <= 1]
     df = df.drop(columns=constant_cols)
     print(f"Dropped {len(constant_cols)} constant columns")
     
@@ -207,7 +198,7 @@ def prepare_data_for_model(train_features, test_features):
     X_train = train_df.drop(['execution_time', 'execution_time_log'], axis=1)
     X_test = test_df.drop(['execution_time', 'execution_time_log'], axis=1)
     
-    scaler_X, scaler_y = StandardScaler(), StandardScaler()
+    scaler_X, scaler_y = RobustScaler(), RobustScaler()
     X_train_scaled = scaler_X.fit_transform(X_train)
     y_train_scaled = scaler_y.fit_transform(y_train)
     X_test_scaled = scaler_X.transform(X_test)
@@ -220,44 +211,40 @@ def prepare_data_for_model(train_features, test_features):
 device = torch.device("cpu")
 
 class EnhancedLSTMModel(nn.Module):
-    def __init__(self, input_size, hidden_sizes=[128, 64, 32], output_size=1, dropout_rate=0.3):
+    def __init__(self, input_size, hidden_sizes=[256, 128, 64], output_size=1, dropout_rate=0.2):
         super().__init__()
-        self.lstm_layers = nn.ModuleList([nn.LSTM(input_size if i == 0 else hidden_sizes[i-1], hs, batch_first=True)
+        self.lstm_layers = nn.ModuleList([nn.LSTM(input_size if i == 0 else hidden_sizes[i-1], hs, batch_first=True, bidirectional=True)
                                          for i, hs in enumerate(hidden_sizes)])
         self.dropout_layers = nn.ModuleList([nn.Dropout(dropout_rate) for _ in hidden_sizes])
-        self.attention = nn.Linear(hidden_sizes[-1], 1)
-        self.fc_layers = nn.ModuleList([nn.Linear(hidden_sizes[-1], hidden_sizes[-1] // 2),
-                                       nn.Linear(hidden_sizes[-1] // 2, hidden_sizes[-1] // 4)])
-        self.bn_layers = nn.ModuleList([nn.BatchNorm1d(hidden_sizes[-1] // 2), nn.BatchNorm1d(hidden_sizes[-1] // 4)])
-        self.output_layer = nn.Linear(hidden_sizes[-1] // 4, output_size)
-        self.relu = nn.ReLU()
+        self.attention = nn.MultiheadAttention(hidden_sizes[-1] * 2, num_heads=4, batch_first=True)  # Bidirectional doubles the size
+        self.fc_layers = nn.ModuleList([nn.Linear(hidden_sizes[-1] * 2, hidden_sizes[-1]),
+                                       nn.Linear(hidden_sizes[-1], hidden_sizes[-1] // 2)])
+        self.ln_layers = nn.ModuleList([nn.LayerNorm(hidden_sizes[-1]), nn.LayerNorm(hidden_sizes[-1] // 2)])
+        self.output_layer = nn.Linear(hidden_sizes[-1] // 2, output_size)
         self.leaky_relu = nn.LeakyReLU(0.1)
-        self.residual_adapter = nn.Linear(hidden_sizes[-1] // 2, hidden_sizes[-1] // 4) if hidden_sizes[-1] // 4 != hidden_sizes[-1] // 2 else None
-    
-    def attention_net(self, lstm_output):
-        attn_weights = torch.softmax(self.attention(lstm_output).squeeze(2), dim=1)
-        return torch.bmm(attn_weights.unsqueeze(1), lstm_output).squeeze(1)
+        self.residual_adapter = nn.Linear(hidden_sizes[-1] * 2, hidden_sizes[-1] // 2) if hidden_sizes[-1] * 2 != hidden_sizes[-1] // 2 else None
     
     def forward(self, x):
         for i, (lstm, dropout) in enumerate(zip(self.lstm_layers, self.dropout_layers)):
             x, _ = lstm(x)
             if i < len(self.lstm_layers) - 1:
                 x = dropout(x)
-        x = self.attention_net(x)
-        x = self.leaky_relu(self.bn_layers[0](self.fc_layers[0](x)))
+        attn_output, _ = self.attention(x, x, x)
+        x = attn_output.squeeze(1)  # Remove sequence dimension
         residual = x if not self.residual_adapter else self.residual_adapter(x)
-        x = self.leaky_relu(self.bn_layers[1](self.fc_layers[1](x)))
+        x = self.leaky_relu(self.ln_layers[0](self.fc_layers[0](x)))
+        x = self.leaky_relu(self.ln_layers[1](self.fc_layers[1](x)))
         x = x + residual
         return self.output_layer(x)
 
-def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=16):
+def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=32):
     train_loader = DataLoader(TensorDataset(X_train, y_train), batch_size=batch_size, shuffle=True)
     test_loader = DataLoader(TensorDataset(X_test, y_test), batch_size=batch_size, shuffle=False)
     return train_loader, test_loader
 
-def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=150, patience=20):
+def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=200, patience=30):
     model.to(device)
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.3, patience=10, verbose=True)
     best_val_loss, epochs_no_improve, best_model_state = float('inf'), 0, None
     train_losses, val_losses = [], []
     
@@ -290,7 +277,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
         scheduler.step(val_loss)
         print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
         
-        if val_loss < best_val_loss:
+        if val_loss < best_val_loss - 0.001:  # Minimum delta for improvement
             best_val_loss, epochs_no_improve = val_loss, 0
             best_model_state = model.state_dict().copy()
         else:
@@ -331,15 +318,15 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_tran
     mse = float(np.mean((y_test_actual - y_pred_actual) ** 2))
     rmse = float(np.sqrt(mse))
     mae = float(np.mean(np.abs(y_test_actual - y_pred_actual)))
-    # Use a threshold to avoid division instability
     mape = float(np.mean(np.abs((y_test_actual - y_pred_actual) / np.maximum(y_test_actual, 1e-3))) * 100)
+    r2 = float(r2_score(y_test_actual, y_pred_actual))
     avg_actual = float(np.mean(y_test_actual))
     avg_predicted = float(np.mean(y_pred_actual))
     
-    print(f"\nOverall Model Performance:\nMSE: {mse:.2f}\nRMSE: {rmse:.2f}\nMAE: {mae:.2f}\nMAPE: {mape:.2f}%\nAvg Actual: {avg_actual:.2f} ms\nAvg Predicted: {avg_predicted:.2f} ms")
+    print(f"\nOverall Model Performance:\nMSE: {mse:.2f}\nRMSE: {rmse:.2f}\nMAE: {mae:.2f}\nMAPE: {mape:.2f}%\nR²: {r2:.4f}\nAvg Actual: {avg_actual:.2f} ms\nAvg Predicted: {avg_predicted:.2f} ms")
     
     performance_metrics = {
-        "mse": mse, "rmse": rmse, "mae": mae, "mape": mape,
+        "mse": mse, "rmse": rmse, "mae": mae, "mape": mape, "r2": r2,
         "avg_actual_execution_time_ms": avg_actual,
         "avg_predicted_execution_time_ms": avg_predicted
     }
@@ -361,11 +348,11 @@ def main(main_dir):
     train_loader, test_loader = create_data_loaders(X_train, y_train, X_test, y_test)
     
     model = EnhancedLSTMModel(input_size=input_size)
-    criterion = nn.HuberLoss(delta=1.0)
-    optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-5)
+    criterion = nn.MSELoss()
+    optimizer = optim.AdamW(model.parameters(), lr=0.005, weight_decay=1e-4)
     
     print("Training Enhanced LSTM model...")
-    train_model(model, train_loader, test_loader, criterion, optimizer)
+    train_losses, val_losses = train_model(model, train_loader, test_loader, criterion, optimizer)
     
     print("\nEvaluating model:")
     y_test_actual, y_pred_actual = evaluate_model(model, X_test, y_test, y_scaler, test_file_names)
