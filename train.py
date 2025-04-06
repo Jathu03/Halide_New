@@ -9,6 +9,7 @@ import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 import random
+import matplotlib.pyplot as plt  # Added for plotting
 
 def get_execution_time(file_path):
     try:
@@ -393,6 +394,18 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
     
     if best_model_state is not None and epochs_no_improve > 0:
         model.load_state_dict(best_model_state)
+    
+    # Plot training and validation losses
+    plt.figure(figsize=(10, 6))
+    plt.plot(range(1, len(train_losses) + 1), train_losses, label='Training Loss')
+    plt.plot(range(1, len(val_losses) + 1), val_losses, label='Validation Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('Training and Validation Loss Over Epochs')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig('lstm_loss_enhanced.png')  # Save as specified filename
+    plt.show()  # Display the plot
     
     return train_losses, val_losses
 
