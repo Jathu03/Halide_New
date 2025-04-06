@@ -10,7 +10,7 @@ from torch.utils.data import TensorDataset, DataLoader
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 import random
 
-# [Existing functions remain unchanged]
+# [Existing functions remain unchanged until noted]
 def get_execution_time(file_path):
     try:
         with open(file_path, 'rb') as f:
@@ -238,7 +238,6 @@ def clean_and_transform_features(train_features, test_features):
     
     return train_df, test_df
 
-# Inside prepare_data_for_model function
 def prepare_data_for_model(train_features, test_features):
     train_df, test_df = clean_and_transform_features(train_features, test_features)
     
@@ -297,7 +296,6 @@ def prepare_data_for_model(train_features, test_features):
     return (X_train_tensor, y_train_tensor, X_test_tensor, y_test_tensor, 
             scaler_y, X_train_scaled.shape[1], 'execution_time_log' in train_df.columns)
 
-# Corrected EnhancedLSTMModel class
 class EnhancedLSTMModel(nn.Module):
     def __init__(self, input_size, hidden_sizes=[128, 64, 32], output_size=1, dropout_rate=0.3):
         super(EnhancedLSTMModel, self).__init__()
@@ -308,19 +306,15 @@ class EnhancedLSTMModel(nn.Module):
         self.lstm_layers = nn.ModuleList()
         self.dropout_layers = nn.ModuleList()
         
-        # First LSTM layer
         self.lstm_layers.append(nn.LSTM(input_size, hidden_sizes[0], batch_first=True))
         self.dropout_layers.append(nn.Dropout(dropout_rate))
         
-        # Subsequent LSTM layers
         for i in range(1, len(hidden_sizes)):
             self.lstm_layers.append(nn.LSTM(hidden_sizes[i-1], hidden_sizes[i], batch_first=True))
             self.dropout_layers.append(nn.Dropout(dropout_rate))
         
-        # Attention layer
         self.attention = nn.Linear(hidden_sizes[-1], 1)
         
-        # Fully connected layers
         self.fc_layers = nn.ModuleList()
         self.bn_layers = nn.ModuleList()
         
@@ -335,7 +329,6 @@ class EnhancedLSTMModel(nn.Module):
         self.relu = nn.ReLU()
         self.leaky_relu = nn.LeakyReLU(0.1)
         
-        # Residual connection check
         self.has_residual = (hidden_sizes[-1] // 4 == hidden_sizes[-1] // 2)
         if not self.has_residual:
             self.residual_adapter = nn.Linear(hidden_sizes[-1] // 2, hidden_sizes[-1] // 4)
@@ -350,23 +343,18 @@ class EnhancedLSTMModel(nn.Module):
         batch_size = x.size(0)
         lstm_out = x
         
-        # Process through each LSTM layer
         for i, (lstm, dropout) in enumerate(zip(self.lstm_layers, self.dropout_layers)):
-            # Initialize hidden state for this layer
             hidden_size = self.hidden_sizes[i]
             device = x.device
             h_0 = torch.zeros(1, batch_size, hidden_size, device=device)
             c_0 = torch.zeros(1, batch_size, hidden_size, device=device)
             
-            # Forward pass through LSTM
             lstm_out, _ = lstm(lstm_out, (h_0, c_0))
             if i < len(self.lstm_layers) - 1:
                 lstm_out = dropout(lstm_out)
         
-        # Apply attention
         attn_output = self.attention_net(lstm_out)
         
-        # Fully connected layers
         fc_out = self.fc_layers[0](attn_output)
         fc_out = self.bn_layers[0](fc_out)
         fc_out = self.leaky_relu(fc_out)
@@ -480,17 +468,22 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_tran
         y_test_actual = y_test_transformed
         y_pred_actual = y_pred_transformed
     
+    # Calculate average execution times
+    avg_actual = np.mean(y_test_actual)
+    avg_predicted = np.mean(y_pred_actual)
+    
     results_by_subfolder = {}
     for i, file_path in enumerate(file_names_test):
         subfolder = file_path.split('/')[0]
         if subfolder not in results_by_subfolder:
             results_by_subfolder[subfolder] = []
         
+        pred = max(y_pred_actual[i][0], 0)  # Ensure non-negative predictions
         results_by_subfolder[subfolder].append({
             'file': file_path,
             'actual': y_test_actual[i][0],
-            'predicted': y_pred_actual[i][0],
-            'error_percentage': abs(y_test_actual[i][0] - y_pred_actual[i][0]) / y_test_actual[i][0] * 100 if y_test_actual[i][0] > 0 else 0
+            'predicted': pred,
+            'error_percentage': abs(y_test_actual[i][0] - pred) / y_test_actual[i][0] * 100 if y_test_actual[i][0] > 0 else 0
         })
     
     for subfolder, results in results_by_subfolder.items():
@@ -507,12 +500,14 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_tran
     mape = np.mean(np.abs((y_test_actual - y_pred_actual) / (y_test_actual + 1e-8))) * 100
     
     print("\nOverall Model Performance:")
+    print(f"Average Actual Execution Time: {avg_actual:.2f} ms")
+    print(f"Average Predicted Execution Time: {avg_predicted:.2f} ms")
     print(f"MSE: {mse:.2f}")
     print(f"RMSE: {rmse:.2f}")
     print(f"MAE: {mae:.2f}")
     print(f"MAPE: {mape:.2f}%")
     
-    return y_test_actual, y_pred_actual
+    return y_test_actual, y_pred_actual, avg_actual, avg_predicted
 
 def main(main_dir):
     print(f"Processing main directory: {main_dir}")
@@ -557,37 +552,34 @@ def main(main_dir):
     
     # Evaluate model
     print("\nEvaluating model:")
-    y_test_actual, y_pred_actual = evaluate_model(model, X_test, y_test, y_scaler, test_file_names, is_log_transformed)
+    y_test_actual, y_pred_actual, avg_actual, avg_predicted = evaluate_model(
+        model, X_test, y_test, y_scaler, test_file_names, is_log_transformed
+    )
     
     # Save the trained model as a .pt file using TorchScript
     print("\nSaving the trained model as 'lstm_model.pt'...")
-    model.eval()  # Set the model to evaluation mode
+    model.eval()
     
-    # Determine the device the model is on
     device = next(model.parameters()).device
     print(f"Model is on device: {device}")
     
     try:
-        # Create sample input and move it to the same device as the model
-        sample_input = torch.randn(1, 1, input_size).to(device)  # [batch_size, sequence_length, input_size]
-        
-        # Trace the model with the sample input
+        sample_input = torch.randn(1, 1, input_size).to(device)
         traced_model = torch.jit.trace(model, sample_input)
-        
-        # Save the traced model to a .pt file
         traced_model.save("lstm_model.pt")
         print("Model successfully saved as 'lstm_model.pt'")
     except Exception as e:
         print(f"Error saving the model: {str(e)}")
     
-    return model, y_scaler, y_test_actual, y_pred_actual
+    # Summary for comparison
+    print(f"\nSummary for Comparison:")
+    print(f"Model: EnhancedLSTM")
+    print(f"Average Actual Execution Time: {avg_actual:.2f} ms")
+    print(f"Average Predicted Execution Time: {avg_predicted:.2f} ms")
+    
+    return model, y_scaler, y_test_actual, y_pred_actual, avg_actual, avg_predicted
 
 if __name__ == "__main__":
-    # Main directory containing subfolders for each program
     main_dir = "synthetic_data"
-    
-    # Set random seed for reproducibility
     random.seed(42)
-    
-    # Run the main function to train and test
-    model, y_scaler, y_test_actual, y_pred_actual = main(main_dir)
+    model, y_scaler, y_test_actual, y_pred_actual, avg_actual, avg_predicted = main(main_dir)
