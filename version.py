@@ -94,7 +94,7 @@ def extract_features_from_file(file_path):
         sched_features.append(sched_feature)
     
     features = {
-        'execution_time': min(max(execution_time, 1e-3), 1e6),  # Clip outliers
+        'execution_time': min(max(execution_time, 1e-3), 1e6),
         'nodes_count': len(nodes_features),
         'edges_count': len(edges_features),
         'scheduling_count': len(sched_features),
@@ -204,6 +204,7 @@ def prepare_data_for_model(train_features, test_features):
     X_test_scaled = scaler_X.transform(X_test)
     y_test_scaled = scaler_y.transform(y_test)
     
+    print(f"X_train_scaled shape: {X_train_scaled.shape}, input_size: {X_train_scaled.shape[1]}")
     return (torch.FloatTensor(X_train_scaled).unsqueeze(1), torch.FloatTensor(y_train_scaled),
             torch.FloatTensor(X_test_scaled).unsqueeze(1), torch.FloatTensor(y_test_scaled),
             scaler_X, scaler_y, X_train_scaled.shape[1], True)
@@ -213,13 +214,22 @@ device = torch.device("cpu")
 class EnhancedLSTMModel(nn.Module):
     def __init__(self, input_size, hidden_sizes=[256, 128, 64], output_size=1, dropout_rate=0.2):
         super().__init__()
-        self.lstm_layers = nn.ModuleList([nn.LSTM(input_size if i == 0 else hidden_sizes[i-1], hs, batch_first=True, bidirectional=True)
-                                         for i, hs in enumerate(hidden_sizes)])
+        self.input_size = input_size
+        self.hidden_sizes = hidden_sizes
+        self.lstm_layers = nn.ModuleList([
+            nn.LSTM(input_size if i == 0 else hidden_sizes[i-1] * 2, hs, batch_first=True, bidirectional=True)
+            for i, hs in enumerate(hidden_sizes)
+        ])
         self.dropout_layers = nn.ModuleList([nn.Dropout(dropout_rate) for _ in hidden_sizes])
-        self.attention = nn.MultiheadAttention(hidden_sizes[-1] * 2, num_heads=4, batch_first=True)  # Bidirectional doubles the size
-        self.fc_layers = nn.ModuleList([nn.Linear(hidden_sizes[-1] * 2, hidden_sizes[-1]),
-                                       nn.Linear(hidden_sizes[-1], hidden_sizes[-1] // 2)])
-        self.ln_layers = nn.ModuleList([nn.LayerNorm(hidden_sizes[-1]), nn.LayerNorm(hidden_sizes[-1] // 2)])
+        self.attention = nn.MultiheadAttention(hidden_sizes[-1] * 2, num_heads=4, batch_first=True)
+        self.fc_layers = nn.ModuleList([
+            nn.Linear(hidden_sizes[-1] * 2, hidden_sizes[-1]),
+            nn.Linear(hidden_sizes[-1], hidden_sizes[-1] // 2)
+        ])
+        self.ln_layers = nn.ModuleList([
+            nn.LayerNorm(hidden_sizes[-1]),
+            nn.LayerNorm(hidden_sizes[-1] // 2)
+        ])
         self.output_layer = nn.Linear(hidden_sizes[-1] // 2, output_size)
         self.leaky_relu = nn.LeakyReLU(0.1)
         self.residual_adapter = nn.Linear(hidden_sizes[-1] * 2, hidden_sizes[-1] // 2) if hidden_sizes[-1] * 2 != hidden_sizes[-1] // 2 else None
@@ -230,7 +240,7 @@ class EnhancedLSTMModel(nn.Module):
             if i < len(self.lstm_layers) - 1:
                 x = dropout(x)
         attn_output, _ = self.attention(x, x, x)
-        x = attn_output.squeeze(1)  # Remove sequence dimension
+        x = attn_output.squeeze(1)
         residual = x if not self.residual_adapter else self.residual_adapter(x)
         x = self.leaky_relu(self.ln_layers[0](self.fc_layers[0](x)))
         x = self.leaky_relu(self.ln_layers[1](self.fc_layers[1](x)))
@@ -277,7 +287,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
         scheduler.step(val_loss)
         print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
         
-        if val_loss < best_val_loss - 0.001:  # Minimum delta for improvement
+        if val_loss < best_val_loss - 0.001:
             best_val_loss, epochs_no_improve = val_loss, 0
             best_model_state = model.state_dict().copy()
         else:
@@ -347,10 +357,11 @@ def main(main_dir):
     save_scaler_params(scaler_X, y_scaler, is_log_transformed)
     train_loader, test_loader = create_data_loaders(X_train, y_train, X_test, y_test)
     
-    model = EnhancedLSTMModel(input_size=input_size)
+    model = EnhancedLSTMModel(input_size=input_size)  # Use input_size from data, not hidden size
     criterion = nn.MSELoss()
     optimizer = optim.AdamW(model.parameters(), lr=0.005, weight_decay=1e-4)
     
+    print(f"Model input_size: {input_size}")
     print("Training Enhanced LSTM model...")
     train_losses, val_losses = train_model(model, train_loader, test_loader, criterion, optimizer)
     
