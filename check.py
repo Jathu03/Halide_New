@@ -534,7 +534,7 @@ def main(main_dir):
     train_losses, val_losses = train_model(
         model, train_loader, test_loader,
         custom_loss, optimizer,
-        num_epochs=300, patience=50, accumulation_steps=4
+        num_epochs=500, patience=50, accumulation_steps=4
     )
     
     if train_losses is None or val_losses is None:
