@@ -271,7 +271,7 @@ def prepare_data_for_model(train_features, test_features):
     return (X_train_tensor, y_train_tensor, X_test_tensor, y_test_tensor, 
             scaler_y, X_train_scaled.shape[1], 'execution_time_log' in train_df.columns)
 
-# Model Definitions
+# LSTM Variant Definitions
 class EnhancedLSTMModel(nn.Module):
     def __init__(self, input_size, hidden_sizes=[128, 64, 32], output_size=1, dropout_rate=0.3):
         super(EnhancedLSTMModel, self).__init__()
@@ -336,36 +336,56 @@ class EnhancedLSTMModel(nn.Module):
         output = self.output_layer(fc_out)
         return output
 
-class SimpleGRUModel(nn.Module):
+class RecursiveLSTMModel(nn.Module):
     def __init__(self, input_size, hidden_size=64, output_size=1, dropout_rate=0.2):
-        super(SimpleGRUModel, self).__init__()
-        self.gru = nn.GRU(input_size, hidden_size, num_layers=2, batch_first=True, dropout=dropout_rate)
+        super(RecursiveLSTMModel, self).__init__()
+        self.hidden_size = hidden_size
+        self.lstm = nn.LSTM(input_size, hidden_size, batch_first=True)
+        self.dropout = nn.Dropout(dropout_rate)
+        self.fc = nn.Linear(hidden_size * 2, output_size)  # Double hidden size for recursive step
+        self.relu = nn.ReLU()
+    
+    def forward(self, x):
+        batch_size = x.size(0)
+        h_0 = torch.zeros(1, batch_size, self.hidden_size).to(x.device)
+        c_0 = torch.zeros(1, batch_size, self.hidden_size).to(x.device)
+        
+        # First pass
+        out, (h_n, c_n) = self.lstm(x, (h_0, c_0))
+        out = self.dropout(out)
+        
+        # Recursive pass: Feed hidden state back as input (simplified recursion)
+        recursive_input = h_n.repeat(1, 1, 2)[:, :, :self.hidden_size]  # Truncate for simplicity
+        out, _ = self.lstm(recursive_input, (h_n, c_n))
+        
+        # Combine outputs
+        combined = torch.cat((h_n.squeeze(0), out[:, -1, :]), dim=1)
+        out = self.relu(combined)
+        out = self.fc(out)
+        return out
+
+class TreeLSTMModel(nn.Module):
+    def __init__(self, input_size, hidden_size=64, output_size=1, dropout_rate=0.2):
+        super(TreeLSTMModel, self).__init__()
+        self.hidden_size = hidden_size
+        self.lstm = nn.LSTMCell(input_size, hidden_size)
+        self.dropout = nn.Dropout(dropout_rate)
         self.fc = nn.Linear(hidden_size, output_size)
         self.relu = nn.ReLU()
     
     def forward(self, x):
         batch_size = x.size(0)
-        h_0 = torch.zeros(2, batch_size, 64).to(x.device)
-        gru_out, _ = self.gru(x, h_0)
-        out = self.relu(gru_out[:, -1, :])
+        h = torch.zeros(batch_size, self.hidden_size).to(x.device)
+        c = torch.zeros(batch_size, self.hidden_size).to(x.device)
+        
+        # Simulate tree-like processing by iterating over "children" (here, just sequence steps)
+        for t in range(x.size(1)):  # Assuming sequence length is 1, this simplifies to one step
+            h, c = self.lstm(x[:, t, :], (h, c))
+            h = self.dropout(h)
+        
+        out = self.relu(h)
         out = self.fc(out)
         return out
-
-class FeedForwardModel(nn.Module):
-    def __init__(self, input_size, hidden_sizes=[256, 128, 64], output_size=1, dropout_rate=0.2):
-        super(FeedForwardModel, self).__init__()
-        layers = []
-        in_size = input_size
-        for h_size in hidden_sizes:
-            layers.append(nn.Linear(in_size, h_size))
-            layers.append(nn.ReLU())
-            layers.append(nn.Dropout(dropout_rate))
-            in_size = h_size
-        layers.append(nn.Linear(in_size, output_size))
-        self.network = nn.Sequential(*layers)
-    
-    def forward(self, x):
-        return self.network(x.squeeze(1))  # Remove sequence dimension
 
 def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=32):
     train_dataset = TensorDataset(X_train, y_train)
@@ -479,11 +499,11 @@ def main(main_dir, num_runs=5):
     # Prepare data
     X_train, y_train, X_test, y_test, y_scaler, input_size, is_log_transformed = prepare_data_for_model(train_features, test_features)
     
-    # Define models to compare
+    # Define LSTM variants to compare
     model_configs = {
         "EnhancedLSTM": lambda: EnhancedLSTMModel(input_size, hidden_sizes=[128, 64, 32], dropout_rate=0.3),
-        "SimpleGRU": lambda: SimpleGRUModel(input_size, hidden_size=64, dropout_rate=0.2),
-        "FeedForward": lambda: FeedForwardModel(input_size, hidden_sizes=[256, 128, 64], dropout_rate=0.2)
+        "RecursiveLSTM": lambda: RecursiveLSTMModel(input_size, hidden_size=64, dropout_rate=0.2),
+        "TreeLSTM": lambda: TreeLSTMModel(input_size, hidden_size=64, dropout_rate=0.2)
     }
     
     # Storage for results
@@ -544,10 +564,10 @@ def main(main_dir, num_runs=5):
         print(f"Avg MAPE: {results[model_name]['avg_mape']:.2f}% (±{results[model_name]['std_mape']:.2f}%)")
     
     # Compare models and select the best
-    best_model_name = min(results, key=lambda x: results[x]["avg_rmse"])  # Using RMSE as the criterion
+    best_model_name = min(results, key=lambda x: results[x]["avg_rmse"])  # Using RMSE as criterion
     best_result = results[best_model_name]
     
-    print(f"\n=== Model Comparison ===")
+    print(f"\n=== LSTM Variant Comparison ===")
     for name, res in results.items():
         print(f"{name}: Avg RMSE = {res['avg_rmse']:.2f} (±{res['std_rmse']:.2f})")
     print(f"\nBest Model: {best_model_name} (Lowest Avg RMSE: {best_result['avg_rmse']:.2f})")
