@@ -9,8 +9,9 @@ import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 import random
+import joblib
 
-# [Existing functions remain unchanged up to prepare_data_for_model]
+# [Existing functions unchanged up to prepare_data_for_model]
 def get_execution_time(file_path):
     try:
         with open(file_path, 'rb') as f:
@@ -270,13 +271,11 @@ def prepare_data_for_model(train_features, test_features):
     return (X_train_tensor, y_train_tensor, X_test_tensor, y_test_tensor, 
             scaler_y, X_train_scaled.shape[1], 'execution_time_log' in train_df.columns)
 
-# [EnhancedLSTMModel class remains unchanged]
+# Model Definitions
 class EnhancedLSTMModel(nn.Module):
     def __init__(self, input_size, hidden_sizes=[128, 64, 32], output_size=1, dropout_rate=0.3):
         super(EnhancedLSTMModel, self).__init__()
-        
         self.hidden_sizes = hidden_sizes
-        
         self.lstm_layers = nn.ModuleList()
         self.dropout_layers = nn.ModuleList()
         
@@ -288,21 +287,16 @@ class EnhancedLSTMModel(nn.Module):
             self.dropout_layers.append(nn.Dropout(dropout_rate))
         
         self.attention = nn.Linear(hidden_sizes[-1], 1)
-        
         self.fc_layers = nn.ModuleList()
         self.bn_layers = nn.ModuleList()
         
         self.fc_layers.append(nn.Linear(hidden_sizes[-1], hidden_sizes[-1] // 2))
         self.bn_layers.append(nn.BatchNorm1d(hidden_sizes[-1] // 2))
-        
         self.fc_layers.append(nn.Linear(hidden_sizes[-1] // 2, hidden_sizes[-1] // 4))
         self.bn_layers.append(nn.BatchNorm1d(hidden_sizes[-1] // 4))
-        
         self.output_layer = nn.Linear(hidden_sizes[-1] // 4, output_size)
         
-        self.relu = nn.ReLU()
         self.leaky_relu = nn.LeakyReLU(0.1)
-        
         self.has_residual = (hidden_sizes[-1] // 4 == hidden_sizes[-1] // 2)
         if not self.has_residual:
             self.residual_adapter = nn.Linear(hidden_sizes[-1] // 2, hidden_sizes[-1] // 4)
@@ -322,13 +316,11 @@ class EnhancedLSTMModel(nn.Module):
             device = x.device
             h_0 = torch.zeros(1, batch_size, hidden_size, device=device)
             c_0 = torch.zeros(1, batch_size, hidden_size, device=device)
-            
             lstm_out, _ = lstm(lstm_out, (h_0, c_0))
             if i < len(self.lstm_layers) - 1:
                 lstm_out = dropout(lstm_out)
         
         attn_output = self.attention_net(lstm_out)
-        
         fc_out = self.fc_layers[0](attn_output)
         fc_out = self.bn_layers[0](fc_out)
         fc_out = self.leaky_relu(fc_out)
@@ -340,20 +332,46 @@ class EnhancedLSTMModel(nn.Module):
         fc_out = self.fc_layers[1](fc_out)
         fc_out = self.bn_layers[1](fc_out)
         fc_out = self.leaky_relu(fc_out)
-        
         fc_out = fc_out + residual
-        
         output = self.output_layer(fc_out)
-        
         return output
+
+class SimpleGRUModel(nn.Module):
+    def __init__(self, input_size, hidden_size=64, output_size=1, dropout_rate=0.2):
+        super(SimpleGRUModel, self).__init__()
+        self.gru = nn.GRU(input_size, hidden_size, num_layers=2, batch_first=True, dropout=dropout_rate)
+        self.fc = nn.Linear(hidden_size, output_size)
+        self.relu = nn.ReLU()
+    
+    def forward(self, x):
+        batch_size = x.size(0)
+        h_0 = torch.zeros(2, batch_size, 64).to(x.device)
+        gru_out, _ = self.gru(x, h_0)
+        out = self.relu(gru_out[:, -1, :])
+        out = self.fc(out)
+        return out
+
+class FeedForwardModel(nn.Module):
+    def __init__(self, input_size, hidden_sizes=[256, 128, 64], output_size=1, dropout_rate=0.2):
+        super(FeedForwardModel, self).__init__()
+        layers = []
+        in_size = input_size
+        for h_size in hidden_sizes:
+            layers.append(nn.Linear(in_size, h_size))
+            layers.append(nn.ReLU())
+            layers.append(nn.Dropout(dropout_rate))
+            in_size = h_size
+        layers.append(nn.Linear(in_size, output_size))
+        self.network = nn.Sequential(*layers)
+    
+    def forward(self, x):
+        return self.network(x.squeeze(1))  # Remove sequence dimension
 
 def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=32):
     train_dataset = TensorDataset(X_train, y_train)
     test_dataset = TensorDataset(X_test, y_test)
-    
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-    
     return train_loader, test_loader
 
 def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=150, patience=20):
@@ -378,9 +396,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
             outputs = model(inputs)
             loss = criterion(outputs, targets)
             loss.backward()
-            
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            
             optimizer.step()
             running_loss += loss.item() * inputs.size(0)
         
@@ -460,120 +476,114 @@ def main(main_dir, num_runs=5):
         print("Error: No valid training or test data found")
         return None
     
-    # Prepare data for model
+    # Prepare data
     X_train, y_train, X_test, y_test, y_scaler, input_size, is_log_transformed = prepare_data_for_model(train_features, test_features)
     
-    # Metrics storage for averaging
-    all_mse = []
-    all_rmse = []
-    all_mae = []
-    all_mape = []
-    best_model = None
-    best_val_loss = float('inf')
-    best_y_test_actual = None
-    best_y_pred_actual = None
-    best_y_scaler = None
+    # Define models to compare
+    model_configs = {
+        "EnhancedLSTM": lambda: EnhancedLSTMModel(input_size, hidden_sizes=[128, 64, 32], dropout_rate=0.3),
+        "SimpleGRU": lambda: SimpleGRUModel(input_size, hidden_size=64, dropout_rate=0.2),
+        "FeedForward": lambda: FeedForwardModel(input_size, hidden_sizes=[256, 128, 64], dropout_rate=0.2)
+    }
     
-    for run in range(num_runs):
-        print(f"\nRun {run+1}/{num_runs}")
-        
-        # Create data loaders
-        train_loader, test_loader = create_data_loaders(X_train, y_train, X_test, y_test, batch_size=16)
-        
-        # Initialize model for this run
-        model = EnhancedLSTMModel(
-            input_size=input_size,
-            hidden_sizes=[128, 64, 32],
-            output_size=1,
-            dropout_rate=0.3
-        )
-        
-        # Define loss function and optimizer
-        criterion = nn.HuberLoss(delta=1.0)
-        optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-5)
-        
-        # Train model
-        print(f"Building and training Enhanced LSTM model for run {run+1}...")
-        train_losses, val_losses, val_loss = train_model(
-            model, 
-            train_loader, 
-            test_loader, 
-            criterion, 
-            optimizer, 
-            num_epochs=150,
-            patience=20
-        )
-        
-        # Evaluate model
-        print(f"\nEvaluating model for run {run+1}:")
-        y_test_actual, y_pred_actual, mse, rmse, mae, mape = evaluate_model(
-            model, X_test, y_test, y_scaler, test_file_names, is_log_transformed
-        )
-        
-        # Store metrics
-        all_mse.append(mse)
-        all_rmse.append(rmse)
-        all_mae.append(mae)
-        all_mape.append(mape)
-        
-        # Track best model based on validation loss
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_model = model
-            best_y_test_actual = y_test_actual
-            best_y_pred_actual = y_pred_actual
-            best_y_scaler = y_scaler
+    # Storage for results
+    results = {}
     
-    # Calculate average metrics
-    avg_mse = np.mean(all_mse)
-    avg_rmse = np.mean(all_rmse)
-    avg_mae = np.mean(all_mae)
-    avg_mape = np.mean(all_mape)
-    std_mse = np.std(all_mse)
-    std_rmse = np.std(all_rmse)
-    std_mae = np.std(all_mae)
-    std_mape = np.std(all_mape)
+    for model_name, model_fn in model_configs.items():
+        print(f"\n=== Evaluating {model_name} ===")
+        all_mse, all_rmse, all_mae, all_mape = [], [], [], []
+        best_model, best_val_loss = None, float('inf')
+        best_y_test_actual, best_y_pred_actual, best_y_scaler = None, None, None
+        
+        for run in range(num_runs):
+            print(f"\nRun {run+1}/{num_runs} for {model_name}")
+            train_loader, test_loader = create_data_loaders(X_train, y_train, X_test, y_test, batch_size=16)
+            
+            model = model_fn()
+            criterion = nn.HuberLoss(delta=1.0)
+            optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-5)
+            
+            print(f"Training {model_name} for run {run+1}...")
+            train_losses, val_losses, val_loss = train_model(
+                model, train_loader, test_loader, criterion, optimizer, num_epochs=150, patience=20
+            )
+            
+            print(f"Evaluating {model_name} for run {run+1}...")
+            y_test_actual, y_pred_actual, mse, rmse, mae, mape = evaluate_model(
+                model, X_test, y_test, y_scaler, test_file_names, is_log_transformed
+            )
+            
+            all_mse.append(mse)
+            all_rmse.append(rmse)
+            all_mae.append(mae)
+            all_mape.append(mape)
+            
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_model = model
+                best_y_test_actual = y_test_actual
+                best_y_pred_actual = y_pred_actual
+                best_y_scaler = y_scaler
+        
+        # Calculate averages
+        results[model_name] = {
+            "avg_mse": np.mean(all_mse), "std_mse": np.std(all_mse),
+            "avg_rmse": np.mean(all_rmse), "std_rmse": np.std(all_rmse),
+            "avg_mae": np.mean(all_mae), "std_mae": np.std(all_mae),
+            "avg_mape": np.mean(all_mape), "std_mape": np.std(all_mape),
+            "best_model": best_model,
+            "best_y_test_actual": best_y_test_actual,
+            "best_y_pred_actual": best_y_pred_actual,
+            "best_y_scaler": best_y_scaler,
+            "best_val_loss": best_val_loss
+        }
+        print(f"\n{model_name} Average Performance:")
+        print(f"Avg MSE: {results[model_name]['avg_mse']:.2f} (±{results[model_name]['std_mse']:.2f})")
+        print(f"Avg RMSE: {results[model_name]['avg_rmse']:.2f} (±{results[model_name]['std_rmse']:.2f})")
+        print(f"Avg MAE: {results[model_name]['avg_mae']:.2f} (±{results[model_name]['std_mae']:.2f})")
+        print(f"Avg MAPE: {results[model_name]['avg_mape']:.2f}% (±{results[model_name]['std_mape']:.2f}%)")
     
-    print("\nAverage Model Performance Across Runs:")
-    print(f"Average MSE: {avg_mse:.2f} (±{std_mse:.2f})")
-    print(f"Average RMSE: {avg_rmse:.2f} (±{std_rmse:.2f})")
-    print(f"Average MAE: {avg_mae:.2f} (±{std_mae:.2f})")
-    print(f"Average MAPE: {avg_mape:.2f}% (±{std_mape:.2f}%)")
+    # Compare models and select the best
+    best_model_name = min(results, key=lambda x: results[x]["avg_rmse"])  # Using RMSE as the criterion
+    best_result = results[best_model_name]
+    
+    print(f"\n=== Model Comparison ===")
+    for name, res in results.items():
+        print(f"{name}: Avg RMSE = {res['avg_rmse']:.2f} (±{res['std_rmse']:.2f})")
+    print(f"\nBest Model: {best_model_name} (Lowest Avg RMSE: {best_result['avg_rmse']:.2f})")
     
     # Detailed evaluation of the best model
-    print("\nBest Model Evaluation (Lowest Validation Loss):")
+    print(f"\nBest Model ({best_model_name}) Evaluation:")
     for subfolder in set(os.path.dirname(f) for f in test_file_names):
         subfolder_results = [
-            (f, y_test_actual[i][0], y_pred_actual[i][0])
+            (f, best_result["best_y_test_actual"][i][0], best_result["best_y_pred_actual"][i][0])
             for i, f in enumerate(test_file_names) if os.path.dirname(f) == subfolder
         ]
         print(f"\nResults for {subfolder}:")
         for fname, actual, pred in subfolder_results:
             print(f"File: {fname}")
-            print(f"  Actual execution time: {actual:.2f} ms")
-            print(f"  Predicted execution time: {pred:.2f} ms")
-            print(f"  Error percentage: {abs(actual - pred) / actual * 100 if actual > 0 else 0:.2f}%")
+            print(f"  Actual: {actual:.2f} ms")
+            print(f"  Predicted: {pred:.2f} ms")
+            print(f"  Error %: {abs(actual - pred) / actual * 100 if actual > 0 else 0:.2f}%")
     
     # Save the best model
-    print("\nSaving the best trained model as 'lstm_model.pt'...")
+    print(f"\nSaving the best model ({best_model_name}) as 'lstm_model.pt'...")
+    best_model = best_result["best_model"]
     best_model.eval()
     device = next(best_model.parameters()).device
-    print(f"Best model is on device: {device}")
-    
     try:
         sample_input = torch.randn(1, 1, input_size).to(device)
         traced_model = torch.jit.trace(best_model, sample_input)
         traced_model.save("lstm_model.pt")
-        print("Best model successfully saved as 'lstm_model.pt'")
+        print("Best model saved as 'lstm_model.pt'")
     except Exception as e:
-        print(f"Error saving the best model: {str(e)}")
+        print(f"Error saving model: {str(e)}")
     
-    # Save scalers for later use
-    import joblib
-    joblib.dump(best_y_scaler, "scaler_y.pkl")
+    # Save scaler
+    joblib.dump(best_result["best_y_scaler"], "scaler_y.pkl")
     print("Y scaler saved as 'scaler_y.pkl'")
     
-    return best_model, best_y_scaler, best_y_test_actual, best_y_pred_actual
+    return best_model, best_result["best_y_scaler"], best_result["best_y_test_actual"], best_result["best_y_pred_actual"]
 
 if __name__ == "__main__":
     main_dir = "synthetic_data"
