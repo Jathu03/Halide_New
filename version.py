@@ -340,9 +340,11 @@ class RecursiveLSTMModel(nn.Module):
     def __init__(self, input_size, hidden_size=64, output_size=1, dropout_rate=0.2):
         super(RecursiveLSTMModel, self).__init__()
         self.hidden_size = hidden_size
+        self.input_size = input_size
         self.lstm = nn.LSTM(input_size, hidden_size, batch_first=True)
         self.dropout = nn.Dropout(dropout_rate)
-        self.fc = nn.Linear(hidden_size * 2, output_size)  # Double hidden size for recursive step
+        self.recurse_proj = nn.Linear(hidden_size, input_size)  # Project hidden state back to input size
+        self.fc = nn.Linear(hidden_size * 2, output_size)  # Double hidden size for combining outputs
         self.relu = nn.ReLU()
     
     def forward(self, x):
@@ -354,12 +356,12 @@ class RecursiveLSTMModel(nn.Module):
         out, (h_n, c_n) = self.lstm(x, (h_0, c_0))
         out = self.dropout(out)
         
-        # Recursive pass: Feed hidden state back as input (simplified recursion)
-        recursive_input = h_n.repeat(1, 1, 2)[:, :, :self.hidden_size]  # Truncate for simplicity
+        # Recursive pass: Project hidden state to match input_size
+        recursive_input = self.recurse_proj(h_n)  # Shape: (1, batch_size, input_size)
         out, _ = self.lstm(recursive_input, (h_n, c_n))
         
         # Combine outputs
-        combined = torch.cat((h_n.squeeze(0), out[:, -1, :]), dim=1)
+        combined = torch.cat((h_n.squeeze(0), out[:, -1, :]), dim=1)  # Shape: (batch_size, hidden_size * 2)
         out = self.relu(combined)
         out = self.fc(out)
         return out
@@ -378,8 +380,8 @@ class TreeLSTMModel(nn.Module):
         h = torch.zeros(batch_size, self.hidden_size).to(x.device)
         c = torch.zeros(batch_size, self.hidden_size).to(x.device)
         
-        # Simulate tree-like processing by iterating over "children" (here, just sequence steps)
-        for t in range(x.size(1)):  # Assuming sequence length is 1, this simplifies to one step
+        # Simulate tree-like processing over sequence steps (here, just one step)
+        for t in range(x.size(1)):  # x has shape (batch_size, 1, input_size)
             h, c = self.lstm(x[:, t, :], (h, c))
             h = self.dropout(h)
         
