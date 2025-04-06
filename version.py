@@ -613,4 +613,4 @@ if __name__ == "__main__":
     torch.manual_seed(42)
     np.random.seed(42)
     
-    model, y_scaler, y_test_actual, y_pred_actual = main(main_dir, num_runs=5)
+    model, y_scaler, y_test_actual, y_pred_actual = main(main_dir, num_runs=2)
