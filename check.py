@@ -8,8 +8,9 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
 from torch.nn.utils.rnn import pad_sequence
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 import random
+import matplotlib.pyplot as plt
 
 # Define important metrics for scheduling sequence
 important_metrics = [
@@ -33,11 +34,12 @@ def get_execution_time(file_path):
         for item in schedules:
             if isinstance(item, dict) and item.get('name') == 'total_execution_time_ms':
                 execution_time = item.get('value')
-                if execution_time is not None:
+                if execution_time is not None and execution_time > 0:
                     return float(execution_time)
         
         print(f"Warning: 'total_execution_time_ms' not found in 'Schedules' of {file_path}")
-        return schedules[len(schedules)-1]["value"]
+        last_value = schedules[-1]["value"]
+        return float(last_value) if last_value > 0 else None
     
     except Exception as e:
         print(f"Error processing {file_path}: {str(e)}")
@@ -48,7 +50,7 @@ def extract_features_from_file(file_path):
         data = json.load(f)
     
     execution_time = get_execution_time(file_path)
-    if execution_time is None or not np.isfinite(execution_time) or execution_time <= 0:
+    if execution_time is None or not np.isfinite(execution_time):
         print(f"Warning: Invalid execution time in {file_path}")
         return None
     
@@ -103,22 +105,21 @@ def extract_features_from_file(file_path):
         working_set = sf.get('working_set', 0.0)
         inner_p = sf.get('inner_parallelism', 0.0)
         outer_p = sf.get('outer_parallelism', 0.0)
-        # Derived features
-        seq_vector.append(np.clip(bytes_prod / max(abs(bytes_real), 1e-4), -1e4, 1e4) if bytes_real != 0 else 0.0)
-        seq_vector.append(np.clip(bytes_prod / max(abs(num_vec), 1e-4), -1e4, 1e4) if num_vec != 0 else 0.0)
-        seq_vector.append(np.clip(points_total / max(abs(num_vec), 1e-4), -1e4, 1e4) if num_vec != 0 else 0.0)
-        seq_vector.append(np.clip(working_set / max(abs(bytes_prod), 1e-4), -1e4, 1e4) if bytes_prod != 0 else 0.0)
-        seq_vector.append(inner_p * outer_p)  # Total parallelism
-        seq_vector.append(np.clip(bytes_prod / max(points_total, 1e-4), -1e4, 1e4) if points_total != 0 else 0.0)
+        # Derived features with log scaling for stability
+        seq_vector.append(np.log1p(abs(bytes_prod)) / np.log1p(max(abs(bytes_real), 1e-4)) if bytes_real != 0 else 0.0)
+        seq_vector.append(np.log1p(bytes_prod) / np.log1p(max(num_vec, 1e-4)) if num_vec != 0 else 0.0)
+        seq_vector.append(np.log1p(points_total) / np.log1p(max(num_vec, 1e-4)) if num_vec != 0 else 0.0)
+        seq_vector.append(np.log1p(working_set) / np.log1p(max(bytes_prod, 1e-4)) if bytes_prod != 0 else 0.0)
+        seq_vector.append(np.log1p(inner_p * outer_p))
+        seq_vector.append(np.log1p(bytes_prod) / np.log1p(max(points_total, 1e-4)) if points_total != 0 else 0.0)
         scheduling_sequence.append(seq_vector)
     if not scheduling_sequence:
-        scheduling_sequence = [[0.0] * (len(important_metrics) + 6)]  # Updated length
+        scheduling_sequence = [[0.0] * (len(important_metrics) + 6)]
     
-    # Normalize sequence per sample with robust scaling
+    # Robust scaling with per-sample normalization
     seq_array = np.array(scheduling_sequence)
-    seq_median = np.median(seq_array, axis=0, keepdims=True)
-    seq_iqr = np.percentile(seq_array, 75, axis=0, keepdims=True) - np.percentile(seq_array, 25, axis=0, keepdims=True) + 1e-6
-    scheduling_sequence = (seq_array - seq_median) / seq_iqr
+    scaler_seq = RobustScaler()
+    scheduling_sequence = scaler_seq.fit_transform(seq_array)
     scheduling_sequence = np.nan_to_num(scheduling_sequence, nan=0.0).tolist()
     
     # Enhanced scalar features
@@ -131,6 +132,8 @@ def extract_features_from_file(file_path):
     total_ops = sum(op_counts.values())
     num_nodes = max(len(nodes_features), 1)
     num_edges = len(edges_features)
+    total_bytes = sum(sf.get('bytes_at_production', 0) for sf in scheduling_features)
+    total_vectors = sum(sf.get('num_vectors', 0) for sf in scheduling_features)
     scalar_features = {
         'nodes_count': num_nodes,
         'edges_count': num_edges,
@@ -138,14 +141,15 @@ def extract_features_from_file(file_path):
         'total_ops': total_ops,
         'op_diversity': len(op_counts) / num_nodes,
         'avg_ops_per_node': total_ops / num_nodes,
-        'edge_density': num_edges / max(num_nodes * max(num_nodes - 1, 1), 1),
+        'edge_density': num_edges / max(num_nodes * (num_nodes - 1), 1),
         'total_parallelism': sum(sf.get('inner_parallelism', 0) * sf.get('outer_parallelism', 1) for sf in scheduling_features),
-        'avg_bytes_per_node': sum(sf.get('bytes_at_production', 0) for sf in scheduling_features) / num_nodes,
-        'vector_op_ratio': op_counts.get('op_vector', 0) / max(total_ops, 1)
+        'avg_bytes_per_node': total_bytes / num_nodes,
+        'vector_op_ratio': op_counts.get('op_vector', 0) / max(total_ops, 1),
+        'bytes_per_vector': total_bytes / max(total_vectors, 1e-4),
+        'ops_per_byte': total_ops / max(total_bytes, 1e-4)
     }
     scalar_features.update(op_counts)
     
-    # Replace NaN in scalar features
     for key in scalar_features:
         if not np.isfinite(scalar_features[key]):
             scalar_features[key] = 0.0
@@ -153,7 +157,7 @@ def extract_features_from_file(file_path):
     return {
         'scheduling_sequence': scheduling_sequence,
         'scalar_features': scalar_features,
-        'execution_time': execution_time
+        'execution、中央_time': execution_time
     }
 
 def process_directory(directory_path):
@@ -221,11 +225,10 @@ def prepare_data_for_model(train_features, test_features):
     train_scalar_df = train_scalar_df.fillna(0)
     test_scalar_df = test_scalar_df.fillna(0)
     
-    # Clip execution times to avoid extreme values
     y_train_raw = np.array([f['execution_time'] for f in train_features])
     y_test_raw = np.array([f['execution_time'] for f in test_features])
-    y_train_raw = np.clip(y_train_raw, 0, np.percentile(y_train_raw, 95))  # Cap at 95th percentile
-    y_test_raw = np.clip(y_test_raw, 0, np.percentile(y_test_raw, 95))
+    y_train_raw = np.clip(y_train_raw, 0, np.percentile(y_train_raw, 99))  # Cap at 99th percentile
+    y_test_raw = np.clip(y_test_raw, 0, np.percentile(y_test_raw, 99))
     
     y_train = np.log1p(y_train_raw).reshape(-1, 1)
     y_test = np.log1p(y_test_raw).reshape(-1, 1)
@@ -286,59 +289,65 @@ class MultiHeadAttention(nn.Module):
         return out
 
 class EnhancedRecursiveLSTMModel(nn.Module):
-    def __init__(self, seq_input_size, scalar_input_size, hidden_sizes=[512, 256, 128], output_size=1, dropout_rate=0.3, num_heads=8):
+    def __init__(self, seq_input_size, scalar_input_size, hidden_sizes=[512, 256, 128], output_size=1, dropout_rate=0.2, num_heads=8):
         super(EnhancedRecursiveLSTMModel, self).__init__()
         
-        # Deeper Bidirectional LSTM layers
+        # Deeper Bidirectional LSTM with LayerNorm
         self.lstm_layers = nn.ModuleList()
+        self.ln_layers = nn.ModuleList()
         self.lstm_layers.append(nn.LSTM(seq_input_size, hidden_sizes[0], batch_first=True, bidirectional=True))
+        self.ln_layers.append(nn.LayerNorm(hidden_sizes[0] * 2))
         for i in range(1, len(hidden_sizes)):
             self.lstm_layers.append(nn.LSTM(hidden_sizes[i-1] * 2, hidden_sizes[i], batch_first=True, bidirectional=True))
-        
-        # Multi-head attention with dropout
-        self.attention = MultiHeadAttention(hidden_sizes[-1] * 2, num_heads, dropout_rate)
-        
-        # Fully connected layers with residual connection
-        self.fc1 = nn.Linear(hidden_sizes[-1] * 2 + scalar_input_size, 256)
-        self.bn1 = nn.BatchNorm1d(256)
-        self.fc2 = nn.Linear(256, 128)
-        self.bn2 = nn.BatchNorm1d(128)
-        self.fc3 = nn.Linear(128, 64)
-        self.bn3 = nn.BatchNorm1d(64)
-        self.output_layer = nn.Linear(64, output_size)
-        
-        self.relu = nn.ReLU()
-        self.dropout = nn.Dropout(dropout_rate)
-        self.residual_proj = nn.Linear(hidden_sizes[-1] * 2 + scalar_input_size, 64) if (hidden_sizes[-1] * 2 + scalar_input_size != 64) else None
-    
-    def forward(self, seq_input, scalar_input):
-        # LSTM layers
-        lstm_out = seq_input
-        for lstm in self.lstm_layers:
-            lstm_out, _ = lstm(lstm_out)
-            lstm_out = self.dropout(lstm_out)
+            self.ln_layers.append(nn.LayerNorm(hidden_sizes[i] * 2))
         
         # Multi-head attention
-        attn_out = self.attention(lstm_out)
-        context = attn_out.mean(dim=1)  # Average over sequence for more robust context
+        self.attention = MultiHeadAttention(hidden_sizes[-1] * 2, num_heads, dropout_rate)
         
-        # Concatenate with scalar features
+        # Fully connected layers with residual connections and LayerNorm
+        combined_size = hidden_sizes[-1] * 2 + scalar_input_size
+        self.fc1 = nn.Linear(combined_size, 256)
+        self.bn1 = nn.BatchNorm1d(256)
+        self.ln1 = nn.LayerNorm(256)
+        self.fc2 = nn.Linear(256, 128)
+        self.bn2 = nn.BatchNorm1d(128)
+        self.ln2 = nn.LayerNorm(128)
+        self.fc3 = nn.Linear(128, 64)
+        self.bn3 = nn.BatchNorm1d(64)
+        self.ln3 = nn.LayerNorm(64)
+        self.output_layer = nn.Linear(64, output_size)
+        
+        self.gelu = nn.GELU()
+        self.dropout = nn.Dropout(dropout_rate)
+        self.residual_proj = nn.Linear(combined_size, 64) if combined_size != 64 else None
+    
+    def forward(self, seq_input, scalar_input):
+        lstm_out = seq_input
+        for lstm, ln in zip(self.lstm_layers, self.ln_layers):
+            lstm_out, _ = lstm(lstm_out)
+            lstm_out = ln(lstm_out)
+            lstm_out = self.dropout(lstm_out)
+        
+        attn_out = self.attention(lstm_out)
+        context = attn_out.mean(dim=1)
+        
         combined = torch.cat((context, scalar_input), dim=1)
         
-        # Fully connected layers with residual connection
         x = self.fc1(combined)
         x = self.bn1(x)
-        x = self.relu(x)
+        x = self.ln1(x)
+        x = self.gelu(x)
         x = self.dropout(x)
         x = self.fc2(x)
         x = self.bn2(x)
-        x = self.relu(x)
+        x = self.ln2(x)
+        x = self.gelu(x)
         x = self.dropout(x)
         x = self.fc3(x)
         x = self.bn3(x)
-        x = self.relu(x)
+        x = self.ln3(x)
+        x = self.gelu(x)
         
-        # Residual connection
         residual = combined if self.residual_proj is None else self.residual_proj(combined)
         x = x + residual
         x = self.dropout(x)
@@ -346,13 +355,13 @@ class EnhancedRecursiveLSTMModel(nn.Module):
         
         return output
 
-def custom_loss(outputs, targets, huber_delta=1.0, mae_weight=0.5, l1_lambda=1e-5):
+def custom_loss(outputs, targets, huber_delta=0.5, mae_weight=0.3, l1_lambda=1e-5):
     huber = nn.HuberLoss(delta=huber_delta)(outputs, targets)
     mae = torch.mean(torch.abs(outputs - targets))
     l1_reg = sum(param.abs().sum() for param in model.parameters()) * l1_lambda
     return huber + mae_weight * mae + l1_reg
 
-def create_data_loaders(train_sequences, train_scalar, y_train, test_sequences, test_scalar, y_test, batch_size=32):
+def create_data_loaders(train_sequences, train_scalar, y_train, test_sequences, test_scalar, y_test, batch_size=64):
     train_dataset = TensorDataset(train_sequences, train_scalar, y_train)
     test_dataset = TensorDataset(test_sequences, test_scalar, y_test)
     
@@ -361,12 +370,12 @@ def create_data_loaders(train_sequences, train_scalar, y_train, test_sequences, 
     
     return train_loader, test_loader
 
-def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=500, patience=50, accumulation_steps=4):
+def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=500, patience=50, accumulation_steps=2):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     model.to(device)
     
-    scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
+    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=50, T_mult=2, eta_min=1e-6)
     
     best_val_loss = float('inf')
     epochs_no_improve = 0
@@ -392,14 +401,14 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
             loss.backward()
             
             if (i + 1) % accumulation_steps == 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
                 optimizer.zero_grad()
             
             running_loss += loss.item() * accumulation_steps * seq_inputs.size(0)
         
         if len(train_loader) % accumulation_steps != 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             optimizer.zero_grad()
         
@@ -436,6 +445,18 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
     
     if best_model_state is not None and epochs_no_improve > 0:
         model.load_state_dict(best_model_state)
+    
+    # Plot training and validation losses
+    plt.figure(figsize=(10, 6))
+    plt.plot(range(1, len(train_losses) + 1), train_losses, label='Training Loss')
+    plt.plot(range(1, len(val_losses) + 1), val_losses, label='Validation Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('Training and Validation Loss Over Epochs')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig('loss_plot.png')
+    plt.show()
     
     return train_losses, val_losses
 
@@ -515,7 +536,7 @@ def main(main_dir):
     train_loader, test_loader = create_data_loaders(
         train_sequences, train_scalar, y_train,
         test_sequences, test_scalar, y_test,
-        batch_size=32
+        batch_size=64
     )
     
     global model  # Define model globally for custom_loss
@@ -528,13 +549,13 @@ def main(main_dir):
         num_heads=8
     )
     
-    optimizer = optim.AdamW(model.parameters(), lr=0.0001, weight_decay=1e-4)
+    optimizer = optim.AdamW(model.parameters(), lr=0.00005, weight_decay=1e-4)
     
     print("Building and training Enhanced Recursive LSTM model...")
     train_losses, val_losses = train_model(
         model, train_loader, test_loader,
         custom_loss, optimizer,
-        num_epochs=500, patience=50, accumulation_steps=4
+        num_epochs=500, patience=50, accumulation_steps=2
     )
     
     if train_losses is None or val_losses is None:
