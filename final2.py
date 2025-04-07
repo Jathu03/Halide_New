@@ -62,19 +62,22 @@ def extract_features_from_file(file_path):
         return None
     
     # Extract node and edge details
-    op_counts = {}
+    op_counts_per_node = []
+    all_op_types = set()
     for node in programming_details['Nodes']:
         node_feature = {'Name': node.get('Name', '')}
+        op_counts = {}
         if 'Details' in node and 'Op histogram' in node['Details']:
             op_hist = node['Details']['Op histogram']
             for op_line in op_hist:
                 parts = op_line.strip().split(':')
                 if len(parts) == 2:
-                    op_name = parts[0].strip()
+                    op_name = parts[0].strip().lower()
                     op_count = int(parts[1].strip())
-                    node_feature[f'op_{op_name.lower()}'] = op_count
-                    op_counts[f'op_{op_name.lower()}'] = op_counts.get(f'op_{op_name.lower()}', 0) + op_count
+                    op_counts[f'op_{op_name}'] = op_count
+                    all_op_types.add(f'op_{op_name}')
         nodes_features.append(node_feature)
+        op_counts_per_node.append(op_counts)
     
     for edge in programming_details['Edges']:
         edge_feature = {'From': edge.get('From', ''), 'To': edge.get('To', ''), 'Name': edge.get('Name', '')}
@@ -83,7 +86,7 @@ def extract_features_from_file(file_path):
     # Graph Embedding (Simple GNN-like aggregation)
     num_nodes = max(len(nodes_features), 1)
     num_edges = len(edges_features)
-    total_ops = sum(op_counts.values())
+    total_ops = sum(sum(node.get(f'op_{op}', 0) for op in all_op_types) for node in op_counts_per_node)
     node_map = {node['Name']: i for i, node in enumerate(nodes_features)}
     adj_matrix = np.zeros((num_nodes, num_nodes))
     for edge in edges_features:
@@ -92,11 +95,23 @@ def extract_features_from_file(file_path):
         if from_idx != -1 and to_idx != -1:
             adj_matrix[from_idx, to_idx] = 1
     
-    node_features = np.array([op_counts.get(f'op_{op}', 0) / max(total_ops, 1) for op in sorted(op_counts.keys())] + [0] * (10 - len(op_counts)))
-    graph_embedding = np.mean(np.dot(adj_matrix, node_features.reshape(-1, 1)) if num_nodes > 1 else node_features, axis=0)
+    # Create node feature matrix (num_nodes, num_features)
+    fixed_op_size = 10  # Maximum number of operation types to consider
+    op_types = sorted(list(all_op_types))[:fixed_op_size]  # Truncate to fixed size
+    node_features = np.zeros((num_nodes, fixed_op_size))
+    for i, op_counts in enumerate(op_counts_per_node):
+        for j, op in enumerate(op_types):
+            node_features[i, j] = op_counts.get(op, 0) / max(total_ops, 1)
+    
+    # Compute graph embedding
+    if num_nodes > 1:
+        graph_embedding = np.mean(np.dot(adj_matrix, node_features), axis=0)
+    else:
+        graph_embedding = np.mean(node_features, axis=0)
+    
     template_features = np.concatenate([
-        [num_nodes, num_edges, total_ops, len(op_counts) / num_nodes],
-        graph_embedding.flatten()
+        [num_nodes, num_edges, total_ops, len(all_op_types) / num_nodes],
+        graph_embedding
     ])
     scaler_template = RobustScaler()
     template_features = scaler_template.fit_transform(template_features.reshape(1, -1)).flatten()
