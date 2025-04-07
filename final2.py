@@ -14,9 +14,8 @@ import matplotlib.pyplot as plt
 
 # Define important metrics for scheduling sequence (schedule-specific)
 important_metrics = [
-    'bytes_at_production', 'bytes_at_realization', 'bytes_at_root', 'bytes_at_task',
-    'inner_parallelism', 'outer_parallelism', 'num_productions', 'num_realizations',
-    'num_scalars', 'num_vectors', 'points_computed_total', 'working_set'
+    'bytes_at_production', 'bytes_at_realization', 'inner_parallelism', 'outer_parallelism',
+    'num_vectors', 'points_computed_total', 'working_set'
 ]
 
 def get_execution_time(file_path):
@@ -44,24 +43,6 @@ def get_execution_time(file_path):
     except Exception as e:
         print(f"Error processing {file_path}: {str(e)}")
         return None
-
-def compute_graph_features(nodes, edges):
-    num_nodes = len(nodes)
-    num_edges = len(edges)
-    adj_matrix = np.zeros((num_nodes, num_nodes))
-    node_map = {node['Name']: i for i, node in enumerate(nodes)}
-    
-    for edge in edges:
-        from_idx = node_map.get(edge['From'], -1)
-        to_idx = node_map.get(edge['To'], -1)
-        if from_idx != -1 and to_idx != -1:
-            adj_matrix[from_idx, to_idx] = 1
-    
-    degrees = np.sum(adj_matrix, axis=1)
-    avg_degree = np.mean(degrees) if num_nodes > 0 else 0
-    clustering = np.mean([np.sum(adj_matrix[i] * adj_matrix.T[i]) / (degrees[i] * (degrees[i] - 1)) if degrees[i] > 1 else 0 for i in range(num_nodes)]) if num_nodes > 1 else 0
-    
-    return avg_degree, clustering
 
 def extract_features_from_file(file_path):
     with open(file_path, 'r') as f:
@@ -99,25 +80,26 @@ def extract_features_from_file(file_path):
         edge_feature = {'From': edge.get('From', ''), 'To': edge.get('To', ''), 'Name': edge.get('Name', '')}
         edges_features.append(edge_feature)
     
-    # Program Template (Static Features) with Graph Features
+    # Graph Embedding (Simple GNN-like aggregation)
     num_nodes = max(len(nodes_features), 1)
     num_edges = len(edges_features)
     total_ops = sum(op_counts.values())
-    avg_degree, clustering = compute_graph_features(nodes_features, edges_features)
-    template_features = [
-        num_nodes,
-        num_edges,
-        num_nodes / max(num_edges, 1),
-        total_ops,
-        len(op_counts) / num_nodes,
-        total_ops / num_nodes,
-        num_edges / max(num_nodes * (num_nodes - 1), 1),
-        op_counts.get('op_vector', 0) / max(total_ops, 1),
-        avg_degree,
-        clustering
-    ] + [op_counts.get(f'op_{op}', 0) for op in sorted(op_counts.keys())]
+    node_map = {node['Name']: i for i, node in enumerate(nodes_features)}
+    adj_matrix = np.zeros((num_nodes, num_nodes))
+    for edge in edges_features:
+        from_idx = node_map.get(edge['From'], -1)
+        to_idx = node_map.get(edge['To'], -1)
+        if from_idx != -1 and to_idx != -1:
+            adj_matrix[from_idx, to_idx] = 1
+    
+    node_features = np.array([op_counts.get(f'op_{op}', 0) / max(total_ops, 1) for op in sorted(op_counts.keys())] + [0] * (10 - len(op_counts)))
+    graph_embedding = np.mean(np.dot(adj_matrix, node_features.reshape(-1, 1)) if num_nodes > 1 else node_features, axis=0)
+    template_features = np.concatenate([
+        [num_nodes, num_edges, total_ops, len(op_counts) / num_nodes],
+        graph_embedding.flatten()
+    ])
     scaler_template = RobustScaler()
-    template_features = scaler_template.fit_transform(np.array(template_features, dtype=np.float32).reshape(1, -1)).flatten()
+    template_features = scaler_template.fit_transform(template_features.reshape(1, -1)).flatten()
     template_features = np.nan_to_num(template_features, nan=0.0)
     
     # Schedule-Specific Features
@@ -137,46 +119,26 @@ def extract_features_from_file(file_path):
             sched_feature.update(sf)
         scheduling_features.append(sched_feature)
     
-    # Statistical Summaries of Scheduling Metrics
-    sched_stats = {metric: [float(sf.get(metric, 0.0)) for sf in scheduling_features] for metric in important_metrics}
-    stat_features = [np.mean(sched_stats[metric]) for metric in important_metrics] + \
-                    [np.std(sched_stats[metric]) for metric in important_metrics]
-    stat_features = np.nan_to_num(stat_features, nan=0.0)
-    
-    # Enhanced Scheduling Sequence with Transformer-Style Positional Encoding
+    # Enhanced Scheduling Sequence with Data Augmentation
     scheduling_sequence = []
-    max_seq_len = 100  # Arbitrary max length for positional encoding
-    d_model = len(important_metrics) + 8 + 2  # Base + derived + pos encoding dim
-    pos_encoding = np.zeros((max_seq_len, 2))
-    for pos in range(max_seq_len):
-        pos_encoding[pos, 0] = np.sin(pos / 10000 ** (0 / d_model))
-        pos_encoding[pos, 1] = np.cos(pos / 10000 ** (0 / d_model))
-    
     for i, sf in enumerate(scheduling_features):
         sched_vector = [float(sf.get(metric, 0.0)) for metric in important_metrics]
         bytes_prod = sf.get('bytes_at_production', 0.0)
-        bytes_real = sf.get('bytes_at_realization', 0.0)
-        num_vec = sf.get('num_vectors', 0.0)
         points_total = sf.get('points_computed_total', 0.0)
-        working_set = sf.get('working_set', 0.0)
         inner_p = sf.get('inner_parallelism', 0.0)
         outer_p = sf.get('outer_parallelism', 0.0)
         sched_vector.extend([
-            np.log1p(abs(bytes_prod)) / np.log1p(max(abs(bytes_real), 1e-4)) if bytes_real != 0 else 0.0,
-            np.log1p(bytes_prod) / np.log1p(max(num_vec, 1e-4)) if num_vec != 0 else 0.0,
-            np.log1p(points_total) / np.log1p(max(num_vec, 1e-4)) if num_vec != 0 else 0.0,
-            np.log1p(working_set) / np.log1p(max(bytes_prod, 1e-4)) if bytes_prod != 0 else 0.0,
             np.log1p(inner_p * outer_p),
-            np.log1p(bytes_prod) / np.log1p(max(points_total, 1e-4)) if points_total != 0 else 0.0,
-            inner_p * outer_p * num_nodes,
-            bytes_prod * total_ops
+            bytes_prod / max(points_total, 1e-4)
         ])
-        pos_enc = pos_encoding[i] if i < max_seq_len else pos_encoding[-1]
-        combined_vector = np.concatenate([template_features, stat_features, np.array(sched_vector, dtype=np.float32), pos_enc])
+        # Augment with noise
+        noise = np.random.normal(0, 0.05, len(sched_vector))
+        augmented_vector = np.array(sched_vector, dtype=np.float32) + noise
+        combined_vector = np.concatenate([template_features, augmented_vector])
         scheduling_sequence.append(combined_vector)
     
     if not scheduling_sequence:
-        scheduling_sequence = [np.concatenate([template_features, stat_features, np.zeros(len(important_metrics) + 8, dtype=np.float32), np.array([0.0, 1.0], dtype=np.float32)])]
+        scheduling_sequence = [np.concatenate([template_features, np.zeros(len(important_metrics) + 2, dtype=np.float32)])]
     
     seq_array = np.array(scheduling_sequence)
     scaler_seq = RobustScaler()
@@ -271,30 +233,17 @@ def prepare_data_for_model(train_features, test_features):
             test_sequences_padded, y_test_tensor,
             scaler_y, train_sequences_padded.shape[2])
 
-class TransformerEncoderLayer(nn.Module):
-    def __init__(self, hidden_size, num_heads, dropout_rate=0.1, feed_forward_size=2048):
-        super(TransformerEncoderLayer, self).__init__()
-        self.attention = nn.MultiheadAttention(hidden_size, num_heads, dropout=dropout_rate, batch_first=True)
-        self.norm1 = nn.LayerNorm(hidden_size)
-        self.dropout1 = nn.Dropout(dropout_rate)
-        self.ffn = nn.Sequential(
-            nn.Linear(hidden_size, feed_forward_size),
-            nn.GELU(),
-            nn.Dropout(dropout_rate),
-            nn.Linear(feed_forward_size, hidden_size)
-        )
-        self.norm2 = nn.LayerNorm(hidden_size)
-        self.dropout2 = nn.Dropout(dropout_rate)
+class AttentionPooling(nn.Module):
+    def __init__(self, hidden_size):
+        super(AttentionPooling, self).__init__()
+        self.attention = nn.Linear(hidden_size, 1)
     
     def forward(self, x):
-        attn_out, _ = self.attention(x, x, x)
-        x = self.norm1(x + self.dropout1(attn_out))
-        ffn_out = self.ffn(x)
-        x = self.norm2(x + self.dropout2(ffn_out))
-        return x
+        weights = torch.softmax(self.attention(x), dim=1)
+        return torch.sum(x * weights, dim=1)
 
 class EnhancedRecursiveLSTMModel(nn.Module):
-    def __init__(self, seq_input_size, hidden_sizes=[768, 384, 192], output_size=1, dropout_rate=0.1, num_heads=12):
+    def __init__(self, seq_input_size, hidden_sizes=[512, 256, 128], output_size=1, dropout_rate=0.2, num_heads=8):
         super(EnhancedRecursiveLSTMModel, self).__init__()
         
         self.lstm_layers = nn.ModuleList()
@@ -308,17 +257,15 @@ class EnhancedRecursiveLSTMModel(nn.Module):
             self.ln_layers.append(nn.LayerNorm(hidden_sizes[i] * 2))
             self.residual_projs.append(nn.Linear(hidden_sizes[i-1] * 2, hidden_sizes[i] * 2) if hidden_sizes[i-1] * 2 != hidden_sizes[i] * 2 else None)
         
-        self.transformer = TransformerEncoderLayer(hidden_sizes[-1] * 2, num_heads, dropout_rate)
+        self.attention = nn.MultiheadAttention(hidden_sizes[-1] * 2, num_heads, dropout=dropout_rate, batch_first=True)
+        self.attn_pool = AttentionPooling(hidden_sizes[-1] * 2)
         
-        self.fc1 = nn.Linear(hidden_sizes[-1] * 2, 512)
-        self.bn1 = nn.BatchNorm1d(512)
-        self.ln1 = nn.LayerNorm(512)
-        self.fc2 = nn.Linear(512, 256)
-        self.bn2 = nn.BatchNorm1d(256)
-        self.ln2 = nn.LayerNorm(256)
-        self.fc3 = nn.Linear(256, 128)
-        self.bn3 = nn.BatchNorm1d(128)
-        self.ln3 = nn.LayerNorm(128)
+        self.fc1 = nn.Linear(hidden_sizes[-1] * 2, 256)
+        self.bn1 = nn.BatchNorm1d(256)
+        self.ln1 = nn.LayerNorm(256)
+        self.fc2 = nn.Linear(256, 128)
+        self.bn2 = nn.BatchNorm1d(128)
+        self.ln2 = nn.LayerNorm(128)
         self.output_layer = nn.Linear(128, output_size)
         
         self.gelu = nn.GELU()
@@ -334,8 +281,8 @@ class EnhancedRecursiveLSTMModel(nn.Module):
             lstm_out = ln(lstm_out)
             lstm_out = self.dropout(lstm_out)
         
-        transformer_out = self.transformer(lstm_out)
-        context = transformer_out.mean(dim=1)
+        attn_out, _ = self.attention(lstm_out, lstm_out, lstm_out)
+        context = self.attn_pool(attn_out)
         
         x = self.fc1(context)
         x = self.bn1(x)
@@ -346,11 +293,6 @@ class EnhancedRecursiveLSTMModel(nn.Module):
         x = self.bn2(x)
         x = self.ln2(x)
         x = self.gelu(x)
-        x = self.dropout(x)
-        x = self.fc3(x)
-        x = self.bn3(x)
-        x = self.ln3(x)
-        x = self.gelu(x)
         
         residual = context if self.final_residual_proj is None else self.final_residual_proj(context)
         x = x + residual
@@ -359,13 +301,11 @@ class EnhancedRecursiveLSTMModel(nn.Module):
         
         return output
 
-def custom_loss(outputs, targets, huber_delta=0.5, mae_weight=0.3, l1_lambda=1e-5):
-    huber = nn.HuberLoss(delta=huber_delta)(outputs, targets)
-    mae = torch.mean(torch.abs(outputs - targets))
-    weights = torch.where(targets > 0.5, 1.5, 1.0)
-    weighted_mae = torch.mean(weights * torch.abs(outputs - targets))
-    l1_reg = sum(param.abs().sum() for param in model.parameters()) * l1_lambda
-    return huber + mae_weight * weighted_mae + l1_reg
+def focal_loss(outputs, targets, alpha=0.25, gamma=2.0):
+    mse = (outputs - targets) ** 2
+    pt = torch.exp(-mse)
+    loss = alpha * (1 - pt) ** gamma * mse
+    return torch.mean(loss)
 
 def create_data_loaders(train_sequences, y_train, test_sequences, y_test, batch_size=16):
     train_dataset = TensorDataset(train_sequences, y_train)
@@ -376,7 +316,7 @@ def create_data_loaders(train_sequences, y_train, test_sequences, y_test, batch_
     
     return train_loader, test_loader
 
-def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=500, patience=50, accumulation_steps=2):
+def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=500, patience=50, accumulation_steps=2, warmup_epochs=10):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
@@ -401,6 +341,12 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
         model.train()
         running_loss = 0.0
         optimizer.zero_grad()
+        
+        # Learning rate warmup
+        if epoch < warmup_epochs:
+            lr_scale = (epoch + 1) / warmup_epochs
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = 0.0001 * lr_scale
         
         for i, (seq_inputs, targets) in enumerate(train_loader):
             seq_inputs, targets = seq_inputs.to(device), targets.to(device)
@@ -441,7 +387,8 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
         val_loss /= len(test_loader.dataset)
         val_losses.append(val_loss)
         
-        scheduler.step(val_loss)
+        if epoch >= warmup_epochs:
+            scheduler.step(val_loss)
         
         print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
         
@@ -556,19 +503,19 @@ def main(main_dir):
     global model
     model = EnhancedRecursiveLSTMModel(
         seq_input_size=seq_input_size,
-        hidden_sizes=[768, 384, 192],
+        hidden_sizes=[512, 256, 128],
         output_size=1,
-        dropout_rate=0.1,
-        num_heads=12
+        dropout_rate=0.2,
+        num_heads=8
     )
     
-    optimizer = optim.AdamW(model.parameters(), lr=0.0002, weight_decay=1e-4)
+    optimizer = optim.AdamW(model.parameters(), lr=0.0001, weight_decay=1e-3)
     
     print("Building and training Enhanced Recursive LSTM model...")
     train_losses, val_losses = train_model(
         model, train_loader, test_loader,
-        custom_loss, optimizer,
-        num_epochs=500, patience=50, accumulation_steps=2
+        focal_loss, optimizer,
+        num_epochs=500, patience=50, accumulation_steps=2, warmup_epochs=10
     )
     
     if train_losses is None or val_losses is None:
