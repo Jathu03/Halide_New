@@ -258,22 +258,15 @@ class TreeLSTMCell(nn.Module):
     def forward(self, x, h_children, c_children):
         batch_size = x.size(0)
         
-        # Initialize hidden and cell states
         h_sum = sum(h_children) if h_children else torch.zeros(batch_size, self.hidden_size, device=x.device)
         c_sum = sum(c_children) if c_children else torch.zeros(batch_size, self.hidden_size, device=x.device)
         
-        # Input gate
         i = torch.sigmoid(self.W_i(x) + self.U_i(h_sum))
-        # Forget gate (one per child, but here we simplify by summing)
         f = torch.sigmoid(self.W_f(x) + self.U_f(h_sum))
-        # Output gate
         o = torch.sigmoid(self.W_o(x) + self.U_o(h_sum))
-        # Cell update
         u = torch.tanh(self.W_u(x) + self.U_u(h_sum))
         
-        # Cell state
         c = i * u + f * c_sum
-        # Hidden state
         h = o * torch.tanh(c)
         
         return h, c
@@ -284,38 +277,45 @@ class TreeLSTM(nn.Module):
         self.cell = TreeLSTMCell(input_size, hidden_size)
         self.hidden_size = hidden_size
     
-    def forward(self, tree):
-        node_features = tree['node_features']
-        children = tree['children']
-        num_nodes = node_features.size(0)
-        device = node_features.device
+    def forward(self, trees):
+        batch_size = len(trees)
+        device = trees[0]['node_features'].device
         
-        h = torch.zeros(num_nodes, self.hidden_size, device=device)
-        c = torch.zeros(num_nodes, self.hidden_size, device=device)
+        h_roots = []
         
-        def compute_node(idx):
-            if h[idx].sum() != 0:  # Already computed
+        for tree in trees:
+            node_features = tree['node_features']
+            children = tree['children']
+            num_nodes = node_features.size(0)
+            
+            h = torch.zeros(num_nodes, self.hidden_size, device=device)
+            c = torch.zeros(num_nodes, self.hidden_size, device=device)
+            
+            def compute_node(idx):
+                if h[idx].sum() != 0:  # Already computed
+                    return h[idx], c[idx]
+                
+                h_children = []
+                c_children = []
+                for child_idx in children[idx]:
+                    h_child, c_child = compute_node(child_idx)
+                    h_children.append(h_child)
+                    c_children.append(c_child)
+                
+                h[idx], c[idx] = self.cell(node_features[idx].unsqueeze(0), h_children, c_children)
                 return h[idx], c[idx]
             
-            h_children = []
-            c_children = []
-            for child_idx in children[idx]:
-                h_child, c_child = compute_node(child_idx)
-                h_children.append(h_child)
-                c_children.append(c_child)
+            # Find root (node with no outgoing edges)
+            root_idx = 0
+            for i in range(num_nodes):
+                if not any(i in child_list for child_list in children):
+                    root_idx = i
+                    break
             
-            h[idx], c[idx] = self.cell(node_features[idx].unsqueeze(0), h_children, c_children)
-            return h[idx], c[idx]
+            h_root, _ = compute_node(root_idx)
+            h_roots.append(h_root)
         
-        # Compute root (assuming node 0 is root or last node with no outgoing edges)
-        root_idx = 0  # Simplified: assume first node is root; adjust if needed
-        for i in range(num_nodes):
-            if not any(i in child_list for child_list in children):
-                root_idx = i
-                break
-        
-        h_root, c_root = compute_node(root_idx)
-        return h_root.squeeze(0)  # Return root hidden state
+        return torch.stack(h_roots)  # Shape: (batch_size, hidden_size)
 
 class TreeLSTMModel(nn.Module):
     def __init__(self, tree_input_size, seq_input_size, hidden_size=256, output_size=1, dropout_rate=0.2):
@@ -326,7 +326,7 @@ class TreeLSTMModel(nn.Module):
         self.attention = nn.MultiheadAttention(hidden_size * 2, num_heads=8, dropout=dropout_rate, batch_first=True)
         self.attn_pool = nn.Linear(hidden_size * 2, 1)
         
-        self.fc1 = nn.Linear(hidden_size * 4, 128)  # Combine tree and seq features
+        self.fc1 = nn.Linear(hidden_size * 3, 128)  # Tree (256) + Seq (512) = 768, adjusted to 3*hidden_size
         self.bn1 = nn.BatchNorm1d(128)
         self.ln1 = nn.LayerNorm(128)
         self.fc2 = nn.Linear(128, 64)
@@ -337,17 +337,17 @@ class TreeLSTMModel(nn.Module):
         self.gelu = nn.GELU()
         self.dropout = nn.Dropout(dropout_rate)
     
-    def forward(self, tree, seq_input):
+    def forward(self, trees, seq_input):
         # TreeLSTM forward
-        tree_h = self.tree_lstm(tree)
+        tree_h = self.tree_lstm(trees)  # Shape: (batch_size, hidden_size)
         
         # Sequential LSTM forward
-        seq_out, _ = self.seq_lstm(seq_input)
+        seq_out, _ = self.seq_lstm(seq_input)  # Shape: (batch_size, seq_len, hidden_size * 2)
         attn_out, _ = self.attention(seq_out, seq_out, seq_out)
-        seq_h = torch.softmax(self.attn_pool(attn_out), dim=1).transpose(1, 2).bmm(attn_out).squeeze(1)
+        seq_h = torch.softmax(self.attn_pool(attn_out), dim=1).transpose(1, 2).bmm(attn_out).squeeze(1)  # Shape: (batch_size, hidden_size * 2)
         
         # Combine tree and sequence features
-        combined = torch.cat([tree_h, seq_h], dim=-1)
+        combined = torch.cat([tree_h, seq_h], dim=-1)  # Shape: (batch_size, hidden_size * 3)
         
         x = self.fc1(combined)
         x = self.bn1(x)
@@ -476,7 +476,7 @@ def train_model(model, train_loader, test_loader, train_trees, test_trees, crite
     plt.title('Training and Validation Loss Over Epochs')
     plt.legend()
     plt.grid(True)
-    plt.savefig('loss_plot.png')
+    plt.savefig('loss_plot_TreeLSTM.png')
     plt.show()
     
     return train_losses, val_losses
