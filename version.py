@@ -220,7 +220,7 @@ def prepare_data_for_model(train_features, test_features):
     
     y_train_raw = np.array([f['execution_time'] for f in train_features])
     y_test_raw = np.array([f['execution_time'] for f in test_features])
-    y_train_raw = np.clip(y_train_raw, 0, np.percentile(y_train_raw, 95))  # Reduced clipping
+    y_train_raw = np.clip(y_train_raw, 0, np.percentile(y_train_raw, 95))
     y_test_raw = np.clip(y_test_raw, 0, np.percentile(y_test_raw, 95))
     
     y_train = np.log1p(y_train_raw).reshape(-1, 1)
@@ -277,7 +277,7 @@ class TreeLSTM(nn.Module):
     def __init__(self, input_size, hidden_size):
         super(TreeLSTM, self).__init__()
         self.cell1 = TreeLSTMCell(input_size, hidden_size)
-        self.cell2 = TreeLSTMCell(hidden_size, hidden_size)  # Second layer
+        self.cell2 = TreeLSTMCell(hidden_size, hidden_size)
         self.hidden_size = hidden_size
     
     def forward(self, trees):
@@ -291,14 +291,15 @@ class TreeLSTM(nn.Module):
             children = tree['children']
             num_nodes = node_features.size(0)
             
-            h1 = torch.zeros(num_nodes, self.hidden_size, device=device)
-            c1 = torch.zeros(num_nodes, self.hidden_size, device=device)
-            h2 = torch.zeros(num_nodes, self.hidden_size, device=device)
-            c2 = torch.zeros(num_nodes, self.hidden_size, device=device)
+            # Avoid inplace by using temporary storage
+            h1_states = {}
+            c1_states = {}
+            h2_states = {}
+            c2_states = {}
             
             def compute_node(idx):
-                if h1[idx].sum() != 0:  # Already computed
-                    return h2[idx], c2[idx]
+                if idx in h2_states:
+                    return h2_states[idx], c2_states[idx]
                 
                 h1_children = []
                 c1_children = []
@@ -307,9 +308,15 @@ class TreeLSTM(nn.Module):
                     h1_children.append(h_child)
                     c1_children.append(c_child)
                 
-                h1[idx], c1[idx] = self.cell1(node_features[idx].unsqueeze(0), [], [])  # First layer
-                h2[idx], c2[idx] = self.cell2(h1[idx].unsqueeze(0), h1_children, c1_children)  # Second layer with children
-                return h2[idx], c2[idx]
+                # Compute first layer
+                h1, c1 = self.cell1(node_features[idx].unsqueeze(0), [], [])
+                h1_states[idx], c1_states[idx] = h1.squeeze(0), c1.squeeze(0)
+                
+                # Compute second layer with children
+                h2, c2 = self.cell2(h1, h1_children, c1_children)
+                h2_states[idx], c2_states[idx] = h2.squeeze(0), c2.squeeze(0)
+                
+                return h2_states[idx], c2_states[idx]
             
             root_idx = 0
             for i in range(num_nodes):
@@ -331,7 +338,7 @@ class TreeLSTMModel(nn.Module):
         self.attention = nn.MultiheadAttention(hidden_size * 2, num_heads=8, dropout=dropout_rate, batch_first=True)
         self.attn_pool = nn.Linear(hidden_size * 2, 1)
         
-        self.fc1 = nn.Linear(hidden_size * 3, 192)  # 384 * 3 = 1152
+        self.fc1 = nn.Linear(hidden_size * 3, 192)
         self.bn1 = nn.BatchNorm1d(192)
         self.ln1 = nn.LayerNorm(192)
         self.fc2 = nn.Linear(192, 96)
@@ -369,7 +376,7 @@ class TreeLSTMModel(nn.Module):
         
         return output
 
-def focal_loss(outputs, targets, alpha=0.25, gamma=3.0):  # Increased gamma
+def focal_loss(outputs, targets, alpha=0.25, gamma=3.0):
     mse = (outputs - targets) ** 2
     pt = torch.exp(-mse)
     loss = alpha * (1 - pt) ** gamma * mse
