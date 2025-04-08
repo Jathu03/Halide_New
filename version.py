@@ -126,7 +126,7 @@ def extract_features_from_file(file_path):
             sched_feature.update(sf)
         scheduling_features.append(sched_feature)
     
-    # Scheduling Sequence with Data Augmentation
+    # Scheduling Sequence with Data Augmentation (increased noise)
     scheduling_sequence = []
     for i, sf in enumerate(scheduling_features):
         sched_vector = [float(sf.get(metric, 0.0)) for metric in important_metrics]
@@ -138,7 +138,7 @@ def extract_features_from_file(file_path):
             np.log1p(inner_p * outer_p),
             bytes_prod / max(points_total, 1e-4)
         ])
-        noise = np.random.normal(0, 0.05, len(sched_vector))
+        noise = np.random.normal(0, 0.1, len(sched_vector))  # Increased noise
         augmented_vector = np.array(sched_vector, dtype=np.float32) + noise
         scheduling_sequence.append(augmented_vector)
     
@@ -291,7 +291,6 @@ class TreeLSTM(nn.Module):
             children = tree['children']
             num_nodes = node_features.size(0)
             
-            # Avoid inplace by using temporary storage
             h1_states = {}
             c1_states = {}
             h2_states = {}
@@ -308,11 +307,9 @@ class TreeLSTM(nn.Module):
                     h1_children.append(h_child)
                     c1_children.append(c_child)
                 
-                # Compute first layer
                 h1, c1 = self.cell1(node_features[idx].unsqueeze(0), [], [])
                 h1_states[idx], c1_states[idx] = h1.squeeze(0), c1.squeeze(0)
                 
-                # Compute second layer with children
                 h2, c2 = self.cell2(h1, h1_children, c1_children)
                 h2_states[idx], c2_states[idx] = h2.squeeze(0), c2.squeeze(0)
                 
@@ -327,10 +324,10 @@ class TreeLSTM(nn.Module):
             h_root, _ = compute_node(root_idx)
             h_roots.append(h_root)
         
-        return torch.stack(h_roots)  # Shape: (batch_size, hidden_size)
+        return torch.stack(h_roots)
 
 class TreeLSTMModel(nn.Module):
-    def __init__(self, tree_input_size, seq_input_size, hidden_size=384, output_size=1, dropout_rate=0.3):
+    def __init__(self, tree_input_size, seq_input_size, hidden_size=256, output_size=1, dropout_rate=0.4):  # Reduced hidden size, increased dropout
         super(TreeLSTMModel, self).__init__()
         self.tree_lstm = TreeLSTM(tree_input_size, hidden_size)
         self.seq_lstm = nn.LSTM(seq_input_size, hidden_size, batch_first=True, bidirectional=True)
@@ -338,26 +335,26 @@ class TreeLSTMModel(nn.Module):
         self.attention = nn.MultiheadAttention(hidden_size * 2, num_heads=8, dropout=dropout_rate, batch_first=True)
         self.attn_pool = nn.Linear(hidden_size * 2, 1)
         
-        self.fc1 = nn.Linear(hidden_size * 3, 192)
-        self.bn1 = nn.BatchNorm1d(192)
-        self.ln1 = nn.LayerNorm(192)
-        self.fc2 = nn.Linear(192, 96)
-        self.bn2 = nn.BatchNorm1d(96)
-        self.ln2 = nn.LayerNorm(96)
-        self.output_layer = nn.Linear(96, output_size)
+        self.fc1 = nn.Linear(hidden_size * 3, 128)  # Adjusted for smaller hidden size
+        self.bn1 = nn.BatchNorm1d(128)
+        self.ln1 = nn.LayerNorm(128)
+        self.fc2 = nn.Linear(128, 64)
+        self.bn2 = nn.BatchNorm1d(64)
+        self.ln2 = nn.LayerNorm(64)
+        self.output_layer = nn.Linear(64, output_size)
         
         self.gelu = nn.GELU()
         self.dropout = nn.Dropout(dropout_rate)
-        self.residual_proj = nn.Linear(hidden_size * 3, 96) if hidden_size * 3 != 96 else None
+        self.residual_proj = nn.Linear(hidden_size * 3, 64) if hidden_size * 3 != 64 else None
     
     def forward(self, trees, seq_input):
-        tree_h = self.tree_lstm(trees)  # (batch_size, hidden_size)
+        tree_h = self.tree_lstm(trees)
         
-        seq_out, _ = self.seq_lstm(seq_input)  # (batch_size, seq_len, hidden_size * 2)
+        seq_out, _ = self.seq_lstm(seq_input)
         attn_out, _ = self.attention(seq_out, seq_out, seq_out)
-        seq_h = torch.softmax(self.attn_pool(attn_out), dim=1).transpose(1, 2).bmm(attn_out).squeeze(1)  # (batch_size, hidden_size * 2)
+        seq_h = torch.softmax(self.attn_pool(attn_out), dim=1).transpose(1, 2).bmm(attn_out).squeeze(1)
         
-        combined = torch.cat([tree_h, seq_h], dim=-1)  # (batch_size, hidden_size * 3)
+        combined = torch.cat([tree_h, seq_h], dim=-1)
         
         x = self.fc1(combined)
         x = self.bn1(x)
@@ -376,7 +373,7 @@ class TreeLSTMModel(nn.Module):
         
         return output
 
-def focal_loss(outputs, targets, alpha=0.25, gamma=3.0):
+def focal_loss(outputs, targets, alpha=0.25, gamma=2.0):  # Reduced gamma for stability
     mse = (outputs - targets) ** 2
     pt = torch.exp(-mse)
     loss = alpha * (1 - pt) ** gamma * mse
@@ -391,12 +388,12 @@ def create_data_loaders(train_trees, train_sequences, y_train, test_trees, test_
     
     return train_loader, test_loader, train_trees, test_trees
 
-def train_model(model, train_loader, test_loader, train_trees, test_trees, criterion, optimizer, num_epochs=500, patience=50):
+def train_model(model, train_loader, test_loader, train_trees, test_trees, criterion, optimizer, num_epochs=500, patience=30, warmup_epochs=10):  # Reduced patience
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     model.to(device)
     
-    scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
+    scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs - warmup_epochs, eta_min=1e-6)
     
     best_val_loss = float('inf')
     epochs_no_improve = 0
@@ -408,6 +405,12 @@ def train_model(model, train_loader, test_loader, train_trees, test_trees, crite
         model.train()
         running_loss = 0.0
         optimizer.zero_grad()
+        
+        # Warmup learning rate
+        if epoch < warmup_epochs:
+            lr_scale = (epoch + 1) / warmup_epochs
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = 0.0001 * lr_scale
         
         for i, (tree_indices, seq_inputs, targets) in enumerate(train_loader):
             trees = [train_trees[idx.item()] for idx in tree_indices]
@@ -423,7 +426,7 @@ def train_model(model, train_loader, test_loader, train_trees, test_trees, crite
                 return None, None
             
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.5)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # Stricter clipping
             optimizer.step()
             optimizer.zero_grad()
             
@@ -448,7 +451,8 @@ def train_model(model, train_loader, test_loader, train_trees, test_trees, crite
         val_loss /= len(test_loader.dataset)
         val_losses.append(val_loss)
         
-        scheduler.step()
+        if epoch >= warmup_epochs:
+            scheduler.step()
         
         print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
         
@@ -490,7 +494,7 @@ def evaluate_model(model, test_trees, X_test_seq, y_test, y_scaler, file_names_t
         tree['node_features'] = tree['node_features'].to(device)
     
     with torch.no_grad():
-        y_pred_scaled = model(test_trees, X_test_seq)
+        y_pred_scaled = model(trees, X_test_seq)
     
     y_pred_scaled = y_pred_scaled.cpu().numpy()
     y_test = y_test.cpu().numpy()
@@ -567,18 +571,18 @@ def main(main_dir):
     model = TreeLSTMModel(
         tree_input_size=10,
         seq_input_size=seq_input_size,
-        hidden_size=384,
+        hidden_size=256,
         output_size=1,
-        dropout_rate=0.3
+        dropout_rate=0.4
     )
     
-    optimizer = optim.AdamW(model.parameters(), lr=0.0001, weight_decay=0.01)
+    optimizer = optim.AdamW(model.parameters(), lr=0.0001, weight_decay=0.02)  # Increased weight decay
     
     print("Building and training Enhanced TreeLSTM model...")
     train_losses, val_losses = train_model(
         model, train_loader, test_loader, train_trees, test_trees,
         focal_loss, optimizer,
-        num_epochs=500, patience=50
+        num_epochs=500, patience=30, warmup_epochs=10
     )
     
     if train_losses is None or val_losses is None:
