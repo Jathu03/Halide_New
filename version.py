@@ -91,7 +91,7 @@ def extract_features_from_file(file_path):
     adj_matrix = np.zeros((num_nodes, num_nodes))
     for edge in edges_features:
         from_idx = node_map.get(edge['From'], -1)
-        to_idx = node_browser.get(edge['To'], -1)
+        to_idx = node_map.get(edge['To'], -1)  # Fixed typo: node_browser -> node_map
         if from_idx != -1 and to_idx != -1:
             adj_matrix[from_idx, to_idx] = 1
     
@@ -265,7 +265,7 @@ class EnhancedRecursiveLSTMModel(nn.Module):
         self.ln_layers = nn.ModuleList()
         self.residual_projs = nn.ModuleList()
         self.lstm_layers.append(nn.LSTM(seq_input_size, hidden_sizes[0], batch_first=True, bidirectional=True))
-        self.ln_layers.append(nn.LayerNorm(hidden_sizes[0] * 2))
+        self.ln_layers.append(nn.Layer\Schema(hidden_sizes[0] * 2))
         self.residual_projs.append(nn.Linear(seq_input_size, hidden_sizes[0] * 2) if seq_input_size != hidden_sizes[0] * 2 else None)
         for i in range(1, len(hidden_sizes)):
             self.lstm_layers.append(nn.LSTM(hidden_sizes[i-1] * 2, hidden_sizes[i], batch_first=True, bidirectional=True))
@@ -472,7 +472,7 @@ def evaluate_model(model, X_test_seq, y_test, y_scaler, file_names_test):
             print(f"File: {result['file']}")
             print(f"  Actual execution time: {result['actual']:.2f} ms")
             print(f"  Predicted execution time: {result['predicted']:.2f} ms")
-            print(f"  Error percentage: {result['error_percentage']:.2f}%")  # Fixed f-string syntax
+            print(f"  Error percentage: {result['error_percentage']:.2f}%")
     
     mse = np.mean((y_test_actual - y_pred_actual) ** 2)
     rmse = np.sqrt(mse)
