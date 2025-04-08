@@ -91,7 +91,7 @@ def extract_features_from_file(file_path):
     adj_matrix = np.zeros((num_nodes, num_nodes))
     for edge in edges_features:
         from_idx = node_map.get(edge['From'], -1)
-        to_idx = node_map.get(edge['To'], -1)  # Fixed typo: node_browser -> node_map
+        to_idx = node_map.get(edge['To'], -1)
         if from_idx != -1 and to_idx != -1:
             adj_matrix[from_idx, to_idx] = 1
     
@@ -265,7 +265,7 @@ class EnhancedRecursiveLSTMModel(nn.Module):
         self.ln_layers = nn.ModuleList()
         self.residual_projs = nn.ModuleList()
         self.lstm_layers.append(nn.LSTM(seq_input_size, hidden_sizes[0], batch_first=True, bidirectional=True))
-        self.ln_layers.append(nn.Layer\Schema(hidden_sizes[0] * 2))
+        self.ln_layers.append(nn.LayerNorm(hidden_sizes[0] * 2))  # Fixed typo: Layer\Schema -> LayerNorm
         self.residual_projs.append(nn.Linear(seq_input_size, hidden_sizes[0] * 2) if seq_input_size != hidden_sizes[0] * 2 else None)
         for i in range(1, len(hidden_sizes)):
             self.lstm_layers.append(nn.LSTM(hidden_sizes[i-1] * 2, hidden_sizes[i], batch_first=True, bidirectional=True))
