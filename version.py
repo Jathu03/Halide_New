@@ -494,7 +494,7 @@ def evaluate_model(model, test_trees, X_test_seq, y_test, y_scaler, file_names_t
         tree['node_features'] = tree['node_features'].to(device)
     
     with torch.no_grad():
-        y_pred_scaled = model(trees, X_test_seq)
+        y_pred_scaled = model(tree, X_test_seq)
     
     y_pred_scaled = y_pred_scaled.cpu().numpy()
     y_test = y_test.cpu().numpy()
