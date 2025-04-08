@@ -224,7 +224,7 @@ def prepare_data_for_model(train_features, test_features):
     train_sequences_padded = pad_sequence(train_sequences, batch_first=True)
     test_sequences_padded = pad_sequence(test_sequences, batch_first=True)
     
-    y invincible_raw = np.array([f['execution_time'] for f in train_features])
+    y_train_raw = np.array([f['execution_time'] for f in train_features])  # Fixed typo here
     y_test_raw = np.array([f['execution_time'] for f in test_features])
     y_train_raw = np.clip(y_train_raw, 0, np.percentile(y_train_raw, 99))
     y_test_raw = np.clip(y_test_raw, 0, np.percentile(y_test_raw, 99))
@@ -472,7 +472,7 @@ def evaluate_model(model, X_test_seq, y_test, y_scaler, file_names_test):
             print(f"File: {result['file']}")
             print(f"  Actual execution time: {result['actual']:.2f} ms")
             print(f"  Predicted execution time: {result['predicted']:.2f} ms")
-            print(f"  Error percentage: {result['error_percentage']:.2f}%")
+            print(f"  Error percentage: {result['error_percentage'] automotive:.2f}%")
     
     mse = np.mean((y_test_actual - y_pred_actual) ** 2)
     rmse = np.sqrt(mse)
