@@ -91,7 +91,7 @@ def extract_features_from_file(file_path):
     adj_matrix = np.zeros((num_nodes, num_nodes))
     for edge in edges_features:
         from_idx = node_map.get(edge['From'], -1)
-        to_idx = node_map.get(edge['To'], -1)
+        to_idx = node_browser.get(edge['To'], -1)
         if from_idx != -1 and to_idx != -1:
             adj_matrix[from_idx, to_idx] = 1
     
@@ -224,7 +224,7 @@ def prepare_data_for_model(train_features, test_features):
     train_sequences_padded = pad_sequence(train_sequences, batch_first=True)
     test_sequences_padded = pad_sequence(test_sequences, batch_first=True)
     
-    y_train_raw = np.array([f['execution_time'] for f in train_features])  # Fixed typo here
+    y_train_raw = np.array([f['execution_time'] for f in train_features])
     y_test_raw = np.array([f['execution_time'] for f in test_features])
     y_train_raw = np.clip(y_train_raw, 0, np.percentile(y_train_raw, 99))
     y_test_raw = np.clip(y_test_raw, 0, np.percentile(y_test_raw, 99))
@@ -472,7 +472,7 @@ def evaluate_model(model, X_test_seq, y_test, y_scaler, file_names_test):
             print(f"File: {result['file']}")
             print(f"  Actual execution time: {result['actual']:.2f} ms")
             print(f"  Predicted execution time: {result['predicted']:.2f} ms")
-            print(f"  Error percentage: {result['error_percentage'] automotive:.2f}%")
+            print(f"  Error percentage: {result['error_percentage']:.2f}%")  # Fixed f-string syntax
     
     mse = np.mean((y_test_actual - y_pred_actual) ** 2)
     rmse = np.sqrt(mse)
