@@ -66,11 +66,11 @@ def extract_features_from_file(file_path, scaler_template=None, scaler_seq=None)
                 parts = op_line.strip().split(':')
                 if len(parts) == 2:
                     op_name = f'op_{parts[0].strip().lower()}'
-                    op_count = min(int(parts[1].strip()), 1e6)  # Cap to prevent overflow
+                    op_count = min(int(parts[1].strip()), 1e6)
                     op_types.add(op_name)
                     total_ops += op_count
         
-        total_ops = min(total_ops, 1e8)  # Cap total_ops
+        total_ops = min(total_ops, 1e8)
         op_types = sorted(list(op_types))[:fixed_op_size]
         for i, node in enumerate(nodes):
             details = node.get('Details', {})
@@ -94,7 +94,6 @@ def extract_features_from_file(file_path, scaler_template=None, scaler_seq=None)
             if from_idx != -1 and to_idx != -1:
                 adj_matrix[from_idx, to_idx] = 1
         
-        # Simplify graph embedding to avoid dimension mismatch
         graph_embedding = np.mean(node_features, axis=0)
         template_features = np.concatenate([[num_nodes, num_edges, total_ops], graph_embedding])
         
@@ -158,7 +157,7 @@ class SchedulingDataset(Dataset):
             self.features[idx] = feat
         feat = self.features[idx]
         if feat is None:
-            dummy_seq = torch.zeros(1, 27, dtype=torch.float32)  # 9 metrics + 3 derived + 15 op features
+            dummy_seq = torch.zeros(1, 27, dtype=torch.float32)
             return dummy_seq, torch.tensor(0.0, dtype=torch.float32), 1
         return (torch.from_numpy(feat['scheduling_sequence']),
                 torch.tensor(feat['execution_time'], dtype=torch.float32),
@@ -189,8 +188,8 @@ def process_main_directory(main_dir):
         print(f"Warning: No valid files found in first 100 samples of {main_dir}. Using default scalers.")
         scaler_template = RobustScaler()
         scaler_seq = RobustScaler()
-        dummy_template = np.ones((1, 18))  # 3 graph metrics + 15 op features
-        dummy_seq = np.ones((1, 27))       # 9 metrics + 3 derived + 15 op features
+        dummy_template = np.ones((1, 18))
+        dummy_seq = np.ones((1, 27))
         scaler_template.fit(dummy_template)
         scaler_seq.fit(dummy_seq)
     
@@ -230,7 +229,7 @@ class HybridTemporalNet(nn.Module):
     def forward(self, seq_input, lengths=None):
         x = self.gelu(self.input_proj(seq_input))
         if lengths:
-            packed = pack_padded_sequence(x, lengths, batch_first=True, enforce_sorted=True)
+            packed = pack_padded_sequence(x, lengths, batch_first=True, enforce_sorted=False)  # Changed to False
             x, _ = self.lstm(packed)
             x, _ = pad_packed_sequence(x, batch_first=True, total_length=seq_input.size(1))
         else:
