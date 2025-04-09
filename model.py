@@ -46,19 +46,15 @@ class LSTMAttention(nn.Module):
         self.dropout = nn.Dropout(dropout)
         
     def forward(self, x):
-        # x shape: (batch_size, timesteps, input_dim)
-        lstm_out, _ = self.lstm(x)  # (batch_size, timesteps, hidden_dim * 2) due to bidirectional
+        lstm_out, _ = self.lstm(x)  # (batch_size, timesteps, hidden_dim * 2)
         lstm_out = self.dropout(lstm_out)
         
-        # Multi-head attention (query, key, value all from lstm_out)
         attn_out, _ = self.attention(lstm_out, lstm_out, lstm_out)  # (batch_size, timesteps, hidden_dim * 2)
         attn_out = self.attn_dropout(attn_out)
         
-        # Residual connection and pooling
-        context = self.norm1(lstm_out + attn_out)  # (batch_size, timesteps, hidden_dim * 2)
+        context = self.norm1(lstm_out + attn_out)  # Residual connection
         context = torch.mean(context, dim=1)  # (batch_size, hidden_dim * 2)
         
-        # Dense layers
         out = self.fc1(context)  # (batch_size, 128)
         out = self.relu(out)
         out = self.norm2(out)
@@ -87,7 +83,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
     train_losses = []
     val_losses = []
     best_val_loss = float('inf')
-    patience = 30  # Further increased patience
+    patience = 30
     
     for epoch in range(num_epochs):
         model.train()
@@ -116,7 +112,9 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
         val_loss /= len(val_loader.dataset)
         val_losses.append(val_loss)
         
-        print(f"Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, LR: {scheduler.get_last_lr()[0]:.6f}")
+        # Get current learning rate from optimizer
+        current_lr = optimizer.param_groups[0]['lr']
+        print(f"Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, LR: {current_lr:.6f}")
         
         # Learning rate scheduling
         scheduler.step(val_loss)
@@ -125,7 +123,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             patience_counter = 0
-            torch.save(model.state_dict(), "best_model.pth")  # Save best model
+            torch.save(model.state_dict(), "best_model.pth")
         else:
             patience_counter += 1
             if patience_counter >= patience:
@@ -194,8 +192,8 @@ if __name__ == "__main__":
     
     # Initialize model, loss, optimizer, and scheduler
     model = LSTMAttention(input_dim, hidden_dim, output_dim, num_layers=num_layers, num_heads=num_heads).to(device)
-    criterion = nn.HuberLoss()  # Robust to outliers
-    optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)  # Increased weight decay
+    criterion = nn.HuberLoss()
+    optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10, verbose=True)
     
     # Train the model
