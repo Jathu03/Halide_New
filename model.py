@@ -12,7 +12,8 @@ import os
 # Custom Dataset class
 class ScheduleDataset(Dataset):
     def __init__(self, sequences, execution_times):
-        self.sequences = torch.FloatTensor(sequences)  # Shape: (samples, timesteps, features)
+        # Ensure sequences is a numeric array
+        self.sequences = torch.FloatTensor(sequences.astype(np.float32))  # Shape: (samples, timesteps, features)
         self.execution_times = torch.FloatTensor(execution_times).view(-1, 1)  # Shape: (samples, 1)
 
     def __len__(self):
@@ -62,10 +63,17 @@ class LSTMAttention(nn.Module):
 
 # Load the preprocessed dataset
 def load_dataset(data_dir="preprocessed_dataset"):
+    # Load with allow_pickle=True and convert object array to numeric
     sequence_data = np.load(f"{data_dir}/sequence_data.npy", allow_pickle=True)
+    # Ensure it’s a 3D numeric array (files × timesteps × features)
+    if sequence_data.dtype == object:
+        sequence_data = np.stack(sequence_data).astype(np.float32)
+    else:
+        sequence_data = sequence_data.astype(np.float32)
+    
     edge_df = pd.read_csv(f"{data_dir}/edge_features.csv")
     node_df = pd.read_csv(f"{data_dir}/node_features.csv")
-    execution_times = np.load(f"{data_dir}/execution_times.npy", allow_pickle=True)
+    execution_times = np.load(f"{data_dir}/execution_times.npy", allow_pickle=True).astype(np.float32)
     return sequence_data, edge_df, node_df, execution_times
 
 # Train the model
@@ -155,7 +163,7 @@ if __name__ == "__main__":
     test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
     
     # Model parameters
-    input_dim = X_train.shape[2]  # Number of features
+    input_dim = X_train.shape[2]  # Number of features (11)
     hidden_dim = 64
     output_dim = 1  # Single execution time prediction
     
