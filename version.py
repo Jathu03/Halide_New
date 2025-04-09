@@ -61,7 +61,6 @@ def extract_features_from_file(file_path):
         print(f"Warning: Incomplete programming_details in {file_path}")
         return None
     
-    # Extract node and edge details
     op_counts_per_node = []
     all_op_types = set()
     for node in programming_details['Nodes']:
@@ -83,11 +82,10 @@ def extract_features_from_file(file_path):
         edge_feature = {'From': edge.get('From', ''), 'To': edge.get('To', ''), 'Name': edge.get('Name', '')}
         edges_features.append(edge_feature)
     
-    # Graph Embedding with Operation Density
     num_nodes = max(len(nodes_features), 1)
     num_edges = len(edges_features)
     total_ops = sum(sum(node.get(f'op_{op}', 0) for op in all_op_types) for node in op_counts_per_node)
-    op_density = total_ops / max(num_nodes, 1)  # New feature: ops per node
+    op_density = total_ops / max(num_nodes, 1)
     node_map = {node['Name']: i for i, node in enumerate(nodes_features)}
     adj_matrix = np.zeros((num_nodes, num_nodes))
     for edge in edges_features:
@@ -116,7 +114,6 @@ def extract_features_from_file(file_path):
     template_features = scaler_template.fit_transform(template_features.reshape(1, -1)).flatten()
     template_features = np.nan_to_num(template_features, nan=0.0)
     
-    # Schedule-Specific Features
     scheduling_features = []
     scheduling_data = data.get("scheduling_data", None)
     if not scheduling_data and programming_details and 'Schedules' in programming_details:
@@ -229,12 +226,10 @@ def prepare_data_for_model(train_features, test_features):
     y_train_raw = np.array([f['execution_time'] for f in train_features])
     y_test_raw = np.array([f['execution_time'] for f in test_features])
     
-    # Cap extreme values more aggressively
     cap = np.percentile(y_train_raw, 99.5)
     y_train_raw = np.clip(y_train_raw, 1e-6, cap)
     y_test_raw = np.clip(y_test_raw, 1e-6, cap)
     
-    # Log transformation with offset to handle small values
     y_train = np.log1p(y_train_raw).reshape(-1, 1)
     y_test = np.log1p(y_test_raw).reshape(-1, 1)
     
@@ -280,14 +275,12 @@ class AttentionPooling(nn.Module):
         return torch.sum(x * weights, dim=1)
 
 class HybridTemporalNet(nn.Module):
-    def __init__(self, seq_input_size, hidden_sizes=[384, 256, 128], output_size=1, dropout_rate=0.4, num_heads=6):
+    def __init__(self, seq_input_size, hidden_sizes=[384, 256, 128], output_size=1, dropout_rate=0.4, num_heads=8):
         super(HybridTemporalNet, self).__init__()
         
-        # Input projection with positional encoding
         self.input_proj = nn.Linear(seq_input_size, hidden_sizes[0])
         self.pos_encoder = PositionalEncoding(hidden_sizes[0])
         
-        # LSTM layers with increased capacity
         self.lstm_layers = nn.ModuleList()
         self.ln_layers = nn.ModuleList()
         self.lstm_layers.append(nn.LSTM(hidden_sizes[0], hidden_sizes[0], batch_first=True, bidirectional=True))
@@ -296,11 +289,9 @@ class HybridTemporalNet(nn.Module):
             self.lstm_layers.append(nn.LSTM(hidden_sizes[i-1] * 2, hidden_sizes[i], batch_first=True, bidirectional=True))
             self.ln_layers.append(nn.LayerNorm(hidden_sizes[i] * 2))
         
-        # Multi-head attention
         self.attention = nn.MultiheadAttention(hidden_sizes[-1] * 2, num_heads, dropout=dropout_rate, batch_first=True)
         self.attn_pool = AttentionPooling(hidden_sizes[-1] * 2)
         
-        # Dense layers with residual connection
         self.fc1 = nn.Linear(hidden_sizes[-1] * 2, 256)
         self.bn1 = nn.BatchNorm1d(256)
         self.ln1 = nn.LayerNorm(256)
@@ -311,7 +302,7 @@ class HybridTemporalNet(nn.Module):
         self.bn3 = nn.BatchNorm1d(64)
         self.ln3 = nn.LayerNorm(64)
         self.output_layer = nn.Linear(64, output_size)
-        self.residual_proj = nn.Linear(hidden_sizes[-1] * 2, 256)  # Residual connection
+        self.residual_proj = nn.Linear(hidden_sizes[-1] * 2, 256)
         
         self.gelu = nn.GELU()
         self.dropout = nn.Dropout(dropout_rate)
@@ -349,12 +340,8 @@ class HybridTemporalNet(nn.Module):
         return output
 
 def log_mse_loss(outputs, targets):
-    # Compute log-transformed MSE to handle scale differences
-    log_outputs = outputs
-    log_targets = targets
-    mse = torch.mean((log_outputs - log_targets) ** 2)
-    # Add a relative error term
-    rel_error = torch.mean(torch.abs(log_outputs - log_targets) / (torch.abs(log_targets) + 1e-6))
+    mse = torch.mean((outputs - targets) ** 2)
+    rel_error = torch.mean(torch.abs(outputs - targets) / (torch.abs(targets) + 1e-6))
     return mse + 0.1 * rel_error
 
 def create_data_loaders(train_sequences, y_train, test_sequences, y_test, batch_size=32):
@@ -481,7 +468,6 @@ def evaluate_model(model, X_test_seq, y_test, y_scaler, file_names_test):
     y_test_actual = np.expm1(y_test_transformed)
     y_pred_actual = np.expm1(y_pred_transformed)
     
-    # Clip predictions to the capped range
     cap = np.percentile(y_test_actual, 99.5)
     y_pred_actual = np.clip(y_pred_actual, 0, cap)
     
@@ -553,10 +539,10 @@ def main(main_dir):
         hidden_sizes=[384, 256, 128],
         output_size=1,
         dropout_rate=0.4,
-        num_heads=6
+        num_heads=8  # Changed from 6 to 8 to ensure divisibility
     )
     
-    optimizer = optim.AdamW(model.parameters(), lr=0.0003, weight_decay=1e-3)  # Adjusted LR and weight decay
+    optimizer = optim.AdamW(model.parameters(), lr=0.0003, weight_decay=1e-3)
     
     print("Building and training Hybrid Temporal Network...")
     train_losses, val_losses = train_model(
