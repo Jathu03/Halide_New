@@ -127,8 +127,13 @@ def extract_features(data):
             }
         node_features.append(node_dict)
     
-    # Total execution time from scheduling_data
-    execution_time = data_dict.get('scheduling_data', {}).get('total_execution_time_ms', 0.0)
+    # Total execution time from scheduling_data (list of dicts)
+    scheduling_data = data_dict.get('scheduling_data', [])
+    execution_time = 0.0
+    for item in scheduling_data:
+        if isinstance(item, dict) and item.get('name') == 'total_execution_time_ms':
+            execution_time = item.get('value', 0.0)
+            break
     if execution_time == 0.0:
         print("Warning: 'total_execution_time_ms' not found in 'scheduling_data'. Using default value 0.0.")
     
