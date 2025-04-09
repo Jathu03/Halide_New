@@ -9,15 +9,20 @@ import matplotlib.pyplot as plt
 def load_json_data(file_path):
     with open(file_path, 'r') as f:
         data = json.load(f)
-    return data  # Return the full JSON object (could be a list)
+    return data  # Return the full JSON object
 
 # 1. Enhanced Feature Extraction
 def extract_features(data):
-    # Check if data is a list and access the first element if so
+    # Debug: Print the raw data structure
+    print("Debug: Raw JSON data:", data)
+    
+    # Handle different JSON structures
     if isinstance(data, list) and len(data) > 0:
         data_dict = data[0]
+    elif isinstance(data, dict):
+        data_dict = data
     else:
-        print("Error: Expected a list with at least one dictionary. Using empty dict as fallback.")
+        print("Error: Unexpected JSON structure. Expected a list or dict. Using empty dict as fallback.")
         data_dict = {}
 
     edges = data_dict.get('programming_details', {}).get('Edges', [])
@@ -140,17 +145,28 @@ def parse_footprint(footprint_str):
 
 # 2. Data Preprocessing Pipeline
 def preprocess_data(edge_features, node_features, temporal_sequences):
-    # Convert to DataFrames
-    edge_df = pd.DataFrame(edge_features)
-    node_df = pd.DataFrame(node_features)
+    # Convert to DataFrames, handle empty cases
+    if not edge_features:
+        print("Warning: No edge features extracted. Returning empty edge DataFrame.")
+        edge_df = pd.DataFrame()
+    else:
+        edge_df = pd.DataFrame(edge_features)
     
-    # Encode categorical variables
+    if not node_features:
+        print("Warning: No node features extracted. Returning empty node DataFrame.")
+        node_df = pd.DataFrame()
+    else:
+        node_df = pd.DataFrame(node_features)
+    
+    # Encode categorical variables only if data exists
     le = LabelEncoder()
-    edge_df['from'] = le.fit_transform(edge_df['from'])
-    edge_df['to'] = le.fit_transform(edge_df['to'])
-    node_df['name'] = le.fit_transform(node_df['name'])
+    if not edge_df.empty and 'from' in edge_df.columns:
+        edge_df['from'] = le.fit_transform(edge_df['from'])
+        edge_df['to'] = le.fit_transform(edge_df['to'])
+    if not node_df.empty and 'name' in node_df.columns:
+        node_df['name'] = le.fit_transform(node_df['name'])
     
-    # Normalize numerical features
+    # Normalize numerical features only if data exists
     scaler = StandardScaler()
     edge_numeric_cols = ['footprint_min_0', 'footprint_max_0', 'footprint_min_1', 
                          'footprint_max_1', 'footprint_min_2', 'footprint_max_2',
@@ -158,25 +174,34 @@ def preprocess_data(edge_features, node_features, temporal_sequences):
     node_numeric_cols = ['pointwise', 'transpose', 'broadcast', 'slice', 
                          'ops_add', 'ops_mul', 'ops_div']
     
-    # Add scheduling features if present
     if 'inner_parallelism' in node_df.columns:
         node_numeric_cols.extend(['inner_parallelism', 'outer_parallelism', 
                                   'num_vectors', 'working_set', 'points_computed_total'])
     
-    edge_df[edge_numeric_cols] = scaler.fit_transform(edge_df[edge_numeric_cols])
-    node_df[node_numeric_cols] = scaler.fit_transform(node_df[node_numeric_cols])
+    if not edge_df.empty and all(col in edge_df.columns for col in edge_numeric_cols):
+        edge_df[edge_numeric_cols] = scaler.fit_transform(edge_df[edge_numeric_cols])
+    if not node_df.empty and all(col in node_df.columns for col in node_numeric_cols):
+        node_df[node_numeric_cols] = scaler.fit_transform(node_df[node_numeric_cols])
     
-    # Create a temporal sequence representation
+    # Create a temporal sequence representation only if data exists
     sequence_data = []
-    for seq in temporal_sequences:
-        edge_idx = edge_df[edge_df['name'] == seq].index[0]
-        edge_row = edge_df.iloc[edge_idx][edge_numeric_cols + ['from', 'to']].values
-        sequence_data.append(edge_row)
+    if edge_df.empty or not temporal_sequences:
+        print("Warning: No temporal sequence data created due to empty edge features or sequences.")
+    else:
+        for seq in temporal_sequences:
+            edge_idx = edge_df[edge_df['name'] == seq].index
+            if not edge_idx.empty:
+                edge_row = edge_df.iloc[edge_idx[0]][edge_numeric_cols + ['from', 'to']].values
+                sequence_data.append(edge_row)
     
-    return edge_df, node_df, np.array(sequence_data)
+    return edge_df, node_df, np.array(sequence_data) if sequence_data else np.array([])
 
 # 3. Validate Feature Distributions
 def validate_distributions(edge_df, node_df):
+    if edge_df.empty or node_df.empty:
+        print("Warning: Cannot validate distributions due to empty DataFrames.")
+        return
+    
     # Plot distributions of key features
     plt.figure(figsize=(12, 6))
     
@@ -212,7 +237,8 @@ if __name__ == "__main__":
     print("Edge DataFrame Shape:", edge_df.shape)
     print("Node DataFrame Shape:", node_df.shape)
     print("Sequence Data Shape:", sequence_data.shape)
-    print("Sample Sequence Data:\n", sequence_data[0])
+    if sequence_data.size > 0:
+        print("Sample Sequence Data:\n", sequence_data[0])
     print("Execution Time:", execution_time)
     
     # Save preprocessed data for next week's model training
