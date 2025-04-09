@@ -12,7 +12,6 @@ import os
 # Custom Dataset class
 class ScheduleDataset(Dataset):
     def __init__(self, sequences, execution_times):
-        # Ensure sequences is a numeric array
         self.sequences = torch.FloatTensor(sequences.astype(np.float32))  # Shape: (samples, timesteps, features)
         self.execution_times = torch.FloatTensor(execution_times).view(-1, 1)  # Shape: (samples, 1)
 
@@ -29,7 +28,7 @@ class LSTMAttention(nn.Module):
         self.hidden_dim = hidden_dim
         
         # LSTM layer
-        self.lstm = nn.LSTM(input_dim, hidden_dim, batch_first=True, return_sequences=True)
+        self.lstm = nn.LSTM(input_dim, hidden_dim, batch_first=True)  # Returns full sequence by default
         
         # Attention mechanism
         self.attention = nn.Linear(hidden_dim, 1)  # Simple attention scoring
@@ -63,9 +62,7 @@ class LSTMAttention(nn.Module):
 
 # Load the preprocessed dataset
 def load_dataset(data_dir="preprocessed_dataset"):
-    # Load with allow_pickle=True and convert object array to numeric
     sequence_data = np.load(f"{data_dir}/sequence_data.npy", allow_pickle=True)
-    # Ensure it’s a 3D numeric array (files × timesteps × features)
     if sequence_data.dtype == object:
         sequence_data = np.stack(sequence_data).astype(np.float32)
     else:
