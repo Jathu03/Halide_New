@@ -21,49 +21,49 @@ class ScheduleDataset(Dataset):
     def __getitem__(self, idx):
         return self.sequences[idx], self.execution_times[idx]
 
-# Improved LSTM with Attention model
+# Enhanced LSTM with Multi-Head Attention
 class LSTMAttention(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, num_layers=2, dropout=0.3):
+    def __init__(self, input_dim, hidden_dim, output_dim, num_layers=2, num_heads=4, dropout=0.4):
         super(LSTMAttention, self).__init__()
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         
-        # Stacked LSTM
-        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers=num_layers, batch_first=True, dropout=dropout if num_layers > 1 else 0)
+        # Bidirectional LSTM
+        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers=num_layers, batch_first=True, 
+                           bidirectional=True, dropout=dropout if num_layers > 1 else 0)
         
-        # Improved attention mechanism
-        self.attention = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, 1)
-        )
-        self.dropout = nn.Dropout(dropout)
+        # Multi-head attention
+        self.attention = nn.MultiheadAttention(hidden_dim * 2, num_heads=num_heads, dropout=dropout, batch_first=True)
+        self.attn_dropout = nn.Dropout(dropout)
         
-        # Dense layers
-        self.fc1 = nn.Linear(hidden_dim, 64)
-        self.fc2 = nn.Linear(64, 32)
-        self.fc3 = nn.Linear(32, output_dim)
+        # Dense layers with residual connection
+        self.fc1 = nn.Linear(hidden_dim * 2, 128)
+        self.fc2 = nn.Linear(128, 64)
+        self.fc3 = nn.Linear(64, output_dim)
         self.relu = nn.ReLU()
-        self.norm = nn.LayerNorm(hidden_dim)
+        self.norm1 = nn.LayerNorm(hidden_dim * 2)
+        self.norm2 = nn.LayerNorm(128)
+        self.dropout = nn.Dropout(dropout)
         
     def forward(self, x):
         # x shape: (batch_size, timesteps, input_dim)
-        lstm_out, _ = self.lstm(x)  # (batch_size, timesteps, hidden_dim)
+        lstm_out, _ = self.lstm(x)  # (batch_size, timesteps, hidden_dim * 2) due to bidirectional
         lstm_out = self.dropout(lstm_out)
         
-        # Attention: Compute scores for each timestep
-        attention_scores = self.attention(lstm_out)  # (batch_size, timesteps, 1)
-        attention_weights = torch.softmax(attention_scores, dim=1)  # (batch_size, timesteps, 1)
+        # Multi-head attention (query, key, value all from lstm_out)
+        attn_out, _ = self.attention(lstm_out, lstm_out, lstm_out)  # (batch_size, timesteps, hidden_dim * 2)
+        attn_out = self.attn_dropout(attn_out)
         
-        # Weighted sum of LSTM outputs
-        context = torch.sum(lstm_out * attention_weights, dim=1)  # (batch_size, hidden_dim)
-        context = self.norm(context)
+        # Residual connection and pooling
+        context = self.norm1(lstm_out + attn_out)  # (batch_size, timesteps, hidden_dim * 2)
+        context = torch.mean(context, dim=1)  # (batch_size, hidden_dim * 2)
         
         # Dense layers
-        out = self.fc1(context)  # (batch_size, 64)
+        out = self.fc1(context)  # (batch_size, 128)
         out = self.relu(out)
+        out = self.norm2(out)
         out = self.dropout(out)
-        out = self.fc2(out)  # (batch_size, 32)
+        out = self.fc2(out)  # (batch_size, 64)
         out = self.relu(out)
         out = self.dropout(out)
         out = self.fc3(out)  # (batch_size, output_dim)
@@ -83,12 +83,11 @@ def load_dataset(data_dir="preprocessed_dataset"):
     return sequence_data, edge_df, node_df, execution_times
 
 # Train the model
-def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs, device):
+def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs, device):
     train_losses = []
     val_losses = []
     best_val_loss = float('inf')
-    patience = 20  # Increased patience for early stopping
-    patience_counter = 0
+    patience = 30  # Further increased patience
     
     for epoch in range(num_epochs):
         model.train()
@@ -117,18 +116,24 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
         val_loss /= len(val_loader.dataset)
         val_losses.append(val_loss)
         
-        print(f"Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
+        print(f"Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, LR: {scheduler.get_last_lr()[0]:.6f}")
         
-        # Early stopping with patience
+        # Learning rate scheduling
+        scheduler.step(val_loss)
+        
+        # Early stopping
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             patience_counter = 0
+            torch.save(model.state_dict(), "best_model.pth")  # Save best model
         else:
             patience_counter += 1
             if patience_counter >= patience:
                 print(f"Early stopping triggered after {patience} epochs of no improvement.")
                 break
     
+    # Load best model
+    model.load_state_dict(torch.load("best_model.pth"))
     return train_losses, val_losses
 
 # Plot and save loss
@@ -138,7 +143,7 @@ def plot_and_save_loss(train_losses, val_losses):
     plt.plot(val_losses, label='Val Loss')
     plt.title('Training and Validation Loss')
     plt.xlabel('Epoch')
-    plt.ylabel('Loss (MSE)')
+    plt.ylabel('Loss (Huber)')
     plt.legend()
     plt.grid(True)
     plt.savefig("loss_new.png")
@@ -176,23 +181,25 @@ if __name__ == "__main__":
     train_dataset = ScheduleDataset(X_train, y_train)
     val_dataset = ScheduleDataset(X_val, y_val)
     test_dataset = ScheduleDataset(X_holdout, y_holdout)
-    train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)  # Increased batch size
+    train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=10, shuffle=False)
     
     # Model parameters
     input_dim = X_train.shape[2]  # 11 features
-    hidden_dim = 128  # Increased hidden dimension
+    hidden_dim = 128
     output_dim = 1
-    num_layers = 2  # Stacked LSTM
+    num_layers = 2
+    num_heads = 4
     
-    # Initialize model, loss, and optimizer
-    model = LSTMAttention(input_dim, hidden_dim, output_dim, num_layers=num_layers).to(device)
-    criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.0005, weight_decay=1e-5)  # Lower lr, add weight decay
+    # Initialize model, loss, optimizer, and scheduler
+    model = LSTMAttention(input_dim, hidden_dim, output_dim, num_layers=num_layers, num_heads=num_heads).to(device)
+    criterion = nn.HuberLoss()  # Robust to outliers
+    optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)  # Increased weight decay
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10, verbose=True)
     
     # Train the model
-    train_losses, val_losses = train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs=200, device=device)
+    train_losses, val_losses = train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs=300, device=device)
     
     # Evaluate on holdout test set
     model.eval()
@@ -229,7 +236,7 @@ if __name__ == "__main__":
     # Plot and save loss
     plot_and_save_loss(train_losses, val_losses)
     
-    # Save the model
+    # Save the final model
     torch.save(model.state_dict(), "lstm_attention_model.pth")
     print("Model saved to lstm_attention_model.pth")
     
