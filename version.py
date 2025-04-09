@@ -62,16 +62,22 @@ def extract_features_from_file(file_path, scaler_template=None, scaler_seq=None)
         total_ops = 0
         
         for i, node in enumerate(nodes):
-            if 'Details' in node and 'Op histogram' in node['Details']:
-                for op_line in node['Details']['Op histogram']:
-                    parts = op_line.strip().split(':')
-                    if len(parts) == 2:
-                        op_name = f'op_{parts[0].strip().lower()}'
-                        op_count = int(parts[1].strip())
-                        if op_name not in op_types and len(op_types) < fixed_op_size:
-                            op_types.add(op_name)
-                        total_ops += op_count
-            node_features[i] = [node['Details']['Op histogram'].count(op) for op in sorted(op_types)][:fixed_op_size] / max(total_ops, 1)
+            details = node.get('Details', {})
+            op_hist = details.get('Op histogram', [])
+            if not op_hist:
+                continue
+            ops = {}
+            for op_line in op_hist:
+                parts = op_line.strip().split(':')
+                if len(parts) == 2:
+                    op_name = f'op_{parts[0].strip().lower()}'
+                    op_count = int(parts[1].strip())
+                    ops[op_name] = op_count
+                    if len(op_types) < fixed_op_size:
+                        op_types.add(op_name)
+                    total_ops += op_count
+            # Convert to array and normalize
+            node_features[i] = np.array([ops.get(op, 0) for op in sorted(op_types)][:fixed_op_size], dtype=np.float32) / max(total_ops, 1)
         
         adj_matrix = np.zeros((num_nodes, num_nodes), dtype=np.int8)
         node_map = {node.get('Name', str(i)): i for i, node in enumerate(nodes)}
@@ -141,15 +147,14 @@ class SchedulingDataset(Dataset):
             self.features[idx] = feat
         feat = self.features[idx]
         if feat is None:
-            # Return a dummy item for invalid files to avoid crashing; filtered later
-            dummy_seq = torch.zeros(1, 27, dtype=torch.float32)  # Adjust size based on expected feature length
+            dummy_seq = torch.zeros(1, 27, dtype=torch.float32)  # 9 metrics + 3 derived + 15 op features
             return dummy_seq, torch.tensor(0.0, dtype=torch.float32), 1
         return (torch.from_numpy(feat['scheduling_sequence']),
                 torch.tensor(feat['execution_time'], dtype=torch.float32),
                 feat['sequence_length'])
 
 def process_main_directory(main_dir):
-    """Optimized directory processing with validation."""
+    """Optimized directory processing with robust scaler initialization."""
     all_file_paths = []
     for subdir in sorted(os.listdir(main_dir)):
         subdir_path = os.path.join(main_dir, subdir)
@@ -165,19 +170,18 @@ def process_main_directory(main_dir):
     train_paths = all_file_paths[:-test_size]
     test_paths = all_file_paths[-test_size:]
     
-    # Precompute scalers on first valid file
+    # Try up to 10 files to initialize scalers
     scaler_template, scaler_seq = None, None
-    for path in train_paths:
+    for i, path in enumerate(train_paths[:10]):
         feat, scaler_template, scaler_seq = extract_features_from_file(path)
         if feat is not None:
             break
     if scaler_template is None:
-        raise ValueError("No valid files found to initialize scalers")
+        raise ValueError(f"No valid files found in first 10 samples of {main_dir}. Check data integrity.")
     
     train_dataset = SchedulingDataset(train_paths, scaler_template, scaler_seq)
     test_dataset = SchedulingDataset(test_paths, scaler_template, scaler_seq)
     
-    # Filter out invalid entries
     valid_train_indices = [i for i in range(len(train_dataset)) if train_dataset[i][1].item() > 0]
     valid_test_indices = [i for i in range(len(test_dataset)) if test_dataset[i][1].item() > 0]
     
@@ -191,7 +195,7 @@ def collate_fn(batch):
     """Custom collate function for efficient batching."""
     valid_batch = [(s, t, l) for s, t, l in batch if t > 0]
     if not valid_batch:
-        return None  # Skip empty batches
+        return None
     sequences, targets, lengths = zip(*valid_batch)
     sequences_padded = pad_sequence(sequences, batch_first=True)
     targets = torch.stack(targets)
