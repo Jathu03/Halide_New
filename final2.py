@@ -116,7 +116,11 @@ def extract_features(data):
         node_features.append(node_dict)
     
     # Total execution time (target variable)
-    execution_time = next(node['value'] for node in nodes if node.get('name') == 'total_execution_time_ms')
+    try:
+        execution_time = next(node['value'] for node in nodes if node.get('name') == 'total_execution_time_ms')
+    except StopIteration:
+        print("Warning: 'total_execution_time_ms' not found in nodes. Setting execution_time to 0.0.")
+        execution_time = 0.0  # Fallback value; adjust if you know the correct field
     
     return edge_features, node_features, temporal_sequences, execution_time
 
