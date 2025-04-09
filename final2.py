@@ -150,7 +150,7 @@ def validate_distributions(edge_df, node_df):
 # Main execution
 if __name__ == "__main__":
     # Replace with actual file path
-    file_path = "0_15.json"
+    file_path = "synthetic_data/program_50001/0_15.json"
     data = load_json_data(file_path)
     
     # Extract features
