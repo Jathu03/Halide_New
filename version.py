@@ -44,15 +44,16 @@ def extract_features_from_file(file_path, scaler_template=None, scaler_seq=None)
         
         execution_time = get_execution_time(file_path)
         if not execution_time or not np.isfinite(execution_time):
-            return None
+            print(f"Warning: Invalid execution time in {file_path}")
+            return None, scaler_template, scaler_seq
         
         programming_details = data.get("programming_details", {})
         nodes = programming_details.get('Nodes', [])
         edges = programming_details.get('Edges', [])
         if not nodes or not edges:
-            return None
+            print(f"Warning: Missing nodes or edges in {file_path}")
+            return None, scaler_template, scaler_seq
         
-        # Preallocate arrays
         num_nodes = len(nodes)
         num_edges = len(edges)
         fixed_op_size = 15
@@ -70,8 +71,7 @@ def extract_features_from_file(file_path, scaler_template=None, scaler_seq=None)
                         if op_name not in op_types and len(op_types) < fixed_op_size:
                             op_types.add(op_name)
                         total_ops += op_count
-            node_features[i] = [node['Details']['Op histogram'].count(op) / max(total_ops, 1) 
-                                for op in sorted(op_types)][:fixed_op_size]
+            node_features[i] = [node['Details']['Op histogram'].count(op) for op in sorted(op_types)][:fixed_op_size] / max(total_ops, 1)
         
         adj_matrix = np.zeros((num_nodes, num_nodes), dtype=np.int8)
         node_map = {node.get('Name', str(i)): i for i, node in enumerate(nodes)}
@@ -92,7 +92,8 @@ def extract_features_from_file(file_path, scaler_template=None, scaler_seq=None)
         
         scheduling_data = data.get("scheduling_data", programming_details.get('Schedules', []))
         if not scheduling_data:
-            return None
+            print(f"Warning: No scheduling data in {file_path}")
+            return None, scaler_template, scaler_seq
         
         scheduling_sequence = []
         seq_length = len(scheduling_data)
@@ -100,9 +101,9 @@ def extract_features_from_file(file_path, scaler_template=None, scaler_seq=None)
             sf = sched.get('Details', {}).get('scheduling_feature', {})
             sched_vector = np.array([float(sf.get(m, 0)) for m in important_metrics], dtype=np.float32)
             derived = [
-                np.log1p(sched_vector[2] * sched_vector[3] + 1e-6),  # inner * outer parallelism
-                sched_vector[0] / max(sched_vector[5], 1e-4),  # bytes_at_production / points_total
-                i / max(seq_length, 1)  # position
+                np.log1p(sched_vector[2] * sched_vector[3] + 1e-6),
+                sched_vector[0] / max(sched_vector[5], 1e-4),
+                i / max(seq_length, 1)
             ]
             combined = np.concatenate([sched_vector, derived])
             scheduling_sequence.append(np.concatenate([template_features, combined]))
@@ -119,30 +120,36 @@ def extract_features_from_file(file_path, scaler_template=None, scaler_seq=None)
             'execution_time': execution_time,
             'sequence_length': seq_length
         }, scaler_template, scaler_seq
-    except Exception:
+    except Exception as e:
+        print(f"Error processing {file_path}: {str(e)}")
         return None, scaler_template, scaler_seq
 
 class SchedulingDataset(Dataset):
-    """Custom Dataset for lazy loading and preprocessing."""
-    def __init__(self, features, file_names, scaler_template=None, scaler_seq=None):
-        self.features = features
-        self.file_names = file_names
+    """Custom Dataset with error handling."""
+    def __init__(self, file_paths, scaler_template=None, scaler_seq=None):
+        self.file_paths = file_paths
         self.scaler_template = scaler_template
         self.scaler_seq = scaler_seq
+        self.features = [None] * len(file_paths)
     
     def __len__(self):
-        return len(self.file_names)
+        return len(self.file_paths)
     
     def __getitem__(self, idx):
         if self.features[idx] is None:
-            self.features[idx], _, _ = extract_features_from_file(self.file_names[idx], self.scaler_template, self.scaler_seq)
+            feat, _, _ = extract_features_from_file(self.file_paths[idx], self.scaler_template, self.scaler_seq)
+            self.features[idx] = feat
         feat = self.features[idx]
+        if feat is None:
+            # Return a dummy item for invalid files to avoid crashing; filtered later
+            dummy_seq = torch.zeros(1, 27, dtype=torch.float32)  # Adjust size based on expected feature length
+            return dummy_seq, torch.tensor(0.0, dtype=torch.float32), 1
         return (torch.from_numpy(feat['scheduling_sequence']),
                 torch.tensor(feat['execution_time'], dtype=torch.float32),
                 feat['sequence_length'])
 
 def process_main_directory(main_dir):
-    """Optimized directory processing with precomputed scalers."""
+    """Optimized directory processing with validation."""
     all_file_paths = []
     for subdir in sorted(os.listdir(main_dir)):
         subdir_path = os.path.join(main_dir, subdir)
@@ -158,19 +165,34 @@ def process_main_directory(main_dir):
     train_paths = all_file_paths[:-test_size]
     test_paths = all_file_paths[-test_size:]
     
-    # Precompute scalers on a subset for efficiency
-    sample_features, scaler_template, scaler_seq = extract_features_from_file(train_paths[0])
-    features = [sample_features] + [None] * (len(all_file_paths) - 1)
+    # Precompute scalers on first valid file
+    scaler_template, scaler_seq = None, None
+    for path in train_paths:
+        feat, scaler_template, scaler_seq = extract_features_from_file(path)
+        if feat is not None:
+            break
+    if scaler_template is None:
+        raise ValueError("No valid files found to initialize scalers")
     
-    train_dataset = SchedulingDataset(features[:-test_size], train_paths, scaler_template, scaler_seq)
-    test_dataset = SchedulingDataset(features[-test_size:], test_paths, scaler_template, scaler_seq)
+    train_dataset = SchedulingDataset(train_paths, scaler_template, scaler_seq)
+    test_dataset = SchedulingDataset(test_paths, scaler_template, scaler_seq)
     
-    print(f"Total files: {len(all_file_paths)}, Training: {len(train_paths)}, Testing: {test_size}")
+    # Filter out invalid entries
+    valid_train_indices = [i for i in range(len(train_dataset)) if train_dataset[i][1].item() > 0]
+    valid_test_indices = [i for i in range(len(test_dataset)) if test_dataset[i][1].item() > 0]
+    
+    train_dataset = torch.utils.data.Subset(train_dataset, valid_train_indices)
+    test_dataset = torch.utils.data.Subset(test_dataset, valid_test_indices)
+    
+    print(f"Total files: {len(all_file_paths)}, Training: {len(train_dataset)}, Testing: {len(test_dataset)}")
     return train_dataset, test_dataset, [os.path.relpath(p, main_dir) for p in test_paths]
 
 def collate_fn(batch):
     """Custom collate function for efficient batching."""
-    sequences, targets, lengths = zip(*batch)
+    valid_batch = [(s, t, l) for s, t, l in batch if t > 0]
+    if not valid_batch:
+        return None  # Skip empty batches
+    sequences, targets, lengths = zip(*valid_batch)
     sequences_padded = pad_sequence(sequences, batch_first=True)
     targets = torch.stack(targets)
     return sequences_padded, targets, lengths
@@ -223,7 +245,10 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, schedule
     for epoch in range(num_epochs):
         model.train()
         running_loss = 0.0
-        for seq_inputs, targets, lengths in train_loader:
+        for batch in train_loader:
+            if batch is None:
+                continue
+            seq_inputs, targets, lengths = batch
             seq_inputs, targets = seq_inputs.to(device), targets.to(device)
             optimizer.zero_grad()
             
@@ -242,7 +267,10 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, schedule
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
-            for seq_inputs, targets, lengths in test_loader:
+            for batch in test_loader:
+                if batch is None:
+                    continue
+                seq_inputs, targets, lengths = batch
                 seq_inputs, targets = seq_inputs.to(device), targets.to(device)
                 with autocast():
                     outputs = model(seq_inputs, lengths)
@@ -282,7 +310,10 @@ def evaluate_model(model, test_loader, test_file_names):
     y_test_actual = []
     y_pred_actual = []
     with torch.no_grad():
-        for seq_inputs, targets, lengths in test_loader:
+        for batch in test_loader:
+            if batch is None:
+                continue
+            seq_inputs, targets, lengths = batch
             seq_inputs, targets = seq_inputs.to(device), targets.to(device)
             with autocast():
                 outputs = model(seq_inputs, lengths)
@@ -316,8 +347,12 @@ def evaluate_model(model, test_loader, test_file_names):
     return y_test_actual, y_pred_actual
 
 def main(main_dir):
-    torch.backends.cudnn.benchmark = True  # Optimize CUDA operations
+    torch.backends.cudnn.benchmark = True
     train_dataset, test_dataset, test_file_names = process_main_directory(main_dir)
+    
+    if len(train_dataset) == 0 or len(test_dataset) == 0:
+        print("Error: No valid data after filtering")
+        return
     
     train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, collate_fn=collate_fn, num_workers=2, pin_memory=True)
     test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, collate_fn=collate_fn, num_workers=2, pin_memory=True)
