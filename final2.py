@@ -253,4 +253,4 @@ if __name__ == "__main__":
     edge_df.to_csv(os.path.join(output_dir, "edge_features.csv"), index=False)
     node_df.to_csv(os.path.join(output_dir, "node_features.csv"), index=False)
     np.save(os.path.join(output_dir, "execution_times.npy"), execution_times)
-    print(f"Dataset saved to {output_dir}")s
+    print(f"Dataset saved to {output_dir}")
