@@ -149,7 +149,8 @@ def extract_features_from_file(file_path):
             ], dtype=np.float32)
             
             combined_vector = np.concatenate([sched_vector, derived])
-            noise = np.random.normal(0, 0.01, combined_vector.shape, dtype=np.float32)
+            # Fix: Remove dtype from np.random.normal and cast afterward
+            noise = np.random.normal(0, 0.01, combined_vector.shape).astype(np.float32)
             scheduling_sequence.append(np.concatenate([template_features, combined_vector + noise]))
         
         if not scheduling_sequence:
