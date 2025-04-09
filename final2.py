@@ -23,7 +23,17 @@ def extract_features(data):
     
     # Extract Edge Features
     for edge in edges:
+        footprint = edge['Details']['Footprint']
         jacobians = edge['Details']['Load Jacobians']
+        
+        # Safely extract Footprint values with defaults
+        fp_min_0 = parse_footprint(footprint[0]) if len(footprint) > 0 else 0.0
+        fp_max_0 = parse_footprint(footprint[1]) if len(footprint) > 1 else 0.0
+        fp_min_1 = parse_footprint(footprint[2]) if len(footprint) > 2 else 0.0
+        fp_max_1 = parse_footprint(footprint[3]) if len(footprint) > 3 else 0.0
+        fp_min_2 = parse_footprint(footprint[4]) if len(footprint) > 4 else 0.0
+        fp_max_2 = parse_footprint(footprint[5]) if len(footprint) > 5 else 0.0
+        
         # Safely extract Jacobian values with defaults
         jacobian_00 = float(jacobians[0].split()[0].replace('_', '0')) if len(jacobians) > 0 else 0.0
         jacobian_11 = float(jacobians[1].split()[1].replace('_', '0')) if len(jacobians) > 1 else 0.0
@@ -34,12 +44,12 @@ def extract_features(data):
             'from': edge['From'],
             'to': edge['To'],
             # Footprint features (min/max bounds for each dimension)
-            'footprint_min_0': parse_footprint(edge['Details']['Footprint'][0]),
-            'footprint_max_0': parse_footprint(edge['Details']['Footprint'][1]),
-            'footprint_min_1': parse_footprint(edge['Details']['Footprint'][2]),
-            'footprint_max_1': parse_footprint(edge['Details']['Footprint'][3]),
-            'footprint_min_2': parse_footprint(edge['Details']['Footprint'][4]),
-            'footprint_max_2': parse_footprint(edge['Details']['Footprint'][5]),
+            'footprint_min_0': fp_min_0,
+            'footprint_max_0': fp_max_0,
+            'footprint_min_1': fp_min_1,
+            'footprint_max_1': fp_max_1,
+            'footprint_min_2': fp_min_2,
+            'footprint_max_2': fp_max_2,
             # Jacobian features (dependency scaling factors)
             'jacobian_00': jacobian_00,
             'jacobian_11': jacobian_11,
@@ -155,7 +165,7 @@ def validate_distributions(edge_df, node_df):
 
 # Main execution
 if __name__ == "__main__":
-    # Replace with actual file path
+    # Updated file path
     file_path = "synthetic_data/program_50001/0_15.json"
     data = load_json_data(file_path)
     
