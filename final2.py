@@ -34,10 +34,16 @@ def extract_features(data):
         fp_min_2 = parse_footprint(footprint[4]) if len(footprint) > 4 else 0.0
         fp_max_2 = parse_footprint(footprint[5]) if len(footprint) > 5 else 0.0
         
-        # Safely extract Jacobian values with defaults
-        jacobian_00 = float(jacobians[0].split()[0].replace('_', '0')) if len(jacobians) > 0 else 0.0
-        jacobian_11 = float(jacobians[1].split()[1].replace('_', '0')) if len(jacobians) > 1 else 0.0
-        jacobian_22 = float(jacobians[2].split()[2].replace('_', '0')) if len(jacobians) > 2 else 0.0
+        # Safely extract Jacobian values with defaults, handling fractions
+        def parse_jacobian(value):
+            try:
+                return float(eval(value.replace('_', '0')))  # Handles fractions like '1/8'
+            except:
+                return 0.0
+        
+        jacobian_00 = parse_jacobian(jacobians[0].split()[0]) if len(jacobians) > 0 else 0.0
+        jacobian_11 = parse_jacobian(jacobians[1].split()[1]) if len(jacobians) > 1 else 0.0
+        jacobian_22 = parse_jacobian(jacobians[2].split()[2]) if len(jacobians) > 2 else 0.0
         
         edge_dict = {
             'name': edge['Name'],
