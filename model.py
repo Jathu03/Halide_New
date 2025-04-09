@@ -181,10 +181,10 @@ if __name__ == "__main__":
     
     # Split into train+val and holdout test set (10 samples)
     X_temp, X_holdout, y_temp, y_holdout = train_test_split(
-        sequence_data, execution_times_scaled, test_size=10, random_state=42
+        sequence_data, execution_times_scaled, test_size=20, random_state=42
     )
     X_train, X_val, y_train, y_val = train_test_split(
-        X_temp, y_temp, test_size=0.222, random_state=42
+        X_temp, y_temp, test_size=0.185, random_state=42
     )
     
     print("Train Shape:", X_train.shape, y_train.shape)
