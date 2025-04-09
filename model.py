@@ -62,10 +62,10 @@ class LSTMAttention(nn.Module):
 
 # Load the preprocessed dataset
 def load_dataset(data_dir="preprocessed_dataset"):
-    sequence_data = np.load(f"{data_dir}/sequence_data.npy")
+    sequence_data = np.load(f"{data_dir}/sequence_data.npy", allow_pickle=True)
     edge_df = pd.read_csv(f"{data_dir}/edge_features.csv")
     node_df = pd.read_csv(f"{data_dir}/node_features.csv")
-    execution_times = np.load(f"{data_dir}/execution_times.npy")
+    execution_times = np.load(f"{data_dir}/execution_times.npy", allow_pickle=True)
     return sequence_data, edge_df, node_df, execution_times
 
 # Train the model
