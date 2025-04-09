@@ -21,9 +21,9 @@ class ScheduleDataset(Dataset):
     def __getitem__(self, idx):
         return self.sequences[idx], self.execution_times[idx]
 
-# Enhanced LSTM model without attention
+# Enhanced LSTM model
 class LSTMRegressor(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, num_layers=3, dropout=0.5):
+    def __init__(self, input_dim, hidden_dim, output_dim, num_layers=4, dropout=0.3):
         super(LSTMRegressor, self).__init__()
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
@@ -33,19 +33,21 @@ class LSTMRegressor(nn.Module):
                            bidirectional=True, dropout=dropout if num_layers > 1 else 0)
         
         # Dense layers for regression
-        self.fc1 = nn.Linear(hidden_dim * 2, 256)  # *2 due to bidirectional
-        self.fc2 = nn.Linear(256, 128)
-        self.fc3 = nn.Linear(128, 64)
-        self.fc4 = nn.Linear(64, output_dim)
+        self.fc1 = nn.Linear(hidden_dim * 2, 512)  # *2 due to bidirectional
+        self.fc2 = nn.Linear(512, 256)
+        self.fc3 = nn.Linear(256, 128)
+        self.fc4 = nn.Linear(128, 64)
+        self.fc5 = nn.Linear(64, output_dim)
         
-        # Additional layers for residual connection
-        self.fc_residual = nn.Linear(hidden_dim * 2, 128)  # Match fc2 output dim
+        # Residual connection
+        self.fc_residual = nn.Linear(hidden_dim * 2, 256)  # Match fc2 output dim
         
         # Activation, normalization, and dropout
         self.relu = nn.ReLU()
         self.norm1 = nn.LayerNorm(hidden_dim * 2)
-        self.norm2 = nn.LayerNorm(256)
-        self.norm3 = nn.LayerNorm(128)
+        self.norm2 = nn.LayerNorm(512)
+        self.norm3 = nn.LayerNorm(256)
+        self.norm4 = nn.LayerNorm(128)
         self.dropout = nn.Dropout(dropout)
         
     def forward(self, x):
@@ -55,26 +57,30 @@ class LSTMRegressor(nn.Module):
         # Global pooling: average and max over timesteps
         avg_pool = torch.mean(lstm_out, dim=1)  # (batch_size, hidden_dim * 2)
         max_pool, _ = torch.max(lstm_out, dim=1)  # (batch_size, hidden_dim * 2)
-        context = torch.cat([avg_pool, max_pool], dim=1)  # (batch_size, hidden_dim * 4)
-        context = self.norm1(context[:, :self.hidden_dim * 2])  # Trim to hidden_dim * 2
+        context = self.norm1(avg_pool + max_pool)  # Combine and normalize
         
         # Dense layers with residual connection
-        out = self.fc1(context)  # (batch_size, 256)
+        out = self.fc1(context)  # (batch_size, 512)
         out = self.relu(out)
         out = self.norm2(out)
         out = self.dropout(out)
         
-        residual = self.fc_residual(context)  # (batch_size, 128)
-        out = self.fc2(out)  # (batch_size, 128)
+        residual = self.fc_residual(context)  # (batch_size, 256)
+        out = self.fc2(out)  # (batch_size, 256)
         out = out + residual  # Residual connection
         out = self.relu(out)
         out = self.norm3(out)
         out = self.dropout(out)
         
-        out = self.fc3(out)  # (batch_size, 64)
+        out = self.fc3(out)  # (batch_size, 128)
+        out = self.relu(out)
+        out = self.norm4(out)
+        out = self.dropout(out)
+        
+        out = self.fc4(out)  # (batch_size, 64)
         out = self.relu(out)
         out = self.dropout(out)
-        out = self.fc4(out)  # (batch_size, output_dim)
+        out = self.fc5(out)  # (batch_size, output_dim)
         return out
 
 # Load the preprocessed dataset
@@ -95,7 +101,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
     train_losses = []
     val_losses = []
     best_val_loss = float('inf')
-    patience = 30
+    patience = 50  # Increased patience
     
     for epoch in range(num_epochs):
         model.train()
@@ -106,6 +112,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
             outputs = model(sequences)
             loss = criterion(outputs, targets)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # Gradient clipping
             optimizer.step()
             train_loss += loss.item() * sequences.size(0)
         
@@ -127,7 +134,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
         current_lr = optimizer.param_groups[0]['lr']
         print(f"Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, LR: {current_lr:.6f}")
         
-        scheduler.step(val_loss)
+        scheduler.step()  # CosineAnnealingLR steps every epoch
         
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -167,9 +174,10 @@ if __name__ == "__main__":
     print("Sequence Data Shape:", sequence_data.shape)
     print("Execution Times Shape:", execution_times.shape)
     
-    # Normalize execution times
+    # Log-transform and normalize execution times
+    execution_times_log = np.log1p(execution_times)  # log(1 + x) to handle zeros
     scaler = StandardScaler()
-    execution_times_scaled = scaler.fit_transform(execution_times.reshape(-1, 1)).flatten()
+    execution_times_scaled = scaler.fit_transform(execution_times_log.reshape(-1, 1)).flatten()
     
     # Split into train+val and holdout test set (10 samples)
     X_temp, X_holdout, y_temp, y_holdout = train_test_split(
@@ -193,15 +201,15 @@ if __name__ == "__main__":
     
     # Model parameters
     input_dim = X_train.shape[2]  # 11 features
-    hidden_dim = 128
+    hidden_dim = 256  # Increased hidden dimension
     output_dim = 1
-    num_layers = 3
+    num_layers = 4  # More layers
     
     # Initialize model, loss, optimizer, and scheduler
     model = LSTMRegressor(input_dim, hidden_dim, output_dim, num_layers=num_layers).to(device)
-    criterion = nn.HuberLoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10, verbose=True)
+    criterion = nn.HuberLoss(delta=0.5)  # Adjusted delta for finer control
+    optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=50, eta_min=1e-6)  # Cosine decay over 50 epochs
     
     # Train the model
     train_losses, val_losses = train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs=300, device=device)
@@ -220,8 +228,11 @@ if __name__ == "__main__":
         y_pred_scaled = np.concatenate(y_pred_scaled).flatten()
         y_true_scaled = np.concatenate(y_true_scaled).flatten()
         
-        y_pred = scaler.inverse_transform(y_pred_scaled.reshape(-1, 1)).flatten()
-        y_true = scaler.inverse_transform(y_true_scaled.reshape(-1, 1)).flatten()
+        # Inverse transform with log scaling
+        y_pred_log = scaler.inverse_transform(y_pred_scaled.reshape(-1, 1)).flatten()
+        y_true_log = scaler.inverse_transform(y_true_scaled.reshape(-1, 1)).flatten()
+        y_pred = np.expm1(y_pred_log)  # Reverse log1p
+        y_true = np.expm1(y_true_log)  # Reverse log1p
         
         test_mae = np.mean(np.abs(y_true - y_pred))
         print(f"\nTest MAE (original scale, 10 holdout samples): {test_mae:.4f} ms")
