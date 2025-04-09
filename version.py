@@ -22,7 +22,6 @@ important_metrics = [
 
 @lru_cache(maxsize=1024)
 def get_execution_time(file_path):
-    """Cached function to retrieve execution time from JSON files."""
     try:
         with open(file_path, 'rb') as f:
             data = json.loads(f.read().decode('utf-8', errors='replace').replace('\0', ''))
@@ -37,7 +36,6 @@ def get_execution_time(file_path):
         return None
 
 def extract_features_from_file(file_path, scaler_template=None, scaler_seq=None):
-    """Optimized feature extraction with precomputed scalers."""
     try:
         with open(file_path, 'r') as f:
             data = json.load(f)
@@ -61,23 +59,34 @@ def extract_features_from_file(file_path, scaler_template=None, scaler_seq=None)
         node_features = np.zeros((num_nodes, fixed_op_size), dtype=np.float32)
         total_ops = 0
         
-        for i, node in enumerate(nodes):
+        # Collect operation types and counts
+        for node in nodes:
             details = node.get('Details', {})
             op_hist = details.get('Op histogram', [])
-            if not op_hist:
-                continue
-            ops = {}
             for op_line in op_hist:
                 parts = op_line.strip().split(':')
                 if len(parts) == 2:
                     op_name = f'op_{parts[0].strip().lower()}'
                     op_count = int(parts[1].strip())
-                    ops[op_name] = op_count
-                    if len(op_types) < fixed_op_size:
-                        op_types.add(op_name)
+                    op_types.add(op_name)
                     total_ops += op_count
-            # Convert to array and normalize
-            node_features[i] = np.array([ops.get(op, 0) for op in sorted(op_types)][:fixed_op_size], dtype=np.float32) / max(total_ops, 1)
+        
+        # Convert to sorted list and limit to fixed_op_size
+        op_types = sorted(list(op_types))[:fixed_op_size]
+        for i, node in enumerate(nodes):
+            details = node.get('Details', {})
+            op_hist = details.get('Op histogram', [])
+            ops = {}
+            for op_line in op_hist:
+                parts = op_line.strip().split(':')
+                if len(parts) == 2:
+                    op_name = f'op_{parts[0].strip().lower()}'
+                    ops[op_name] = int(parts[1].strip())
+            # Pad or truncate to fixed_op_size
+            features = [ops.get(op, 0) for op in op_types]
+            if len(features) < fixed_op_size:
+                features.extend([0] * (fixed_op_size - len(features)))
+            node_features[i] = np.array(features[:fixed_op_size], dtype=np.float32) / max(total_ops, 1)
         
         adj_matrix = np.zeros((num_nodes, num_nodes), dtype=np.int8)
         node_map = {node.get('Name', str(i)): i for i, node in enumerate(nodes)}
@@ -87,7 +96,8 @@ def extract_features_from_file(file_path, scaler_template=None, scaler_seq=None)
             if from_idx != -1 and to_idx != -1:
                 adj_matrix[from_idx, to_idx] = 1
         
-        graph_embedding = np.mean(node_features @ adj_matrix, axis=0) if num_nodes > 1 else np.mean(node_features, axis=0)
+        # Compute graph embedding with consistent dimensions
+        graph_embedding = np.mean(node_features, axis=0) if num_nodes == 1 else np.mean(np.dot(node_features, adj_matrix), axis=0)
         template_features = np.concatenate([[num_nodes, num_edges, total_ops], graph_embedding])
         
         if scaler_template:
@@ -131,7 +141,6 @@ def extract_features_from_file(file_path, scaler_template=None, scaler_seq=None)
         return None, scaler_template, scaler_seq
 
 class SchedulingDataset(Dataset):
-    """Custom Dataset with error handling."""
     def __init__(self, file_paths, scaler_template=None, scaler_seq=None):
         self.file_paths = file_paths
         self.scaler_template = scaler_template
@@ -154,7 +163,6 @@ class SchedulingDataset(Dataset):
                 feat['sequence_length'])
 
 def process_main_directory(main_dir):
-    """Optimized directory processing with robust scaler initialization."""
     all_file_paths = []
     for subdir in sorted(os.listdir(main_dir)):
         subdir_path = os.path.join(main_dir, subdir)
@@ -170,14 +178,21 @@ def process_main_directory(main_dir):
     train_paths = all_file_paths[:-test_size]
     test_paths = all_file_paths[-test_size:]
     
-    # Try up to 10 files to initialize scalers
+    # Try up to 100 files to initialize scalers
     scaler_template, scaler_seq = None, None
-    for i, path in enumerate(train_paths[:10]):
+    for i, path in enumerate(train_paths[:100]):
         feat, scaler_template, scaler_seq = extract_features_from_file(path)
         if feat is not None:
             break
     if scaler_template is None:
-        raise ValueError(f"No valid files found in first 10 samples of {main_dir}. Check data integrity.")
+        print(f"Warning: No valid files found in first 100 samples of {main_dir}. Using default scalers.")
+        scaler_template = PowerTransformer(method='yeo-johnson')
+        scaler_seq = PowerTransformer(method='yeo-johnson')
+        # Create a dummy feature set to fit scalers
+        dummy_template = np.ones((1, 18))  # 3 graph metrics + 15 op features
+        dummy_seq = np.ones((1, 27))       # 9 metrics + 3 derived + 15 op features
+        scaler_template.fit(dummy_template)
+        scaler_seq.fit(dummy_seq)
     
     train_dataset = SchedulingDataset(train_paths, scaler_template, scaler_seq)
     test_dataset = SchedulingDataset(test_paths, scaler_template, scaler_seq)
@@ -192,7 +207,6 @@ def process_main_directory(main_dir):
     return train_dataset, test_dataset, [os.path.relpath(p, main_dir) for p in test_paths]
 
 def collate_fn(batch):
-    """Custom collate function for efficient batching."""
     valid_batch = [(s, t, l) for s, t, l in batch if t > 0]
     if not valid_batch:
         return None
@@ -231,7 +245,6 @@ class HybridTemporalNet(nn.Module):
         return self.fc(self.dropout(context))
 
 def combined_loss(outputs, targets):
-    """Simplified loss function for efficiency."""
     mse = nn.MSELoss()(outputs, targets)
     rel_error = torch.mean(torch.abs(outputs - targets) / (targets.abs() + 1e-6))
     return mse + 0.1 * rel_error
