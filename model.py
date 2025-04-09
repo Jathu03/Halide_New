@@ -28,7 +28,7 @@ class LSTMAttention(nn.Module):
         self.hidden_dim = hidden_dim
         
         # LSTM layer
-        self.lstm = nn.LSTM(input_dim, hidden_dim, batch_first=True)  # Returns full sequence by default
+        self.lstm = nn.LSTM(input_dim, hidden_dim, batch_first=True)
         
         # Attention mechanism
         self.attention = nn.Linear(hidden_dim, 1)  # Simple attention scoring
@@ -41,19 +41,15 @@ class LSTMAttention(nn.Module):
         self.norm = nn.LayerNorm(hidden_dim)
         
     def forward(self, x):
-        # x shape: (batch_size, timesteps, input_dim)
         lstm_out, _ = self.lstm(x)  # (batch_size, timesteps, hidden_dim)
         lstm_out = self.dropout(lstm_out)
         
-        # Attention: Compute scores for each timestep
         attention_scores = self.attention(lstm_out)  # (batch_size, timesteps, 1)
         attention_weights = torch.softmax(attention_scores, dim=1)  # (batch_size, timesteps, 1)
         
-        # Weighted sum of LSTM outputs
         context = torch.sum(lstm_out * attention_weights, dim=1)  # (batch_size, hidden_dim)
         context = self.norm(context)
         
-        # Dense layers
         out = self.fc1(context)  # (batch_size, 32)
         out = self.relu(out)
         out = self.dropout(out)
@@ -79,12 +75,10 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
     val_losses = []
     
     for epoch in range(num_epochs):
-        # Training phase
         model.train()
         train_loss = 0.0
         for sequences, targets in train_loader:
             sequences, targets = sequences.to(device), targets.to(device)
-            
             optimizer.zero_grad()
             outputs = model(sequences)
             loss = criterion(outputs, targets)
@@ -95,7 +89,6 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
         train_loss /= len(train_loader.dataset)
         train_losses.append(train_loss)
         
-        # Validation phase
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
@@ -110,7 +103,6 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
         
         print(f"Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
         
-        # Early stopping (simple version)
         if epoch > 10 and val_losses[-1] > val_losses[-2]:
             print("Early stopping triggered.")
             break
@@ -146,18 +138,26 @@ if __name__ == "__main__":
     scaler = StandardScaler()
     execution_times_scaled = scaler.fit_transform(execution_times.reshape(-1, 1)).flatten()
     
-    # Split into train and test sets
-    X_train, X_test, y_train, y_test = train_test_split(
-        sequence_data, execution_times_scaled, test_size=0.2, random_state=42
+    # Split into train+val and holdout test set (10 samples)
+    X_temp, X_holdout, y_temp, y_holdout = train_test_split(
+        sequence_data, execution_times_scaled, test_size=10, random_state=42
     )
+    # Further split train+val into train and val
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_temp, y_temp, test_size=0.222, random_state=42  # ~20% of remaining for validation
+    )
+    
     print("Train Shape:", X_train.shape, y_train.shape)
-    print("Test Shape:", X_test.shape, y_test.shape)
+    print("Validation Shape:", X_val.shape, y_val.shape)
+    print("Holdout Test Shape:", X_holdout.shape, y_holdout.shape)
     
     # Create datasets and dataloaders
     train_dataset = ScheduleDataset(X_train, y_train)
-    test_dataset = ScheduleDataset(X_test, y_test)
+    val_dataset = ScheduleDataset(X_val, y_val)
+    test_dataset = ScheduleDataset(X_holdout, y_holdout)
     train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
+    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=10, shuffle=False)  # Batch size = 10 for holdout
     
     # Model parameters
     input_dim = X_train.shape[2]  # Number of features (11)
@@ -170,9 +170,9 @@ if __name__ == "__main__":
     optimizer = optim.Adam(model.parameters(), lr=0.001)
     
     # Train the model
-    train_losses, val_losses = train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=100, device=device)
+    train_losses, val_losses = train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs=100, device=device)
     
-    # Evaluate on test set
+    # Evaluate on holdout test set and calculate error percentage
     model.eval()
     with torch.no_grad():
         y_pred_scaled = []
@@ -190,8 +190,22 @@ if __name__ == "__main__":
         y_pred = scaler.inverse_transform(y_pred_scaled.reshape(-1, 1)).flatten()
         y_true = scaler.inverse_transform(y_true_scaled.reshape(-1, 1)).flatten()
         
+        # Calculate MAE and percentage error for each sample
         test_mae = np.mean(np.abs(y_true - y_pred))
-        print(f"Test MAE (original scale): {test_mae:.4f} ms")
+        print(f"\nTest MAE (original scale, 10 holdout samples): {test_mae:.4f} ms")
+        
+        print("\nPredictions for 10 Holdout Samples:")
+        print("Sample | True Time (ms) | Predicted Time (ms) | Error (%)")
+        print("-" * 60)
+        for i in range(len(y_true)):
+            true_time = y_true[i]
+            pred_time = y_pred[i]
+            error_percent = abs(true_time - pred_time) / true_time * 100 if true_time != 0 else 0
+            print(f"{i+1:6d} | {true_time:13.4f} | {pred_time:17.4f} | {error_percent:9.2f}")
+        
+        # Average error percentage
+        avg_error_percent = np.mean([abs(true - pred) / true * 100 if true != 0 else 0 for true, pred in zip(y_true, y_pred)])
+        print(f"\nAverage Error Percentage: {avg_error_percent:.2f}%")
     
     # Plot and save loss
     plot_and_save_loss(train_losses, val_losses)
