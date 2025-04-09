@@ -21,39 +21,52 @@ class ScheduleDataset(Dataset):
     def __getitem__(self, idx):
         return self.sequences[idx], self.execution_times[idx]
 
-# LSTM with Attention model
+# Improved LSTM with Attention model
 class LSTMAttention(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, dropout=0.2):
+    def __init__(self, input_dim, hidden_dim, output_dim, num_layers=2, dropout=0.3):
         super(LSTMAttention, self).__init__()
         self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
         
-        # LSTM layer
-        self.lstm = nn.LSTM(input_dim, hidden_dim, batch_first=True)
+        # Stacked LSTM
+        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers=num_layers, batch_first=True, dropout=dropout if num_layers > 1 else 0)
         
-        # Attention mechanism
-        self.attention = nn.Linear(hidden_dim, 1)  # Simple attention scoring
+        # Improved attention mechanism
+        self.attention = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, 1)
+        )
         self.dropout = nn.Dropout(dropout)
         
         # Dense layers
-        self.fc1 = nn.Linear(hidden_dim, 32)
-        self.fc2 = nn.Linear(32, output_dim)
+        self.fc1 = nn.Linear(hidden_dim, 64)
+        self.fc2 = nn.Linear(64, 32)
+        self.fc3 = nn.Linear(32, output_dim)
         self.relu = nn.ReLU()
         self.norm = nn.LayerNorm(hidden_dim)
         
     def forward(self, x):
+        # x shape: (batch_size, timesteps, input_dim)
         lstm_out, _ = self.lstm(x)  # (batch_size, timesteps, hidden_dim)
         lstm_out = self.dropout(lstm_out)
         
+        # Attention: Compute scores for each timestep
         attention_scores = self.attention(lstm_out)  # (batch_size, timesteps, 1)
         attention_weights = torch.softmax(attention_scores, dim=1)  # (batch_size, timesteps, 1)
         
+        # Weighted sum of LSTM outputs
         context = torch.sum(lstm_out * attention_weights, dim=1)  # (batch_size, hidden_dim)
         context = self.norm(context)
         
-        out = self.fc1(context)  # (batch_size, 32)
+        # Dense layers
+        out = self.fc1(context)  # (batch_size, 64)
         out = self.relu(out)
         out = self.dropout(out)
-        out = self.fc2(out)  # (batch_size, output_dim)
+        out = self.fc2(out)  # (batch_size, 32)
+        out = self.relu(out)
+        out = self.dropout(out)
+        out = self.fc3(out)  # (batch_size, output_dim)
         return out
 
 # Load the preprocessed dataset
@@ -73,6 +86,9 @@ def load_dataset(data_dir="preprocessed_dataset"):
 def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs, device):
     train_losses = []
     val_losses = []
+    best_val_loss = float('inf')
+    patience = 20  # Increased patience for early stopping
+    patience_counter = 0
     
     for epoch in range(num_epochs):
         model.train()
@@ -103,9 +119,15 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
         
         print(f"Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
         
-        if epoch > 10 and val_losses[-1] > val_losses[-2]:
-            print("Early stopping triggered.")
-            break
+        # Early stopping with patience
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f"Early stopping triggered after {patience} epochs of no improvement.")
+                break
     
     return train_losses, val_losses
 
@@ -142,9 +164,8 @@ if __name__ == "__main__":
     X_temp, X_holdout, y_temp, y_holdout = train_test_split(
         sequence_data, execution_times_scaled, test_size=10, random_state=42
     )
-    # Further split train+val into train and val
     X_train, X_val, y_train, y_val = train_test_split(
-        X_temp, y_temp, test_size=0.222, random_state=42  # ~20% of remaining for validation
+        X_temp, y_temp, test_size=0.222, random_state=42
     )
     
     print("Train Shape:", X_train.shape, y_train.shape)
@@ -155,24 +176,25 @@ if __name__ == "__main__":
     train_dataset = ScheduleDataset(X_train, y_train)
     val_dataset = ScheduleDataset(X_val, y_val)
     test_dataset = ScheduleDataset(X_holdout, y_holdout)
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size=10, shuffle=False)  # Batch size = 10 for holdout
+    train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)  # Increased batch size
+    val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=10, shuffle=False)
     
     # Model parameters
-    input_dim = X_train.shape[2]  # Number of features (11)
-    hidden_dim = 64
-    output_dim = 1  # Single execution time prediction
+    input_dim = X_train.shape[2]  # 11 features
+    hidden_dim = 128  # Increased hidden dimension
+    output_dim = 1
+    num_layers = 2  # Stacked LSTM
     
     # Initialize model, loss, and optimizer
-    model = LSTMAttention(input_dim, hidden_dim, output_dim).to(device)
+    model = LSTMAttention(input_dim, hidden_dim, output_dim, num_layers=num_layers).to(device)
     criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    optimizer = optim.Adam(model.parameters(), lr=0.0005, weight_decay=1e-5)  # Lower lr, add weight decay
     
     # Train the model
-    train_losses, val_losses = train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs=100, device=device)
+    train_losses, val_losses = train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs=200, device=device)
     
-    # Evaluate on holdout test set and calculate error percentage
+    # Evaluate on holdout test set
     model.eval()
     with torch.no_grad():
         y_pred_scaled = []
@@ -186,11 +208,9 @@ if __name__ == "__main__":
         y_pred_scaled = np.concatenate(y_pred_scaled).flatten()
         y_true_scaled = np.concatenate(y_true_scaled).flatten()
         
-        # Inverse transform to original scale
         y_pred = scaler.inverse_transform(y_pred_scaled.reshape(-1, 1)).flatten()
         y_true = scaler.inverse_transform(y_true_scaled.reshape(-1, 1)).flatten()
         
-        # Calculate MAE and percentage error for each sample
         test_mae = np.mean(np.abs(y_true - y_pred))
         print(f"\nTest MAE (original scale, 10 holdout samples): {test_mae:.4f} ms")
         
@@ -203,7 +223,6 @@ if __name__ == "__main__":
             error_percent = abs(true_time - pred_time) / true_time * 100 if true_time != 0 else 0
             print(f"{i+1:6d} | {true_time:13.4f} | {pred_time:17.4f} | {error_percent:9.2f}")
         
-        # Average error percentage
         avg_error_percent = np.mean([abs(true - pred) / true * 100 if true != 0 else 0 for true, pred in zip(y_true, y_pred)])
         print(f"\nAverage Error Percentage: {avg_error_percent:.2f}%")
     
