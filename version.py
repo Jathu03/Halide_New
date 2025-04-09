@@ -70,7 +70,7 @@ def extract_features_from_file(file_path, scaler_template=None, scaler_seq=None)
                     op_types.add(op_name)
                     total_ops += op_count
         
-        total_ops = min(total_ops, 1e8)
+        total_ops = min(max(total_ops, 1), 1e8)  # Ensure non-zero and cap
         op_types = sorted(list(op_types))[:fixed_op_size]
         for i, node in enumerate(nodes):
             details = node.get('Details', {})
@@ -84,7 +84,7 @@ def extract_features_from_file(file_path, scaler_template=None, scaler_seq=None)
             features = [ops.get(op, 0) for op in op_types]
             if len(features) < fixed_op_size:
                 features.extend([0] * (fixed_op_size - len(features)))
-            node_features[i] = np.array(features[:fixed_op_size], dtype=np.float32) / max(total_ops, 1)
+            node_features[i] = np.array(features[:fixed_op_size], dtype=np.float32) / total_ops
         
         adj_matrix = np.zeros((num_nodes, num_nodes), dtype=np.int8)
         node_map = {node.get('Name', str(i)): i for i, node in enumerate(nodes)}
@@ -96,6 +96,9 @@ def extract_features_from_file(file_path, scaler_template=None, scaler_seq=None)
         
         graph_embedding = np.mean(node_features, axis=0)
         template_features = np.concatenate([[num_nodes, num_edges, total_ops], graph_embedding])
+        if not np.all(np.isfinite(template_features)):
+            print(f"Warning: Non-finite template features in {file_path}")
+            return None, scaler_template, scaler_seq
         
         if scaler_template:
             template_features = scaler_template.transform(template_features.reshape(1, -1)).flatten()
@@ -131,6 +134,10 @@ def extract_features_from_file(file_path, scaler_template=None, scaler_seq=None)
         else:
             scaler_seq = RobustScaler()
             seq_array = scaler_seq.fit_transform(seq_array)
+        
+        if not np.all(np.isfinite(seq_array)):
+            print(f"Warning: Non-finite values after scaling in {file_path}")
+            return None, scaler_template, scaler_seq
         
         return {
             'scheduling_sequence': seq_array,
@@ -206,7 +213,7 @@ def process_main_directory(main_dir):
     return train_dataset, test_dataset, [os.path.relpath(p, main_dir) for p in test_paths]
 
 def collate_fn(batch):
-    valid_batch = [(s, t, l) for s, t, l in batch if t > 0]
+    valid_batch = [(s, t, l) for s, t, l in batch if t > 0 and torch.all(torch.isfinite(s))]
     if not valid_batch:
         return None
     sequences, targets, lengths = zip(*valid_batch)
@@ -227,9 +234,13 @@ class HybridTemporalNet(nn.Module):
         self.gelu = nn.GELU()
     
     def forward(self, seq_input, lengths=None):
+        if not torch.all(torch.isfinite(seq_input)):
+            print("Warning: Non-finite values in model input")
+            return torch.zeros(seq_input.size(0), 1, device=seq_input.device)
+        
         x = self.gelu(self.input_proj(seq_input))
         if lengths:
-            packed = pack_padded_sequence(x, lengths, batch_first=True, enforce_sorted=False)  # Changed to False
+            packed = pack_padded_sequence(x, lengths, batch_first=True, enforce_sorted=False)
             x, _ = self.lstm(packed)
             x, _ = pad_packed_sequence(x, batch_first=True, total_length=seq_input.size(1))
         else:
@@ -241,9 +252,19 @@ class HybridTemporalNet(nn.Module):
         
         weights = torch.softmax(self.pool(x), dim=1)
         context = (x * weights).sum(dim=1)
-        return self.fc(self.dropout(context))
+        output = self.fc(self.dropout(context))
+        
+        if not torch.all(torch.isfinite(output)):
+            print("Warning: Non-finite values in model output")
+            return torch.zeros(seq_input.size(0), 1, device=seq_input.device)
+        
+        return output
 
 def combined_loss(outputs, targets):
+    mask = torch.isfinite(outputs) & torch.isfinite(targets)
+    if not mask.any():
+        return torch.tensor(0.0, device=outputs.device, requires_grad=True)
+    outputs, targets = outputs[mask], targets[mask]
     mse = nn.MSELoss()(outputs, targets)
     rel_error = torch.mean(torch.abs(outputs - targets) / (targets.abs() + 1e-6))
     return mse + 0.1 * rel_error
@@ -270,9 +291,10 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, schedule
             
             with autocast():
                 outputs = model(seq_inputs, lengths)
-                loss = criterion(outputs, targets)
+                loss = criterion(outputs.squeeze(), targets)  # Ensure shapes match
             
             scaler.scale(loss).backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # Gradient clipping
             scaler.step(optimizer)
             scaler.update()
             running_loss += loss.item() * seq_inputs.size(0)
@@ -290,7 +312,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, schedule
                 seq_inputs, targets = seq_inputs.to(device), targets.to(device)
                 with autocast():
                     outputs = model(seq_inputs, lengths)
-                    loss = criterion(outputs, targets)
+                    loss = criterion(outputs.squeeze(), targets)
                 val_loss += loss.item() * seq_inputs.size(0)
         
         val_loss /= len(test_loader.dataset)
@@ -299,7 +321,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, schedule
         
         print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
         
-        if val_loss < best_val_loss:
+        if val_loss < best_val_loss and np.isfinite(val_loss):
             best_val_loss = val_loss
             epochs_no_improve = 0
             torch.save(model.state_dict(), 'best_model.pt')
@@ -334,13 +356,14 @@ def evaluate_model(model, test_loader, test_file_names):
             with autocast():
                 outputs = model(seq_inputs, lengths)
             y_test_actual.extend(targets.cpu().numpy())
-            y_pred_actual.extend(outputs.cpu().numpy())
+            y_pred_actual.extend(outputs.squeeze().cpu().numpy())
     
     y_test_actual = np.array(y_test_actual)
+    y_pred_actual = np.array(y_pred_actual)
     y_pred_actual = np.clip(y_pred_actual, 0, np.percentile(y_test_actual, 99))
     
     results_by_subfolder = {}
-    for i, file_path in enumerate(test_file_names):
+    for i, file_path in enumerate(test_file_names[:len(y_test_actual)]):  # Ensure length match
         subfolder = file_path.split('/')[0]
         results_by_subfolder.setdefault(subfolder, []).append({
             'file': file_path,
@@ -385,4 +408,4 @@ if __name__ == "__main__":
     random.seed(42)
     torch.manual_seed(42)
     np.random.seed(42)
-    main(main_dir)
+    main(main_dir)s
