@@ -9,12 +9,19 @@ import matplotlib.pyplot as plt
 def load_json_data(file_path):
     with open(file_path, 'r') as f:
         data = json.load(f)
-    return data  # Return the full JSON object, not just 'programming_details'
+    return data  # Return the full JSON object (could be a list)
 
 # 1. Enhanced Feature Extraction
 def extract_features(data):
-    edges = data['programming_details']['Edges']
-    nodes = data['programming_details']['Nodes']
+    # Check if data is a list and access the first element if so
+    if isinstance(data, list) and len(data) > 0:
+        data_dict = data[0]
+    else:
+        print("Error: Expected a list with at least one dictionary. Using empty dict as fallback.")
+        data_dict = {}
+
+    edges = data_dict.get('programming_details', {}).get('Edges', [])
+    nodes = data_dict.get('programming_details', {}).get('Nodes', [])
     
     # Feature dictionaries
     edge_features = []
@@ -116,7 +123,7 @@ def extract_features(data):
         node_features.append(node_dict)
     
     # Total execution time from scheduling_data
-    execution_time = data.get('scheduling_data', {}).get('total_execution_time_ms', 0.0)
+    execution_time = data_dict.get('scheduling_data', {}).get('total_execution_time_ms', 0.0)
     if execution_time == 0.0:
         print("Warning: 'total_execution_time_ms' not found in 'scheduling_data'. Using default value 0.0.")
     
