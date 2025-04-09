@@ -2,7 +2,7 @@ import os
 import json
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import PowerTransformer, StandardScaler
+from sklearn.preprocessing import RobustScaler
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -59,7 +59,6 @@ def extract_features_from_file(file_path, scaler_template=None, scaler_seq=None)
         node_features = np.zeros((num_nodes, fixed_op_size), dtype=np.float32)
         total_ops = 0
         
-        # Collect operation types and counts
         for node in nodes:
             details = node.get('Details', {})
             op_hist = details.get('Op histogram', [])
@@ -67,11 +66,11 @@ def extract_features_from_file(file_path, scaler_template=None, scaler_seq=None)
                 parts = op_line.strip().split(':')
                 if len(parts) == 2:
                     op_name = f'op_{parts[0].strip().lower()}'
-                    op_count = int(parts[1].strip())
+                    op_count = min(int(parts[1].strip()), 1e6)  # Cap to prevent overflow
                     op_types.add(op_name)
                     total_ops += op_count
         
-        # Convert to sorted list and limit to fixed_op_size
+        total_ops = min(total_ops, 1e8)  # Cap total_ops
         op_types = sorted(list(op_types))[:fixed_op_size]
         for i, node in enumerate(nodes):
             details = node.get('Details', {})
@@ -81,8 +80,7 @@ def extract_features_from_file(file_path, scaler_template=None, scaler_seq=None)
                 parts = op_line.strip().split(':')
                 if len(parts) == 2:
                     op_name = f'op_{parts[0].strip().lower()}'
-                    ops[op_name] = int(parts[1].strip())
-            # Pad or truncate to fixed_op_size
+                    ops[op_name] = min(int(parts[1].strip()), 1e6)
             features = [ops.get(op, 0) for op in op_types]
             if len(features) < fixed_op_size:
                 features.extend([0] * (fixed_op_size - len(features)))
@@ -96,14 +94,14 @@ def extract_features_from_file(file_path, scaler_template=None, scaler_seq=None)
             if from_idx != -1 and to_idx != -1:
                 adj_matrix[from_idx, to_idx] = 1
         
-        # Compute graph embedding with consistent dimensions
-        graph_embedding = np.mean(node_features, axis=0) if num_nodes == 1 else np.mean(np.dot(node_features, adj_matrix), axis=0)
+        # Simplify graph embedding to avoid dimension mismatch
+        graph_embedding = np.mean(node_features, axis=0)
         template_features = np.concatenate([[num_nodes, num_edges, total_ops], graph_embedding])
         
         if scaler_template:
             template_features = scaler_template.transform(template_features.reshape(1, -1)).flatten()
         else:
-            scaler_template = PowerTransformer(method='yeo-johnson')
+            scaler_template = RobustScaler()
             template_features = scaler_template.fit_transform(template_features.reshape(1, -1)).flatten()
         
         scheduling_data = data.get("scheduling_data", programming_details.get('Schedules', []))
@@ -115,20 +113,24 @@ def extract_features_from_file(file_path, scaler_template=None, scaler_seq=None)
         seq_length = len(scheduling_data)
         for i, sched in enumerate(scheduling_data):
             sf = sched.get('Details', {}).get('scheduling_feature', {})
-            sched_vector = np.array([float(sf.get(m, 0)) for m in important_metrics], dtype=np.float32)
+            sched_vector = np.array([min(float(sf.get(m, 0)), 1e10) for m in important_metrics], dtype=np.float32)
             derived = [
-                np.log1p(sched_vector[2] * sched_vector[3] + 1e-6),
-                sched_vector[0] / max(sched_vector[5], 1e-4),
+                np.log1p(min(sched_vector[2] * sched_vector[3], 1e10) + 1e-6),
+                min(sched_vector[0] / max(sched_vector[5], 1e-4), 1e6),
                 i / max(seq_length, 1)
             ]
             combined = np.concatenate([sched_vector, derived])
             scheduling_sequence.append(np.concatenate([template_features, combined]))
         
         seq_array = np.array(scheduling_sequence, dtype=np.float32)
+        if not np.all(np.isfinite(seq_array)):
+            print(f"Warning: Non-finite values in sequence for {file_path}")
+            return None, scaler_template, scaler_seq
+        
         if scaler_seq:
             seq_array = scaler_seq.transform(seq_array)
         else:
-            scaler_seq = PowerTransformer(method='yeo-johnson')
+            scaler_seq = RobustScaler()
             seq_array = scaler_seq.fit_transform(seq_array)
         
         return {
@@ -178,7 +180,6 @@ def process_main_directory(main_dir):
     train_paths = all_file_paths[:-test_size]
     test_paths = all_file_paths[-test_size:]
     
-    # Try up to 100 files to initialize scalers
     scaler_template, scaler_seq = None, None
     for i, path in enumerate(train_paths[:100]):
         feat, scaler_template, scaler_seq = extract_features_from_file(path)
@@ -186,9 +187,8 @@ def process_main_directory(main_dir):
             break
     if scaler_template is None:
         print(f"Warning: No valid files found in first 100 samples of {main_dir}. Using default scalers.")
-        scaler_template = PowerTransformer(method='yeo-johnson')
-        scaler_seq = PowerTransformer(method='yeo-johnson')
-        # Create a dummy feature set to fit scalers
+        scaler_template = RobustScaler()
+        scaler_seq = RobustScaler()
         dummy_template = np.ones((1, 18))  # 3 graph metrics + 15 op features
         dummy_seq = np.ones((1, 27))       # 9 metrics + 3 derived + 15 op features
         scaler_template.fit(dummy_template)
