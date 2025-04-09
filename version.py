@@ -12,7 +12,7 @@ from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 import random
 import matplotlib.pyplot as plt
 
-# Define important metrics for scheduling sequence (schedule-specific)
+# Define important metrics for scheduling sequence
 important_metrics = [
     'bytes_at_production', 'bytes_at_realization', 'inner_parallelism', 'outer_parallelism',
     'num_vectors', 'points_computed_total', 'working_set'
@@ -83,7 +83,7 @@ def extract_features_from_file(file_path):
         edge_feature = {'From': edge.get('From', ''), 'To': edge.get('To', ''), 'Name': edge.get('Name', '')}
         edges_features.append(edge_feature)
     
-    # Graph Embedding (Simple GNN-like aggregation)
+    # Graph Embedding
     num_nodes = max(len(nodes_features), 1)
     num_edges = len(edges_features)
     total_ops = sum(sum(node.get(f'op_{op}', 0) for op in all_op_types) for node in op_counts_per_node)
@@ -95,7 +95,6 @@ def extract_features_from_file(file_path):
         if from_idx != -1 and to_idx != -1:
             adj_matrix[from_idx, to_idx] = 1
     
-    # Create node feature matrix (num_nodes, num_features)
     fixed_op_size = 10
     op_types = sorted(list(all_op_types))[:fixed_op_size]
     node_features = np.zeros((num_nodes, fixed_op_size))
@@ -103,7 +102,6 @@ def extract_features_from_file(file_path):
         for j, op in enumerate(op_types):
             node_features[i, j] = op_counts.get(op, 0) / max(total_ops, 1)
     
-    # Compute graph embedding
     if num_nodes > 1:
         graph_embedding = np.mean(np.dot(adj_matrix, node_features), axis=0)
     else:
@@ -134,7 +132,7 @@ def extract_features_from_file(file_path):
             sched_feature.update(sf)
         scheduling_features.append(sched_feature)
     
-    # Enhanced Scheduling Sequence with Data Augmentation
+    # Enhanced Scheduling Sequence with Improved Features
     scheduling_sequence = []
     for i, sf in enumerate(scheduling_features):
         sched_vector = [float(sf.get(metric, 0.0)) for metric in important_metrics]
@@ -142,15 +140,14 @@ def extract_features_from_file(file_path):
         points_total = sf.get('points_computed_total', 0.0)
         inner_p = sf.get('inner_parallelism', 0.0)
         outer_p = sf.get('outer_parallelism', 0.0)
+        # Normalize and add relative features
         sched_vector.extend([
-            np.log1p(inner_p * outer_p),
-            bytes_prod / max(points_total, 1e-4),
-            inner_p / max(outer_p, 1e-4)  # Additional feature
+            np.log1p(inner_p * outer_p + 1e-6),  # Avoid log(0)
+            np.log1p(bytes_prod / max(points_total, 1e-4) + 1e-6),  # Log-normalized ratio
+            inner_p / max(outer_p, 1e-4)  # Relative parallelism
         ])
-        # Augment with noise and scaling
-        noise = np.random.normal(0, 0.1, len(sched_vector))  # Increased noise
-        scale = np.random.uniform(0.95, 1.05)  # Random scaling
-        augmented_vector = (np.array(sched_vector, dtype=np.float32) + noise) * scale
+        noise = np.random.normal(0, 0.05, len(sched_vector))  # Reduced noise
+        augmented_vector = np.array(sched_vector, dtype=np.float32) + noise
         combined_vector = np.concatenate([template_features, augmented_vector])
         scheduling_sequence.append(combined_vector)
     
@@ -228,8 +225,8 @@ def prepare_data_for_model(train_features, test_features):
     
     y_train_raw = np.array([f['execution_time'] for f in train_features])
     y_test_raw = np.array([f['execution_time'] for f in test_features])
-    y_train_raw = np.clip(y_train_raw, 0, np.percentile(y_train_raw, 99))
-    y_test_raw = np.clip(y_test_raw, 0, np.percentile(y_test_raw, 99))
+    y_train_raw = np.clip(y_train_raw, 1e-6, np.percentile(y_train_raw, 99))  # Avoid zero
+    y_test_raw = np.clip(y_test_raw, 1e-6, np.percentile(y_test_raw, 99))
     
     y_train = np.log1p(y_train_raw).reshape(-1, 1)
     y_test = np.log1p(y_test_raw).reshape(-1, 1)
@@ -260,7 +257,7 @@ class AttentionPooling(nn.Module):
         return torch.sum(x * weights, dim=1)
 
 class EnhancedRecursiveLSTMModel(nn.Module):
-    def __init__(self, seq_input_size, hidden_sizes=[512, 256, 128, 64], output_size=1, dropout_rate=0.4, num_heads=8):
+    def __init__(self, seq_input_size, hidden_sizes=[256, 128, 64], output_size=1, dropout_rate=0.5, num_heads=4):
         super(EnhancedRecursiveLSTMModel, self).__init__()
         
         self.lstm_layers = nn.ModuleList()
@@ -274,24 +271,21 @@ class EnhancedRecursiveLSTMModel(nn.Module):
             self.ln_layers.append(nn.LayerNorm(hidden_sizes[i] * 2))
             self.residual_projs.append(nn.Linear(hidden_sizes[i-1] * 2, hidden_sizes[i] * 2) if hidden_sizes[i-1] * 2 != hidden_sizes[i] * 2 else None)
         
-        self.pre_attn_ln = nn.LayerNorm(hidden_sizes[-1] * 2)  # Added pre-attention normalization
+        self.pre_attn_ln = nn.LayerNorm(hidden_sizes[-1] * 2)
         self.attention = nn.MultiheadAttention(hidden_sizes[-1] * 2, num_heads, dropout=dropout_rate, batch_first=True)
         self.attn_pool = AttentionPooling(hidden_sizes[-1] * 2)
         
-        self.fc1 = nn.Linear(hidden_sizes[-1] * 2, 256)  # Increased size
-        self.bn1 = nn.BatchNorm1d(256)
-        self.ln1 = nn.LayerNorm(256)
-        self.fc2 = nn.Linear(256, 128)
-        self.bn2 = nn.BatchNorm1d(128)
-        self.ln2 = nn.LayerNorm(128)
-        self.fc3 = nn.Linear(128, 64)  # Added extra layer
-        self.bn3 = nn.BatchNorm1d(64)
-        self.ln3 = nn.LayerNorm(64)
+        self.fc1 = nn.Linear(hidden_sizes[-1] * 2, 128)
+        self.bn1 = nn.BatchNorm1d(128)
+        self.ln1 = nn.LayerNorm(128)
+        self.fc2 = nn.Linear(128, 64)
+        self.bn2 = nn.BatchNorm1d(64)
+        self.ln2 = nn.LayerNorm(64)
         self.output_layer = nn.Linear(64, output_size)
         
         self.gelu = nn.GELU()
         self.dropout = nn.Dropout(dropout_rate)
-        self.final_residual_proj = nn.Linear(hidden_sizes[-1] * 2, 64) if hidden_sizes[-1] * 2 != 64 else None
+        self.fc_residual = nn.Linear(hidden_sizes[-1] * 2, 128)  # Residual connection for FC layers
     
     def forward(self, seq_input):
         lstm_out = seq_input
@@ -302,11 +296,13 @@ class EnhancedRecursiveLSTMModel(nn.Module):
             lstm_out = ln(lstm_out)
             lstm_out = self.dropout(lstm_out)
         
-        lstm_out = self.pre_attn_ln(lstm_out)  # Apply normalization before attention
+        lstm_out = self.pre_attn_ln(lstm_out)
         attn_out, _ = self.attention(lstm_out, lstm_out, lstm_out)
         context = self.attn_pool(attn_out)
         
         x = self.fc1(context)
+        residual_fc = self.fc_residual(context)  # Residual connection
+        x = x + residual_fc
         x = self.bn1(x)
         x = self.ln1(x)
         x = self.gelu(x)
@@ -315,26 +311,20 @@ class EnhancedRecursiveLSTMModel(nn.Module):
         x = self.bn2(x)
         x = self.ln2(x)
         x = self.gelu(x)
-        x = self.fc3(x)  # Added extra layer
-        x = self.bn3(x)
-        x = self.ln3(x)
-        x = self.gelu(x)
-        
-        residual = context if self.final_residual_proj is None else self.final_residual_proj(context)
-        x = x + residual
-        x = self.dropout(x)
         output = self.output_layer(x)
         
         return output
 
-def combined_loss(outputs, targets, alpha=0.5, gamma=1.5, mse_weight=0.5):
+def combined_loss(outputs, targets, alpha=0.7, gamma=2.0, mse_weight=0.3):
     mse = nn.MSELoss()(outputs, targets)
     focal_mse = (outputs - targets) ** 2
     pt = torch.exp(-focal_mse)
     focal = alpha * (1 - pt) ** gamma * focal_mse
-    return mse_weight * mse + (1 - mse_weight) * torch.mean(focal)
+    # Add relative error term
+    rel_error = torch.mean(torch.abs(outputs - targets) / (targets.abs() + 1e-6))
+    return mse_weight * mse + (1 - mse_weight) * torch.mean(focal) + 0.1 * rel_error
 
-def create_data_loaders(train_sequences, y_train, test_sequences, y_test, batch_size=64):  # Increased batch size
+def create_data_loaders(train_sequences, y_train, test_sequences, y_test, batch_size=32):
     train_dataset = TensorDataset(train_sequences, y_train)
     test_dataset = TensorDataset(test_sequences, y_test)
     
@@ -343,7 +333,7 @@ def create_data_loaders(train_sequences, y_train, test_sequences, y_test, batch_
     
     return train_loader, test_loader
 
-def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=500, patience=50, accumulation_steps=4, T_0=10):
+def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=500, patience=50, accumulation_steps=2, T_0=20):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
@@ -458,6 +448,9 @@ def evaluate_model(model, X_test_seq, y_test, y_scaler, file_names_test):
     y_test_actual = np.expm1(y_test_transformed)
     y_pred_actual = np.expm1(y_pred_transformed)
     
+    # Clip predictions to reasonable range based on training data
+    y_pred_actual = np.clip(y_pred_actual, 0, np.percentile(y_test_actual, 99))
+    
     results_by_subfolder = {}
     for i, file_path in enumerate(file_names_test):
         subfolder = file_path.split('/')[0]
@@ -517,25 +510,25 @@ def main(main_dir):
     train_loader, test_loader = create_data_loaders(
         train_sequences, y_train,
         test_sequences, y_test,
-        batch_size=64
+        batch_size=32
     )
     
     global model
     model = EnhancedRecursiveLSTMModel(
         seq_input_size=seq_input_size,
-        hidden_sizes=[512, 256, 128, 64],  # Increased capacity
+        hidden_sizes=[256, 128, 64],  # Reduced complexity
         output_size=1,
-        dropout_rate=0.4,  # Adjusted dropout
-        num_heads=8  # Increased attention heads
+        dropout_rate=0.5,  # Increased dropout
+        num_heads=4
     )
     
-    optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-4)  # Adjusted LR and weight decay
+    optimizer = optim.AdamW(model.parameters(), lr=0.0005, weight_decay=5e-4)  # Adjusted LR and weight decay
     
     print("Building and training Enhanced Recursive LSTM model...")
     train_losses, val_losses = train_model(
         model, train_loader, test_loader,
         combined_loss, optimizer,
-        num_epochs=500, patience=50, accumulation_steps=4, T_0=10
+        num_epochs=500, patience=50, accumulation_steps=2, T_0=20
     )
     
     if train_losses is None or val_losses is None:
