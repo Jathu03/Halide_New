@@ -70,7 +70,7 @@ def extract_features_from_file(file_path, scaler_template=None, scaler_seq=None)
                     op_types.add(op_name)
                     total_ops += op_count
         
-        total_ops = min(max(total_ops, 1), 1e8)  # Ensure non-zero and cap
+        total_ops = min(max(total_ops, 1), 1e8)
         op_types = sorted(list(op_types))[:fixed_op_size]
         for i, node in enumerate(nodes):
             details = node.get('Details', {})
@@ -235,8 +235,8 @@ class HybridTemporalNet(nn.Module):
     
     def forward(self, seq_input, lengths=None):
         if not torch.all(torch.isfinite(seq_input)):
-            print("Warning: Non-finite values in model input")
-            return torch.zeros(seq_input.size(0), 1, device=seq_input.device)
+            print(f"Warning: Non-finite values in model input: {seq_input}")
+            seq_input = torch.nan_to_num(seq_input, nan=0.0, posinf=1e6, neginf=-1e6)
         
         x = self.gelu(self.input_proj(seq_input))
         if lengths:
@@ -247,6 +247,10 @@ class HybridTemporalNet(nn.Module):
             x, _ = self.lstm(x)
         
         x = self.norm(x)
+        if not torch.all(torch.isfinite(x)):
+            print(f"Warning: Non-finite values after LSTM: {x}")
+            x = torch.nan_to_num(x, nan=0.0, posinf=1e6, neginf=-1e6)
+        
         mask = torch.arange(seq_input.size(1), device=x.device)[None, :] >= torch.tensor(lengths, device=x.device)[:, None] if lengths else None
         x, _ = self.attn(x, x, x, key_padding_mask=mask)
         
@@ -254,16 +258,19 @@ class HybridTemporalNet(nn.Module):
         context = (x * weights).sum(dim=1)
         output = self.fc(self.dropout(context))
         
+        output = torch.clamp(output, min=-1e6, max=1e6)  # Prevent extreme values
+        
         if not torch.all(torch.isfinite(output)):
-            print("Warning: Non-finite values in model output")
-            return torch.zeros(seq_input.size(0), 1, device=seq_input.device)
+            print(f"Warning: Non-finite values in model output: {output}")
+            output = torch.nan_to_num(output, nan=0.0, posinf=1e6, neginf=-1e6)
         
         return output
 
 def combined_loss(outputs, targets):
     mask = torch.isfinite(outputs) & torch.isfinite(targets)
     if not mask.any():
-        return torch.tensor(0.0, device=outputs.device, requires_grad=True)
+        # Return a small loss tied to outputs to preserve gradients
+        return torch.mean(outputs * 0.0 + 1e-6)  # Small constant ensures grad_fn
     outputs, targets = outputs[mask], targets[mask]
     mse = nn.MSELoss()(outputs, targets)
     rel_error = torch.mean(torch.abs(outputs - targets) / (targets.abs() + 1e-6))
@@ -291,10 +298,10 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, schedule
             
             with autocast():
                 outputs = model(seq_inputs, lengths)
-                loss = criterion(outputs.squeeze(), targets)  # Ensure shapes match
+                loss = criterion(outputs.squeeze(), targets)
             
             scaler.scale(loss).backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
             running_loss += loss.item() * seq_inputs.size(0)
@@ -363,7 +370,7 @@ def evaluate_model(model, test_loader, test_file_names):
     y_pred_actual = np.clip(y_pred_actual, 0, np.percentile(y_test_actual, 99))
     
     results_by_subfolder = {}
-    for i, file_path in enumerate(test_file_names[:len(y_test_actual)]):  # Ensure length match
+    for i, file_path in enumerate(test_file_names[:len(y_test_actual)]):
         subfolder = file_path.split('/')[0]
         results_by_subfolder.setdefault(subfolder, []).append({
             'file': file_path,
