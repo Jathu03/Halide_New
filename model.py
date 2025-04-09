@@ -28,26 +28,26 @@ class LSTMRegressor(nn.Module):
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         
-        # Bidirectional LSTM with more layers
+        # Bidirectional LSTM
         self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers=num_layers, batch_first=True, 
                            bidirectional=True, dropout=dropout if num_layers > 1 else 0)
         
-        # Dense layers for regression
-        self.fc1 = nn.Linear(hidden_dim * 2, 512)  # *2 due to bidirectional
+        # Dense layers with batch normalization
+        self.fc1 = nn.Linear(hidden_dim * 2, 512)
+        self.bn1 = nn.BatchNorm1d(512)
         self.fc2 = nn.Linear(512, 256)
+        self.bn2 = nn.BatchNorm1d(256)
         self.fc3 = nn.Linear(256, 128)
+        self.bn3 = nn.BatchNorm1d(128)
         self.fc4 = nn.Linear(128, 64)
+        self.bn4 = nn.BatchNorm1d(64)
         self.fc5 = nn.Linear(64, output_dim)
         
         # Residual connection
         self.fc_residual = nn.Linear(hidden_dim * 2, 256)  # Match fc2 output dim
         
-        # Activation, normalization, and dropout
+        # Activation and dropout
         self.relu = nn.ReLU()
-        self.norm1 = nn.LayerNorm(hidden_dim * 2)
-        self.norm2 = nn.LayerNorm(512)
-        self.norm3 = nn.LayerNorm(256)
-        self.norm4 = nn.LayerNorm(128)
         self.dropout = nn.Dropout(dropout)
         
     def forward(self, x):
@@ -55,35 +55,37 @@ class LSTMRegressor(nn.Module):
         lstm_out, _ = self.lstm(x)  # (batch_size, timesteps, hidden_dim * 2)
         
         # Global pooling: average and max over timesteps
-        avg_pool = torch.mean(lstm_out, dim=1)  # (batch_size, hidden_dim * 2)
-        max_pool, _ = torch.max(lstm_out, dim=1)  # (batch_size, hidden_dim * 2)
-        context = self.norm1(avg_pool + max_pool)  # Combine and normalize
+        avg_pool = torch.mean(lstm_out, dim=1)
+        max_pool, _ = torch.max(lstm_out, dim=1)
+        context = avg_pool + max_pool  # Combine without normalization
         
-        # Dense layers with residual connection
+        # Dense layers with residual connection and batch norm
         out = self.fc1(context)  # (batch_size, 512)
+        out = self.bn1(out)
         out = self.relu(out)
-        out = self.norm2(out)
         out = self.dropout(out)
         
         residual = self.fc_residual(context)  # (batch_size, 256)
         out = self.fc2(out)  # (batch_size, 256)
-        out = out + residual  # Residual connection
+        out = self.bn2(out)
+        out = out + residual
         out = self.relu(out)
-        out = self.norm3(out)
         out = self.dropout(out)
         
         out = self.fc3(out)  # (batch_size, 128)
+        out = self.bn3(out)
         out = self.relu(out)
-        out = self.norm4(out)
         out = self.dropout(out)
         
         out = self.fc4(out)  # (batch_size, 64)
+        out = self.bn4(out)
         out = self.relu(out)
         out = self.dropout(out)
+        
         out = self.fc5(out)  # (batch_size, output_dim)
         return out
 
-# Load the preprocessed dataset
+# Load and preprocess dataset
 def load_dataset(data_dir="preprocessed_dataset"):
     sequence_data = np.load(f"{data_dir}/sequence_data.npy", allow_pickle=True)
     if sequence_data.dtype == object:
@@ -91,17 +93,28 @@ def load_dataset(data_dir="preprocessed_dataset"):
     else:
         sequence_data = sequence_data.astype(np.float32)
     
+    # Scale sequence_data
+    scaler_seq = StandardScaler()
+    sequence_data_flat = sequence_data.reshape(-1, sequence_data.shape[-1])
+    sequence_data_scaled = scaler_seq.fit_transform(sequence_data_flat).reshape(sequence_data.shape)
+    
     edge_df = pd.read_csv(f"{data_dir}/edge_features.csv")
     node_df = pd.read_csv(f"{data_dir}/node_features.csv")
     execution_times = np.load(f"{data_dir}/execution_times.npy", allow_pickle=True).astype(np.float32)
-    return sequence_data, edge_df, node_df, execution_times
+    
+    # Log-transform and scale execution times
+    execution_times_log = np.log1p(execution_times)
+    scaler_time = StandardScaler()
+    execution_times_scaled = scaler_time.fit_transform(execution_times_log.reshape(-1, 1)).flatten()
+    
+    return sequence_data_scaled, edge_df, node_df, execution_times_scaled, scaler_seq, scaler_time
 
 # Train the model
 def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs, device):
     train_losses = []
     val_losses = []
     best_val_loss = float('inf')
-    patience = 50  # Increased patience
+    patience = 50
     
     for epoch in range(num_epochs):
         model.train()
@@ -112,7 +125,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
             outputs = model(sequences)
             loss = criterion(outputs, targets)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             train_loss += loss.item() * sequences.size(0)
         
@@ -134,7 +147,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
         current_lr = optimizer.param_groups[0]['lr']
         print(f"Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, LR: {current_lr:.6f}")
         
-        scheduler.step()  # CosineAnnealingLR steps every epoch
+        scheduler.step()  # CosineAnnealingWarmRestarts steps every epoch
         
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -169,19 +182,14 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
-    # Load dataset
-    sequence_data, edge_df, node_df, execution_times = load_dataset()
+    # Load and preprocess dataset
+    sequence_data, edge_df, node_df, execution_times, scaler_seq, scaler_time = load_dataset()
     print("Sequence Data Shape:", sequence_data.shape)
     print("Execution Times Shape:", execution_times.shape)
     
-    # Log-transform and normalize execution times
-    execution_times_log = np.log1p(execution_times)  # log(1 + x) to handle zeros
-    scaler = StandardScaler()
-    execution_times_scaled = scaler.fit_transform(execution_times_log.reshape(-1, 1)).flatten()
-    
     # Split into train+val and holdout test set (10 samples)
     X_temp, X_holdout, y_temp, y_holdout = train_test_split(
-        sequence_data, execution_times_scaled, test_size=10, random_state=42
+        sequence_data, execution_times, test_size=10, random_state=42
     )
     X_train, X_val, y_train, y_val = train_test_split(
         X_temp, y_temp, test_size=0.222, random_state=42
@@ -201,52 +209,58 @@ if __name__ == "__main__":
     
     # Model parameters
     input_dim = X_train.shape[2]  # 11 features
-    hidden_dim = 256  # Increased hidden dimension
+    hidden_dim = 384  # Increased for more capacity
     output_dim = 1
-    num_layers = 4  # More layers
+    num_layers = 4
     
     # Initialize model, loss, optimizer, and scheduler
     model = LSTMRegressor(input_dim, hidden_dim, output_dim, num_layers=num_layers).to(device)
-    criterion = nn.HuberLoss(delta=0.5)  # Adjusted delta for finer control
-    optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=50, eta_min=1e-6)  # Cosine decay over 50 epochs
+    criterion = nn.HuberLoss(delta=0.5)
+    optimizer = optim.AdamW(model.parameters(), lr=0.0005, weight_decay=1e-5)  # AdamW for better regularization
+    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=50, T_mult=2, eta_min=1e-6)  # Warm restarts
     
     # Train the model
-    train_losses, val_losses = train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs=300, device=device)
+    train_losses, val_losses = train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs=500, device=device)
     
-    # Evaluate on holdout test set
+    # Evaluate on holdout test set with ensemble-like averaging
     model.eval()
+    num_runs = 3  # Average predictions over 3 runs
+    y_pred_all = []
     with torch.no_grad():
-        y_pred_scaled = []
-        y_true_scaled = []
-        for sequences, targets in test_loader:
-            sequences = sequences.to(device)
-            outputs = model(sequences)
-            y_pred_scaled.append(outputs.cpu().numpy())
-            y_true_scaled.append(targets.numpy())
+        for _ in range(num_runs):
+            y_pred_scaled = []
+            y_true_scaled = []
+            for sequences, targets in test_loader:
+                sequences = sequences.to(device)
+                outputs = model(sequences)
+                y_pred_scaled.append(outputs.cpu().numpy())
+                y_true_scaled.append(targets.numpy())
+            
+            y_pred_scaled = np.concatenate(y_pred_scaled).flatten()
+            y_pred_log = scaler_time.inverse_transform(y_pred_scaled.reshape(-1, 1)).flatten()
+            y_pred = np.expm1(y_pred_log)
+            y_pred_all.append(y_pred)
         
-        y_pred_scaled = np.concatenate(y_pred_scaled).flatten()
         y_true_scaled = np.concatenate(y_true_scaled).flatten()
+        y_true_log = scaler_time.inverse_transform(y_true_scaled.reshape(-1, 1)).flatten()
+        y_true = np.expm1(y_true_log)
         
-        # Inverse transform with log scaling
-        y_pred_log = scaler.inverse_transform(y_pred_scaled.reshape(-1, 1)).flatten()
-        y_true_log = scaler.inverse_transform(y_true_scaled.reshape(-1, 1)).flatten()
-        y_pred = np.expm1(y_pred_log)  # Reverse log1p
-        y_true = np.expm1(y_true_log)  # Reverse log1p
+        # Average predictions
+        y_pred_avg = np.mean(y_pred_all, axis=0)
         
-        test_mae = np.mean(np.abs(y_true - y_pred))
-        print(f"\nTest MAE (original scale, 10 holdout samples): {test_mae:.4f} ms")
+        test_mae = np.mean(np.abs(y_true - y_pred_avg))
+        print(f"\nTest MAE (original scale, 10 holdout samples, averaged over {num_runs} runs): {test_mae:.4f} ms")
         
         print("\nPredictions for 10 Holdout Samples:")
         print("Sample | True Time (ms) | Predicted Time (ms) | Error (%)")
         print("-" * 60)
         for i in range(len(y_true)):
             true_time = y_true[i]
-            pred_time = y_pred[i]
+            pred_time = y_pred_avg[i]
             error_percent = abs(true_time - pred_time) / true_time * 100 if true_time != 0 else 0
             print(f"{i+1:6d} | {true_time:13.4f} | {pred_time:17.4f} | {error_percent:9.2f}")
         
-        avg_error_percent = np.mean([abs(true - pred) / true * 100 if true != 0 else 0 for true, pred in zip(y_true, y_pred)])
+        avg_error_percent = np.mean([abs(true - pred) / true * 100 if true != 0 else 0 for true, pred in zip(y_true, y_pred_avg)])
         print(f"\nAverage Error Percentage: {avg_error_percent:.2f}%")
     
     # Plot and save loss
@@ -256,6 +270,7 @@ if __name__ == "__main__":
     torch.save(model.state_dict(), "lstm_regressor_model.pth")
     print("Model saved to lstm_regressor_model.pth")
     
-    # Save the scaler
-    np.save("execution_time_scaler.npy", [scaler.mean_, scaler.scale_])
-    print("Scaler saved to execution_time_scaler.npy")
+    # Save the scalers
+    np.save("sequence_scaler.npy", [scaler_seq.mean_, scaler_seq.scale_])
+    np.save("execution_time_scaler.npy", [scaler_time.mean_, scaler_time.scale_])
+    print("Scalers saved to sequence_scaler.npy and execution_time_scaler.npy")
