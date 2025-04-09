@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
 from torch.nn.utils.rnn import pad_sequence
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 import random
 import matplotlib.pyplot as plt
 
@@ -96,8 +96,8 @@ def extract_features_from_file(file_path):
             adj_matrix[from_idx, to_idx] = 1
     
     # Create node feature matrix (num_nodes, num_features)
-    fixed_op_size = 10  # Maximum number of operation types to consider
-    op_types = sorted(list(all_op_types))[:fixed_op_size]  # Truncate to fixed size
+    fixed_op_size = 10
+    op_types = sorted(list(all_op_types))[:fixed_op_size]
     node_features = np.zeros((num_nodes, fixed_op_size))
     for i, op_counts in enumerate(op_counts_per_node):
         for j, op in enumerate(op_types):
@@ -144,16 +144,18 @@ def extract_features_from_file(file_path):
         outer_p = sf.get('outer_parallelism', 0.0)
         sched_vector.extend([
             np.log1p(inner_p * outer_p),
-            bytes_prod / max(points_total, 1e-4)
+            bytes_prod / max(points_total, 1e-4),
+            inner_p / max(outer_p, 1e-4)  # Additional feature
         ])
-        # Augment with noise
-        noise = np.random.normal(0, 0.05, len(sched_vector))
-        augmented_vector = np.array(sched_vector, dtype=np.float32) + noise
+        # Augment with noise and scaling
+        noise = np.random.normal(0, 0.1, len(sched_vector))  # Increased noise
+        scale = np.random.uniform(0.95, 1.05)  # Random scaling
+        augmented_vector = (np.array(sched_vector, dtype=np.float32) + noise) * scale
         combined_vector = np.concatenate([template_features, augmented_vector])
         scheduling_sequence.append(combined_vector)
     
     if not scheduling_sequence:
-        scheduling_sequence = [np.concatenate([template_features, np.zeros(len(important_metrics) + 2, dtype=np.float32)])]
+        scheduling_sequence = [np.concatenate([template_features, np.zeros(len(important_metrics) + 3, dtype=np.float32)])]
     
     seq_array = np.array(scheduling_sequence)
     scaler_seq = RobustScaler()
@@ -258,29 +260,33 @@ class AttentionPooling(nn.Module):
         return torch.sum(x * weights, dim=1)
 
 class EnhancedRecursiveLSTMModel(nn.Module):
-    def __init__(self, seq_input_size, hidden_sizes=[256, 128, 64], output_size=1, dropout_rate=0.3, num_heads=4):
+    def __init__(self, seq_input_size, hidden_sizes=[512, 256, 128, 64], output_size=1, dropout_rate=0.4, num_heads=8):
         super(EnhancedRecursiveLSTMModel, self).__init__()
         
         self.lstm_layers = nn.ModuleList()
         self.ln_layers = nn.ModuleList()
         self.residual_projs = nn.ModuleList()
         self.lstm_layers.append(nn.LSTM(seq_input_size, hidden_sizes[0], batch_first=True, bidirectional=True))
-        self.ln_layers.append(nn.LayerNorm(hidden_sizes[0] * 2))  # Fixed typo: Layer\Schema -> LayerNorm
+        self.ln_layers.append(nn.LayerNorm(hidden_sizes[0] * 2))
         self.residual_projs.append(nn.Linear(seq_input_size, hidden_sizes[0] * 2) if seq_input_size != hidden_sizes[0] * 2 else None)
         for i in range(1, len(hidden_sizes)):
             self.lstm_layers.append(nn.LSTM(hidden_sizes[i-1] * 2, hidden_sizes[i], batch_first=True, bidirectional=True))
             self.ln_layers.append(nn.LayerNorm(hidden_sizes[i] * 2))
             self.residual_projs.append(nn.Linear(hidden_sizes[i-1] * 2, hidden_sizes[i] * 2) if hidden_sizes[i-1] * 2 != hidden_sizes[i] * 2 else None)
         
+        self.pre_attn_ln = nn.LayerNorm(hidden_sizes[-1] * 2)  # Added pre-attention normalization
         self.attention = nn.MultiheadAttention(hidden_sizes[-1] * 2, num_heads, dropout=dropout_rate, batch_first=True)
         self.attn_pool = AttentionPooling(hidden_sizes[-1] * 2)
         
-        self.fc1 = nn.Linear(hidden_sizes[-1] * 2, 128)
-        self.bn1 = nn.BatchNorm1d(128)
-        self.ln1 = nn.LayerNorm(128)
-        self.fc2 = nn.Linear(128, 64)
-        self.bn2 = nn.BatchNorm1d(64)
-        self.ln2 = nn.LayerNorm(64)
+        self.fc1 = nn.Linear(hidden_sizes[-1] * 2, 256)  # Increased size
+        self.bn1 = nn.BatchNorm1d(256)
+        self.ln1 = nn.LayerNorm(256)
+        self.fc2 = nn.Linear(256, 128)
+        self.bn2 = nn.BatchNorm1d(128)
+        self.ln2 = nn.LayerNorm(128)
+        self.fc3 = nn.Linear(128, 64)  # Added extra layer
+        self.bn3 = nn.BatchNorm1d(64)
+        self.ln3 = nn.LayerNorm(64)
         self.output_layer = nn.Linear(64, output_size)
         
         self.gelu = nn.GELU()
@@ -296,6 +302,7 @@ class EnhancedRecursiveLSTMModel(nn.Module):
             lstm_out = ln(lstm_out)
             lstm_out = self.dropout(lstm_out)
         
+        lstm_out = self.pre_attn_ln(lstm_out)  # Apply normalization before attention
         attn_out, _ = self.attention(lstm_out, lstm_out, lstm_out)
         context = self.attn_pool(attn_out)
         
@@ -308,6 +315,10 @@ class EnhancedRecursiveLSTMModel(nn.Module):
         x = self.bn2(x)
         x = self.ln2(x)
         x = self.gelu(x)
+        x = self.fc3(x)  # Added extra layer
+        x = self.bn3(x)
+        x = self.ln3(x)
+        x = self.gelu(x)
         
         residual = context if self.final_residual_proj is None else self.final_residual_proj(context)
         x = x + residual
@@ -316,13 +327,14 @@ class EnhancedRecursiveLSTMModel(nn.Module):
         
         return output
 
-def focal_loss(outputs, targets, alpha=0.5, gamma=1.5):
-    mse = (outputs - targets) ** 2
-    pt = torch.exp(-mse)
-    loss = alpha * (1 - pt) ** gamma * mse
-    return torch.mean(loss)
+def combined_loss(outputs, targets, alpha=0.5, gamma=1.5, mse_weight=0.5):
+    mse = nn.MSELoss()(outputs, targets)
+    focal_mse = (outputs - targets) ** 2
+    pt = torch.exp(-focal_mse)
+    focal = alpha * (1 - pt) ** gamma * focal_mse
+    return mse_weight * mse + (1 - mse_weight) * torch.mean(focal)
 
-def create_data_loaders(train_sequences, y_train, test_sequences, y_test, batch_size=32):
+def create_data_loaders(train_sequences, y_train, test_sequences, y_test, batch_size=64):  # Increased batch size
     train_dataset = TensorDataset(train_sequences, y_train)
     test_dataset = TensorDataset(test_sequences, y_test)
     
@@ -331,7 +343,7 @@ def create_data_loaders(train_sequences, y_train, test_sequences, y_test, batch_
     
     return train_loader, test_loader
 
-def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=500, patience=30, accumulation_steps=2, warmup_epochs=20):
+def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=500, patience=50, accumulation_steps=4, T_0=10):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
@@ -344,7 +356,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
         device = torch.device('cpu')
         model.to(device)
     
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.3, patience=5, verbose=True)
+    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=T_0, T_mult=2, eta_min=1e-6)
     
     best_val_loss = float('inf')
     epochs_no_improve = 0
@@ -356,11 +368,6 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
         model.train()
         running_loss = 0.0
         optimizer.zero_grad()
-        
-        if epoch < warmup_epochs:
-            lr_scale = (epoch + 1) / warmup_epochs
-            for param_group in optimizer.param_groups:
-                param_group['lr'] = 0.0001 * lr_scale
         
         for i, (seq_inputs, targets) in enumerate(train_loader):
             seq_inputs, targets = seq_inputs.to(device), targets.to(device)
@@ -401,10 +408,9 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
         val_loss /= len(test_loader.dataset)
         val_losses.append(val_loss)
         
-        if epoch >= warmup_epochs:
-            scheduler.step(val_loss)
+        scheduler.step()
         
-        print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
+        print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, LR: {scheduler.get_last_lr()[0]:.6f}')
         
         if val_loss < best_val_loss and not np.isnan(val_loss) and not np.isinf(val_loss):
             best_val_loss = val_loss
@@ -511,25 +517,25 @@ def main(main_dir):
     train_loader, test_loader = create_data_loaders(
         train_sequences, y_train,
         test_sequences, y_test,
-        batch_size=32
+        batch_size=64
     )
     
     global model
     model = EnhancedRecursiveLSTMModel(
         seq_input_size=seq_input_size,
-        hidden_sizes=[256, 128, 64],
+        hidden_sizes=[512, 256, 128, 64],  # Increased capacity
         output_size=1,
-        dropout_rate=0.3,
-        num_heads=4
+        dropout_rate=0.4,  # Adjusted dropout
+        num_heads=8  # Increased attention heads
     )
     
-    optimizer = optim.AdamW(model.parameters(), lr=0.0001, weight_decay=5e-3)
+    optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-4)  # Adjusted LR and weight decay
     
     print("Building and training Enhanced Recursive LSTM model...")
     train_losses, val_losses = train_model(
         model, train_loader, test_loader,
-        focal_loss, optimizer,
-        num_epochs=500, patience=30, accumulation_steps=2, warmup_epochs=20
+        combined_loss, optimizer,
+        num_epochs=500, patience=50, accumulation_steps=4, T_0=10
     )
     
     if train_losses is None or val_losses is None:
