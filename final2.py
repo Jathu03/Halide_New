@@ -67,6 +67,21 @@ def extract_features(data):
     # Extract Node Features
     for node in nodes:
         details = node['Details']
+        # Safely extract operation counts from Op histogram
+        op_hist = details['Op histogram']
+        ops_add = 0
+        ops_mul = 0
+        ops_div = 0
+        for line in op_hist:
+            parts = line.split()
+            if len(parts) >= 2:
+                if parts[1] == '+:':
+                    ops_add = int(parts[2])
+                elif parts[1] == '*:':
+                    ops_mul = int(parts[2])
+                elif parts[1] == '/:':
+                    ops_div = int(parts[2])
+        
         if 'scheduling_feature' in details:
             sched = details['scheduling_feature']
             node_dict = {
@@ -77,9 +92,9 @@ def extract_features(data):
                 'broadcast': sum(map(int, details['Memory access patterns'][2].split()[1:])),
                 'slice': sum(map(int, details['Memory access patterns'][3].split()[1:])),
                 # Operation histogram (computational complexity)
-                'ops_add': int(details['Op histogram'][4].split()[2]),
-                'ops_mul': int(details['Op histogram'][7].split()[2]),
-                'ops_div': int(details['Op histogram'][8].split()[2]),
+                'ops_add': ops_add,
+                'ops_mul': ops_mul,
+                'ops_div': ops_div,
                 # Scheduling features
                 'inner_parallelism': sched['inner_parallelism'],
                 'outer_parallelism': sched['outer_parallelism'],
@@ -94,9 +109,9 @@ def extract_features(data):
                 'transpose': sum(map(int, details['Memory access patterns'][1].split()[1:])),
                 'broadcast': sum(map(int, details['Memory access patterns'][2].split()[1:])),
                 'slice': sum(map(int, details['Memory access patterns'][3].split()[1:])),
-                'ops_add': int(details['Op histogram'][4].split()[2]),
-                'ops_mul': int(details['Op histogram'][7].split()[2]),
-                'ops_div': int(details['Op histogram'][8].split()[2]),
+                'ops_add': ops_add,
+                'ops_mul': ops_mul,
+                'ops_div': ops_div,
             }
         node_features.append(node_dict)
     
