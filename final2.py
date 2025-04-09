@@ -23,6 +23,12 @@ def extract_features(data):
     
     # Extract Edge Features
     for edge in edges:
+        jacobians = edge['Details']['Load Jacobians']
+        # Safely extract Jacobian values with defaults
+        jacobian_00 = float(jacobians[0].split()[0].replace('_', '0')) if len(jacobians) > 0 else 0.0
+        jacobian_11 = float(jacobians[1].split()[1].replace('_', '0')) if len(jacobians) > 1 else 0.0
+        jacobian_22 = float(jacobians[2].split()[2].replace('_', '0')) if len(jacobians) > 2 else 0.0
+        
         edge_dict = {
             'name': edge['Name'],
             'from': edge['From'],
@@ -35,9 +41,9 @@ def extract_features(data):
             'footprint_min_2': parse_footprint(edge['Details']['Footprint'][4]),
             'footprint_max_2': parse_footprint(edge['Details']['Footprint'][5]),
             # Jacobian features (dependency scaling factors)
-            'jacobian_00': float(edge['Details']['Load Jacobians'][0].split()[0].replace('_', '0')),
-            'jacobian_11': float(edge['Details']['Load Jacobians'][1].split()[1].replace('_', '0')),
-            'jacobian_22': float(edge['Details']['Load Jacobians'][2].split()[2].replace('_', '0')),
+            'jacobian_00': jacobian_00,
+            'jacobian_11': jacobian_11,
+            'jacobian_22': jacobian_22,
         }
         edge_features.append(edge_dict)
         temporal_sequences.append(edge['Name'])  # Preserve edge order
