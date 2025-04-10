@@ -463,7 +463,7 @@ def main(main_dir):
     best_val_loss = float('inf')
     
     for fold, (train_idx, val_idx) in enumerate(kf.split(X_train)):
-        print(f"\nFold {fold+1}/5")
+        print(f"\nFold {fold+1}/3")
         X_tr, X_val = X_train[train_idx], X_train[val_idx]
         y_tr, y_val = y_train[train_idx], y_train[val_idx]
         
