@@ -196,6 +196,10 @@ def load_and_preprocess_dataset(data_dir="preprocessed_dataset"):
     node_df = pd.read_csv(f"{data_dir}/node_features.csv")
     execution_times = np.load(f"{data_dir}/execution_times.npy", allow_pickle=True).astype(np.float32)
     
+    # Check for invalid values
+    if np.any(np.isnan(execution_times)) or np.any(np.isinf(execution_times)):
+        raise ValueError("Execution times contain NaN or Inf values")
+    
     enhanced_sequences = []
     for sequence in sequence_data:
         features = [sequence]
@@ -224,9 +228,13 @@ def load_and_preprocess_dataset(data_dir="preprocessed_dataset"):
     scaler = RobustScaler(quantile_range=(10.0, 90.0))
     execution_times_scaled = scaler.fit_transform(execution_times_log.reshape(-1, 1)).flatten()
     
+    # Validate scaled targets
+    if np.any(np.isnan(execution_times_scaled)) or np.any(np.isinf(execution_times_scaled)):
+        raise ValueError("Scaled execution times contain NaN or Inf values")
+    
     return enhanced_sequences_normalized, edge_df, node_df, execution_times, execution_times_scaled, scaler
 
-# Custom loss
+# Custom loss with NaN protection
 class EnhancedLoss(nn.Module):
     def __init__(self, delta=0.5, smoothing=0.05, relative_weight=0.2):
         super(EnhancedLoss, self).__init__()
@@ -237,10 +245,18 @@ class EnhancedLoss(nn.Module):
     def forward(self, outputs, targets):
         smoothed_targets = targets * (1 - self.smoothing) + self.smoothing * torch.mean(targets)
         huber_loss = self.huber(outputs, smoothed_targets)
-        relative_error = torch.mean(torch.abs((outputs - targets) / (targets + 1e-6)))
-        return huber_loss + self.relative_weight * relative_error
+        
+        # Stabilize relative error
+        denominator = torch.abs(targets) + 1e-6  # Ensure positive denominator
+        relative_error = torch.mean(torch.abs((outputs - targets) / denominator))
+        
+        loss = huber_loss + self.relative_weight * relative_error
+        if torch.isnan(loss) or torch.isinf(loss):
+            print(f"Warning: Loss is NaN or Inf - Huber: {huber_loss.item()}, Relative: {relative_error.item()}")
+            return torch.tensor(0.0, device=outputs.device, requires_grad=True)
+        return loss
 
-# Training function with mixed precision
+# Training function with NaN handling
 def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs, device, grad_accum_steps=4):
     scaler = GradScaler()
     train_losses = []
@@ -260,12 +276,15 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
             with autocast():
                 outputs = model(sequences)
                 loss = criterion(outputs, targets)
+                if torch.isnan(loss) or torch.isinf(loss):
+                    print(f"Epoch {epoch+1}: Train loss became NaN/Inf, skipping batch")
+                    continue
                 loss = loss / grad_accum_steps
             
             scaler.scale(loss).backward()
             accumulated_steps += 1
             if accumulated_steps % grad_accum_steps == 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)  # Tighter clipping
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
@@ -273,7 +292,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
             train_loss += (loss.item() * grad_accum_steps) * sequences.size(0)
         
         if accumulated_steps % grad_accum_steps != 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad()
@@ -289,17 +308,25 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
                 with autocast():
                     outputs = model(sequences)
                     loss = criterion(outputs, targets)
+                    if torch.isnan(loss) or torch.isinf(loss):
+                        print(f"Epoch {epoch+1}: Val loss became NaN/Inf")
+                        val_loss = float('inf')  # Set to inf to trigger early stopping
+                        break
                 val_loss += loss.item() * sequences.size(0)
         
         val_loss /= len(val_loader.dataset)
         val_losses.append(val_loss)
         
-        scheduler.step(val_loss)
+        # Handle NaN in scheduler
+        if not torch.isfinite(torch.tensor(val_loss)):
+            print(f"Epoch {epoch+1}: Skipping scheduler step due to invalid val_loss: {val_loss}")
+        else:
+            scheduler.step(val_loss)
         
         current_lr = optimizer.param_groups[0]['lr']
         print(f"Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}, LR: {current_lr:.6f}")
         
-        if val_loss < best_val_loss:
+        if torch.isfinite(torch.tensor(val_loss)) and val_loss < best_val_loss:
             best_val_loss = val_loss
             early_stop_counter = 0
             torch.save({
@@ -512,7 +539,7 @@ def main():
     best_train_losses = []
     best_val_losses = []
     
-    for fold, (train_idx, val_idx) in enumerate(kfold.split(X_temp, y_temp, bins_temp)):  # Fixed syntax error
+    for fold, (train_idx, val_idx) in enumerate(kfold.split(X_temp, y_temp, bins_temp)):
         print(f"\nFold {fold+1}/{n_splits}")
         X_train, X_val = X_temp[train_idx], X_temp[val_idx]
         y_train, y_val = y_temp[train_idx], y_temp[val_idx]
