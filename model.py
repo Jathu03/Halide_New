@@ -11,7 +11,7 @@ import os
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 import random
 from scipy import stats
-from torch.cuda.amp import autocast, GradScaler  # For mixed precision
+from torch.cuda.amp import autocast, GradScaler
 
 # Set random seeds for reproducibility
 def set_seed(seed=42):
@@ -64,7 +64,7 @@ class ScheduleDataset(Dataset):
 
 # Multi-Head Self-Attention Module
 class MultiHeadSelfAttention(nn.Module):
-    def __init__(self, hidden_dim, num_heads=4):  # Reduced num_heads
+    def __init__(self, hidden_dim, num_heads=4):
         super(MultiHeadSelfAttention, self).__init__()
         assert hidden_dim % num_heads == 0
         self.hidden_dim = hidden_dim
@@ -94,12 +94,12 @@ class MultiHeadSelfAttention(nn.Module):
 
 # Slimmed-down CNN-LSTM-Attention model
 class EnhancedLSTMRegressor(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, num_layers=4, dropout=0.3):  # Reduced layers and dropout
+    def __init__(self, input_dim, hidden_dim, output_dim, num_layers=4, dropout=0.3):
         super(EnhancedLSTMRegressor, self).__init__()
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         
-        self.conv1d = nn.Conv1d(in_channels=input_dim, out_channels=64, kernel_size=3, padding=1)  # Reduced channels
+        self.conv1d = nn.Conv1d(in_channels=input_dim, out_channels=64, kernel_size=3, padding=1)
         self.bn_conv = nn.BatchNorm1d(64)
         self.relu = nn.ReLU()
         
@@ -126,10 +126,10 @@ class EnhancedLSTMRegressor(nn.Module):
             nn.Dropout(dropout)
         )
         
-        self.fc1 = nn.Linear(hidden_dim * 4, 1024)  # Reduced capacity
+        self.fc1 = nn.Linear(hidden_dim * 4, 1024)
         self.fc2 = nn.Linear(1024, 512)
         self.fc3 = nn.Linear(512, 256)
-        self.fc4 = nn.Linear(256, output_dim)  # Simplified
+        self.fc4 = nn.Linear(256, output_dim)
         
         self.skip1 = nn.Linear(hidden_dim * 4, 512)
         self.skip2 = nn.Linear(1024, 256)
@@ -209,7 +209,6 @@ def load_and_preprocess_dataset(data_dir="preprocessed_dataset"):
             sequence_df = pd.DataFrame(sequence)
             rolling_mean = sequence_df.rolling(window=3, min_periods=1).mean().values
             features.append(rolling_mean)
-            # Limited feature engineering to reduce input_dim
         
         enhanced_sequence = np.concatenate(features, axis=1)
         enhanced_sequences.append(enhanced_sequence)
@@ -243,7 +242,7 @@ class EnhancedLoss(nn.Module):
 
 # Training function with mixed precision
 def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs, device, grad_accum_steps=4):
-    scaler = GradScaler()  # For mixed precision
+    scaler = GradScaler()
     train_losses = []
     val_losses = []
     best_val_loss = float('inf')
@@ -321,7 +320,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
     model.load_state_dict(checkpoint['model_state_dict'])
     print(f"Loaded best model from epoch {checkpoint['epoch']+1} with validation loss: {checkpoint['val_loss']:.6f}")
     
-    torch.cuda.empty_cache()  # Clear memory after training
+    torch.cuda.empty_cache()
     return train_losses, val_losses
 
 # Evaluation function
@@ -513,7 +512,7 @@ def main():
     best_train_losses = []
     best_val_losses = []
     
-    for fold, (train_idx, val_idx) in enumerate(kfold.split(X_temp, y_temp Natl):
+    for fold, (train_idx, val_idx) in enumerate(kfold.split(X_temp, y_temp, bins_temp)):  # Fixed syntax error
         print(f"\nFold {fold+1}/{n_splits}")
         X_train, X_val = X_temp[train_idx], X_temp[val_idx]
         y_train, y_val = y_temp[train_idx], y_temp[val_idx]
@@ -521,13 +520,13 @@ def main():
         train_dataset = ScheduleDataset(X_train, y_train, augment=True)
         val_dataset = ScheduleDataset(X_val, y_val, augment=False)
         
-        train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True, drop_last=True)  # Reduced batch size
+        train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True, drop_last=True)
         val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False)
         
         input_dim = X_train.shape[2]
-        hidden_dim = 256  # Reduced from 768
+        hidden_dim = 256
         output_dim = 1
-        num_layers = 4  # Reduced from 6
+        num_layers = 4
         
         model = EnhancedLSTMRegressor(input_dim, hidden_dim, output_dim, num_layers=num_layers).to(device)
         criterion = EnhancedLoss(delta=0.5, smoothing=0.05, relative_weight=0.2)
@@ -543,7 +542,7 @@ def main():
             scheduler, 
             num_epochs=300,
             device=device,
-            grad_accum_steps=4  # Reduced from 8
+            grad_accum_steps=4
         )
         
         checkpoint = torch.load("best_model.pth")
@@ -554,7 +553,7 @@ def main():
             best_val_losses = val_losses
             torch.save(checkpoint, "best_model_kfold.pth")
         
-        torch.cuda.empty_cache()  # Clear memory between folds
+        torch.cuda.empty_cache()
     
     print(f"\nBest model from k-fold with validation loss: {best_val_loss:.6f}")
     
