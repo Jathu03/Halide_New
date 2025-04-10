@@ -38,15 +38,12 @@ class ScheduleDataset(Dataset):
         seq = self.sequences[idx]
         target = self.execution_times[idx]
         
-        # Apply data augmentation during training
         if self.augment:
-            # Add random noise
             if random.random() < 0.5:
                 noise_factor = 0.05
                 noise = torch.randn_like(seq) * noise_factor
                 seq = seq + noise
             
-            # Randomly mask timesteps
             if random.random() < 0.5:
                 mask_prob = 0.1
                 mask = torch.rand(seq.shape[0]) > mask_prob
@@ -54,7 +51,6 @@ class ScheduleDataset(Dataset):
                 masked_seq[~mask] = 0.0
                 seq = masked_seq
             
-            # Mixup augmentation
             if random.random() < 0.3:
                 mix_idx = random.randint(0, len(self.sequences) - 1)
                 mix_seq = self.sequences[mix_idx]
@@ -95,25 +91,22 @@ class MultiHeadSelfAttention(nn.Module):
         x = self.fc_out(x)
         return x, attention
 
-# Enhanced LSTM model with multi-head attention and residual connections
+# Enhanced CNN-LSTM-Attention model
 class EnhancedLSTMRegressor(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim, num_layers=6, dropout=0.4):
         super(EnhancedLSTMRegressor, self).__init__()
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         
-        # Feature extraction
-        self.feature_extractor = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.2)
-        )
+        # CNN for local feature extraction
+        self.conv1d = nn.Conv1d(in_channels=input_dim, out_channels=128, kernel_size=3, padding=1)
+        self.bn_conv = nn.BatchNorm1d(128)
+        self.relu = nn.ReLU()
         
         # Bidirectional LSTM with residual connections
         self.lstm_layers = nn.ModuleList()
         for i in range(num_layers):
-            in_dim = hidden_dim if i == 0 else hidden_dim * 2
+            in_dim = 128 if i == 0 else hidden_dim * 2  # 128 from CNN output
             self.lstm_layers.append(
                 nn.LSTM(
                     in_dim,
@@ -121,7 +114,7 @@ class EnhancedLSTMRegressor(nn.Module):
                     num_layers=1,
                     batch_first=True,
                     bidirectional=True,
-                    dropout=0.0  # Dropout handled externally
+                    dropout=0.0
                 )
             )
         
@@ -131,37 +124,41 @@ class EnhancedLSTMRegressor(nn.Module):
         # Global context
         self.global_context = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim * 2),
-            nn.LayerNorm(hidden_dim * 2),
+            nn.BatchNorm1d(hidden_dim * 2),
             nn.ReLU(),
             nn.Dropout(dropout)
         )
         
         # Dense layers with skip connections
-        self.fc1 = nn.Linear(hidden_dim * 4, 1024)
-        self.fc2 = nn.Linear(1024, 512)
-        self.fc3 = nn.Linear(512, 256)
-        self.fc4 = nn.Linear(256, 128)
-        self.fc5 = nn.Linear(128, output_dim)
+        self.fc1 = nn.Linear(hidden_dim * 4, 1536)  # Increased capacity
+        self.fc2 = nn.Linear(1536, 768)
+        self.fc3 = nn.Linear(768, 384)
+        self.fc4 = nn.Linear(384, 192)
+        self.fc5 = nn.Linear(192, output_dim)
         
-        self.skip1 = nn.Linear(hidden_dim * 4, 512)
-        self.skip2 = nn.Linear(1024, 256)
-        self.skip3 = nn.Linear(512, 128)
+        self.skip1 = nn.Linear(hidden_dim * 4, 768)
+        self.skip2 = nn.Linear(1536, 384)
+        self.skip3 = nn.Linear(768, 192)
         
-        self.norm1 = nn.LayerNorm(1024)
-        self.norm2 = nn.LayerNorm(512)
-        self.norm3 = nn.LayerNorm(256)
-        self.norm4 = nn.LayerNorm(128)
-        self.relu = nn.ReLU()
+        self.norm1 = nn.BatchNorm1d(1536)
+        self.norm2 = nn.BatchNorm1d(768)
+        self.norm3 = nn.BatchNorm1d(384)
+        self.norm4 = nn.BatchNorm1d(192)
         self.dropout = nn.Dropout(dropout)
     
     def forward(self, x):
-        x = self.feature_extractor(x)
+        # CNN: (batch_size, timesteps, input_dim) -> (batch_size, input_dim, timesteps)
+        x = x.permute(0, 2, 1)
+        x = self.conv1d(x)  # (batch_size, 128, timesteps)
+        x = self.bn_conv(x)
+        x = self.relu(x)
+        x = x.permute(0, 2, 1)  # (batch_size, timesteps, 128)
         
         # LSTM with residual connections
         for i, lstm in enumerate(self.lstm_layers):
             lstm_out, _ = lstm(x)
             if i > 0:
-                x = x + lstm_out  # Residual connection
+                x = x + lstm_out
             else:
                 x = lstm_out
         
@@ -205,7 +202,7 @@ class EnhancedLSTMRegressor(nn.Module):
         out = self.fc5(out)
         return out
 
-# Enhanced data preprocessing with advanced feature engineering
+# Enhanced data preprocessing with feature engineering and normalization
 def load_and_preprocess_dataset(data_dir="preprocessed_dataset"):
     sequence_data = np.load(f"{data_dir}/sequence_data.npy", allow_pickle=True)
     if sequence_data.dtype == object:
@@ -223,19 +220,16 @@ def load_and_preprocess_dataset(data_dir="preprocessed_dataset"):
         seq_len, feat_dim = sequence.shape
         
         if seq_len > 1:
-            # Trend (first derivative)
             trend = np.zeros_like(sequence)
             trend[1:, :] = sequence[1:, :] - sequence[:-1, :]
             features.append(trend)
             
-            # Rolling statistics
             sequence_df = pd.DataFrame(sequence)
             rolling_mean = sequence_df.rolling(window=3, min_periods=1).mean().values
             rolling_std = sequence_df.rolling(window=3, min_periods=1).std().fillna(0).values
             features.append(rolling_mean)
             features.append(rolling_std)
             
-            # Feature interactions
             for i in range(feat_dim):
                 for j in range(i+1, min(i+3, feat_dim)):
                     interaction = sequence[:, i:i+1] * sequence[:, j:j+1]
@@ -246,31 +240,39 @@ def load_and_preprocess_dataset(data_dir="preprocessed_dataset"):
     
     enhanced_sequences = np.array(enhanced_sequences)
     
-    # Robust outlier handling
+    # Normalize enhanced sequences
+    scaler_features = StandardScaler()
+    seq_reshaped = enhanced_sequences.reshape(-1, enhanced_sequences.shape[-1])
+    enhanced_sequences_normalized = scaler_features.fit_transform(seq_reshaped).reshape(enhanced_sequences.shape)
+    
+    # Robust outlier handling and log-scaling
     execution_times_win = stats.mstats.winsorize(execution_times, limits=[0.02, 0.02])
     execution_times_log = np.log1p(execution_times_win)
     scaler = RobustScaler(quantile_range=(10.0, 90.0))
     execution_times_scaled = scaler.fit_transform(execution_times_log.reshape(-1, 1)).flatten()
     
-    return enhanced_sequences, edge_df, node_df, execution_times, execution_times_scaled, scaler
+    return enhanced_sequences_normalized, edge_df, node_df, execution_times, execution_times_scaled, scaler
 
-# Custom loss with label smoothing
-class SmoothHuberLoss(nn.Module):
-    def __init__(self, delta=0.5, smoothing=0.1):
-        super(SmoothHuberLoss, self).__init__()
+# Custom loss with Huber, smoothing, and relative error
+class EnhancedLoss(nn.Module):
+    def __init__(self, delta=0.5, smoothing=0.05, relative_weight=0.2):
+        super(EnhancedLoss, self).__init__()
         self.huber = nn.HuberLoss(delta=delta)
         self.smoothing = smoothing
+        self.relative_weight = relative_weight
     
     def forward(self, outputs, targets):
         smoothed_targets = targets * (1 - self.smoothing) + self.smoothing * torch.mean(targets)
-        return self.huber(outputs, smoothed_targets)
+        huber_loss = self.huber(outputs, smoothed_targets)
+        relative_error = torch.mean(torch.abs((outputs - targets) / (targets + 1e-6)))
+        return huber_loss + self.relative_weight * relative_error
 
-# Advanced training function with k-fold validation
-def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs, device, grad_accum_steps=4):
+# Training function
+def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs, device, grad_accum_steps=8):
     train_losses = []
     val_losses = []
     best_val_loss = float('inf')
-    early_stop_patience = 30
+    early_stop_patience = 40
     early_stop_counter = 0
     
     for epoch in range(num_epochs):
@@ -342,7 +344,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
     
     return train_losses, val_losses
 
-# Enhanced evaluation with confidence intervals
+# Evaluation function
 def evaluate_model(model, test_loader, scaler, device):
     model.eval()
     predictions = []
@@ -403,11 +405,10 @@ def evaluate_model(model, test_loader, scaler, device):
         }
     }
 
-# Plot and save detailed evaluation results
+# Plot and save results
 def plot_and_save_results(train_losses, val_losses, results):
     os.makedirs("evaluation_results", exist_ok=True)
     
-    # Loss curves
     plt.figure(figsize=(10, 6))
     plt.plot(train_losses, label='Training Loss', color='blue')
     plt.plot(val_losses, label='Validation Loss', color='orange')
@@ -417,11 +418,10 @@ def plot_and_save_results(train_losses, val_losses, results):
     plt.legend()
     plt.grid(True)
     plt.tight_layout()
-    plt.savefig("evaluation_results/loss_curves.png")
-    plt.show()  # Display the plot
+    plt.savefig("evaluation_results/loss_model.png")
     plt.close()
+    print("Loss plot saved as 'evaluation_results/loss_model.png'")
     
-    # Additional plots (scatter, error distribution)
     plt.figure(figsize=(12, 8))
     plt.subplot(2, 2, 1)
     plt.scatter(results['y_true'], results['y_pred'], alpha=0.6)
@@ -488,10 +488,10 @@ def plot_and_save_results(train_losses, val_losses, results):
     
     return df_results
 
-# Ensemble predictions with more samples
-def create_ensemble_predictions(model, test_loader, scaler, device, num_samples=10):
+# Ensemble predictions with Monte Carlo Dropout
+def create_ensemble_predictions(model, test_loader, scaler, device, num_samples=20):
     ensemble_predictions = []
-    model.train()
+    model.train()  # Enable dropout for Monte Carlo
     
     with torch.no_grad():
         for _ in range(num_samples):
@@ -508,7 +508,7 @@ def create_ensemble_predictions(model, test_loader, scaler, device, num_samples=
     y_pred = np.expm1(y_pred_log)
     return y_pred
 
-# Main execution function with k-fold validation
+# Main execution with k-fold validation
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -524,7 +524,6 @@ def main():
         sequence_data, execution_times_scaled, bins, test_size=10, random_state=42, stratify=bins
     )
     
-    # K-fold cross-validation
     n_splits = 5
     kfold = KFold(n_splits=n_splits, shuffle=True, random_state=42)
     best_val_loss = float('inf')
@@ -543,15 +542,15 @@ def main():
         train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, drop_last=True)
         val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
         
-        input_dim = X_train.shape[2]
-        hidden_dim = 512  # Increased
+        input_dim = X_train.shape[2]  # Adjusted after feature engineering
+        hidden_dim = 768  # Increased capacity
         output_dim = 1
         num_layers = 6
         
         model = EnhancedLSTMRegressor(input_dim, hidden_dim, output_dim, num_layers=num_layers).to(device)
-        criterion = SmoothHuberLoss(delta=0.5, smoothing=0.05)
-        optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=2e-4)
-        scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2, eta_min=1e-6)
+        criterion = EnhancedLoss(delta=0.5, smoothing=0.05, relative_weight=0.2)
+        optimizer = optim.AdamW(model.parameters(), lr=0.0005, weight_decay=5e-4)
+        scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=5, T_mult=2, eta_min=1e-6)
         
         train_losses, val_losses = train_model(
             model, 
@@ -560,9 +559,9 @@ def main():
             criterion, 
             optimizer, 
             scheduler, 
-            num_epochs=200, 
+            num_epochs=300,  # Increased epochs
             device=device,
-            grad_accum_steps=4
+            grad_accum_steps=8
         )
         
         checkpoint = torch.load("best_model.pth")
@@ -581,7 +580,7 @@ def main():
     results = evaluate_model(best_model, test_loader, scaler, device)
     df_results = plot_and_save_results(best_train_losses, best_val_losses, results)
     
-    ensemble_pred = create_ensemble_predictions(best_model, test_loader, scaler, device, num_samples=10)
+    ensemble_pred = create_ensemble_predictions(best_model, test_loader, scaler, device, num_samples=20)
     
     ensemble_mae = np.mean(np.abs(results['y_true'] - ensemble_pred))
     ensemble_mape = np.mean(np.abs((results['y_true'] - ensemble_pred) / np.maximum(results['y_true'], 1e-7))) * 100
@@ -602,7 +601,6 @@ def main():
         ens_err = abs(ens_pred - actual) / max(actual, 1e-7) * 100
         print(f"{i+1:6d} | {actual:11.4f} | {pred:13.4f} | {ens_pred:16.4f} | {pred_err:13.2f} | {ens_err:13.2f}")
     
-    # Save predictions
     pred_df = pd.DataFrame({
         'Sample': range(1, len(results['y_true']) + 1),
         'Actual': results['y_true'],
