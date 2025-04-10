@@ -536,7 +536,7 @@ def main():
         sequence_data, execution_times_scaled, bins, test_size=10, random_state=42, stratify=bins
     )
     
-    n_splits = 5
+    n_splits = 3
     kfold = KFold(n_splits=n_splits, shuffle=True, random_state=42)
     best_val_loss = float('inf')
     best_model = None
