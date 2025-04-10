@@ -404,7 +404,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
     plt.title('Training and Validation Loss Over Epochs')
     plt.legend()
     plt.grid(True)
-    plt.savefig('lstm_loss_enhanced.png')  # Save as specified filename
+    plt.savefig('loss_enhanced.png')  # Save as specified filename
     plt.show()  # Display the plot
     
     return train_losses, val_losses
