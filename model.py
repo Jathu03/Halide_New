@@ -182,6 +182,8 @@ class EnhancedLSTMRegressor(nn.Module):
         out = self.dropout(out)
         
         out = self.fc4(out)
+        # Clip outputs to prevent extreme values
+        out = torch.clamp(out, min=-100.0, max=100.0)
         return out
 
 # Optimized data preprocessing
@@ -196,7 +198,6 @@ def load_and_preprocess_dataset(data_dir="preprocessed_dataset"):
     node_df = pd.read_csv(f"{data_dir}/node_features.csv")
     execution_times = np.load(f"{data_dir}/execution_times.npy", allow_pickle=True).astype(np.float32)
     
-    # Check for invalid values
     if np.any(np.isnan(execution_times)) or np.any(np.isinf(execution_times)):
         raise ValueError("Execution times contain NaN or Inf values")
     
@@ -228,13 +229,12 @@ def load_and_preprocess_dataset(data_dir="preprocessed_dataset"):
     scaler = RobustScaler(quantile_range=(10.0, 90.0))
     execution_times_scaled = scaler.fit_transform(execution_times_log.reshape(-1, 1)).flatten()
     
-    # Validate scaled targets
     if np.any(np.isnan(execution_times_scaled)) or np.any(np.isinf(execution_times_scaled)):
         raise ValueError("Scaled execution times contain NaN or Inf values")
     
     return enhanced_sequences_normalized, edge_df, node_df, execution_times, execution_times_scaled, scaler
 
-# Custom loss with NaN protection
+# Custom loss with enhanced stability
 class EnhancedLoss(nn.Module):
     def __init__(self, delta=0.5, smoothing=0.05, relative_weight=0.2):
         super(EnhancedLoss, self).__init__()
@@ -246,17 +246,17 @@ class EnhancedLoss(nn.Module):
         smoothed_targets = targets * (1 - self.smoothing) + self.smoothing * torch.mean(targets)
         huber_loss = self.huber(outputs, smoothed_targets)
         
-        # Stabilize relative error
-        denominator = torch.abs(targets) + 1e-6  # Ensure positive denominator
-        relative_error = torch.mean(torch.abs((outputs - targets) / denominator))
+        # Enhanced stability for relative error
+        denominator = torch.abs(targets) + 1e-4  # Larger epsilon
+        relative_error = torch.mean(torch.clamp(torch.abs((outputs - targets) / denominator), max=100.0))  # Cap relative error
         
         loss = huber_loss + self.relative_weight * relative_error
         if torch.isnan(loss) or torch.isinf(loss):
-            print(f"Warning: Loss is NaN or Inf - Huber: {huber_loss.item()}, Relative: {relative_error.item()}")
+            print(f"Warning: Loss is NaN/Inf - Huber: {huber_loss.item()}, Relative: {relative_error.item()}, Outputs: {outputs[:5]}, Targets: {targets[:5]}")
             return torch.tensor(0.0, device=outputs.device, requires_grad=True)
         return loss
 
-# Training function with NaN handling
+# Training function with robust NaN handling
 def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs, device, grad_accum_steps=4):
     scaler = GradScaler()
     train_losses = []
@@ -264,6 +264,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
     best_val_loss = float('inf')
     early_stop_patience = 40
     early_stop_counter = 0
+    last_valid_lr = optimizer.param_groups[0]['lr']
     
     for epoch in range(num_epochs):
         model.train()
@@ -277,14 +278,14 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
                 outputs = model(sequences)
                 loss = criterion(outputs, targets)
                 if torch.isnan(loss) or torch.isinf(loss):
-                    print(f"Epoch {epoch+1}: Train loss became NaN/Inf, skipping batch")
+                    print(f"Epoch {epoch+1}: Train loss NaN/Inf - Outputs: {outputs[:5]}, Targets: {targets[:5]}")
                     continue
                 loss = loss / grad_accum_steps
             
             scaler.scale(loss).backward()
             accumulated_steps += 1
             if accumulated_steps % grad_accum_steps == 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)  # Tighter clipping
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.05)  # Even tighter clipping
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
@@ -292,7 +293,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
             train_loss += (loss.item() * grad_accum_steps) * sequences.size(0)
         
         if accumulated_steps % grad_accum_steps != 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.05)
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad()
@@ -309,19 +310,22 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
                     outputs = model(sequences)
                     loss = criterion(outputs, targets)
                     if torch.isnan(loss) or torch.isinf(loss):
-                        print(f"Epoch {epoch+1}: Val loss became NaN/Inf")
-                        val_loss = float('inf')  # Set to inf to trigger early stopping
+                        print(f"Epoch {epoch+1}: Val loss NaN/Inf - Outputs: {outputs[:5]}, Targets: {targets[:5]}")
+                        val_loss = float('inf')
                         break
                 val_loss += loss.item() * sequences.size(0)
         
         val_loss /= len(val_loader.dataset)
         val_losses.append(val_loss)
         
-        # Handle NaN in scheduler
-        if not torch.isfinite(torch.tensor(val_loss)):
-            print(f"Epoch {epoch+1}: Skipping scheduler step due to invalid val_loss: {val_loss}")
-        else:
+        # Robust scheduler handling
+        if torch.isfinite(torch.tensor(val_loss)):
             scheduler.step(val_loss)
+            last_valid_lr = optimizer.param_groups[0]['lr']
+        else:
+            print(f"Epoch {epoch+1}: Skipping scheduler step due to val_loss: {val_loss}, reverting to last valid LR: {last_valid_lr}")
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = last_valid_lr
         
         current_lr = optimizer.param_groups[0]['lr']
         print(f"Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}, LR: {current_lr:.6f}")
