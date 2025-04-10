@@ -247,7 +247,7 @@ def prepare_data_for_model(train_features, test_features):
     print(f"Input feature dimension: {X_train_scaled.shape[1]}")
     return X_train_tensor, y_train_tensor, X_test_tensor, y_test_tensor, scaler_X, scaler_y, X_train_scaled.shape[1], True
 
-# Enhanced LSTM model (unchanged from your snippet)
+# Enhanced LSTM model
 class EnhancedLSTMModel(nn.Module):
     def __init__(self, input_size, hidden_sizes=[256, 128, 64], output_size=1, num_heads=4, dropout_rate=0.4):
         super(EnhancedLSTMModel, self).__init__()
@@ -298,7 +298,146 @@ class EnhancedLSTMModel(nn.Module):
         out = self.fc_layers[-1](out)
         return out
 
-# (Assuming train_model, evaluate_model, create_data_loaders are defined elsewhere as in your previous snippets)
+# Create data loaders
+def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=32):
+    train_dataset = TensorDataset(X_train, y_train)
+    test_dataset = TensorDataset(X_test, y_test)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    return train_loader, test_loader
+
+# Train model function
+def train_model(model, X_train, y_train, X_test, y_test, criterion, num_epochs=200, batch_size=32, patience=30):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    model.to(device)
+    
+    train_loader, test_loader = create_data_loaders(X_train, y_train, X_test, y_test, batch_size)
+    optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-4)
+    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2, eta_min=1e-6)
+    scaler = GradScaler()
+    
+    best_val_loss = float('inf')
+    epochs_no_improve = 0
+    best_model_state = None
+    train_losses = []
+    val_losses = []
+    
+    for epoch in range(num_epochs):
+        model.train()
+        running_loss = 0.0
+        for inputs, targets in train_loader:
+            inputs, targets = inputs.to(device), targets.to(device)
+            optimizer.zero_grad()
+            with autocast():
+                outputs = model(inputs)
+                loss = criterion(outputs, targets)
+            scaler.scale(loss).backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+            scaler.step(optimizer)
+            scaler.update()
+            running_loss += loss.item() * inputs.size(0)
+        
+        train_loss = running_loss / len(train_loader.dataset)
+        train_losses.append(train_loss)
+        
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for inputs, targets in test_loader:
+                inputs, targets = inputs.to(device), targets.to(device)
+                with autocast():
+                    outputs = model(inputs)
+                    loss = criterion(outputs, targets)
+                val_loss += loss.item() * inputs.size(0)
+        
+        val_loss /= len(test_loader.dataset)
+        val_losses.append(val_loss)
+        scheduler.step()
+        
+        print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, LR: {optimizer.param_groups[0]["lr"]:.6f}')
+        
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            epochs_no_improve = 0
+            best_model_state = model.state_dict().copy()
+        else:
+            epochs_no_improve += 1
+        
+        if epochs_no_improve >= patience:
+            print(f'Early stopping after {epoch+1} epochs')
+            break
+    
+    model.load_state_dict(best_model_state)
+    
+    plt.figure(figsize=(10, 6))
+    plt.plot(train_losses, label='Training Loss')
+    plt.plot(val_losses, label='Validation Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('Training and Validation Loss')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig('lstm_loss_enhanced.png')
+    plt.show()
+    
+    return train_losses, val_losses, model
+
+# Evaluate model (assuming this is defined elsewhere, added here for completeness)
+def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_transformed=True):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model.to(device)
+    model.eval()
+    
+    X_test = X_test.to(device)
+    with torch.no_grad():
+        with autocast():
+            y_pred_scaled = model(X_test)
+    
+    y_pred_scaled = y_pred_scaled.cpu().numpy()
+    y_test = y_test.cpu().numpy()
+    
+    y_test_transformed = y_scaler.inverse_transform(y_test)
+    y_pred_transformed = y_scaler.inverse_transform(y_pred_scaled)
+    
+    y_test_actual = np.expm1(y_test_transformed) if is_log_transformed else y_test_transformed
+    y_pred_actual = np.expm1(y_pred_transformed) if is_log_transformed else y_pred_transformed
+    y_pred_actual = np.clip(y_pred_actual, 0, None)
+    
+    results_by_subfolder = {}
+    for i, file_path in enumerate(file_names_test):
+        subfolder = file_path.split('/')[0]
+        results_by_subfolder.setdefault(subfolder, []).append({
+            'file': file_path,
+            'actual': y_test_actual[i][0],
+            'predicted': y_pred_actual[i][0],
+            'error_percentage': abs(y_test_actual[i][0] - y_pred_actual[i][0]) / (y_test_actual[i][0] + 1e-8) * 100
+        })
+    
+    mse = np.mean((y_test_actual - y_pred_actual) ** 2)
+    rmse = np.sqrt(mse)
+    mae = np.mean(np.abs(y_test_actual - y_pred_actual))
+    mape = np.mean([r['error_percentage'] for subfolder in results_by_subfolder.values() for r in subfolder])
+    
+    print("\nDetailed Results:")
+    for subfolder, results in results_by_subfolder.items():
+        print(f"\n{subfolder}:")
+        for r in results:
+            print(f"  File: {r['file']}, Actual: {r['actual']:.2f} ms, Predicted: {r['predicted']:.2f} ms, Error: {r['error_percentage']:.2f}%")
+    
+    print(f"\nOverall Performance: MSE: {mse:.2f}, RMSE: {rmse:.2f}, MAE: {mae:.2f}, MAPE: {mape:.2f}%")
+    
+    plt.figure(figsize=(8, 6))
+    plt.scatter(y_test_actual, y_pred_actual, alpha=0.5)
+    plt.plot([y_test_actual.min(), y_test_actual.max()], [y_test_actual.min(), y_test_actual.max()], 'r--')
+    plt.xlabel('Actual Execution Time (ms)')
+    plt.ylabel('Predicted Execution Time (ms)')
+    plt.title('Actual vs Predicted')
+    plt.grid(True)
+    plt.savefig('actual_vs_predicted.png')
+    plt.show()
+    
+    return y_test_actual, y_pred_actual, np.mean(y_test_actual), np.mean(y_pred_actual)
 
 # Main function
 def main(main_dir):
