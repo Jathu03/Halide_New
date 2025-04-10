@@ -24,18 +24,42 @@ def set_seed(seed=42):
 
 set_seed()
 
+# Extract execution time from JSON
+def get_execution_time(file_path):
+    try:
+        with open(file_path, 'rb') as f:
+            raw_content = f.read()
+            content = raw_content.decode('utf-8', errors='replace').replace('\0', '')
+            data = json.loads(content)
+        
+        if 'programming_details' not in data:
+            print(f"Error: 'programming_details' key not found in {file_path}")
+            return None
+        
+        schedules = data["scheduling_data"]
+        for item in schedules:
+            if isinstance(item, dict) and item.get('name') == 'total_execution_time_ms':
+                execution_time = item.get('value')
+                if execution_time is not None:
+                    return float(execution_time)
+        
+        print(f"Warning: 'total_execution_time_ms' not found in {file_path}")
+        return schedules[-1]["value"]
+    
+    except Exception as e:
+        print(f"Error processing {file_path}: {str(e)}")
+        return None
+
 # Save scaler parameters (corrected for RobustScaler)
 def save_scaler_params(scaler_X, scaler_y, is_log_transformed):
-    # Handle RobustScaler for X
     scaler_X_data = {
         "feature_names": list(scaler_X.feature_names_in_),
-        "centers": scaler_X.center_.tolist(),  # Use center_ instead of mean_
+        "centers": scaler_X.center_.tolist(),
         "scales": scaler_X.scale_.tolist()
     }
     with open("scaler_X.json", "w") as f:
         json.dump(scaler_X_data, f)
 
-    # Handle StandardScaler for y
     scaler_y_data = {
         "mean": float(scaler_y.mean_[0]),
         "scale": float(scaler_y.scale_[0]),
@@ -44,7 +68,159 @@ def save_scaler_params(scaler_X, scaler_y, is_log_transformed):
     with open("scaler_y.json", "w") as f:
         json.dump(scaler_y_data, f)
 
-# (Previous functions like get_execution_time, extract_features_from_file, etc., remain unchanged)
+# Extract features from a single file
+def extract_features_from_file(file_path):
+    with open(file_path, 'r') as f:
+        data = json.load(f)
+    
+    execution_time = get_execution_time(file_path)
+    if execution_time is None or execution_time <= 0:
+        print(f"Warning: Invalid execution time in {file_path}")
+        return None
+    
+    nodes_features = []
+    edges_features = []
+    programming_details = data.get("programming_details", {})
+    
+    if 'Nodes' in programming_details:
+        for node in programming_details['Nodes']:
+            node_feature = {'Name': node.get('Name', '')}
+            if 'Details' in node and 'Op histogram' in node['Details']:
+                op_hist = node['Details']['Op histogram']
+                for op_line in op_hist:
+                    parts = op_line.strip().split(':')
+                    if len(parts) == 2:
+                        op_name = parts[0].strip().lower()
+                        op_count = int(parts[1].strip())
+                        node_feature[f'op_{op_name}'] = op_count
+            nodes_features.append(node_feature)
+    
+    if 'Edges' in programming_details:
+        for edge in programming_details['Edges']:
+            edge_feature = {
+                'From': edge.get('From', ''),
+                'To': edge.get('To', ''),
+                'Name': edge.get('Name', '')
+            }
+            edges_features.append(edge_feature)
+    
+    scheduling_features = data.get("scheduling_data", programming_details.get('Schedules', []))
+    features = {
+        'execution_time': execution_time,
+        'nodes_count': len(nodes_features),
+        'edges_count': len(edges_features),
+        'scheduling_count': len(scheduling_features),
+        'node_edge_ratio': len(nodes_features) / (len(edges_features) + 1e-8),
+    }
+    
+    op_counts = {}
+    for node in nodes_features:
+        for key, value in node.items():
+            if key.startswith('op_'):
+                op_counts[key] = op_counts.get(key, 0) + value
+    features.update(op_counts)
+    
+    if scheduling_features:
+        metrics = [
+            'bytes_at_production', 'bytes_at_realization', 'bytes_at_root', 'bytes_at_task',
+            'inner_parallelism', 'outer_parallelism', 'num_productions', 'num_realizations',
+            'num_scalars', 'num_vectors', 'points_computed_total', 'working_set'
+        ]
+        for metric in metrics:
+            if metric in scheduling_features[0]:
+                features[f'sched_{metric}'] = scheduling_features[0][metric]
+        
+        total_bytes = sum(sf.get('bytes_at_production', 0) for sf in scheduling_features)
+        total_vectors = sum(sf.get('num_vectors', 0) for sf in scheduling_features)
+        total_parallelism = sum(sf.get('inner_parallelism', 0) * sf.get('outer_parallelism', 1) for sf in scheduling_features)
+        
+        features.update({
+            'total_bytes_at_production': total_bytes,
+            'total_vectors': total_vectors,
+            'total_parallelism': total_parallelism,
+            'bytes_per_vector': total_bytes / (total_vectors + 1e-8),
+            'memory_pressure': scheduling_features[0].get('working_set', 0) / (scheduling_features[0].get('bytes_at_production', 1) + 1e-8),
+            'parallelism_per_node': total_parallelism / (len(nodes_features) + 1e-8),
+        })
+    
+    if nodes_features:
+        features.update({
+            'avg_ops_per_node': sum(op_counts.values()) / len(nodes_features),
+            'op_diversity': len(op_counts) / len(nodes_features),
+        })
+    
+    return features
+
+# Process a single directory
+def process_directory(directory_path):
+    all_features = []
+    file_names = []
+    json_files = sorted([f for f in os.listdir(directory_path) if f.endswith('.json')])
+    
+    for filename in json_files:
+        file_path = os.path.join(directory_path, filename)
+        features = extract_features_from_file(file_path)
+        if features:
+            all_features.append(features)
+            file_names.append(filename)
+    
+    return all_features, file_names
+
+# Process main directory with subdirectories
+def process_main_directory(main_dir):
+    all_features = []
+    all_file_names = []
+    subdirs = sorted([d for d in os.listdir(main_dir) if os.path.isdir(os.path.join(main_dir, d))])
+    
+    if not subdirs:
+        raise ValueError(f"No subdirectories found in {main_dir}")
+    
+    for subdir in subdirs:
+        subdir_path = os.path.join(main_dir, subdir)
+        features, file_names = process_directory(subdir_path)
+        all_features.extend(features)
+        all_file_names.extend([os.path.join(subdir, fname) for fname in file_names])
+        print(f"Processed {subdir}: {len(features)} files")
+    
+    if len(all_features) < 50:
+        raise ValueError(f"Found {len(all_features)} files, expected at least 50")
+    
+    combined = list(zip(all_features, all_file_names))
+    random.shuffle(combined)
+    all_features, all_file_names = zip(*combined)
+    
+    test_size = 50
+    train_features = all_features[:-test_size]
+    test_features = all_features[-test_size:]
+    train_file_names = all_file_names[:-test_size]
+    test_file_names = all_file_names[-test_size:]
+    
+    print(f"Total: {len(all_features)}, Train: {len(train_features)}, Test: {len(test_features)}")
+    return train_features, test_features, list(test_file_names)
+
+# Clean and transform features
+def clean_and_transform_features(train_features, test_features):
+    all_features_df = pd.DataFrame(train_features + test_features).fillna(0)
+    
+    constant_cols = [col for col in all_features_df.columns if col != 'execution_time' and all_features_df[col].nunique() <= 1]
+    all_features_df.drop(columns=constant_cols, inplace=True)
+    print(f"Dropped {len(constant_cols)} constant columns")
+    
+    all_features_df['execution_time'] = np.clip(all_features_df['execution_time'], 1e-3, 1e6)
+    all_features_df['execution_time_log'] = np.log1p(all_features_df['execution_time'])
+    
+    if 'total_vectors' in all_features_df and all_features_df['total_vectors'].max() > 0:
+        all_features_df['log_bytes_per_vector'] = np.log1p(all_features_df['total_bytes_at_production'] / (all_features_df['total_vectors'] + 1e-8))
+    if 'nodes_count' in all_features_df and 'edges_count' in all_features_df:
+        all_features_df['node_edge_interaction'] = all_features_df['nodes_count'] * all_features_df['edges_count']
+    
+    numeric_cols = all_features_df.select_dtypes(include=['number']).columns
+    all_features_df = all_features_df[numeric_cols]
+    
+    train_df = all_features_df.iloc[:len(train_features)]
+    test_df = all_features_df.iloc[len(train_features):]
+    
+    return train_df, test_df
 
 # Prepare data with robust scaling
 def prepare_data_for_model(train_features, test_features):
@@ -71,10 +247,61 @@ def prepare_data_for_model(train_features, test_features):
     print(f"Input feature dimension: {X_train_scaled.shape[1]}")
     return X_train_tensor, y_train_tensor, X_test_tensor, y_test_tensor, scaler_X, scaler_y, X_train_scaled.shape[1], True
 
-# (Other functions like EnhancedLSTMModel, train_model, evaluate_model remain unchanged)
+# Enhanced LSTM model (unchanged from your snippet)
+class EnhancedLSTMModel(nn.Module):
+    def __init__(self, input_size, hidden_sizes=[256, 128, 64], output_size=1, num_heads=4, dropout_rate=0.4):
+        super(EnhancedLSTMModel, self).__init__()
+        
+        self.lstm_layers = nn.ModuleList()
+        self.dropout_layers = nn.ModuleList()
+        
+        self.lstm_layers.append(nn.LSTM(input_size, hidden_sizes[0], batch_first=True, bidirectional=True))
+        self.dropout_layers.append(nn.Dropout(dropout_rate))
+        
+        for i in range(1, len(hidden_sizes)):
+            self.lstm_layers.append(nn.LSTM(hidden_sizes[i-1] * 2, hidden_sizes[i], batch_first=True, bidirectional=True))
+            self.dropout_layers.append(nn.Dropout(dropout_rate))
+        
+        self.attention = nn.MultiheadAttention(hidden_sizes[-1] * 2, num_heads=num_heads, dropout=dropout_rate)
+        self.attn_fc = nn.Linear(hidden_sizes[-1] * 2, hidden_sizes[-1])
+        
+        self.fc_layers = nn.ModuleList([
+            nn.Linear(hidden_sizes[-1], hidden_sizes[-1] // 2),
+            nn.Linear(hidden_sizes[-1] // 2, hidden_sizes[-1] // 4),
+            nn.Linear(hidden_sizes[-1] // 4, output_size)
+        ])
+        self.bn_layers = nn.ModuleList([
+            nn.BatchNorm1d(hidden_sizes[-1] // 2),
+            nn.BatchNorm1d(hidden_sizes[-1] // 4)
+        ])
+        
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(dropout_rate)
+    
+    def forward(self, x):
+        for i, (lstm, dropout) in enumerate(zip(self.lstm_layers, self.dropout_layers)):
+            lstm_out, _ = lstm(x if i == 0 else lstm_out)
+            lstm_out = dropout(lstm_out)
+        
+        lstm_out = lstm_out.transpose(0, 1)
+        attn_out, _ = self.attention(lstm_out, lstm_out, lstm_out)
+        attn_out = attn_out.transpose(0, 1)
+        context = self.attn_fc(attn_out[:, -1, :])
+        
+        out = context
+        for i, (fc, bn) in enumerate(zip(self.fc_layers[:-1], self.bn_layers)):
+            out = fc(out)
+            out = bn(out)
+            out = self.relu(out)
+            out = self.dropout(out)
+        
+        out = self.fc_layers[-1](out)
+        return out
+
+# (Assuming train_model, evaluate_model, create_data_loaders are defined elsewhere as in your previous snippets)
 
 # Main function
-def main(main_dir="synthetic_data"):
+def main(main_dir):
     print(f"Processing {main_dir}")
     train_features, test_features, test_file_names = process_main_directory(main_dir)
     
