@@ -457,7 +457,7 @@ def main(main_dir):
     criterion = nn.HuberLoss(delta=1.0)
     
     print("Training with cross-validation...")
-    kf = KFold(n_splits=5, shuffle=True, random_state=42)
+    kf = KFold(n_splits=3, shuffle=True, random_state=42)
     cv_scores = []
     best_model = None
     best_val_loss = float('inf')
