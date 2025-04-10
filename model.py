@@ -74,7 +74,7 @@ def prepare_data_for_model(train_features, test_features):
 # (Other functions like EnhancedLSTMModel, train_model, evaluate_model remain unchanged)
 
 # Main function
-def main(main_dir):
+def main(main_dir="synthetic_data"):
     print(f"Processing {main_dir}")
     train_features, test_features, test_file_names = process_main_directory(main_dir)
     
