@@ -16,9 +16,23 @@ if torch.cuda.is_available():
 
 # 1. Load the preprocessed data
 def load_preprocessed_data(data_dir="preprocessed_dataset"):
-    sequence_data = np.load(os.path.join(data_dir, "sequence_data.npy"))
-    execution_times = np.load(os.path.join(data_dir, "execution_times.npy"))
-    return sequence_data, execution_times
+    try:
+        # Load with allow_pickle=True to handle object arrays
+        sequence_data = np.load(os.path.join(data_dir, "sequence_data.npy"), allow_pickle=True)
+        execution_times = np.load(os.path.join(data_dir, "execution_times.npy"), allow_pickle=True)
+        
+        # Convert to float32 to ensure compatibility with PyTorch
+        sequence_data = sequence_data.astype(np.float32)
+        execution_times = execution_times.astype(np.float32)
+        
+        # Validate data
+        if sequence_data.size == 0 or execution_times.size == 0:
+            raise ValueError("Loaded data is empty. Check the .npy files.")
+        
+        return sequence_data, execution_times
+    except Exception as e:
+        print(f"Error loading data from {data_dir}: {e}")
+        raise
 
 # 2. Custom Dataset for PyTorch
 class ExecutionTimeDataset(Dataset):
