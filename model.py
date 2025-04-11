@@ -53,10 +53,8 @@ def prepare_lstm_data(sequence_data, execution_times, batch_size=32):
 
     scaler_y = StandardScaler()
     y_scaled = scaler_y.fit_transform(execution_times.reshape(-1, 1)).flatten()  # (7999,)
-    # Replicate single execution time 10 times per sample
     y_scaled_10 = np.tile(y_scaled[:, np.newaxis], (1, 10))  # (7999, 10)
 
-    # Split into train (80%) and val (20%)
     X_train, X_val, y_train, y_val = train_test_split(
         X_scaled, y_scaled_10, test_size=0.2, random_state=42
     )
@@ -69,7 +67,7 @@ def prepare_lstm_data(sequence_data, execution_times, batch_size=32):
 
     return train_loader, val_loader, X_train, X_val, y_train, y_val, scaler_X, scaler_y
 
-# 4. Define improved LSTM model with fixed tracing
+# 4. Define LSTM model for scripting
 class LSTMModel(nn.Module):
     def __init__(self, input_size, hidden_size1=512, hidden_size2=256, hidden_size3=128, dropout=0.3, num_heads=4):
         super(LSTMModel, self).__init__()
@@ -91,7 +89,7 @@ class LSTMModel(nn.Module):
         self.bn3 = nn.BatchNorm1d(hidden_size3 * 2)
         self.dropout3 = nn.Dropout(dropout)
         
-        # Residual projection layers defined in __init__
+        # Residual projection layers
         self.residual_proj1 = nn.Linear(input_size, hidden_size1 * 2)
         self.residual_proj2 = nn.Linear(hidden_size1 * 2, hidden_size2 * 2)
         self.residual_proj3 = nn.Linear(hidden_size2 * 2, hidden_size3 * 2)
@@ -114,43 +112,43 @@ class LSTMModel(nn.Module):
     
     def forward(self, x):
         # x: (batch_size, 38, input_size)
-        out1, _ = self.lstm1(x)  # (batch_size, 38, hidden_size1 * 2)
+        out1, _ = self.lstm1(x)
         out1 = self.bn1(out1.transpose(1, 2)).transpose(1, 2)
         out1 = self.dropout1(out1)
-        residual1 = self.residual_proj1(x)  # Project input to match dimensions
-        out1 = out1 + residual1  # Residual
+        residual1 = self.residual_proj1(x)
+        out1 = out1 + residual1
         
-        out2, _ = self.lstm2(out1)  # (batch_size, 38, hidden_size2 * 2)
+        out2, _ = self.lstm2(out1)
         out2 = self.bn2(out2.transpose(1, 2)).transpose(1, 2)
         out2 = self.dropout2(out2)
         residual2 = self.residual_proj2(out1)
-        out2 = out2 + residual2  # Residual
+        out2 = out2 + residual2
         
-        out3, _ = self.lstm3(out2)  # (batch_size, 38, hidden_size3 * 2)
+        out3, _ = self.lstm3(out2)
         out3 = self.bn3(out3.transpose(1, 2)).transpose(1, 2)
         out3 = self.dropout3(out3)
         residual3 = self.residual_proj3(out2)
-        out3 = out3 + residual3  # Residual
+        out3 = out3 + residual3
         
         # Multi-head self-attention
-        attn_output, _ = self.attention(out3, out3, out3)  # (batch_size, 38, hidden_size3 * 2)
-        out = torch.mean(attn_output, dim=1)  # (batch_size, hidden_size3 * 2)
+        attn_output, _ = self.attention(out3, out3, out3)
+        out = torch.mean(attn_output, dim=1)
         
         # Fully connected layers
-        out = self.fc1(out)  # (batch_size, 128)
+        out = self.fc1(out)
         out = self.bn_fc1(out)
         out = self.relu1(out)
         out = self.dropout_fc1(out)
         
-        out = self.fc2(out)  # (batch_size, 64)
+        out = self.fc2(out)
         out = self.bn_fc2(out)
         out = self.relu2(out)
         out = self.dropout_fc2(out)
         
-        out = self.fc3(out)  # (batch_size, 10)
+        out = self.fc3(out)
         return out
 
-# 5. Train the model
+# 5. Train the model and save with scripting
 def train_model(model, train_loader, val_loader, device, epochs=300, patience=20):
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=0.001)
@@ -164,26 +162,24 @@ def train_model(model, train_loader, val_loader, device, epochs=300, patience=20
     best_val_loss = float('inf')
     epochs_no_improve = 0
     best_model_path = "best_lstm_model.pt"
+    best_model_state = None
     
     for epoch in range(epochs):
         model.train()
         train_loss = 0.0
         for X_batch, y_batch in train_loader:
-            X_batch, y_batch = X_batch.to(device), y_batch.to(device)  # y_batch: (batch_size, 10)
-            
+            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
             optimizer.zero_grad()
-            outputs = model(X_batch)  # (batch_size, 10)
+            outputs = model(X_batch)
             loss = criterion(outputs, y_batch)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
-            
             train_loss += loss.item() * X_batch.size(0)
         
         train_loss /= len(train_loader.dataset)
         train_losses.append(train_loss)
         
-        # Validation
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
@@ -203,12 +199,19 @@ def train_model(model, train_loader, val_loader, device, epochs=300, patience=20
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             epochs_no_improve = 0
-            torch.jit.save(torch.jit.trace(model.eval(), torch.randn(1, 38, 11).to(device)), best_model_path)
+            best_model_state = model.state_dict()  # Save state_dict instead of tracing here
         else:
             epochs_no_improve += 1
             if epochs_no_improve >= patience:
                 print(f"Early stopping triggered after {epoch+1} epochs")
                 break
+    
+    # After training, load best weights and script the model
+    model.load_state_dict(best_model_state)
+    model.eval()
+    scripted_model = torch.jit.script(model)
+    scripted_model.save(best_model_path)
+    print(f"Scripted model saved to {best_model_path}")
     
     np.save("loss_model/train_losses.npy", np.array(train_losses))
     np.save("loss_model/val_losses.npy", np.array(val_losses))
@@ -220,19 +223,16 @@ def evaluate_model(model, X_val, y_val, scaler_y, device):
     model.eval()
     X_val_tensor = torch.tensor(X_val, dtype=torch.float32).to(device)
     with torch.no_grad():
-        y_pred = model(X_val_tensor).cpu().numpy()  # (n_val, 10)
+        y_pred = model(X_val_tensor).cpu().numpy()
     
-    # Inverse transform
     n_val = y_val.shape[0]
-    y_val_orig = scaler_y.inverse_transform(y_val.reshape(-1, 1)).reshape(n_val, 10)  # (n_val, 10)
-    y_pred_orig = scaler_y.inverse_transform(y_pred.reshape(-1, 1)).reshape(n_val, 10)  # (n_val, 10)
+    y_val_orig = scaler_y.inverse_transform(y_val.reshape(-1, 1)).reshape(n_val, 10)
+    y_pred_orig = scaler_y.inverse_transform(y_pred.reshape(-1, 1)).reshape(n_val, 10)
     
-    # Error percentage
     error_percentages = np.abs(y_val_orig - y_pred_orig) / np.maximum(y_val_orig, 1e-6) * 100
     mean_error_percentage = np.mean(error_percentages)
     print(f"Mean Error Percentage across 10 schedules: {mean_error_percentage:.4f}%")
     
-    # Print sample predictions
     print("\nSample Predictions (first 5 samples, first 3 schedules):")
     for i in range(min(5, n_val)):
         print(f"Sample {i+1}: Actual={y_val_orig[i, 0]:.4f} ms, Predicted={y_pred_orig[i, 0]:.4f} ms, "
@@ -308,7 +308,7 @@ if __name__ == "__main__":
         model, train_loader, val_loader, device, epochs=300, patience=20
     )
     
-    # Load best model
+    # Load best scripted model
     model = torch.jit.load(best_model_path).to(device)
     
     # Evaluate and predict
@@ -317,11 +317,11 @@ if __name__ == "__main__":
     # Plot results
     plot_results(train_losses, val_losses)
     
-    # Save the final model
+    # Save the final model state dict (optional)
     torch.save(model.state_dict(), "lstm_execution_time_model.pth")
     print("Model state dict saved to lstm_execution_time_model.pth")
     model.save("lstm_model.pt")
-    print("TorchScript model saved to lstm_model.pt")
+    print("Scripted model saved to lstm_model.pt")
 
     # Save scalers
     save_scalers(scaler_X, scaler_y)
