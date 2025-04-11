@@ -107,7 +107,7 @@ def load_and_split_data(file_path='data_r.pkl'):
     return train_data, val_data, test_data
 
 # Training function
-def train_model(model, train_loader, val_loader, num_epochs=50, lr=0.001):
+def train_model(model, train_loader, val_loader, num_epochs=100, lr=0.001):
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -226,6 +226,6 @@ if __name__ == "__main__":
         lstm_hidden_dim=32
     )
     
-    train_losses, val_losses = train_model(model, train_loader, val_loader, num_epochs=50)
+    train_losses, val_losses = train_model(model, train_loader, val_loader, num_epochs=100)
     plot_loss(train_losses, val_losses)
     mean_error_percentage = evaluate_model(model, test_loader)
