@@ -34,64 +34,61 @@ class HalideDataset(Dataset):
 class RecursiveLSTM(nn.Module):
     def __init__(self, node_feature_dim, node_seq_dim, edge_feature_dim, edge_seq_dim, hidden_dim=64, lstm_hidden_dim=32):
         super(RecursiveLSTM, self).__init__()
-        # Node LSTM for sequential data
         self.node_lstm = nn.LSTM(node_seq_dim, lstm_hidden_dim, batch_first=True)
-        # Edge LSTM for sequential data
         self.edge_lstm = nn.LSTM(edge_seq_dim, lstm_hidden_dim, batch_first=True)
-        # Fully connected layers for node and edge feature aggregation
         self.node_fc = nn.Linear(node_feature_dim + lstm_hidden_dim, hidden_dim)
         self.edge_fc = nn.Linear(edge_feature_dim + lstm_hidden_dim, hidden_dim)
-        # Graph-level aggregation
         self.graph_fc = nn.Linear(hidden_dim * 2, hidden_dim)
-        # Output layer
         self.output_fc = nn.Linear(hidden_dim, 1)
         self.relu = nn.ReLU()
 
     def forward(self, adj_list, node_features, node_sequences, edge_features, edge_sequences):
-        batch_size = node_features.size(0)  # Assuming batched input
+        batch_size = len(node_features)  # Number of graphs in the batch
+        outputs = []
 
-        # Process node sequences with LSTM
-        node_seq_out, _ = self.node_lstm(node_sequences)  # Shape: (batch, nodes, seq_len, lstm_hidden_dim)
-        node_seq_out = node_seq_out[:, :, -1, :]  # Take last timestep: (batch, nodes, lstm_hidden_dim)
+        for i in range(batch_size):
+            # Process node sequences for the i-th graph
+            node_seq = node_sequences[i].unsqueeze(0)  # Add batch dim: (1, nodes, seq_len)
+            node_seq_out, _ = self.node_lstm(node_seq)  # (1, nodes, seq_len, lstm_hidden_dim)
+            node_seq_out = node_seq_out[:, :, -1, :]  # Last timestep: (1, nodes, lstm_hidden_dim)
 
-        # Combine node features and LSTM output
-        node_combined = torch.cat([node_features, node_seq_out], dim=-1)  # (batch, nodes, node_feature_dim + lstm_hidden_dim)
-        node_out = self.relu(self.node_fc(node_combined))  # (batch, nodes, hidden_dim)
+            # Combine node features and LSTM output
+            node_feat = node_features[i].unsqueeze(0)  # (1, nodes, node_feature_dim)
+            node_combined = torch.cat([node_feat, node_seq_out], dim=-1)  # (1, nodes, node_feature_dim + lstm_hidden_dim)
+            node_out = self.relu(self.node_fc(node_combined))  # (1, nodes, hidden_dim)
 
-        # Process edges (if any)
-        if edge_sequences.size(1) > 0:
-            edge_seq_out, _ = self.edge_lstm(edge_sequences)  # (batch, edges, seq_len, lstm_hidden_dim)
-            edge_seq_out = edge_seq_out[:, :, -1, :]  # Last timestep: (batch, edges, lstm_hidden_dim)
-            edge_combined = torch.cat([edge_features, edge_seq_out], dim=-1)  # (batch, edges, edge_feature_dim + lstm_hidden_dim)
-            edge_out = self.relu(self.edge_fc(edge_combined))  # (batch, edges, hidden_dim)
-        else:
-            edge_out = torch.zeros(batch_size, 1, node_out.size(-1), device=node_out.device)
+            # Process edge sequences for the i-th graph
+            edge_seq = edge_sequences[i].unsqueeze(0)  # (1, edges, seq_len)
+            if edge_seq.size(1) > 0:  # Check if there are edges
+                edge_seq_out, _ = self.edge_lstm(edge_seq)  # (1, edges, seq_len, lstm_hidden_dim)
+                edge_seq_out = edge_seq_out[:, :, -1, :]  # (1, edges, lstm_hidden_dim)
+                edge_feat = edge_features[i].unsqueeze(0)  # (1, edges, edge_feature_dim)
+                edge_combined = torch.cat([edge_feat, edge_seq_out], dim=-1)  # (1, edges, edge_feature_dim + lstm_hidden_dim)
+                edge_out = self.relu(self.edge_fc(edge_combined))  # (1, edges, hidden_dim)
+            else:
+                edge_out = torch.zeros(1, 1, node_out.size(-1), device=node_out.device)
 
-        # Recursive graph aggregation (simplified: average over nodes and edges)
-        node_agg = torch.mean(node_out, dim=1)  # (batch, hidden_dim)
-        edge_agg = torch.mean(edge_out, dim=1)  # (batch, hidden_dim)
-        graph_combined = torch.cat([node_agg, edge_agg], dim=-1)  # (batch, hidden_dim * 2)
+            # Aggregate node and edge representations
+            node_agg = torch.mean(node_out, dim=1)  # (1, hidden_dim)
+            edge_agg = torch.mean(edge_out, dim=1)  # (1, hidden_dim)
+            graph_combined = torch.cat([node_agg, edge_agg], dim=-1)  # (1, hidden_dim * 2)
 
-        # Final prediction
-        graph_out = self.relu(self.graph_fc(graph_combined))  # (batch, hidden_dim)
-        pred = self.output_fc(graph_out)  # (batch, 1)
-        return pred
+            # Final prediction for this graph
+            graph_out = self.relu(self.graph_fc(graph_combined))  # (1, hidden_dim)
+            pred = self.output_fc(graph_out)  # (1, 1)
+            outputs.append(pred)
+
+        return torch.cat(outputs, dim=0)  # (batch_size, 1)
 
 # Collate function for DataLoader
 def collate_fn(batch):
-    adj_lists = [item['adj_list'] for item in batch]
-    node_features = torch.stack([item['node_features'] for item in batch])
-    node_sequences = torch.stack([item['node_sequences'] for item in batch])
-    edge_features = torch.stack([item['edge_features'] for item in batch])
-    edge_sequences = torch.stack([item['edge_sequences'] for item in batch])
-    execution_times = torch.stack([item['execution_time'] for item in batch])
     return {
-        'adj_list': adj_lists,  # List, not stacked due to variable graph structure
-        'node_features': node_features,
-        'node_sequences': node_sequences,
-        'edge_features': edge_features,
-        'edge_sequences': edge_sequences,
-        'execution_time': execution_times
+        'adj_list': [item['adj_list'] for item in batch],
+        'node_features': [item['node_features'] for item in batch],  # List of tensors
+        'node_sequences': [item['node_sequences'] for item in batch],  # List of tensors
+        'edge_features': [item['edge_features'] for item in batch],  # List of tensors
+        'edge_sequences': [item['edge_sequences'] for item in batch],  # List of tensors
+        'execution_time': torch.stack([item['execution_time'] for item in batch])
     }
 
 # Load and split dataset
@@ -127,10 +124,10 @@ def train_model(model, train_loader, val_loader, num_epochs=50, lr=0.001):
         train_loss = 0
         for batch in train_loader:
             adj_list = batch['adj_list']
-            node_features = batch['node_features'].to(device)
-            node_sequences = batch['node_sequences'].to(device)
-            edge_features = batch['edge_features'].to(device)
-            edge_sequences = batch['edge_sequences'].to(device)
+            node_features = [nf.to(device) for nf in batch['node_features']]
+            node_sequences = [ns.to(device) for ns in batch['node_sequences']]
+            edge_features = [ef.to(device) for ef in batch['edge_features']]
+            edge_sequences = [es.to(device) for es in batch['edge_sequences']]
             targets = batch['execution_time'].to(device).view(-1, 1)
             
             optimizer.zero_grad()
@@ -149,10 +146,10 @@ def train_model(model, train_loader, val_loader, num_epochs=50, lr=0.001):
         with torch.no_grad():
             for batch in val_loader:
                 adj_list = batch['adj_list']
-                node_features = batch['node_features'].to(device)
-                node_sequences = batch['node_sequences'].to(device)
-                edge_features = batch['edge_features'].to(device)
-                edge_sequences = batch['edge_sequences'].to(device)
+                node_features = [nf.to(device) for nf in batch['node_features']]
+                node_sequences = [ns.to(device) for ns in batch['node_sequences']]
+                edge_features = [ef.to(device) for ef in batch['edge_features']]
+                edge_sequences = [es.to(device) for es in batch['edge_sequences']]
                 targets = batch['execution_time'].to(device).view(-1, 1)
                 
                 outputs = model(adj_list, node_features, node_sequences, edge_features, edge_sequences)
@@ -190,10 +187,10 @@ def evaluate_model(model, test_loader):
     with torch.no_grad():
         for batch in test_loader:
             adj_list = batch['adj_list']
-            node_features = batch['node_features'].to(device)
-            node_sequences = batch['node_sequences'].to(device)
-            edge_features = batch['edge_features'].to(device)
-            edge_sequences = batch['edge_sequences'].to(device)
+            node_features = [nf.to(device) for nf in batch['node_features']]
+            node_sequences = [ns.to(device) for ns in batch['node_sequences']]
+            edge_features = [ef.to(device) for ef in batch['edge_features']]
+            edge_sequences = [es.to(device) for es in batch['edge_sequences']]
             targets = batch['execution_time'].to(device).view(-1, 1)
             
             outputs = model(adj_list, node_features, node_sequences, edge_features, edge_sequences)
@@ -226,7 +223,7 @@ if __name__ == "__main__":
     val_loader = DataLoader(val_dataset, batch_size=4, shuffle=False, collate_fn=collate_fn)
     test_loader = DataLoader(test_dataset, batch_size=4, shuffle=False, collate_fn=collate_fn)
     
-    # Initialize model (dimensions based on data_r structure)
+    # Initialize model (dimensions based on first sample)
     sample = train_data[0]
     model = RecursiveLSTM(
         node_feature_dim=sample['node_features'].shape[-1],
