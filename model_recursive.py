@@ -48,32 +48,30 @@ class RecursiveLSTM(nn.Module):
 
         for i in range(batch_size):
             # Process node sequences for the i-th graph
-            node_seq = node_sequences[i].unsqueeze(0)  # Add batch dim: (1, nodes, seq_len)
-            node_seq_out, _ = self.node_lstm(node_seq)  # (1, nodes, seq_len, lstm_hidden_dim)
-            node_seq_out = node_seq_out[:, :, -1, :]  # Last timestep: (1, nodes, lstm_hidden_dim)
+            node_seq = node_sequences[i].unsqueeze(0)  # (1, nodes, seq_len)
+            node_seq_out, _ = self.node_lstm(node_seq)  # (1, nodes, lstm_hidden_dim)
+            node_seq_out = node_seq_out[:, -1, :]  # Last timestep: (1, lstm_hidden_dim)
 
-            # Combine node features and LSTM output
-            node_feat = node_features[i].unsqueeze(0)  # (1, nodes, node_feature_dim)
-            node_combined = torch.cat([node_feat, node_seq_out], dim=-1)  # (1, nodes, node_feature_dim + lstm_hidden_dim)
-            node_out = self.relu(self.node_fc(node_combined))  # (1, nodes, hidden_dim)
+            # Combine with node features (average over nodes)
+            node_feat = node_features[i]  # (nodes, node_feature_dim)
+            node_feat_avg = torch.mean(node_feat, dim=0, keepdim=True)  # (1, node_feature_dim)
+            node_combined = torch.cat([node_feat_avg, node_seq_out], dim=-1)  # (1, node_feature_dim + lstm_hidden_dim)
+            node_out = self.relu(self.node_fc(node_combined))  # (1, hidden_dim)
 
             # Process edge sequences for the i-th graph
             edge_seq = edge_sequences[i].unsqueeze(0)  # (1, edges, seq_len)
             if edge_seq.size(1) > 0:  # Check if there are edges
-                edge_seq_out, _ = self.edge_lstm(edge_seq)  # (1, edges, seq_len, lstm_hidden_dim)
-                edge_seq_out = edge_seq_out[:, :, -1, :]  # (1, edges, lstm_hidden_dim)
-                edge_feat = edge_features[i].unsqueeze(0)  # (1, edges, edge_feature_dim)
-                edge_combined = torch.cat([edge_feat, edge_seq_out], dim=-1)  # (1, edges, edge_feature_dim + lstm_hidden_dim)
-                edge_out = self.relu(self.edge_fc(edge_combined))  # (1, edges, hidden_dim)
+                edge_seq_out, _ = self.edge_lstm(edge_seq)  # (1, edges, lstm_hidden_dim)
+                edge_seq_out = edge_seq_out[:, -1, :]  # Last timestep: (1, lstm_hidden_dim)
+                edge_feat = edge_features[i]  # (edges, edge_feature_dim)
+                edge_feat_avg = torch.mean(edge_feat, dim=0, keepdim=True)  # (1, edge_feature_dim)
+                edge_combined = torch.cat([edge_feat_avg, edge_seq_out], dim=-1)  # (1, edge_feature_dim + lstm_hidden_dim)
+                edge_out = self.relu(self.edge_fc(edge_combined))  # (1, hidden_dim)
             else:
-                edge_out = torch.zeros(1, 1, node_out.size(-1), device=node_out.device)
+                edge_out = torch.zeros(1, hidden_dim, device=node_out.device)  # (1, hidden_dim)
 
-            # Aggregate node and edge representations
-            node_agg = torch.mean(node_out, dim=1)  # (1, hidden_dim)
-            edge_agg = torch.mean(edge_out, dim=1)  # (1, hidden_dim)
-            graph_combined = torch.cat([node_agg, edge_agg], dim=-1)  # (1, hidden_dim * 2)
-
-            # Final prediction for this graph
+            # Combine node and edge representations
+            graph_combined = torch.cat([node_out, edge_out], dim=-1)  # (1, hidden_dim * 2)
             graph_out = self.relu(self.graph_fc(graph_combined))  # (1, hidden_dim)
             pred = self.output_fc(graph_out)  # (1, 1)
             outputs.append(pred)
@@ -84,10 +82,10 @@ class RecursiveLSTM(nn.Module):
 def collate_fn(batch):
     return {
         'adj_list': [item['adj_list'] for item in batch],
-        'node_features': [item['node_features'] for item in batch],  # List of tensors
-        'node_sequences': [item['node_sequences'] for item in batch],  # List of tensors
-        'edge_features': [item['edge_features'] for item in batch],  # List of tensors
-        'edge_sequences': [item['edge_sequences'] for item in batch],  # List of tensors
+        'node_features': [item['node_features'] for item in batch],
+        'node_sequences': [item['node_sequences'] for item in batch],
+        'edge_features': [item['edge_features'] for item in batch],
+        'edge_sequences': [item['edge_sequences'] for item in batch],
         'execution_time': torch.stack([item['execution_time'] for item in batch])
     }
 
@@ -119,7 +117,6 @@ def train_model(model, train_loader, val_loader, num_epochs=50, lr=0.001):
     val_losses = []
     
     for epoch in range(num_epochs):
-        # Training
         model.train()
         train_loss = 0
         for batch in train_loader:
@@ -140,7 +137,6 @@ def train_model(model, train_loader, val_loader, num_epochs=50, lr=0.001):
         train_loss /= len(train_loader)
         train_losses.append(train_loss)
         
-        # Validation
         model.eval()
         val_loss = 0
         with torch.no_grad():
@@ -197,7 +193,6 @@ def evaluate_model(model, test_loader):
             predictions.extend(outputs.cpu().numpy().flatten())
             actuals.extend(targets.cpu().numpy().flatten())
     
-    # Calculate error percentage
     error_percentages = [abs(pred - actual) / actual * 100 for pred, actual in zip(predictions, actuals) if actual != 0]
     mean_error_percentage = np.mean(error_percentages)
     
@@ -210,11 +205,9 @@ def evaluate_model(model, test_loader):
 
 # Main execution
 if __name__ == "__main__":
-    # Load and split data
     train_data, val_data, test_data = load_and_split_data('data_r.pkl')
     print(f"Train samples: {len(train_data)}, Val samples: {len(val_data)}, Test samples: {len(test_data)}")
     
-    # Create DataLoaders
     train_dataset = HalideDataset(train_data)
     val_dataset = HalideDataset(val_data)
     test_dataset = HalideDataset(test_data)
@@ -223,7 +216,6 @@ if __name__ == "__main__":
     val_loader = DataLoader(val_dataset, batch_size=4, shuffle=False, collate_fn=collate_fn)
     test_loader = DataLoader(test_dataset, batch_size=4, shuffle=False, collate_fn=collate_fn)
     
-    # Initialize model (dimensions based on first sample)
     sample = train_data[0]
     model = RecursiveLSTM(
         node_feature_dim=sample['node_features'].shape[-1],
@@ -234,11 +226,6 @@ if __name__ == "__main__":
         lstm_hidden_dim=32
     )
     
-    # Train model
     train_losses, val_losses = train_model(model, train_loader, val_loader, num_epochs=50)
-    
-    # Plot loss
     plot_loss(train_losses, val_losses)
-    
-    # Evaluate on test set
     mean_error_percentage = evaluate_model(model, test_loader)
