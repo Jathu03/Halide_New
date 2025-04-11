@@ -40,15 +40,16 @@ class HalideDataset(Dataset):
 
 # Recursive LSTM Model with improved graph processing
 class RecursiveLSTM(nn.Module):
-    def __init__(self, node_feature_dim, node_seq_dim, edge_feature_dim, edge_seq_dim, hidden_dim=128, lstm_hidden_dim=64):
+    def __init__(self, node_feature_dim, node_seq_dim, edge_feature_dim, edge_seq_dim, hidden_dim=256, lstm_hidden_dim=128):
         super(RecursiveLSTM, self).__init__()
-        self.node_lstm = nn.LSTM(node_seq_dim, lstm_hidden_dim, batch_first=True, num_layers=2)
-        self.edge_lstm = nn.LSTM(edge_seq_dim, lstm_hidden_dim, batch_first=True, num_layers=2)
+        self.node_lstm = nn.LSTM(node_seq_dim, lstm_hidden_dim, batch_first=True, num_layers=2, dropout=0.2)
+        self.edge_lstm = nn.LSTM(edge_seq_dim, lstm_hidden_dim, batch_first=True, num_layers=2, dropout=0.2)
         self.node_fc = nn.Linear(node_feature_dim + lstm_hidden_dim, hidden_dim)
         self.edge_fc = nn.Linear(edge_feature_dim + lstm_hidden_dim, hidden_dim)
         self.graph_fc = nn.Linear(hidden_dim, hidden_dim)
         self.output_fc = nn.Linear(hidden_dim, 1)
         self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(0.2)
 
     def forward(self, adj_list, node_features, node_sequences, edge_features, edge_sequences):
         batch_size = len(node_features)
@@ -73,7 +74,7 @@ class RecursiveLSTM(nn.Module):
                 edge_out = torch.zeros(1, hidden_dim, device=node_out.device)
 
             # Recursive aggregation using adj_list
-            adj = adj_list[i]  # List of lists: [node_idx: [neighbor_indices]]
+            adj = adj_list[i]
             node_agg = node_out.clone()
             for node_idx, neighbors in enumerate(adj):
                 if neighbors:
@@ -83,7 +84,7 @@ class RecursiveLSTM(nn.Module):
             # Graph-level aggregation
             node_mean = torch.mean(node_agg, dim=0, keepdim=True)  # (1, hidden_dim)
             edge_mean = torch.mean(edge_out, dim=0, keepdim=True)  # (1, hidden_dim)
-            graph_out = self.relu(self.graph_fc(node_mean + edge_mean))  # (1, hidden_dim)
+            graph_out = self.dropout(self.relu(self.graph_fc(node_mean + edge_mean)))  # (1, hidden_dim)
             pred = self.output_fc(graph_out)  # (1, 1)
             graph_outputs.append(pred)
 
@@ -110,7 +111,6 @@ def load_and_split_data(file_path='data_r.pkl'):
     remaining_data = valid_data[10:]
     train_data, val_data = train_test_split(remaining_data, test_size=0.2, random_state=42)
     
-    # Fit scaler on training data only
     train_dataset = HalideDataset(train_data)
     scaler = train_dataset.scaler
     val_dataset = HalideDataset(val_data, scaler)
@@ -118,15 +118,17 @@ def load_and_split_data(file_path='data_r.pkl'):
     
     return train_dataset, val_dataset, test_dataset
 
-# Training function
-def train_model(model, train_loader, val_loader, num_epochs=100, lr=0.0001):
+# Training function with early stopping
+def train_model(model, train_loader, val_loader, num_epochs=100, lr=0.001, patience=10):
     criterion = nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)  # L2 regularization
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.to(device)
     
     train_losses = []
     val_losses = []
+    best_val_loss = float('inf')
+    patience_counter = 0
     
     for epoch in range(num_epochs):
         model.train()
@@ -143,6 +145,7 @@ def train_model(model, train_loader, val_loader, num_epochs=100, lr=0.0001):
             outputs = model(adj_list, node_features, node_sequences, edge_features, edge_sequences)
             loss = criterion(outputs, targets)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # Gradient clipping
             optimizer.step()
             train_loss += loss.item()
         
@@ -168,7 +171,20 @@ def train_model(model, train_loader, val_loader, num_epochs=100, lr=0.0001):
         val_losses.append(val_loss)
         
         print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
+        
+        # Early stopping
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+            torch.save(model.state_dict(), 'best_model.pt')  # Save best model
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f"Early stopping triggered after {epoch+1} epochs")
+                break
     
+    # Load best model
+    model.load_state_dict(torch.load('best_model.pt'))
     return train_losses, val_losses
 
 # Plot loss
@@ -205,7 +221,6 @@ def evaluate_model(model, test_loader, dataset):
             predictions.extend(outputs.cpu().numpy().flatten())
             actuals.extend(targets.cpu().numpy().flatten())
     
-    # Inverse transform predictions and actuals
     predictions = dataset.inverse_transform(np.array(predictions))
     actuals = dataset.inverse_transform(np.array(actuals))
     
@@ -224,9 +239,9 @@ if __name__ == "__main__":
     train_dataset, val_dataset, test_dataset = load_and_split_data('data_r.pkl')
     print(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}, Test samples: {len(test_dataset)}")
     
-    train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True, collate_fn=collate_fn)
-    val_loader = DataLoader(val_dataset, batch_size=4, shuffle=False, collate_fn=collate_fn)
-    test_loader = DataLoader(test_dataset, batch_size=4, shuffle=False, collate_fn=collate_fn)
+    train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True, collate_fn=collate_fn)  # Increased batch size
+    val_loader = DataLoader(val_dataset, batch_size=8, shuffle=False, collate_fn=collate_fn)
+    test_loader = DataLoader(test_dataset, batch_size=8, shuffle=False, collate_fn=collate_fn)
     
     sample = train_dataset.data[0]
     model = RecursiveLSTM(
@@ -234,10 +249,10 @@ if __name__ == "__main__":
         node_seq_dim=sample['node_sequences'].shape[-1],
         edge_feature_dim=sample['edge_features'].shape[-1],
         edge_seq_dim=sample['edge_sequences'].shape[-1],
-        hidden_dim=128,
-        lstm_hidden_dim=64
+        hidden_dim=256,
+        lstm_hidden_dim=128
     )
     
-    train_losses, val_losses = train_model(model, train_loader, val_loader, num_epochs=100, lr=0.0001)
+    train_losses, val_losses = train_model(model, train_loader, val_loader, num_epochs=100, lr=0.001, patience=10)
     plot_loss(train_losses, val_losses)
     mean_error_percentage = evaluate_model(model, test_loader, test_dataset)
