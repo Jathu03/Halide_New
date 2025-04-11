@@ -69,7 +69,7 @@ def prepare_lstm_data(sequence_data, execution_times, batch_size=32):
 
     return train_loader, val_loader, X_train, X_val, y_train, y_val, scaler_X, scaler_y
 
-# 4. Define improved LSTM model with enhanced architecture
+# 4. Define improved LSTM model with fixed tracing
 class LSTMModel(nn.Module):
     def __init__(self, input_size, hidden_size1=512, hidden_size2=256, hidden_size3=128, dropout=0.3, num_heads=4):
         super(LSTMModel, self).__init__()
@@ -78,7 +78,7 @@ class LSTMModel(nn.Module):
         self.hidden_size3 = hidden_size3
         self.num_heads = num_heads
         
-        # LSTM layers with increased capacity and residual connections
+        # LSTM layers
         self.lstm1 = nn.LSTM(input_size, hidden_size1, batch_first=True, bidirectional=True)
         self.bn1 = nn.BatchNorm1d(hidden_size1 * 2)
         self.dropout1 = nn.Dropout(dropout)
@@ -91,10 +91,15 @@ class LSTMModel(nn.Module):
         self.bn3 = nn.BatchNorm1d(hidden_size3 * 2)
         self.dropout3 = nn.Dropout(dropout)
         
+        # Residual projection layers defined in __init__
+        self.residual_proj1 = nn.Linear(input_size, hidden_size1 * 2)
+        self.residual_proj2 = nn.Linear(hidden_size1 * 2, hidden_size2 * 2)
+        self.residual_proj3 = nn.Linear(hidden_size2 * 2, hidden_size3 * 2)
+        
         # Multi-head self-attention
         self.attention = nn.MultiheadAttention(embed_dim=hidden_size3 * 2, num_heads=num_heads, batch_first=True)
         
-        # Fully connected layers with an extra layer
+        # Fully connected layers
         self.fc1 = nn.Linear(hidden_size3 * 2, 128)
         self.bn_fc1 = nn.BatchNorm1d(128)
         self.relu1 = nn.ReLU()
@@ -112,29 +117,23 @@ class LSTMModel(nn.Module):
         out1, _ = self.lstm1(x)  # (batch_size, 38, hidden_size1 * 2)
         out1 = self.bn1(out1.transpose(1, 2)).transpose(1, 2)
         out1 = self.dropout1(out1)
-        
-        # Residual connection (project input to match dimensions)
-        if x.size(2) != out1.size(2):
-            residual1 = nn.Linear(x.size(2), self.hidden_size1 * 2).to(x.device)(x)
-        else:
-            residual1 = x
+        residual1 = self.residual_proj1(x)  # Project input to match dimensions
         out1 = out1 + residual1  # Residual
         
         out2, _ = self.lstm2(out1)  # (batch_size, 38, hidden_size2 * 2)
         out2 = self.bn2(out2.transpose(1, 2)).transpose(1, 2)
         out2 = self.dropout2(out2)
-        residual2 = nn.Linear(self.hidden_size1 * 2, self.hidden_size2 * 2).to(x.device)(out1)
+        residual2 = self.residual_proj2(out1)
         out2 = out2 + residual2  # Residual
         
         out3, _ = self.lstm3(out2)  # (batch_size, 38, hidden_size3 * 2)
         out3 = self.bn3(out3.transpose(1, 2)).transpose(1, 2)
         out3 = self.dropout3(out3)
-        residual3 = nn.Linear(self.hidden_size2 * 2, self.hidden_size3 * 2).to(x.device)(out2)
+        residual3 = self.residual_proj3(out2)
         out3 = out3 + residual3  # Residual
         
         # Multi-head self-attention
         attn_output, _ = self.attention(out3, out3, out3)  # (batch_size, 38, hidden_size3 * 2)
-        # Average over timesteps
         out = torch.mean(attn_output, dim=1)  # (batch_size, hidden_size3 * 2)
         
         # Fully connected layers
@@ -204,7 +203,7 @@ def train_model(model, train_loader, val_loader, device, epochs=300, patience=20
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             epochs_no_improve = 0
-            torch.jit.save(torch.jit.trace(model, torch.randn(1, 38, 11).to(device)), best_model_path)
+            torch.jit.save(torch.jit.trace(model.eval(), torch.randn(1, 38, 11).to(device)), best_model_path)
         else:
             epochs_no_improve += 1
             if epochs_no_improve >= patience:
