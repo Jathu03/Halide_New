@@ -44,7 +44,7 @@ class ExecutionTimeDataset(Dataset):
     def __getitem__(self, idx):
         return self.X[idx], self.y[idx]
 
-# 3. Prepare data with train/val/test split, selecting smallest execution times for test
+# 3. Prepare data with train/val/test split, selecting low execution time test samples
 def prepare_lstm_data(sequence_data, execution_times, batch_size=32, test_size=10):
     scaler_X = StandardScaler()
     n_samples, seq_len, n_features = sequence_data.shape
@@ -57,15 +57,25 @@ def prepare_lstm_data(sequence_data, execution_times, batch_size=32, test_size=1
     y_scaled = scaler_y.fit_transform(execution_times_log.reshape(-1, 1)).flatten()
     y_scaled_10 = np.tile(y_scaled[:, np.newaxis], (1, 10))  # (n_samples, 10)
 
-    # Sort by execution time and select 10 smallest for test set
-    sorted_indices = np.argsort(execution_times)
-    test_indices = sorted_indices[:test_size]
-    remain_indices = sorted_indices[test_size:]
+    # Filter out zero or negative execution times and sort by execution time
+    valid_indices = execution_times > 0
+    X_valid = X_scaled[valid_indices]
+    y_valid = y_scaled_10[valid_indices]
+    exec_times_valid = execution_times[valid_indices]
 
-    X_test = X_scaled[test_indices]
-    y_test = y_scaled_10[test_indices]
-    X_remain = X_scaled[remain_indices]
-    y_remain = y_scaled_10[remain_indices]
+    # Select test samples from the lower 25th percentile
+    percentile_25 = np.percentile(exec_times_valid, 25)
+    low_time_indices = np.where(exec_times_valid <= percentile_25)[0]
+    test_indices = np.random.choice(low_time_indices, size=test_size, replace=False)
+    
+    # Create test set
+    X_test = X_valid[test_indices]
+    y_test = y_valid[test_indices]
+    
+    # Remaining data for train/val split
+    remain_indices = np.setdiff1d(np.arange(len(X_valid)), test_indices)
+    X_remain = X_valid[remain_indices]
+    y_remain = y_valid[remain_indices]
 
     # Split remaining data into train and validation (80-20 split)
     X_train, X_val, y_train, y_val = train_test_split(
@@ -82,7 +92,7 @@ def prepare_lstm_data(sequence_data, execution_times, batch_size=32, test_size=1
 
     return train_loader, val_loader, test_loader, X_train, X_val, X_test, y_train, y_val, y_test, scaler_X, scaler_y
 
-# 4. Define improved LSTM model with 4 layers
+# 4. Define improved LSTM model with additional layer and attention
 class LSTMModel(nn.Module):
     def __init__(self, input_size, hidden_size1=256, hidden_size2=128, hidden_size3=64, hidden_size4=32, dropout=0.2, num_heads=4):
         super(LSTMModel, self).__init__()
@@ -113,7 +123,8 @@ class LSTMModel(nn.Module):
         self.residual_proj3 = nn.Linear(hidden_size2 * 2, hidden_size3 * 2)
         self.residual_proj4 = nn.Linear(hidden_size3 * 2, hidden_size4 * 2)
         
-        self.attention = nn.MultiheadAttention(embed_dim=hidden_size4 * 2, num_heads=num_heads, batch_first=True)
+        self.attention1 = nn.MultiheadAttention(embed_dim=hidden_size4 * 2, num_heads=num_heads, batch_first=True)
+        self.attention2 = nn.MultiheadAttention(embed_dim=hidden_size4 * 2, num_heads=num_heads, batch_first=True)
         
         self.fc1 = nn.Linear(hidden_size4 * 2, 64)
         self.ln_fc1 = nn.LayerNorm(64)
@@ -152,8 +163,9 @@ class LSTMModel(nn.Module):
         residual4 = self.residual_proj4(out3)
         out4 = out4 + 0.3 * residual4
         
-        attn_output, _ = self.attention(out4, out4, out4)
-        out = torch.mean(attn_output, dim=1)
+        attn_output1, _ = self.attention1(out4, out4, out4)
+        attn_output2, _ = self.attention2(attn_output1, attn_output1, attn_output1)
+        out = torch.mean(attn_output2, dim=1)
         
         out = self.fc1(out)
         out = self.ln_fc1(out)
@@ -168,12 +180,12 @@ class LSTMModel(nn.Module):
         out = self.fc3(out)
         return out
 
-# 5. Train the model with cosine annealing
-def train_model(model, train_loader, val_loader, device, epochs=300, patience=20):
+# 5. Train the model with gradient accumulation
+def train_model(model, train_loader, val_loader, device, epochs=300, patience=20, accum_steps=4):
     criterion_mse = nn.MSELoss()
     criterion_l1 = nn.L1Loss()
     optimizer = optim.AdamW(model.parameters(), lr=0.0005, weight_decay=1e-4)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
     
     train_losses = []
     val_losses = []
@@ -185,20 +197,31 @@ def train_model(model, train_loader, val_loader, device, epochs=300, patience=20
     best_model_path = "best_lstm_model.pt"
     best_model_state = None
     
+    warmup_epochs = 10
     for epoch in range(epochs):
+        if epoch < warmup_epochs:
+            lr = 1e-6 + (0.0005 - 1e-6) * (epoch / warmup_epochs)
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = lr
+        else:
+            scheduler.step(val_loss if epoch > 0 else best_val_loss)
+
         model.train()
         train_loss = 0.0
-        for X_batch, y_batch in train_loader:
+        optimizer.zero_grad()
+        for i, (X_batch, y_batch) in enumerate(train_loader):
             X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-            optimizer.zero_grad()
             outputs = model(X_batch)
             mse_loss = criterion_mse(outputs, y_batch)
             l1_loss = criterion_l1(outputs, y_batch)
-            loss = mse_loss + 0.1 * l1_loss
+            loss = (mse_loss + 0.1 * l1_loss) / accum_steps  # Normalize by accumulation steps
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)  # Lowered max norm
-            optimizer.step()
-            train_loss += loss.item() * X_batch.size(0)
+            train_loss += loss.item() * X_batch.size(0) * accum_steps
+            
+            if (i + 1) % accum_steps == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                optimizer.zero_grad()
         
         train_loss /= len(train_loader.dataset)
         train_losses.append(train_loss)
@@ -216,8 +239,6 @@ def train_model(model, train_loader, val_loader, device, epochs=300, patience=20
         
         val_loss /= len(val_loader.dataset)
         val_losses.append(val_loss)
-        
-        scheduler.step()  # Update learning rate with cosine annealing
         
         print(f"Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, "
               f"LR: {optimizer.param_groups[0]['lr']:.6f}")
@@ -340,9 +361,9 @@ if __name__ == "__main__":
     input_size = sequence_data.shape[2]  # 11 features
     model = LSTMModel(input_size=input_size).to(device)
     
-    # Train model
+    # Train model with gradient accumulation
     train_losses, val_losses, best_model_path = train_model(
-        model, train_loader, val_loader, device, epochs=300, patience=20
+        model, train_loader, val_loader, device, epochs=300, patience=20, accum_steps=4
     )
     
     # Load best scripted model
