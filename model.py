@@ -17,11 +17,10 @@ if torch.cuda.is_available():
 # 1. Load the preprocessed data
 def load_preprocessed_data(data_dir="preprocessed_dataset"):
     try:
-        # Load with allow_pickle=True to handle object arrays
         sequence_data = np.load(os.path.join(data_dir, "sequence_data.npy"), allow_pickle=True)
         execution_times = np.load(os.path.join(data_dir, "execution_times.npy"), allow_pickle=True)
         
-        # Convert to float32 to ensure compatibility with PyTorch
+        # Convert to float32 for PyTorch compatibility
         sequence_data = sequence_data.astype(np.float32)
         execution_times = execution_times.astype(np.float32)
         
@@ -71,8 +70,10 @@ def prepare_lstm_data(sequence_data, execution_times, batch_size=32):
 class LSTMModel(nn.Module):
     def __init__(self, input_size, hidden_size1=128, hidden_size2=64, dropout=0.2):
         super(LSTMModel, self).__init__()
-        self.lstm1 = nn.LSTM(input_size, hidden_size1, batch_first=True, return_sequences=True)
+        # First LSTM layer (returns full sequence by default)
+        self.lstm1 = nn.LSTM(input_size, hidden_size1, batch_first=True)
         self.dropout1 = nn.Dropout(dropout)
+        # Second LSTM layer (takes last timestep implicitly)
         self.lstm2 = nn.LSTM(hidden_size1, hidden_size2, batch_first=True)
         self.dropout2 = nn.Dropout(dropout)
         self.fc1 = nn.Linear(hidden_size2, 32)
@@ -80,13 +81,14 @@ class LSTMModel(nn.Module):
         self.fc2 = nn.Linear(32, 1)
     
     def forward(self, x):
-        out, _ = self.lstm1(x)
+        # x shape: (batch_size, sequence_length, input_size)
+        out, _ = self.lstm1(x)  # out: (batch_size, sequence_length, hidden_size1)
         out = self.dropout1(out)
-        out, _ = self.lstm2(out)
-        out = self.dropout2(out[:, -1, :])  # Take the last timestep
-        out = self.fc1(out)
+        out, _ = self.lstm2(out)  # out: (batch_size, sequence_length, hidden_size2)
+        out = self.dropout2(out[:, -1, :])  # Take last timestep: (batch_size, hidden_size2)
+        out = self.fc1(out)  # (batch_size, 32)
         out = self.relu(out)
-        out = self.fc2(out)
+        out = self.fc2(out)  # (batch_size, 1)
         return out
 
 # 5. Train the model
@@ -107,7 +109,7 @@ def train_model(model, train_loader, test_loader, device, epochs=50):
             X_batch, y_batch = X_batch.to(device), y_batch.to(device)
             
             optimizer.zero_grad()
-            outputs = model(X_batch).squeeze()
+            outputs = model(X_batch).squeeze()  # (batch_size,)
             loss = criterion(outputs, y_batch)
             loss.backward()
             optimizer.step()
@@ -158,7 +160,6 @@ def evaluate_model(model, X_test, y_test, scaler_y, device):
 
 # 7. Plot results
 def plot_results(train_losses, test_losses, train_maes, test_maes, y_test_orig, y_pred_orig):
-    # Plot training & validation loss
     plt.figure(figsize=(12, 5))
     
     plt.subplot(1, 2, 1)
@@ -169,7 +170,6 @@ def plot_results(train_losses, test_losses, train_maes, test_maes, y_test_orig, 
     plt.ylabel('Loss (MSE)')
     plt.legend()
     
-    # Plot training & validation MAE
     plt.subplot(1, 2, 2)
     plt.plot(train_maes, label='Training MAE')
     plt.plot(test_maes, label='Validation MAE')
@@ -181,7 +181,6 @@ def plot_results(train_losses, test_losses, train_maes, test_maes, y_test_orig, 
     plt.tight_layout()
     plt.show()
 
-    # Scatter plot of true vs predicted execution times
     plt.figure(figsize=(8, 6))
     plt.scatter(y_test_orig, y_pred_orig, alpha=0.5)
     plt.plot([y_test_orig.min(), y_test_orig.max()], [y_test_orig.min(), y_test_orig.max()], 'r--')
@@ -211,7 +210,7 @@ if __name__ == "__main__":
     
     # Initialize model
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    input_size = sequence_data.shape[2]  # Number of features
+    input_size = sequence_data.shape[2]  # Number of features (11)
     model = LSTMModel(input_size=input_size).to(device)
     
     # Print model summary
@@ -228,6 +227,13 @@ if __name__ == "__main__":
     # Plot results
     plot_results(train_losses, test_losses, train_maes, test_maes, y_test_orig, y_pred_orig)
     
-    # Save the model
+    # Save the model (state dict)
     torch.save(model.state_dict(), "lstm_execution_time_model.pth")
     print("Model saved to lstm_execution_time_model.pth")
+
+    # Save as TorchScript for inference compatibility with C++
+    model.eval()
+    example_input = torch.randn(1, 38, input_size).to(device)  # Example input matching sequence length and features
+    traced_model = torch.jit.trace(model, example_input)
+    traced_model.save("lstm_model.pt")
+    print("TorchScript model saved to lstm_model.pt")
