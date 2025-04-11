@@ -44,15 +44,17 @@ class ExecutionTimeDataset(Dataset):
     def __getitem__(self, idx):
         return self.X[idx], self.y[idx]
 
-# 3. Prepare data with train/val/test split
+# 3. Prepare data with train/val/test split and log transformation
 def prepare_lstm_data(sequence_data, execution_times, batch_size=32, test_size=10):
     scaler_X = StandardScaler()
     n_samples, seq_len, n_features = sequence_data.shape
     X_reshaped = sequence_data.reshape(-1, n_features)
     X_scaled = scaler_X.fit_transform(X_reshaped).reshape(n_samples, seq_len, n_features)
 
+    # Log transform execution times (add small epsilon to avoid log(0))
+    execution_times_log = np.log1p(execution_times)  # log(1 + x)
     scaler_y = StandardScaler()
-    y_scaled = scaler_y.fit_transform(execution_times.reshape(-1, 1)).flatten()
+    y_scaled = scaler_y.fit_transform(execution_times_log.reshape(-1, 1)).flatten()
     y_scaled_10 = np.tile(y_scaled[:, np.newaxis], (1, 10))  # (n_samples, 10)
 
     # Split off 10 samples for testing
@@ -75,9 +77,9 @@ def prepare_lstm_data(sequence_data, execution_times, batch_size=32, test_size=1
 
     return train_loader, val_loader, test_loader, X_train, X_val, X_test, y_train, y_val, y_test, scaler_X, scaler_y
 
-# 4. Define LSTM model
+# 4. Define LSTM model with reduced capacity
 class LSTMModel(nn.Module):
-    def __init__(self, input_size, hidden_size1=512, hidden_size2=256, hidden_size3=128, dropout=0.3, num_heads=4):
+    def __init__(self, input_size, hidden_size1=256, hidden_size2=128, hidden_size3=64, dropout=0.3, num_heads=4):
         super(LSTMModel, self).__init__()
         self.hidden_size1 = hidden_size1
         self.hidden_size2 = hidden_size2
@@ -102,17 +104,17 @@ class LSTMModel(nn.Module):
         
         self.attention = nn.MultiheadAttention(embed_dim=hidden_size3 * 2, num_heads=num_heads, batch_first=True)
         
-        self.fc1 = nn.Linear(hidden_size3 * 2, 128)
-        self.bn_fc1 = nn.BatchNorm1d(128)
+        self.fc1 = nn.Linear(hidden_size3 * 2, 64)
+        self.bn_fc1 = nn.BatchNorm1d(64)
         self.relu1 = nn.ReLU()
         self.dropout_fc1 = nn.Dropout(dropout)
         
-        self.fc2 = nn.Linear(128, 64)
-        self.bn_fc2 = nn.BatchNorm1d(64)
+        self.fc2 = nn.Linear(64, 32)
+        self.bn_fc2 = nn.BatchNorm1d(32)
         self.relu2 = nn.ReLU()
         self.dropout_fc2 = nn.Dropout(dropout)
         
-        self.fc3 = nn.Linear(64, 10)
+        self.fc3 = nn.Linear(32, 10)
     
     def forward(self, x):
         out1, _ = self.lstm1(x)
@@ -149,10 +151,10 @@ class LSTMModel(nn.Module):
         out = self.fc3(out)
         return out
 
-# 5. Train the model
+# 5. Train the model with weight decay and warmup
 def train_model(model, train_loader, val_loader, device, epochs=300, patience=20):
     criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)  # Added weight decay
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
     
     train_losses = []
@@ -165,7 +167,16 @@ def train_model(model, train_loader, val_loader, device, epochs=300, patience=20
     best_model_path = "best_lstm_model.pt"
     best_model_state = None
     
+    # Warmup phase: linearly increase LR from 1e-6 to 0.001 over first 10 epochs
+    warmup_epochs = 10
     for epoch in range(epochs):
+        if epoch < warmup_epochs:
+            lr = 1e-6 + (0.001 - 1e-6) * (epoch / warmup_epochs)
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = lr
+        else:
+            scheduler.step(val_loss if epoch > 0 else best_val_loss)
+
         model.train()
         train_loss = 0.0
         for X_batch, y_batch in train_loader:
@@ -195,8 +206,6 @@ def train_model(model, train_loader, val_loader, device, epochs=300, patience=20
         print(f"Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, "
               f"LR: {optimizer.param_groups[0]['lr']:.6f}")
         
-        scheduler.step(val_loss)
-        
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             epochs_no_improve = 0
@@ -207,7 +216,6 @@ def train_model(model, train_loader, val_loader, device, epochs=300, patience=20
                 print(f"Early stopping triggered after {epoch+1} epochs")
                 break
     
-    # Save the best model
     model.load_state_dict(best_model_state)
     model.eval()
     scripted_model = torch.jit.script(model)
@@ -234,9 +242,11 @@ def evaluate_model(model, test_loader, scaler_y, device):
     y_pred = np.concatenate(y_pred_list, axis=0)  # (10, 10)
     y_true = np.concatenate(y_true_list, axis=0)  # (10, 10)
     
-    # Inverse transform
-    y_true_orig = scaler_y.inverse_transform(y_true.reshape(-1, 1)).reshape(10, 10)
-    y_pred_orig = scaler_y.inverse_transform(y_pred.reshape(-1, 1)).reshape(10, 10)
+    # Inverse transform: first scaler, then expm1 to reverse log1p
+    y_true_scaled = scaler_y.inverse_transform(y_true.reshape(-1, 1)).flatten()
+    y_pred_scaled = scaler_y.inverse_transform(y_pred.reshape(-1, 1)).flatten()
+    y_true_orig = np.expm1(y_true_scaled).reshape(10, 10)
+    y_pred_orig = np.expm1(y_pred_scaled).reshape(10, 10)
     
     # Calculate error percentages
     error_percentages = np.abs(y_true_orig - y_pred_orig) / np.maximum(y_true_orig, 1e-6) * 100
@@ -247,7 +257,7 @@ def evaluate_model(model, test_loader, scaler_y, device):
     print("\nTest Set Predictions (10 samples, first 3 schedules):")
     for i in range(10):
         print(f"Sample {i+1}:")
-        for j in range(min(3, 10)):  # Show first 3 schedules
+        for j in range(min(3, 10)):
             print(f"  Schedule {j+1}: Actual={y_true_orig[i, j]:.4f} ms, "
                   f"Predicted={y_pred_orig[i, j]:.4f} ms, "
                   f"Error%={error_percentages[i, j]:.4f}%")
@@ -283,7 +293,7 @@ def save_scalers(scaler_X, scaler_y):
     scaler_y_data = {
         "mean": float(scaler_y.mean_[0]),
         "scale": float(scaler_y.scale_[0]),
-        "is_log_transformed": False
+        "is_log_transformed": True  # Indicate log transformation
     }
     with open("scaler_y.json", "w") as f:
         json.dump(scaler_y_data, f)
