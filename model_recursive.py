@@ -92,7 +92,7 @@ def prepare_lstm_data(sequence_data, execution_times, batch_size=32, test_size=1
 
     return train_loader, val_loader, test_loader, X_train, X_val, X_test, y_train, y_val, y_test, scaler_X, scaler_y
 
-# 4. Define corrected Recursive LSTM model
+# 4. Define corrected Recursive LSTM model with iterative reduction
 class RecursiveLSTMModel(nn.Module):
     def __init__(self, input_size, hidden_size=128, lstm_hidden_size=64, dropout=0.2, num_heads=4):
         super(RecursiveLSTMModel, self).__init__()
@@ -133,40 +133,40 @@ class RecursiveLSTMModel(nn.Module):
         
         self.fc3 = nn.Linear(32, 10)
     
-    def recursive_step(self, x, is_initial=False):
+    def iterative_recursive_step(self, x):
         # x: (batch_size, seq_len, feature_size)
         batch_size, seq_len, feature_size = x.size()
+        current_seq = x
         
-        # Base case: if seq_len <= 1, return as is
-        if seq_len <= 1:
-            return x
+        # First step with initial input size
+        while seq_len > 1:
+            if seq_len % 2 != 0:
+                padding = torch.zeros(batch_size, 1, current_seq.size(-1), device=x.device)
+                current_seq = torch.cat([current_seq, padding], dim=1)
+                seq_len += 1
+            
+            # Pairwise combination
+            current_seq = current_seq.view(batch_size, seq_len // 2, 2, current_seq.size(-1))
+            current_seq = current_seq.reshape(batch_size, seq_len // 2, current_seq.size(-1) * 2)
+            
+            # Apply appropriate transformation
+            if current_seq.size(-1) == self.input_size * 2:  # Initial step
+                current_seq = self.initial_recursive_fc(current_seq)
+            else:  # Subsequent steps
+                current_seq = self.recursive_fc(current_seq)
+            
+            current_seq = self.recursive_ln(current_seq)
+            current_seq = self.relu1(current_seq)
+            current_seq = self.recursive_dropout(current_seq)
+            
+            # Update seq_len for next iteration
+            seq_len = current_seq.size(1)
         
-        # Pairwise combination
-        if seq_len % 2 != 0:
-            padding = torch.zeros(batch_size, 1, feature_size, device=x.device)
-            x = torch.cat([x, padding], dim=1)
-            seq_len += 1
-        
-        # Split into pairs
-        x_pairs = x.view(batch_size, seq_len // 2, 2, feature_size)
-        x_pairs = x_pairs.reshape(batch_size, seq_len // 2, feature_size * 2)
-        
-        # Apply appropriate recursive transformation
-        if is_initial:
-            out = self.initial_recursive_fc(x_pairs)  # (batch_size, seq_len//2, hidden_size)
-        else:
-            out = self.recursive_fc(x_pairs)  # (batch_size, seq_len//2, hidden_size)
-        
-        out = self.recursive_ln(out)
-        out = self.relu1(out)
-        out = self.recursive_dropout(out)
-        
-        # Recursively process the result
-        return self.recursive_step(out, is_initial=False)
+        return current_seq
     
     def forward(self, x):
-        # Recursive processing (initial step uses input_size)
-        recursive_out = self.recursive_step(x, is_initial=True)  # (batch_size, reduced_seq_len, hidden_size)
+        # Iterative recursive processing
+        recursive_out = self.iterative_recursive_step(x)  # (batch_size, reduced_seq_len, hidden_size)
         
         # Sequential LSTM processing
         out, _ = self.lstm1(recursive_out)
