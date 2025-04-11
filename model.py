@@ -51,8 +51,8 @@ def prepare_lstm_data(sequence_data, execution_times, batch_size=32, test_size=1
     X_reshaped = sequence_data.reshape(-1, n_features)
     X_scaled = scaler_X.fit_transform(X_reshaped).reshape(n_samples, seq_len, n_features)
 
-    # Log transform execution times (add small epsilon to avoid log(0))
-    execution_times_log = np.log1p(execution_times)  # log(1 + x)
+    # Log transform execution times
+    execution_times_log = np.log1p(execution_times)
     scaler_y = StandardScaler()
     y_scaled = scaler_y.fit_transform(execution_times_log.reshape(-1, 1)).flatten()
     y_scaled_10 = np.tile(y_scaled[:, np.newaxis], (1, 10))  # (n_samples, 10)
@@ -77,9 +77,9 @@ def prepare_lstm_data(sequence_data, execution_times, batch_size=32, test_size=1
 
     return train_loader, val_loader, test_loader, X_train, X_val, X_test, y_train, y_val, y_test, scaler_X, scaler_y
 
-# 4. Define LSTM model with reduced capacity
+# 4. Define improved LSTM model
 class LSTMModel(nn.Module):
-    def __init__(self, input_size, hidden_size1=256, hidden_size2=128, hidden_size3=64, dropout=0.3, num_heads=4):
+    def __init__(self, input_size, hidden_size1=256, hidden_size2=128, hidden_size3=64, dropout=0.2, num_heads=4):
         super(LSTMModel, self).__init__()
         self.hidden_size1 = hidden_size1
         self.hidden_size2 = hidden_size2
@@ -87,15 +87,15 @@ class LSTMModel(nn.Module):
         self.num_heads = num_heads
         
         self.lstm1 = nn.LSTM(input_size, hidden_size1, batch_first=True, bidirectional=True)
-        self.bn1 = nn.BatchNorm1d(hidden_size1 * 2)
+        self.ln1 = nn.LayerNorm(hidden_size1 * 2)
         self.dropout1 = nn.Dropout(dropout)
         
         self.lstm2 = nn.LSTM(hidden_size1 * 2, hidden_size2, batch_first=True, bidirectional=True)
-        self.bn2 = nn.BatchNorm1d(hidden_size2 * 2)
+        self.ln2 = nn.LayerNorm(hidden_size2 * 2)
         self.dropout2 = nn.Dropout(dropout)
         
         self.lstm3 = nn.LSTM(hidden_size2 * 2, hidden_size3, batch_first=True, bidirectional=True)
-        self.bn3 = nn.BatchNorm1d(hidden_size3 * 2)
+        self.ln3 = nn.LayerNorm(hidden_size3 * 2)
         self.dropout3 = nn.Dropout(dropout)
         
         self.residual_proj1 = nn.Linear(input_size, hidden_size1 * 2)
@@ -105,12 +105,12 @@ class LSTMModel(nn.Module):
         self.attention = nn.MultiheadAttention(embed_dim=hidden_size3 * 2, num_heads=num_heads, batch_first=True)
         
         self.fc1 = nn.Linear(hidden_size3 * 2, 64)
-        self.bn_fc1 = nn.BatchNorm1d(64)
+        self.ln_fc1 = nn.LayerNorm(64)
         self.relu1 = nn.ReLU()
         self.dropout_fc1 = nn.Dropout(dropout)
         
         self.fc2 = nn.Linear(64, 32)
-        self.bn_fc2 = nn.BatchNorm1d(32)
+        self.ln_fc2 = nn.LayerNorm(32)
         self.relu2 = nn.ReLU()
         self.dropout_fc2 = nn.Dropout(dropout)
         
@@ -118,43 +118,44 @@ class LSTMModel(nn.Module):
     
     def forward(self, x):
         out1, _ = self.lstm1(x)
-        out1 = self.bn1(out1.transpose(1, 2)).transpose(1, 2)
+        out1 = self.ln1(out1)
         out1 = self.dropout1(out1)
         residual1 = self.residual_proj1(x)
-        out1 = out1 + residual1
+        out1 = out1 + 0.3 * residual1  # Scaled residual connection
         
         out2, _ = self.lstm2(out1)
-        out2 = self.bn2(out2.transpose(1, 2)).transpose(1, 2)
+        out2 = self.ln2(out2)
         out2 = self.dropout2(out2)
         residual2 = self.residual_proj2(out1)
-        out2 = out2 + residual2
+        out2 = out2 + 0.3 * residual2
         
         out3, _ = self.lstm3(out2)
-        out3 = self.bn3(out3.transpose(1, 2)).transpose(1, 2)
+        out3 = self.ln3(out3)
         out3 = self.dropout3(out3)
         residual3 = self.residual_proj3(out2)
-        out3 = out3 + residual3
+        out3 = out3 + 0.3 * residual3
         
         attn_output, _ = self.attention(out3, out3, out3)
         out = torch.mean(attn_output, dim=1)
         
         out = self.fc1(out)
-        out = self.bn_fc1(out)
+        out = self.ln_fc1(out)
         out = self.relu1(out)
         out = self.dropout_fc1(out)
         
         out = self.fc2(out)
-        out = self.bn_fc2(out)
+        out = self.ln_fc2(out)
         out = self.relu2(out)
         out = self.dropout_fc2(out)
         
         out = self.fc3(out)
         return out
 
-# 5. Train the model with weight decay and warmup
+# 5. Train the model with AdamW and combined loss
 def train_model(model, train_loader, val_loader, device, epochs=300, patience=20):
-    criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-4)  # Added weight decay
+    criterion_mse = nn.MSELoss()
+    criterion_l1 = nn.L1Loss()
+    optimizer = optim.AdamW(model.parameters(), lr=0.0005, weight_decay=1e-4)  # Switched to AdamW
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
     
     train_losses = []
@@ -167,11 +168,10 @@ def train_model(model, train_loader, val_loader, device, epochs=300, patience=20
     best_model_path = "best_lstm_model.pt"
     best_model_state = None
     
-    # Warmup phase: linearly increase LR from 1e-6 to 0.001 over first 10 epochs
     warmup_epochs = 10
     for epoch in range(epochs):
         if epoch < warmup_epochs:
-            lr = 1e-6 + (0.001 - 1e-6) * (epoch / warmup_epochs)
+            lr = 1e-6 + (0.0005 - 1e-6) * (epoch / warmup_epochs)
             for param_group in optimizer.param_groups:
                 param_group['lr'] = lr
         else:
@@ -183,7 +183,9 @@ def train_model(model, train_loader, val_loader, device, epochs=300, patience=20
             X_batch, y_batch = X_batch.to(device), y_batch.to(device)
             optimizer.zero_grad()
             outputs = model(X_batch)
-            loss = criterion(outputs, y_batch)
+            mse_loss = criterion_mse(outputs, y_batch)
+            l1_loss = criterion_l1(outputs, y_batch)
+            loss = mse_loss + 0.1 * l1_loss  # Combined loss
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
@@ -198,7 +200,10 @@ def train_model(model, train_loader, val_loader, device, epochs=300, patience=20
             for X_batch, y_batch in val_loader:
                 X_batch, y_batch = X_batch.to(device), y_batch.to(device)
                 outputs = model(X_batch)
-                val_loss += criterion(outputs, y_batch).item() * X_batch.size(0)
+                mse_loss = criterion_mse(outputs, y_batch)
+                l1_loss = criterion_l1(outputs, y_batch)
+                loss = mse_loss + 0.1 * l1_loss
+                val_loss += loss.item() * X_batch.size(0)
         
         val_loss /= len(val_loader.dataset)
         val_losses.append(val_loss)
@@ -242,7 +247,7 @@ def evaluate_model(model, test_loader, scaler_y, device):
     y_pred = np.concatenate(y_pred_list, axis=0)  # (10, 10)
     y_true = np.concatenate(y_true_list, axis=0)  # (10, 10)
     
-    # Inverse transform: first scaler, then expm1 to reverse log1p
+    # Inverse transform
     y_true_scaled = scaler_y.inverse_transform(y_true.reshape(-1, 1)).flatten()
     y_pred_scaled = scaler_y.inverse_transform(y_pred.reshape(-1, 1)).flatten()
     y_true_orig = np.expm1(y_true_scaled).reshape(10, 10)
@@ -293,7 +298,7 @@ def save_scalers(scaler_X, scaler_y):
     scaler_y_data = {
         "mean": float(scaler_y.mean_[0]),
         "scale": float(scaler_y.scale_[0]),
-        "is_log_transformed": True  # Indicate log transformation
+        "is_log_transformed": True
     }
     with open("scaler_y.json", "w") as f:
         json.dump(scaler_y_data, f)
