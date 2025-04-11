@@ -7,6 +7,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 import matplotlib.pyplot as plt
 import os
+import json
 
 # Set random seed for reproducibility
 torch.manual_seed(42)
@@ -20,11 +21,9 @@ def load_preprocessed_data(data_dir="preprocessed_dataset"):
         sequence_data = np.load(os.path.join(data_dir, "sequence_data.npy"), allow_pickle=True)
         execution_times = np.load(os.path.join(data_dir, "execution_times.npy"), allow_pickle=True)
         
-        # Convert to float32 for PyTorch compatibility
         sequence_data = sequence_data.astype(np.float32)
         execution_times = execution_times.astype(np.float32)
         
-        # Validate data
         if sequence_data.size == 0 or execution_times.size == 0:
             raise ValueError("Loaded data is empty. Check the .npy files.")
         
@@ -47,13 +46,19 @@ class ExecutionTimeDataset(Dataset):
 
 # 3. Prepare data for LSTM
 def prepare_lstm_data(sequence_data, execution_times, batch_size=32):
-    # Normalize execution times
+    # Normalize sequence data (X) - 11 features across 38 timesteps
+    scaler_X = StandardScaler()
+    n_samples, seq_len, n_features = sequence_data.shape
+    X_reshaped = sequence_data.reshape(-1, n_features)  # (7999*38, 11)
+    X_scaled = scaler_X.fit_transform(X_reshaped).reshape(n_samples, seq_len, n_features)
+
+    # Normalize execution times (y)
     scaler_y = StandardScaler()
     y = scaler_y.fit_transform(execution_times.reshape(-1, 1)).flatten()
 
     # Split into train and test sets
     X_train, X_test, y_train, y_test = train_test_split(
-        sequence_data, y, test_size=0.2, random_state=42
+        X_scaled, y, test_size=0.2, random_state=42
     )
 
     # Create datasets
@@ -64,16 +69,14 @@ def prepare_lstm_data(sequence_data, execution_times, batch_size=32):
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
-    return train_loader, test_loader, X_train, X_test, y_train, y_test, scaler_y
+    return train_loader, test_loader, X_train, X_test, y_train, y_test, scaler_X, scaler_y
 
 # 4. Define LSTM model
 class LSTMModel(nn.Module):
     def __init__(self, input_size, hidden_size1=128, hidden_size2=64, dropout=0.2):
         super(LSTMModel, self).__init__()
-        # First LSTM layer (returns full sequence by default)
         self.lstm1 = nn.LSTM(input_size, hidden_size1, batch_first=True)
         self.dropout1 = nn.Dropout(dropout)
-        # Second LSTM layer (takes last timestep implicitly)
         self.lstm2 = nn.LSTM(hidden_size1, hidden_size2, batch_first=True)
         self.dropout2 = nn.Dropout(dropout)
         self.fc1 = nn.Linear(hidden_size2, 32)
@@ -81,18 +84,17 @@ class LSTMModel(nn.Module):
         self.fc2 = nn.Linear(32, 1)
     
     def forward(self, x):
-        # x shape: (batch_size, sequence_length, input_size)
-        out, _ = self.lstm1(x)  # out: (batch_size, sequence_length, hidden_size1)
+        out, _ = self.lstm1(x)
         out = self.dropout1(out)
-        out, _ = self.lstm2(out)  # out: (batch_size, sequence_length, hidden_size2)
-        out = self.dropout2(out[:, -1, :])  # Take last timestep: (batch_size, hidden_size2)
-        out = self.fc1(out)  # (batch_size, 32)
+        out, _ = self.lstm2(out)
+        out = self.dropout2(out[:, -1, :])  # Last timestep
+        out = self.fc1(out)
         out = self.relu(out)
-        out = self.fc2(out)  # (batch_size, 1)
+        out = self.fc2(out)
         return out
 
 # 5. Train the model
-def train_model(model, train_loader, test_loader, device, epochs=50):
+def train_model(model, train_loader, test_loader, device, epochs=300):
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=0.001)
     
@@ -100,6 +102,9 @@ def train_model(model, train_loader, test_loader, device, epochs=50):
     test_losses = []
     train_maes = []
     test_maes = []
+    
+    # Create loss_model directory
+    os.makedirs("loss_model", exist_ok=True)
     
     for epoch in range(epochs):
         model.train()
@@ -109,7 +114,7 @@ def train_model(model, train_loader, test_loader, device, epochs=50):
             X_batch, y_batch = X_batch.to(device), y_batch.to(device)
             
             optimizer.zero_grad()
-            outputs = model(X_batch).squeeze()  # (batch_size,)
+            outputs = model(X_batch).squeeze()
             loss = criterion(outputs, y_batch)
             loss.backward()
             optimizer.step()
@@ -140,6 +145,12 @@ def train_model(model, train_loader, test_loader, device, epochs=50):
         
         print(f"Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.4f}, Test Loss: {test_loss:.4f}, "
               f"Train MAE: {train_mae:.4f}, Test MAE: {test_mae:.4f}")
+    
+    # Save losses as numpy arrays
+    np.save("loss_model/train_losses.npy", np.array(train_losses))
+    np.save("loss_model/test_losses.npy", np.array(test_losses))
+    np.save("loss_model/train_maes.npy", np.array(train_maes))
+    np.save("loss_model/test_maes.npy", np.array(test_maes))
     
     return train_losses, test_losses, train_maes, test_maes
 
@@ -189,6 +200,28 @@ def plot_results(train_losses, test_losses, train_maes, test_maes, y_test_orig, 
     plt.ylabel('Predicted Execution Time (ms)')
     plt.show()
 
+# 8. Save scalers for external inference
+def save_scalers(scaler_X, scaler_y):
+    # Save scaler_X (for sequence features)
+    scaler_X_data = {
+        "means": scaler_X.mean_.tolist(),
+        "scales": scaler_X.scale_.tolist(),
+        "feature_names": [f"feature_{i}" for i in range(len(scaler_X.mean_))]  # Generic names for 11 features
+    }
+    with open("scaler_X.json", "w") as f:
+        json.dump(scaler_X_data, f)
+    print("Scaler X saved to scaler_X.json")
+
+    # Save scaler_y (for execution times)
+    scaler_y_data = {
+        "mean": float(scaler_y.mean_[0]),
+        "scale": float(scaler_y.scale_[0]),
+        "is_log_transformed": False  # StandardScaler, not log-transformed
+    }
+    with open("scaler_y.json", "w") as f:
+        json.dump(scaler_y_data, f)
+    print("Scaler Y saved to scaler_y.json")
+
 # Main execution
 if __name__ == "__main__":
     # Load data
@@ -204,21 +237,21 @@ if __name__ == "__main__":
 
     # Prepare data
     batch_size = 32
-    train_loader, test_loader, X_train, X_test, y_train, y_test, scaler_y = prepare_lstm_data(
+    train_loader, test_loader, X_train, X_test, y_train, y_test, scaler_X, scaler_y = prepare_lstm_data(
         sequence_data, execution_times, batch_size
     )
     
     # Initialize model
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    input_size = sequence_data.shape[2]  # Number of features (11)
+    input_size = sequence_data.shape[2]  # 11 features
     model = LSTMModel(input_size=input_size).to(device)
     
     # Print model summary
     print(model)
     
-    # Train model
+    # Train model with 300 epochs
     train_losses, test_losses, train_maes, test_maes = train_model(
-        model, train_loader, test_loader, device, epochs=50
+        model, train_loader, test_loader, device, epochs=300
     )
     
     # Evaluate and predict
@@ -227,13 +260,16 @@ if __name__ == "__main__":
     # Plot results
     plot_results(train_losses, test_losses, train_maes, test_maes, y_test_orig, y_pred_orig)
     
-    # Save the model (state dict)
+    # Save the model
     torch.save(model.state_dict(), "lstm_execution_time_model.pth")
     print("Model saved to lstm_execution_time_model.pth")
 
-    # Save as TorchScript for inference compatibility with C++
+    # Save as TorchScript
     model.eval()
-    example_input = torch.randn(1, 38, input_size).to(device)  # Example input matching sequence length and features
+    example_input = torch.randn(1, 38, input_size).to(device)
     traced_model = torch.jit.trace(model, example_input)
     traced_model.save("lstm_model.pt")
     print("TorchScript model saved to lstm_model.pt")
+
+    # Save scalers
+    save_scalers(scaler_X, scaler_y)
