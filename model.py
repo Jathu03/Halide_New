@@ -69,12 +69,16 @@ def prepare_lstm_data(sequence_data, execution_times, batch_size=32):
 
     return train_loader, val_loader, X_train, X_val, y_train, y_val, scaler_X, scaler_y
 
-# 4. Define improved LSTM model with 10 outputs
+# 4. Define improved LSTM model with enhanced architecture
 class LSTMModel(nn.Module):
-    def __init__(self, input_size, hidden_size1=256, hidden_size2=128, hidden_size3=64, dropout=0.3):
+    def __init__(self, input_size, hidden_size1=512, hidden_size2=256, hidden_size3=128, dropout=0.3, num_heads=4):
         super(LSTMModel, self).__init__()
+        self.hidden_size1 = hidden_size1
+        self.hidden_size2 = hidden_size2
         self.hidden_size3 = hidden_size3
+        self.num_heads = num_heads
         
+        # LSTM layers with increased capacity and residual connections
         self.lstm1 = nn.LSTM(input_size, hidden_size1, batch_first=True, bidirectional=True)
         self.bn1 = nn.BatchNorm1d(hidden_size1 * 2)
         self.dropout1 = nn.Dropout(dropout)
@@ -87,32 +91,64 @@ class LSTMModel(nn.Module):
         self.bn3 = nn.BatchNorm1d(hidden_size3 * 2)
         self.dropout3 = nn.Dropout(dropout)
         
-        # Attention layer
-        self.attention = nn.Linear(hidden_size3 * 2, 1)
-        self.fc1 = nn.Linear(hidden_size3 * 2, 64)
-        self.relu = nn.ReLU()
-        self.fc2 = nn.Linear(64, 10)  # 10 outputs for 10 schedules
+        # Multi-head self-attention
+        self.attention = nn.MultiheadAttention(embed_dim=hidden_size3 * 2, num_heads=num_heads, batch_first=True)
+        
+        # Fully connected layers with an extra layer
+        self.fc1 = nn.Linear(hidden_size3 * 2, 128)
+        self.bn_fc1 = nn.BatchNorm1d(128)
+        self.relu1 = nn.ReLU()
+        self.dropout_fc1 = nn.Dropout(dropout)
+        
+        self.fc2 = nn.Linear(128, 64)
+        self.bn_fc2 = nn.BatchNorm1d(64)
+        self.relu2 = nn.ReLU()
+        self.dropout_fc2 = nn.Dropout(dropout)
+        
+        self.fc3 = nn.Linear(64, 10)  # 10 outputs for 10 schedules
     
     def forward(self, x):
-        out, _ = self.lstm1(x)  # (batch_size, 38, hidden_size1 * 2)
-        out = self.bn1(out.transpose(1, 2)).transpose(1, 2)
-        out = self.dropout1(out)
+        # x: (batch_size, 38, input_size)
+        out1, _ = self.lstm1(x)  # (batch_size, 38, hidden_size1 * 2)
+        out1 = self.bn1(out1.transpose(1, 2)).transpose(1, 2)
+        out1 = self.dropout1(out1)
         
-        out, _ = self.lstm2(out)  # (batch_size, 38, hidden_size2 * 2)
-        out = self.bn2(out.transpose(1, 2)).transpose(1, 2)
-        out = self.dropout2(out)
+        # Residual connection (project input to match dimensions)
+        if x.size(2) != out1.size(2):
+            residual1 = nn.Linear(x.size(2), self.hidden_size1 * 2).to(x.device)(x)
+        else:
+            residual1 = x
+        out1 = out1 + residual1  # Residual
         
-        out, _ = self.lstm3(out)  # (batch_size, 38, hidden_size3 * 2)
-        out = self.bn3(out.transpose(1, 2)).transpose(1, 2)
-        out = self.dropout3(out)
+        out2, _ = self.lstm2(out1)  # (batch_size, 38, hidden_size2 * 2)
+        out2 = self.bn2(out2.transpose(1, 2)).transpose(1, 2)
+        out2 = self.dropout2(out2)
+        residual2 = nn.Linear(self.hidden_size1 * 2, self.hidden_size2 * 2).to(x.device)(out1)
+        out2 = out2 + residual2  # Residual
         
-        # Attention
-        attn_weights = torch.softmax(self.attention(out), dim=1)  # (batch_size, 38, 1)
-        out = torch.sum(out * attn_weights, dim=1)  # (batch_size, hidden_size3 * 2)
+        out3, _ = self.lstm3(out2)  # (batch_size, 38, hidden_size3 * 2)
+        out3 = self.bn3(out3.transpose(1, 2)).transpose(1, 2)
+        out3 = self.dropout3(out3)
+        residual3 = nn.Linear(self.hidden_size2 * 2, self.hidden_size3 * 2).to(x.device)(out2)
+        out3 = out3 + residual3  # Residual
         
-        out = self.fc1(out)  # (batch_size, 64)
-        out = self.relu(out)
-        out = self.fc2(out)  # (batch_size, 10)
+        # Multi-head self-attention
+        attn_output, _ = self.attention(out3, out3, out3)  # (batch_size, 38, hidden_size3 * 2)
+        # Average over timesteps
+        out = torch.mean(attn_output, dim=1)  # (batch_size, hidden_size3 * 2)
+        
+        # Fully connected layers
+        out = self.fc1(out)  # (batch_size, 128)
+        out = self.bn_fc1(out)
+        out = self.relu1(out)
+        out = self.dropout_fc1(out)
+        
+        out = self.fc2(out)  # (batch_size, 64)
+        out = self.bn_fc2(out)
+        out = self.relu2(out)
+        out = self.dropout_fc2(out)
+        
+        out = self.fc3(out)  # (batch_size, 10)
         return out
 
 # 5. Train the model
