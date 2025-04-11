@@ -4,6 +4,7 @@ import numpy as np
 from pathlib import Path
 from typing import List, Dict, Any
 import re
+import pickle
 
 def extract_numerical_features(data: Dict[str, Any]) -> np.ndarray:
     """
@@ -146,10 +147,11 @@ def create_graph_representation(program_data: Dict[str, Any]) -> Dict[str, Any]:
 
 def create_dataset(data_dir: str = 'synthetic_data') -> List[Dict[str, Any]]:
     """
-    Create a dataset from all JSON files in the synthetic_data folder.
-    Returns a list of graph representations.
+    Create a dataset named data_r from all JSON files in the synthetic_data folder.
+    Saves the dataset to data_r.pkl for access in other scripts.
+    Returns the dataset as a list of graph representations.
     """
-    data = []
+    data_r = []
     data_path = Path(data_dir)
 
     if not data_path.exists():
@@ -164,25 +166,33 @@ def create_dataset(data_dir: str = 'synthetic_data') -> List[Dict[str, Any]]:
                     with open(json_file, 'r') as f:
                         program_data = json.load(f)
                     graph_data = create_graph_representation(program_data)
-                    data.append(graph_data)
+                    data_r.append(graph_data)
                     print(f"Processed {json_file}")
                 except Exception as e:
                     print(f"Error processing {json_file}: {e}")
 
-    return data
+    # Save the dataset to a pickle file
+    try:
+        with open('data_r.pkl', 'wb') as f:
+            pickle.dump(data_r, f)
+        print("Dataset data_r saved to data_r.pkl")
+    except Exception as e:
+        print(f"Failed to save data_r.pkl: {e}")
+
+    return data_r
 
 # Create the dataset
 if __name__ == '__main__':
     try:
-        data = create_dataset('synthetic_data')
-        print(f"Dataset created with {len(data)} samples")
+        data_r = create_dataset('synthetic_data')
+        print(f"Dataset data_r created with {len(data_r)} samples")
         # Example: Print first sample structure
-        if data:
+        if data_r:
             print("Sample data structure:")
-            for key, value in data[0].items():
+            for key, value in data_r[0].items():
                 if isinstance(value, np.ndarray):
                     print(f"{key}: shape {value.shape}")
                 else:
                     print(f"{key}: {value}")
     except Exception as e:
-        print(f"Failed to create dataset: {e}")
+        print(f"Failed to create dataset data_r: {e}")
