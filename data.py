@@ -60,13 +60,17 @@ def create_graph_representation(program_data: Dict[str, Any]) -> Dict[str, Any]:
     """
     nodes = program_data['programming_details']['Nodes']
     edges = program_data['programming_details']['Edges']
-    execution_time = next(
-        (item['value'] for item in program_data['programming_details']['Nodes'] if item.get('name') == 'total_execution_time_ms'),
-        None
-    )
+    
+    # Extract execution time from scheduling_data
+    scheduling_data = program_data.get('scheduling_data', [])
+    execution_time = None
+    for item in scheduling_data:
+        if isinstance(item, dict) and item.get('name') == 'total_execution_time_ms':
+            execution_time = item.get('value')
+            break
 
     if execution_time is None:
-        raise ValueError("Execution time not found in program data")
+        raise ValueError("Execution time not found in scheduling_data")
 
     # Node mapping (name to index)
     node_map = {node['Name']: idx for idx, node in enumerate(nodes)}
