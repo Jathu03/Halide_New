@@ -5,16 +5,21 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import MinMaxScaler
 from typing import List, Dict, Any
 
 # Set random seed for reproducibility
 torch.manual_seed(42)
 np.random.seed(42)
 
-# Custom Dataset class
+# Custom Dataset class with normalization
 class HalideDataset(Dataset):
-    def __init__(self, data: List[Dict[str, Any]]):
+    def __init__(self, data: List[Dict[str, Any]], scaler=None):
         self.data = data
+        self.scaler = scaler if scaler else MinMaxScaler()
+        execution_times = np.array([d['execution_time'] for d in data]).reshape(-1, 1)
+        self.scaler.fit(execution_times) if not scaler else None
+        self.scaled_times = self.scaler.transform(execution_times)
 
     def __len__(self):
         return len(self.data)
@@ -27,58 +32,64 @@ class HalideDataset(Dataset):
             'node_sequences': torch.tensor(sample['node_sequences'], dtype=torch.float32),
             'edge_features': torch.tensor(sample['edge_features'], dtype=torch.float32),
             'edge_sequences': torch.tensor(sample['edge_sequences'], dtype=torch.float32),
-            'execution_time': torch.tensor(sample['execution_time'], dtype=torch.float32)
+            'execution_time': torch.tensor(self.scaled_times[idx], dtype=torch.float32)
         }
 
-# Recursive LSTM Model
+    def inverse_transform(self, scaled_values):
+        return self.scaler.inverse_transform(scaled_values.reshape(-1, 1)).flatten()
+
+# Recursive LSTM Model with improved graph processing
 class RecursiveLSTM(nn.Module):
-    def __init__(self, node_feature_dim, node_seq_dim, edge_feature_dim, edge_seq_dim, hidden_dim=64, lstm_hidden_dim=32):
+    def __init__(self, node_feature_dim, node_seq_dim, edge_feature_dim, edge_seq_dim, hidden_dim=128, lstm_hidden_dim=64):
         super(RecursiveLSTM, self).__init__()
-        self.node_lstm = nn.LSTM(node_seq_dim, lstm_hidden_dim, batch_first=True)
-        self.edge_lstm = nn.LSTM(edge_seq_dim, lstm_hidden_dim, batch_first=True)
+        self.node_lstm = nn.LSTM(node_seq_dim, lstm_hidden_dim, batch_first=True, num_layers=2)
+        self.edge_lstm = nn.LSTM(edge_seq_dim, lstm_hidden_dim, batch_first=True, num_layers=2)
         self.node_fc = nn.Linear(node_feature_dim + lstm_hidden_dim, hidden_dim)
         self.edge_fc = nn.Linear(edge_feature_dim + lstm_hidden_dim, hidden_dim)
-        self.graph_fc = nn.Linear(hidden_dim * 2, hidden_dim)
+        self.graph_fc = nn.Linear(hidden_dim, hidden_dim)
         self.output_fc = nn.Linear(hidden_dim, 1)
         self.relu = nn.ReLU()
 
     def forward(self, adj_list, node_features, node_sequences, edge_features, edge_sequences):
-        batch_size = len(node_features)  # Number of graphs in the batch
-        outputs = []
+        batch_size = len(node_features)
+        graph_outputs = []
 
         for i in range(batch_size):
-            # Process node sequences for the i-th graph
+            # Node processing
             node_seq = node_sequences[i].unsqueeze(0)  # (1, nodes, seq_len)
             node_seq_out, _ = self.node_lstm(node_seq)  # (1, nodes, lstm_hidden_dim)
-            node_seq_out = node_seq_out[:, -1, :]  # Last timestep: (1, lstm_hidden_dim)
-
-            # Combine with node features (average over nodes)
             node_feat = node_features[i]  # (nodes, node_feature_dim)
-            node_feat_avg = torch.mean(node_feat, dim=0, keepdim=True)  # (1, node_feature_dim)
-            node_combined = torch.cat([node_feat_avg, node_seq_out], dim=-1)  # (1, node_feature_dim + lstm_hidden_dim)
-            node_out = self.relu(self.node_fc(node_combined))  # (1, hidden_dim)
+            node_combined = torch.cat([node_feat, node_seq_out.squeeze(0)], dim=-1)  # (nodes, node_feature_dim + lstm_hidden_dim)
+            node_out = self.relu(self.node_fc(node_combined))  # (nodes, hidden_dim)
 
-            # Process edge sequences for the i-th graph
+            # Edge processing
             edge_seq = edge_sequences[i].unsqueeze(0)  # (1, edges, seq_len)
-            if edge_seq.size(1) > 0:  # Check if there are edges
+            if edge_seq.size(1) > 0:
                 edge_seq_out, _ = self.edge_lstm(edge_seq)  # (1, edges, lstm_hidden_dim)
-                edge_seq_out = edge_seq_out[:, -1, :]  # Last timestep: (1, lstm_hidden_dim)
                 edge_feat = edge_features[i]  # (edges, edge_feature_dim)
-                edge_feat_avg = torch.mean(edge_feat, dim=0, keepdim=True)  # (1, edge_feature_dim)
-                edge_combined = torch.cat([edge_feat_avg, edge_seq_out], dim=-1)  # (1, edge_feature_dim + lstm_hidden_dim)
-                edge_out = self.relu(self.edge_fc(edge_combined))  # (1, hidden_dim)
+                edge_combined = torch.cat([edge_feat, edge_seq_out.squeeze(0)], dim=-1)  # (edges, edge_feature_dim + lstm_hidden_dim)
+                edge_out = self.relu(self.edge_fc(edge_combined))  # (edges, hidden_dim)
             else:
-                edge_out = torch.zeros(1, hidden_dim, device=node_out.device)  # (1, hidden_dim)
+                edge_out = torch.zeros(1, hidden_dim, device=node_out.device)
 
-            # Combine node and edge representations
-            graph_combined = torch.cat([node_out, edge_out], dim=-1)  # (1, hidden_dim * 2)
-            graph_out = self.relu(self.graph_fc(graph_combined))  # (1, hidden_dim)
+            # Recursive aggregation using adj_list
+            adj = adj_list[i]  # List of lists: [node_idx: [neighbor_indices]]
+            node_agg = node_out.clone()
+            for node_idx, neighbors in enumerate(adj):
+                if neighbors:
+                    neighbor_outs = node_out[neighbors]  # (num_neighbors, hidden_dim)
+                    node_agg[node_idx] = self.relu(node_out[node_idx] + torch.mean(neighbor_outs, dim=0))
+
+            # Graph-level aggregation
+            node_mean = torch.mean(node_agg, dim=0, keepdim=True)  # (1, hidden_dim)
+            edge_mean = torch.mean(edge_out, dim=0, keepdim=True)  # (1, hidden_dim)
+            graph_out = self.relu(self.graph_fc(node_mean + edge_mean))  # (1, hidden_dim)
             pred = self.output_fc(graph_out)  # (1, 1)
-            outputs.append(pred)
+            graph_outputs.append(pred)
 
-        return torch.cat(outputs, dim=0)  # (batch_size, 1)
+        return torch.cat(graph_outputs, dim=0)  # (batch_size, 1)
 
-# Collate function for DataLoader
+# Collate function
 def collate_fn(batch):
     return {
         'adj_list': [item['adj_list'] for item in batch],
@@ -94,20 +105,21 @@ def load_and_split_data(file_path='data_r.pkl'):
     with open(file_path, 'rb') as f:
         data_r = pickle.load(f)
     
-    # Filter schedules with execution_time > 0
     valid_data = [d for d in data_r if d['execution_time'] > 0]
-    
-    # Select 10 schedules for testing
     test_data = valid_data[:10]
     remaining_data = valid_data[10:]
-    
-    # Split remaining into training (80%) and validation (20%)
     train_data, val_data = train_test_split(remaining_data, test_size=0.2, random_state=42)
     
-    return train_data, val_data, test_data
+    # Fit scaler on training data only
+    train_dataset = HalideDataset(train_data)
+    scaler = train_dataset.scaler
+    val_dataset = HalideDataset(val_data, scaler)
+    test_dataset = HalideDataset(test_data, scaler)
+    
+    return train_dataset, val_dataset, test_dataset
 
 # Training function
-def train_model(model, train_loader, val_loader, num_epochs=100, lr=0.001):
+def train_model(model, train_loader, val_loader, num_epochs=100, lr=0.0001):
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -173,8 +185,8 @@ def plot_loss(train_losses, val_losses):
     plt.close()
     print("Loss plot saved as loss_r.png")
 
-# Calculate error percentage
-def evaluate_model(model, test_loader):
+# Evaluate model
+def evaluate_model(model, test_loader, dataset):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.eval()
     predictions = []
@@ -193,6 +205,10 @@ def evaluate_model(model, test_loader):
             predictions.extend(outputs.cpu().numpy().flatten())
             actuals.extend(targets.cpu().numpy().flatten())
     
+    # Inverse transform predictions and actuals
+    predictions = dataset.inverse_transform(np.array(predictions))
+    actuals = dataset.inverse_transform(np.array(actuals))
+    
     error_percentages = [abs(pred - actual) / actual * 100 for pred, actual in zip(predictions, actuals) if actual != 0]
     mean_error_percentage = np.mean(error_percentages)
     
@@ -205,27 +221,23 @@ def evaluate_model(model, test_loader):
 
 # Main execution
 if __name__ == "__main__":
-    train_data, val_data, test_data = load_and_split_data('data_r.pkl')
-    print(f"Train samples: {len(train_data)}, Val samples: {len(val_data)}, Test samples: {len(test_data)}")
-    
-    train_dataset = HalideDataset(train_data)
-    val_dataset = HalideDataset(val_data)
-    test_dataset = HalideDataset(test_data)
+    train_dataset, val_dataset, test_dataset = load_and_split_data('data_r.pkl')
+    print(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}, Test samples: {len(test_dataset)}")
     
     train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True, collate_fn=collate_fn)
     val_loader = DataLoader(val_dataset, batch_size=4, shuffle=False, collate_fn=collate_fn)
     test_loader = DataLoader(test_dataset, batch_size=4, shuffle=False, collate_fn=collate_fn)
     
-    sample = train_data[0]
+    sample = train_dataset.data[0]
     model = RecursiveLSTM(
         node_feature_dim=sample['node_features'].shape[-1],
         node_seq_dim=sample['node_sequences'].shape[-1],
         edge_feature_dim=sample['edge_features'].shape[-1],
         edge_seq_dim=sample['edge_sequences'].shape[-1],
-        hidden_dim=64,
-        lstm_hidden_dim=32
+        hidden_dim=128,
+        lstm_hidden_dim=64
     )
     
-    train_losses, val_losses = train_model(model, train_loader, val_loader, num_epochs=100)
+    train_losses, val_losses = train_model(model, train_loader, val_loader, num_epochs=100, lr=0.0001)
     plot_loss(train_losses, val_losses)
-    mean_error_percentage = evaluate_model(model, test_loader)
+    mean_error_percentage = evaluate_model(model, test_loader, test_dataset)
