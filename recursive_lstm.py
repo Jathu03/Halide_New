@@ -146,7 +146,6 @@ def extract_features_from_file(file_path):
         'vector_op_ratio': op_counts.get('op_vector', 0) / max(total_ops, 1),
         'bytes_per_vector': total_bytes / max(total_vectors, 1e-4),
         'ops_per_byte': total_ops / max(total_bytes, 1e-4),
-        # New interaction features
         'nodes_ops_interaction': num_nodes * total_ops,
         'bytes_parallelism_ratio': total_bytes / max(total_parallelism, 1e-4),
         'vectors_parallelism': total_vectors * total_parallelism
@@ -230,7 +229,6 @@ def prepare_data_for_model(train_features, test_features):
     
     y_train_raw = np.array([f['execution_time'] for f in train_features])
     y_test_raw = np.array([f['execution_time'] for f in test_features])
-    # Tighter clipping to reduce outlier impact
     y_train_raw = np.clip(y_train_raw, 0, np.percentile(y_train_raw, 95))
     y_test_raw = np.clip(y_test_raw, 0, np.percentile(y_test_raw, 95))
     
@@ -269,6 +267,8 @@ class MultiHeadAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
         
+        assert hidden_size % num_heads == 0, f"hidden_size {hidden_size} must be divisible by num_heads {num_heads}"
+        
         self.query = nn.Linear(hidden_size, hidden_size)
         self.key = nn.Linear(hidden_size, hidden_size)
         self.value = nn.Linear(hidden_size, hidden_size)
@@ -277,23 +277,25 @@ class MultiHeadAttention(nn.Module):
         self.scale = torch.sqrt(torch.FloatTensor([self.head_dim]))
     
     def forward(self, x):
-        batch_size = x.shape[0]
+        batch_size, seq_len, hidden_size = x.shape
+        print(f"MultiHeadAttention input shape: {x.shape}")
         
-        Q = self.query(x).view(batch_size, -1, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
-        K = self.key(x).view(batch_size, -1, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
-        V = self.value(x).view(batch_size, -1, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        Q = self.query(x).view(batch_size, seq_len, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        K = self.key(x).view(batch_size, seq_len, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        V = self.value(x).view(batch_size, seq_len, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
         
         energy = torch.matmul(Q, K.transpose(-1, -2)) / self.scale.to(x.device)
         attention = torch.softmax(energy, dim=-1)
         attention = self.dropout(attention)
         out = torch.matmul(attention, V).permute(0, 2, 1, 3).contiguous()
-        out = out.view(batch_size, -1, self.hidden_size)
+        out = out.view(batch_size, seq_len, self.hidden_size)
         out = self.fc_out(out)
         
+        print(f"MultiHeadAttention output shape: {out.shape}")
         return out
 
 class EnhancedRecursiveLSTMModel(nn.Module):
-    def __init__(self, seq_input_size, scalar_input_size, hidden_sizes=[768, 512, 256, 128], output_size=1, dropout_rate=0.15, num_heads=12):
+    def __init__(self, seq_input_size, scalar_input_size, hidden_sizes=[768, 512, 256, 128], output_size=1, dropout_rate=0.15, num_heads=8):
         super(EnhancedRecursiveLSTMModel, self).__init__()
         
         self.lstm_layers = nn.ModuleList()
@@ -301,7 +303,7 @@ class EnhancedRecursiveLSTMModel(nn.Module):
         self.lstm_layers.append(nn.LSTM(seq_input_size, hidden_sizes[0], batch_first=True, bidirectional=True))
         self.ln_layers.append(nn.LayerNorm(hidden_sizes[0] * 2))
         for i in range(1, len(hidden_sizes)):
-            self.lstm_layers.append(nn.LSTM(hidden_sizes[i-1] * 2, hidden_sizes[i], batch_first=True, bidirectional=True))
+            self.lstm_layers.append(nn Neanderthal-LSTM(hidden_sizes[i-1] * 2, hidden_sizes[i], batch_first=True, bidirectional=True))
             self.ln_layers.append(nn.LayerNorm(hidden_sizes[i] * 2))
         
         self.attention = MultiHeadAttention(hidden_sizes[-1] * 2, num_heads, dropout_rate)
@@ -566,7 +568,7 @@ def main(main_dir):
         hidden_sizes=[768, 512, 256, 128],
         output_size=1,
         dropout_rate=0.15,
-        num_heads=12
+        num_heads=8
     )
     
     optimizer = optim.AdamW(model.parameters(), lr=0.00002, weight_decay=1e-4)
