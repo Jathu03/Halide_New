@@ -155,7 +155,7 @@ class HalideDataset(Dataset):
         # Initialize data_list before parent class init
         self.data_list = data_list if data_list is not None else []
         super(HalideDataset, self).__init__(root)
-        self.processed_dir = os.path.join(root, 'processed')
+        # Use the inherited processed_dir property and ensure directory exists
         os.makedirs(self.processed_dir, exist_ok=True)
     
     @property
