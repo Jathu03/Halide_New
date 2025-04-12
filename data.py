@@ -1,198 +1,245 @@
 import os
 import json
+import torch
+import torch_geometric
+from torch_geometric.data import Data, Dataset
 import numpy as np
-from pathlib import Path
-from typing import List, Dict, Any
-import re
+from collections import defaultdict
 import pickle
 
-def extract_numerical_features(data: Dict[str, Any]) -> np.ndarray:
-    """
-    Extract numerical features from a dictionary, handling lists and nested structures.
-    Returns a flattened numpy array of numerical values.
-    """
-    numerical_features = []
-
-    def parse_value(value: Any):
-        if isinstance(value, (int, float)):
-            numerical_features.append(float(value))
-        elif isinstance(value, list):
-            for item in value:
-                parse_value(item)
-        elif isinstance(value, dict):
-            for k, v in value.items():
-                parse_value(v)
-        elif isinstance(value, str):
-            # Try to extract numbers from strings (e.g., "1/8" -> 0.125)
-            try:
-                if '/' in value:
-                    num, denom = map(float, value.split('/'))
-                    numerical_features.append(num / denom)
-                else:
-                    numerical_features.append(float(value))
-            except (ValueError, TypeError):
-                pass  # Skip non-numerical strings
-
-    parse_value(data)
-    return np.array(numerical_features, dtype=np.float32)
-
-def process_sequential_data(data: List[str]) -> np.ndarray:
-    """
-    Process sequential data (e.g., memory access patterns, footprints) into a numerical sequence.
-    Returns a padded numpy array for consistent length.
-    """
-    sequence = []
-    for item in data:
-        # Extract numbers from strings using regex
-        numbers = re.findall(r'-?\d*\.?\d+', item)
-        sequence.extend([float(n) for n in numbers])
-    # Pad or truncate to a fixed length (e.g., 100) for consistency
-    max_len = 100
-    if len(sequence) < max_len:
-        sequence.extend([0.0] * (max_len - len(sequence)))
-    else:
-        sequence = sequence[:max_len]
-    return np.array(sequence, dtype=np.float32)
-
-def create_graph_representation(program_data: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Create a graph representation for a single program.
-    Returns a dictionary with nodes, edges, features, and target.
-    """
-    nodes = program_data['programming_details']['Nodes']
-    edges = program_data['programming_details']['Edges']
+# Define a function to parse a single JSON file and create a graph representation
+def parse_json_file(file_path):
+    with open(file_path, 'r') as f:
+        data = json.load(f)
+    
+    # Extract programming details
+    edges_data = data.get('programming_details', {}).get('Edges', [])
+    nodes_data = data.get('programming_details', {}).get('Nodes', [])
     
     # Extract execution time from scheduling_data
-    scheduling_data = program_data.get('scheduling_data', [])
+    scheduling_data = data.get('scheduling_data', [])
     execution_time = None
     for item in scheduling_data:
-        if isinstance(item, dict) and item.get('name') == 'total_execution_time_ms':
+        if item.get('name') == 'total_execution_time_ms':
             execution_time = item.get('value')
             break
-
     if execution_time is None:
-        raise ValueError("Execution time not found in scheduling_data")
-
-    # Node mapping (name to index)
-    node_map = {node['Name']: idx for idx, node in enumerate(nodes)}
-
-    # Initialize graph components
-    num_nodes = len(nodes)
-    adj_list = [[] for _ in range(num_nodes)]  # Adjacency list for edges
+        raise ValueError(f"No execution time found in {file_path}")
+    
+    # Create node mapping (name to index)
+    node_name_to_idx = {node['Name']: idx for idx, node in enumerate(nodes_data)}
+    
+    # Initialize lists for graph construction
+    edge_index = []
+    edge_attr = []
     node_features = []
-    node_sequences = []  # For LSTM processing
-    edge_features = []
-    edge_sequences = []
-
+    node_sequences = []  # For LSTM input (sequential features)
+    
     # Process nodes
-    for node in nodes:
-        details = node['Details']
-        # Extract numerical features
-        numerical = extract_numerical_features(details)
-        node_features.append(numerical)
+    for node in nodes_data:
+        node_name = node['Name']
+        details = node.get('Details', {})
         
-        # Extract sequential data (e.g., memory access patterns, region computed)
-        seq_data = []
-        if 'Memory access patterns' in details:
-            seq_data.extend(details['Memory access patterns'])
-        if 'Region computed' in details:
-            seq_data.extend(details['Region computed'])
-        if 'Op histogram' in details:
-            seq_data.extend(details['Op histogram'])
-        node_sequences.append(process_sequential_data(seq_data))
-
-    # Process edges
-    for edge in edges:
-        from_node = edge['From']
-        to_node = edge['To']
-        if from_node in node_map and to_node in node_map:
-            from_idx = node_map[from_node]
-            to_idx = node_map[to_node]
-            adj_list[from_idx].append(to_idx)
-            
-            # Extract edge features
-            details = edge['Details']
-            numerical = extract_numerical_features(details)
-            edge_features.append(numerical)
-            
-            # Extract sequential data (Footprint, Load Jacobians)
-            seq_data = []
-            if 'Footprint' in details:
-                seq_data.extend(details['Footprint'])
-            if 'Load Jacobians' in details:
-                seq_data.extend(details['Load Jacobians'])
-            edge_sequences.append(process_sequential_data(seq_data))
-
-    # Pad node and edge features to fixed length
-    max_node_feat_len = max(len(f) for f in node_features) if node_features else 1
-    max_edge_feat_len = max(len(f) for f in edge_features) if edge_features else 1
-
-    node_features = [
-        np.pad(f, (0, max_node_feat_len - len(f)), mode='constant') if len(f) < max_node_feat_len else f[:max_node_feat_len]
-        for f in node_features
-    ]
-    edge_features = [
-        np.pad(f, (0, max_edge_feat_len - len(f)), mode='constant') if len(f) < max_edge_feat_len else f[:max_edge_feat_len]
-        for f in edge_features
-    ]
-
-    return {
-        'adj_list': adj_list,
-        'node_features': np.array(node_features, dtype=np.float32),
-        'node_sequences': np.array(node_sequences, dtype=np.float32),
-        'edge_features': np.array(edge_features, dtype=np.float32),
-        'edge_sequences': np.array(edge_sequences, dtype=np.float32),
-        'execution_time': float(execution_time)
-    }
-
-def create_dataset(data_dir: str = 'synthetic_data') -> List[Dict[str, Any]]:
-    """
-    Create a dataset named data_r from all JSON files in the synthetic_data folder.
-    Saves the dataset to data_r.pkl for access in other scripts.
-    Returns the dataset as a list of graph representations.
-    """
-    data_r = []
-    data_path = Path(data_dir)
-
-    if not data_path.exists():
-        raise FileNotFoundError(f"Directory {data_dir} does not exist")
-
-    # Iterate through subfolders
-    for subfolder in data_path.iterdir():
-        if subfolder.is_dir():
-            # Iterate through JSON files in subfolder
-            for json_file in subfolder.glob('*.json'):
+        # Structural features (for GNN)
+        # Example: Op histogram and memory access patterns
+        op_histogram = details.get('Op histogram', [])
+        op_features = []
+        for op in op_histogram:
+            # Extract numerical value from strings like "Constant:   5"
+            try:
+                value = float(op.split(':')[-1].strip())
+                op_features.append(value)
+            except:
+                op_features.append(0.0)
+        
+        memory_patterns = details.get('Memory access patterns', [])
+        memory_features = []
+        for pattern in memory_patterns:
+            # Extract numerical values from strings like "Pointwise:      1 0 0 1"
+            try:
+                values = [float(x) for x in pattern.split(':')[-1].strip().split()]
+                memory_features.extend(values)
+            except:
+                memory_features.extend([0.0] * 4)  # Assume 4 values per pattern
+        
+        # Pad or truncate to fixed length
+        max_op_len = 24  # Adjust based on max op histogram length
+        max_mem_len = 32  # Adjust based on max memory patterns (e.g., 8 patterns * 4 values)
+        op_features = (op_features + [0.0] * max_op_len)[:max_op_len]
+        memory_features = (memory_features + [0.0] * max_mem_len)[:max_mem_len]
+        
+        structural_features = op_features + memory_features
+        
+        # Sequential features (for LSTM)
+        # Example: Scheduling features as a sequence
+        scheduling_features = details.get('scheduling_feature', {})
+        seq_features = []
+        if scheduling_features:
+            # Convert scheduling features to a sequence
+            for key, value in scheduling_features.items():
                 try:
-                    with open(json_file, 'r') as f:
-                        program_data = json.load(f)
-                    graph_data = create_graph_representation(program_data)
-                    data_r.append(graph_data)
-                    print(f"Processed {json_file}")
-                except Exception as e:
-                    print(f"Error processing {json_file}: {e}")
+                    seq_features.append(float(value))
+                except:
+                    seq_features.append(0.0)
+        else:
+            # Fallback: Use memory patterns as sequence
+            seq_features = memory_features[:]
+        
+        # Pad or truncate sequential features
+        max_seq_len = 50  # Adjust based on max scheduling features
+        seq_features = (seq_features + [0.0] * max_seq_len)[:max_seq_len]
+        
+        node_features.append(structural_features)
+        node_sequences.append(seq_features)
+    
+    # Process edges
+    for edge in edges_data:
+        from_node = edge.get('From')
+        to_node = edge.get('To')
+        if from_node in node_name_to_idx and to_node in node_name_to_idx:
+            from_idx = node_name_to_idx[from_node]
+            to_idx = node_name_to_idx[to_node]
+            edge_index.append([from_idx, to_idx])
+            
+            # Edge features (e.g., Load Jacobians, Footprint transformations)
+            details = edge.get('Details', {})
+            jacobians = details.get('Load Jacobians', [])
+            footprint = details.get('Footprint', [])
+            
+            edge_features = []
+            # Process Jacobians
+            for jac in jacobians:
+                try:
+                    values = [float(x) for x in jac.strip().split()]
+                    edge_features.extend(values)
+                except:
+                    edge_features.extend([0.0] * 4)  # Adjust based on Jacobian size
+            
+            # Process Footprint (simplified: extract numerical values)
+            for fp in footprint:
+                try:
+                    # Extract numbers from strings like "Min 0: (upsampled_linear__0._0.min/8)"
+                    import re
+                    numbers = re.findall(r'[-+]?\d*\.\d+|\d+', fp)
+                    values = [float(x) for x in numbers]
+                    edge_features.extend(values)
+                except:
+                    edge_features.append(0.0)
+            
+            # Pad or truncate edge features
+            max_edge_len = 50  # Adjust based on max edge feature length
+            edge_features = (edge_features + [0.0] * max_edge_len)[:max_edge_len]
+            edge_attr.append(edge_features)
+    
+    # Convert to tensors
+    x = torch.tensor(node_features, dtype=torch.float)
+    node_sequences = torch.tensor(node_sequences, dtype=torch.float)  # Shape: [num_nodes, seq_len]
+    edge_index = torch.tensor(edge_index, dtype=torch.long).t().contiguous()
+    edge_attr = torch.tensor(edge_attr, dtype=torch.float)
+    y = torch.tensor([execution_time], dtype=torch.float)
+    
+    # Create PyTorch Geometric Data object
+    data = Data(
+        x=x,
+        edge_index=edge_index,
+        edge_attr=edge_attr,
+        y=y,
+        node_sequences=node_sequences  # Custom attribute for LSTM
+    )
+    
+    return data
 
-    # Save the dataset to a pickle file
-    try:
-        with open('data_r.pkl', 'wb') as f:
-            pickle.dump(data_r, f)
-        print("Dataset data_r saved to data_r.pkl")
-    except Exception as e:
-        print(f"Failed to save data_r.pkl: {e}")
+# Define a custom Dataset class
+class HalideDataset(Dataset):
+    def __init__(self, data_list, root='data_g'):
+        self.data_list = data_list
+        super(HalideDataset, self).__init__(root)
+    
+    def len(self):
+        return len(self.data_list)
+    
+    def get(self, idx):
+        return self.data_list[idx]
+    
+    def process(self):
+        # Save processed data
+        os.makedirs(self.root, exist_ok=True)
+        for i, data in enumerate(self.data_list):
+            torch.save(data, os.path.join(self.root, f'data_{i}.pt'))
 
-    return data_r
+# Main function to process all files
+def create_dataset(data_dir='synthetic_data', output_dir='data_g'):
+    data_list = []
+    
+    # Iterate through all subfolders and files
+    for program_folder in os.listdir(data_dir):
+        program_path = os.path.join(data_dir, program_folder)
+        if not os.path.isdir(program_path):
+            continue
+        
+        for file_name in os.listdir(program_path):
+            if not file_name.endswith('.json'):
+                continue
+            
+            file_path = os.path.join(program_path, file_name)
+            try:
+                data = parse_json_file(file_path)
+                data_list.append(data)
+                print(f"Processed {file_path}")
+            except Exception as e:
+                print(f"Error processing {file_path}: {str(e)}")
+    
+    # Create and save dataset
+    dataset = HalideDataset(data_list, root=output_dir)
+    dataset.process()
+    
+    # Save dataset metadata
+    with open(os.path.join(output_dir, 'metadata.pkl'), 'wb') as f:
+        pickle.dump({
+            'num_graphs': len(data_list),
+            'node_feature_dim': data_list[0].x.shape[1] if data_list else 0,
+            'edge_feature_dim': data_list[0].edge_attr.shape[1] if data_list and data_list[0].edge_attr.numel() > 0 else 0,
+            'seq_feature_dim': data_list[0].node_sequences.shape[1] if data_list else 0
+        }, f)
+    
+    print(f"Dataset saved to {output_dir} with {len(data_list)} graphs")
+    return dataset
 
-# Create the dataset
-if __name__ == '__main__':
-    try:
-        data_r = create_dataset('synthetic_data')
-        print(f"Dataset data_r created with {len(data_r)} samples")
-        # Example: Print first sample structure
-        if data_r:
-            print("Sample data structure:")
-            for key, value in data_r[0].items():
-                if isinstance(value, np.ndarray):
-                    print(f"{key}: shape {value.shape}")
-                else:
-                    print(f"{key}: {value}")
-    except Exception as e:
-        print(f"Failed to create dataset data_r: {e}")
+# Example GNN+LSTM model (for reference, not trained here)
+import torch.nn as nn
+from torch_geometric.nn import GCNConv
+
+class GNNLSTMModel(nn.Module):
+    def __init__(self, node_dim, edge_dim, seq_dim, hidden_dim, lstm_layers=2):
+        super(GNNLSTMModel, self).__init__()
+        self.gnn1 = GCNConv(node_dim, hidden_dim)
+        self.gnn2 = GCNConv(hidden_dim, hidden_dim)
+        self.lstm = nn.LSTM(seq_dim, hidden_dim // 2, lstm_layers, batch_first=True)
+        self.fc = nn.Linear(hidden_dim + hidden_dim // 2, 1)
+        self.relu = nn.ReLU()
+    
+    def forward(self, data):
+        x, edge_index, edge_attr, node_sequences = data.x, data.edge_index, data.edge_attr, data.node_sequences
+        
+        # GNN part
+        x = self.gnn1(x, edge_index)
+        x = self.relu(x)
+        x = self.gnn2(x, edge_index)
+        gnn_out = self.relu(x)  # [num_nodes, hidden_dim]
+        
+        # LSTM part
+        lstm_out, _ = self.lstm(node_sequences)  # [num_nodes, seq_len, hidden_dim // 2]
+        lstm_out = lstm_out[:, -1, :]  # Take last output: [num_nodes, hidden_dim // 2]
+        
+        # Combine
+        combined = torch.cat([gnn_out, lstm_out], dim=1)  # [num_nodes, hidden_dim + hidden_dim // 2]
+        
+        # Global pooling (e.g., mean) and predict
+        out = combined.mean(dim=0)  # [hidden_dim + hidden_dim // 2]
+        out = self.fc(out)  # [1]
+        return out
+
+# Run the dataset creation
+if __name__ == "__main__":
+    dataset = create_dataset(data_dir='synthetic_data', output_dir='data_g')
+    print("Dataset creation completed.")
