@@ -48,7 +48,7 @@ class HalideDataset(Dataset):
     def inverse_transform_time(self, scaled_values):
         return self.time_scaler.inverse_transform(scaled_values.reshape(-1, 1)).flatten()
 
-# Graph Convolution Layer (simplified)
+# Graph Convolution Layer
 class GraphConv(nn.Module):
     def __init__(self, in_dim, out_dim):
         super(GraphConv, self).__init__()
@@ -70,12 +70,12 @@ class GraphConv(nn.Module):
                 for dst in neighbors:
                     adj_matrix[src, dst] = 1.0
             
-            # Normalize adjacency (simplified)
+            # Normalize adjacency
             degree = torch.sum(adj_matrix, dim=1).clamp(min=1)
             norm_adj = adj_matrix / degree.unsqueeze(1)
             
-            # Graph convolution: aggregate neighbors
-            aggregated = torch.matmul(norm_adj, nodes)  # (num_nodes, in_dim)
+            # Graph convolution
+            aggregated = torch.matmul(norm_adj, nodes)
             updated = self.leaky_relu(self.linear(aggregated + nodes))  # Residual connection
             updated_nodes.append(updated)
         
@@ -90,7 +90,7 @@ class Attention(nn.Module):
 
     def forward(self, features):
         scores = self.attn(torch.cat([features, features], dim=-1))  # (num_nodes, 1)
-        weights = self.softmax(scores)  # (num_nodes, 1)
+        weights = self.softmax(scores)
         return torch.sum(features * weights, dim=0, keepdim=True)  # (1, hidden_dim)
 
 # Enhanced Recursive LSTM Model
@@ -141,8 +141,9 @@ class RecursiveLSTM(nn.Module):
 
             # Graph-level processing
             graph_combined = torch.cat([node_agg, edge_agg], dim=-1)  # (1, hidden_dim * 2)
-            graph_out = self.dropout(self.leaky_relu(self.graph_fc(graph_combined)))
-            pred = self.output_fc(graph_out + graph_combined)  # Residual connection
+            graph_out = self.dropout(self.leaky_relu(self.graph_fc(graph_combined)))  # (1, hidden_dim)
+            residual = self.graph_fc(graph_combined)  # (1, hidden_dim) to match graph_out
+            pred = self.output_fc(self.leaky_relu(graph_out + residual))  # Fixed residual connection
             graph_outputs.append(pred)
 
         return torch.cat(graph_outputs, dim=0)  # (batch_size, 1)
