@@ -152,20 +152,27 @@ def parse_json_file(file_path):
 # Define a custom Dataset class
 class HalideDataset(Dataset):
     def __init__(self, data_list, root='data_g'):
-        self.data_list = data_list
         super(HalideDataset, self).__init__(root)
+        self.data_list = data_list
+        self.processed_dir = os.path.join(root, 'processed')
+        os.makedirs(self.processed_dir, exist_ok=True)
+    
+    @property
+    def processed_file_names(self):
+        # Define the names of the processed files
+        return [f'data_{i}.pt' for i in range(len(self.data_list))]
     
     def len(self):
         return len(self.data_list)
     
     def get(self, idx):
-        return self.data_list[idx]
+        data = torch.load(os.path.join(self.processed_dir, f'data_{idx}.pt'))
+        return data
     
     def process(self):
-        # Save processed data
-        os.makedirs(self.root, exist_ok=True)
+        # Process and save data files
         for i, data in enumerate(self.data_list):
-            torch.save(data, os.path.join(self.root, f'data_{i}.pt'))
+            torch.save(data, os.path.join(self.processed_dir, f'data_{i}.pt'))
 
 # Main function to process all files
 def create_dataset(data_dir='synthetic_data', output_dir='data_g'):
@@ -189,12 +196,15 @@ def create_dataset(data_dir='synthetic_data', output_dir='data_g'):
             except Exception as e:
                 print(f"Error processing {file_path}: {str(e)}")
     
-    # Create and save dataset
+    # Create dataset
     dataset = HalideDataset(data_list, root=output_dir)
+    
+    # Process and save the dataset
     dataset.process()
     
     # Save dataset metadata
-    with open(os.path.join(output_dir, 'metadata.pkl'), 'wb') as f:
+    metadata_path = os.path.join(output_dir, 'metadata.pkl')
+    with open(metadata_path, 'wb') as f:
         pickle.dump({
             'num_graphs': len(data_list),
             'node_feature_dim': data_list[0].x.shape[1] if data_list else 0,
