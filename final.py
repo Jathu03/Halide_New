@@ -2,13 +2,14 @@ import os
 import json
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.preprocessing import StandardScaler
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 import random
+import matplotlib.pyplot as plt  # Added for plotting
 
 def get_execution_time(file_path):
     try:
@@ -506,6 +507,19 @@ def main(main_dir):
         patience=20
     )
     
+    # Plot and save training and validation loss
+    plt.figure(figsize=(10, 6))
+    plt.plot(range(1, len(train_losses) + 1), train_losses, label='Training Loss')
+    plt.plot(range(1, len(val_losses) + 1), val_losses, label='Validation Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('Training and Validation Loss over Epochs')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig('loss_enhanced_model.png')
+    plt.close()
+    print("Training plot saved as 'loss_enhanced_model.png'")
+    
     # Evaluate model
     print("\nEvaluating model:")
     y_test_actual, y_pred_actual = evaluate_model(model, X_test, y_test, y_scaler, test_file_names, is_log_transformed)
@@ -541,4 +555,6 @@ if __name__ == "__main__":
     random.seed(42)
     
     # Run the main function to train and test
-    model, y_scaler, y_test_actual, y_pred_actual = main(main_dir)
+    result = main(main_dir)
+    if result is not None:
+        model, y_scaler, y_test_actual, y_pred_actual = result
