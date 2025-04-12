@@ -223,7 +223,6 @@ def clean_and_transform_features(train_features, test_features):
     all_features_df = all_features_df.drop(columns=constant_columns)
     print(f"Dropped {len(constant_columns)} constant columns")
     
-    # Always apply log transformation to execution time
     if 'execution_time' in all_features_df.columns:
         all_features_df['execution_time_log'] = np.log1p(all_features_df['execution_time'])
     
@@ -242,7 +241,6 @@ def clean_and_transform_features(train_features, test_features):
 def prepare_data_for_model(train_features, test_features):
     train_df, test_df = clean_and_transform_features(train_features, test_features)
     
-    # Use log-transformed execution time if available
     if 'execution_time_log' in train_df.columns:
         y_train = train_df['execution_time_log'].values.reshape(-1, 1)
         y_test = test_df['execution_time_log'].values.reshape(-1, 1)
@@ -256,7 +254,6 @@ def prepare_data_for_model(train_features, test_features):
         test_df = test_df.drop('execution_time', axis=1)
         is_log_transformed = False
     
-    # Debug: Print raw and transformed target values
     print("\nDebugging target values in prepare_data_for_model:")
     print(f"First 5 y_train raw: {y_train[:5].flatten()}")
     print(f"First 5 y_test raw: {y_test[:5].flatten()}")
@@ -283,7 +280,7 @@ def prepare_data_for_model(train_features, test_features):
             scaler_y, X_train_scaled.shape[1], is_log_transformed)
 
 class EnhancedLSTMModel(nn.Module):
-    def __init__(self, input_size, hidden_sizes=[128, 64, 32], output_size=1, dropout_rate=0.3):
+    def __init__(self, input_size, hidden_sizes=[256, 128, 64, 32], output_size=1, dropout_rate=0.2):
         super(EnhancedLSTMModel, self).__init__()
         
         self.lstm_layers = nn.ModuleList()
@@ -349,7 +346,7 @@ class EnhancedLSTMModel(nn.Module):
         
         return output
 
-def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=16):
+def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=8):
     train_dataset = TensorDataset(X_train, y_train)
     test_dataset = TensorDataset(X_test, y_test)
     
@@ -358,12 +355,12 @@ def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=16):
     
     return train_loader, test_loader
 
-def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=150, patience=20):
+def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=200, patience=30):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     model.to(device)
     
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10, verbose=True)
     
     best_val_loss = float('inf')
     epochs_no_improve = 0
@@ -434,16 +431,13 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_tran
     y_pred_scaled = y_pred_scaled.cpu().numpy()
     y_test = y_test.cpu().numpy()
     
-    # Inverse transform the scaled values
     y_test_transformed = y_scaler.inverse_transform(y_test)
     y_pred_transformed = y_scaler.inverse_transform(y_pred_scaled)
     
-    # Debugging: Print transformed values before inverse log
     print("\nDebugging transformed values before inverse log:")
     for i in range(min(5, len(y_test_transformed))):
         print(f"Sample {i}: y_test_transformed={y_test_transformed[i][0]}, y_pred_transformed={y_pred_transformed[i][0]}")
     
-    # Apply inverse log transformation if needed
     if is_log_transformed:
         y_test_actual = np.expm1(y_test_transformed)
         y_pred_actual = np.expm1(y_pred_transformed)
@@ -451,7 +445,6 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_tran
         y_test_actual = y_test_transformed
         y_pred_actual = y_pred_transformed
     
-    # Debugging: Print final actual and predicted values
     print("\nDebugging final values after all transformations:")
     for i in range(min(5, len(y_test_actual))):
         print(f"Sample {i}: y_test_actual={y_test_actual[i][0]}, y_pred_actual={y_pred_actual[i][0]}")
@@ -507,30 +500,24 @@ def main(main_dir):
         print("Error: No valid training or test data found")
         return None
     
-    # Collect original execution times for debugging
     original_execution_times = {}
     for feature, fname in zip(test_features, test_file_names):
         original_execution_times[fname] = feature['execution_time']
     
-    # Prepare data for model
     X_train, y_train, X_test, y_test, y_scaler, input_size, is_log_transformed = prepare_data_for_model(train_features, test_features)
     
-    # Create data loaders
-    train_loader, test_loader = create_data_loaders(X_train, y_train, X_test, y_test, batch_size=16)
+    train_loader, test_loader = create_data_loaders(X_train, y_train, X_test, y_test, batch_size=8)
     
-    # Initialize enhanced model
     model = EnhancedLSTMModel(
         input_size=input_size,
-        hidden_sizes=[128, 64, 32],
+        hidden_sizes=[256, 128, 64, 32],
         output_size=1,
-        dropout_rate=0.3
+        dropout_rate=0.2
     )
     
-    # Define loss function and optimizer
-    criterion = nn.HuberLoss(delta=1.0)
-    optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-5)
+    criterion = nn.HuberLoss(delta=0.5)
+    optimizer = optim.AdamW(model.parameters(), lr=0.0005, weight_decay=1e-5)
     
-    # Build and train model
     print("Building and training Enhanced LSTM model...")
     train_losses, val_losses = train_model(
         model, 
@@ -538,11 +525,10 @@ def main(main_dir):
         test_loader, 
         criterion, 
         optimizer, 
-        num_epochs=150,
-        patience=20
+        num_epochs=200,
+        patience=30
     )
     
-    # Plot and save training and validation loss
     plt.figure(figsize=(10, 6))
     plt.plot(range(1, len(train_losses) + 1), train_losses, label='Training Loss')
     plt.plot(range(1, len(val_losses) + 1), val_losses, label='Validation Loss')
@@ -555,17 +541,14 @@ def main(main_dir):
     plt.close()
     print("Training plot saved as 'loss_enhanced_model.png'")
     
-    # Evaluate model
     print("\nEvaluating model:")
     y_test_actual, y_pred_actual = evaluate_model(
         model, X_test, y_test, y_scaler, test_file_names, 
         is_log_transformed, original_execution_times
     )
     
-    # Save the trained model as a .pt file using TorchScript
     print("\nSaving the trained model as 'lstm_model.pt'...")
     model.eval()
-    
     device = next(model.parameters()).device
     print(f"Model is on device: {device}")
     
