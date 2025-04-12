@@ -5,48 +5,106 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import MinMaxScaler
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
 from typing import List, Dict, Any
 
 # Set random seed for reproducibility
 torch.manual_seed(42)
 np.random.seed(42)
 
-# Custom Dataset class with normalization
+# Custom Dataset class with feature normalization
 class HalideDataset(Dataset):
-    def __init__(self, data: List[Dict[str, Any]], scaler=None):
+    def __init__(self, data: List[Dict[str, Any]], time_scaler=None, feature_scaler=None):
         self.data = data
-        self.scaler = scaler if scaler else MinMaxScaler()
+        self.time_scaler = time_scaler if time_scaler else MinMaxScaler()
+        self.feature_scaler = feature_scaler if feature_scaler else StandardScaler()
+        
+        # Scale execution times
         execution_times = np.array([d['execution_time'] for d in data]).reshape(-1, 1)
-        self.scaler.fit(execution_times) if not scaler else None
-        self.scaled_times = self.scaler.transform(execution_times)
-
+        self.time_scaler.fit(execution_times) if not time_scaler else None
+        self.scaled_times = self.time_scaler.transform(execution_times)
+        
+        # Scale node and edge features
+        node_features = np.concatenate([d['node_features'] for d in data], axis=0)
+        edge_features = np.concatenate([d['edge_features'] for d in data if d['edge_features'].size > 0], axis=0) if any(d['edge_features'].size > 0 for d in data) else np.array([])
+        self.feature_scaler.fit(node_features) if not feature_scaler and node_features.size > 0 else None
+        
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, idx):
         sample = self.data[idx]
+        node_feats = self.feature_scaler.transform(sample['node_features']) if sample['node_features'].size > 0 else sample['node_features']
+        edge_feats = self.feature_scaler.transform(sample['edge_features']) if sample['edge_features'].size > 0 else sample['edge_features']
         return {
             'adj_list': sample['adj_list'],
-            'node_features': torch.tensor(sample['node_features'], dtype=torch.float32),
+            'node_features': torch.tensor(node_feats, dtype=torch.float32),
             'node_sequences': torch.tensor(sample['node_sequences'], dtype=torch.float32),
-            'edge_features': torch.tensor(sample['edge_features'], dtype=torch.float32),
+            'edge_features': torch.tensor(edge_feats, dtype=torch.float32),
             'edge_sequences': torch.tensor(sample['edge_sequences'], dtype=torch.float32),
             'execution_time': torch.tensor(self.scaled_times[idx], dtype=torch.float32)
         }
 
-    def inverse_transform(self, scaled_values):
-        return self.scaler.inverse_transform(scaled_values.reshape(-1, 1)).flatten()
+    def inverse_transform_time(self, scaled_values):
+        return self.time_scaler.inverse_transform(scaled_values.reshape(-1, 1)).flatten()
 
-# Recursive LSTM Model with improved gradient flow
+# Graph Convolution Layer (simplified)
+class GraphConv(nn.Module):
+    def __init__(self, in_dim, out_dim):
+        super(GraphConv, self).__init__()
+        self.linear = nn.Linear(in_dim, out_dim)
+        self.leaky_relu = nn.LeakyReLU(0.1)
+
+    def forward(self, node_features, adj_list, device):
+        batch_size = len(node_features)
+        updated_nodes = []
+        
+        for i in range(batch_size):
+            nodes = node_features[i]  # (num_nodes, in_dim)
+            adj = adj_list[i]
+            num_nodes = nodes.size(0)
+            
+            # Build adjacency matrix
+            adj_matrix = torch.zeros(num_nodes, num_nodes, device=device)
+            for src, neighbors in enumerate(adj):
+                for dst in neighbors:
+                    adj_matrix[src, dst] = 1.0
+            
+            # Normalize adjacency (simplified)
+            degree = torch.sum(adj_matrix, dim=1).clamp(min=1)
+            norm_adj = adj_matrix / degree.unsqueeze(1)
+            
+            # Graph convolution: aggregate neighbors
+            aggregated = torch.matmul(norm_adj, nodes)  # (num_nodes, in_dim)
+            updated = self.leaky_relu(self.linear(aggregated + nodes))  # Residual connection
+            updated_nodes.append(updated)
+        
+        return updated_nodes
+
+# Attention Mechanism
+class Attention(nn.Module):
+    def __init__(self, hidden_dim):
+        super(Attention, self).__init__()
+        self.attn = nn.Linear(hidden_dim * 2, 1)
+        self.softmax = nn.Softmax(dim=1)
+
+    def forward(self, features):
+        scores = self.attn(torch.cat([features, features], dim=-1))  # (num_nodes, 1)
+        weights = self.softmax(scores)  # (num_nodes, 1)
+        return torch.sum(features * weights, dim=0, keepdim=True)  # (1, hidden_dim)
+
+# Enhanced Recursive LSTM Model
 class RecursiveLSTM(nn.Module):
     def __init__(self, node_feature_dim, node_seq_dim, edge_feature_dim, edge_seq_dim, hidden_dim=256, lstm_hidden_dim=128):
         super(RecursiveLSTM, self).__init__()
         self.node_lstm = nn.LSTM(node_seq_dim, lstm_hidden_dim, batch_first=True, num_layers=2, dropout=0.2, bidirectional=True)
         self.edge_lstm = nn.LSTM(edge_seq_dim, lstm_hidden_dim, batch_first=True, num_layers=2, dropout=0.2, bidirectional=True)
-        self.node_fc = nn.Linear(node_feature_dim + lstm_hidden_dim * 2, hidden_dim)  # *2 for bidirectional
-        self.edge_fc = nn.Linear(edge_feature_dim + lstm_hidden_dim * 2, hidden_dim)  # *2 for bidirectional
-        self.graph_fc = nn.Linear(hidden_dim, hidden_dim)
+        self.node_embed = nn.Linear(node_feature_dim + lstm_hidden_dim * 2, hidden_dim)
+        self.edge_embed = nn.Linear(edge_feature_dim + lstm_hidden_dim * 2, hidden_dim)
+        self.graph_conv = GraphConv(hidden_dim, hidden_dim)
+        self.node_attention = Attention(hidden_dim)
+        self.edge_attention = Attention(hidden_dim)
+        self.graph_fc = nn.Linear(hidden_dim * 2, hidden_dim)
         self.output_fc = nn.Linear(hidden_dim, 1)
         self.leaky_relu = nn.LeakyReLU(0.1)
         self.dropout = nn.Dropout(0.2)
@@ -54,38 +112,37 @@ class RecursiveLSTM(nn.Module):
     def forward(self, adj_list, node_features, node_sequences, edge_features, edge_sequences):
         batch_size = len(node_features)
         graph_outputs = []
+        device = node_features[0].device
 
         for i in range(batch_size):
             # Node processing
             node_seq = node_sequences[i].unsqueeze(0)  # (1, nodes, seq_len)
             node_seq_out, _ = self.node_lstm(node_seq)  # (1, nodes, lstm_hidden_dim * 2)
             node_feat = node_features[i]  # (nodes, node_feature_dim)
-            node_combined = torch.cat([node_feat, node_seq_out.squeeze(0)], dim=-1)  # (nodes, node_feature_dim + lstm_hidden_dim * 2)
-            node_out = self.leaky_relu(self.node_fc(node_combined))  # (nodes, hidden_dim)
+            node_combined = torch.cat([node_feat, node_seq_out.squeeze(0)], dim=-1)
+            node_embed = self.leaky_relu(self.node_embed(node_combined))  # (nodes, hidden_dim)
 
             # Edge processing
             edge_seq = edge_sequences[i].unsqueeze(0)  # (1, edges, seq_len)
             if edge_seq.size(1) > 0:
                 edge_seq_out, _ = self.edge_lstm(edge_seq)  # (1, edges, lstm_hidden_dim * 2)
                 edge_feat = edge_features[i]  # (edges, edge_feature_dim)
-                edge_combined = torch.cat([edge_feat, edge_seq_out.squeeze(0)], dim=-1)  # (edges, edge_feature_dim + lstm_hidden_dim * 2)
-                edge_out = self.leaky_relu(self.edge_fc(edge_combined))  # (edges, hidden_dim)
+                edge_combined = torch.cat([edge_feat, edge_seq_out.squeeze(0)], dim=-1)
+                edge_embed = self.leaky_relu(self.edge_embed(edge_combined))  # (edges, hidden_dim)
             else:
-                edge_out = torch.zeros(1, hidden_dim, device=node_out.device)
+                edge_embed = torch.zeros(1, hidden_dim, device=device)
 
-            # Recursive aggregation using adj_list
-            adj = adj_list[i]
-            node_agg = node_out.clone()
-            for node_idx, neighbors in enumerate(adj):
-                if neighbors:
-                    neighbor_outs = node_out[neighbors]  # (num_neighbors, hidden_dim)
-                    node_agg[node_idx] = self.leaky_relu(node_out[node_idx] + torch.mean(neighbor_outs, dim=0))
+            # Graph convolution
+            node_updated = self.graph_conv([node_embed], [adj_list[i]], device)[0]  # (nodes, hidden_dim)
 
-            # Graph-level aggregation
-            node_mean = torch.mean(node_agg, dim=0, keepdim=True)  # (1, hidden_dim)
-            edge_mean = torch.mean(edge_out, dim=0, keepdim=True)  # (1, hidden_dim)
-            graph_out = self.dropout(self.leaky_relu(self.graph_fc(node_mean + edge_mean)))  # (1, hidden_dim)
-            pred = self.output_fc(graph_out)  # (1, 1)
+            # Attention-based aggregation
+            node_agg = self.node_attention(node_updated)  # (1, hidden_dim)
+            edge_agg = self.edge_attention(edge_embed) if edge_embed.size(0) > 0 else torch.zeros(1, hidden_dim, device=device)
+
+            # Graph-level processing
+            graph_combined = torch.cat([node_agg, edge_agg], dim=-1)  # (1, hidden_dim * 2)
+            graph_out = self.dropout(self.leaky_relu(self.graph_fc(graph_combined)))
+            pred = self.output_fc(graph_out + graph_combined)  # Residual connection
             graph_outputs.append(pred)
 
         return torch.cat(graph_outputs, dim=0)  # (batch_size, 1)
@@ -112,13 +169,14 @@ def load_and_split_data(file_path='data_r.pkl'):
     train_data, val_data = train_test_split(remaining_data, test_size=0.2, random_state=42)
     
     train_dataset = HalideDataset(train_data)
-    scaler = train_dataset.scaler
-    val_dataset = HalideDataset(val_data, scaler)
-    test_dataset = HalideDataset(test_data, scaler)
+    time_scaler = train_dataset.time_scaler
+    feature_scaler = train_dataset.feature_scaler
+    val_dataset = HalideDataset(val_data, time_scaler, feature_scaler)
+    test_dataset = HalideDataset(test_data, time_scaler, feature_scaler)
     
     return train_dataset, val_dataset, test_dataset
 
-# Training function with learning rate scheduler
+# Training function
 def train_model(model, train_loader, val_loader, num_epochs=100, lr=0.001, patience=10):
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
@@ -173,7 +231,7 @@ def train_model(model, train_loader, val_loader, num_epochs=100, lr=0.001, patie
         
         print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
         
-        scheduler.step(val_loss)  # Adjust learning rate based on val_loss
+        scheduler.step(val_loss)
         
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -222,8 +280,8 @@ def evaluate_model(model, test_loader, dataset):
             predictions.extend(outputs.cpu().numpy().flatten())
             actuals.extend(targets.cpu().numpy().flatten())
     
-    predictions = dataset.inverse_transform(np.array(predictions))
-    actuals = dataset.inverse_transform(np.array(actuals))
+    predictions = dataset.inverse_transform_time(np.array(predictions))
+    actuals = dataset.inverse_transform_time(np.array(actuals))
     
     error_percentages = [abs(pred - actual) / actual * 100 for pred, actual in zip(predictions, actuals) if actual != 0]
     mean_error_percentage = np.mean(error_percentages)
