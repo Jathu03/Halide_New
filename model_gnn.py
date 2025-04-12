@@ -12,21 +12,43 @@ import pickle
 from sklearn.metrics import mean_absolute_error
 from sklearn.preprocessing import StandardScaler, RobustScaler
 
-# Define the HalideDataset class with outlier handling
+# Custom scaler with adaptive clipping
+class AdaptiveScaler:
+    def __init__(self, quantile_range=(5, 95)):
+        self.scaler = RobustScaler()
+        self.quantile_range = quantile_range
+        self.clip_min = None
+        self.clip_max = None
+    
+    def fit(self, X):
+        X_clipped = np.clip(X, np.percentile(X, self.quantile_range[0]), np.percentile(X, self.quantile_range[1]))
+        self.scaler.fit(X_clipped)
+        self.clip_min = np.percentile(X, self.quantile_range[0])
+        self.clip_max = np.percentile(X, self.quantile_range[1])
+        return self
+    
+    def transform(self, X):
+        X_clipped = np.clip(X, self.clip_min, self.clip_max)
+        return self.scaler.transform(X_clipped)
+    
+    def inverse_transform(self, X):
+        X_orig = self.scaler.inverse_transform(X)
+        return np.clip(X_orig, self.clip_min, self.clip_max)
+
+# Define the HalideDataset class with adaptive scaling
 class HalideDataset(Dataset):
-    def __init__(self, data_list=None, root='data_g', y_max=1e5):
+    def __init__(self, data_list=None, root='data_g'):
         self.data_list = data_list if data_list is not None else []
-        self.y_max = y_max
         super(HalideDataset, self).__init__(root)
         os.makedirs(self.processed_dir, exist_ok=True)
         self.x_scaler = StandardScaler()
-        self.y_scaler = RobustScaler()
+        self.y_scaler = AdaptiveScaler(quantile_range=(5, 95))
         self.node_seq_scaler = StandardScaler()
         self.valid_files_cache = None
         self.scaler_cache_path = os.path.join(self.processed_dir, 'scalers.pkl')
         if self.data_list:
             self._fit_scalers()
-            self.data_list = [self._normalize_data(data) for data in self.data_list if data.x.shape[0] > 0 and data.y <= self.y_max]
+            self.data_list = [self._normalize_data(data) for data in self.data_list if data.x.shape[0] > 0]
         else:
             self._load_valid_files()
             self._load_or_fit_scalers()
@@ -37,10 +59,9 @@ class HalideDataset(Dataset):
         node_seq_data = []
         data_source = self.data_list if self.data_list else [torch.load(os.path.join(self.processed_dir, f)) for f in self.valid_files_cache]
         for data in data_source:
-            if data.x.shape[0] > 0 and data.y <= self.y_max:
+            if data.x.shape[0] > 0:
                 x_data.append(data.x.numpy())
-                y_clipped = np.clip(data.y.numpy(), 1e-6, self.y_max)
-                y_data.append(np.log1p(y_clipped).reshape(-1, 1))
+                y_data.append(np.log1p(np.clip(data.y.numpy(), 1e-6, 1e6)).reshape(-1, 1))
                 node_seq_data.append(data.node_sequences.numpy().reshape(-1, data.node_sequences.shape[-1]))
         if x_data:
             self.x_scaler.fit(np.vstack(x_data))
@@ -71,7 +92,9 @@ class HalideDataset(Dataset):
     
     def _normalize_data(self, data):
         x = torch.tensor(self.x_scaler.transform(data.x.numpy()), dtype=torch.float)
-        y_clipped = np.clip(data.y.numpy(), 1e-6, self.y_max)
+        # Add small noise to node features for robustness
+        x += torch.randn_like(x) * 0.01
+        y_clipped = np.clip(data.y.numpy(), 1e-6, 1e6)
         y = torch.tensor(self.y_scaler.transform(np.log1p(y_clipped).reshape(-1, 1)).flatten(), dtype=torch.float)
         node_seq = torch.tensor(self.node_seq_scaler.transform(data.node_sequences.numpy().reshape(-1, data.node_sequences.shape[-1])).reshape(data.node_sequences.shape), dtype=torch.float)
         return Data(x=x, edge_index=data.edge_index, edge_attr=data.edge_attr, y=y, node_sequences=node_seq)
@@ -94,7 +117,7 @@ class HalideDataset(Dataset):
             if f.endswith('.pt'):
                 try:
                     data = torch.load(os.path.join(self.processed_dir, f))
-                    if data.x.shape[0] > 0 and data.y <= self.y_max:
+                    if data.x.shape[0] > 0:
                         valid_files.append(f)
                 except:
                     continue
@@ -141,9 +164,9 @@ class HalideDataset(Dataset):
             if f.endswith('.pt') or f in ['valid_files.pkl', 'scalers.pkl']:
                 os.remove(os.path.join(self.processed_dir, f))
         for i, data in enumerate(self.data_list):
-            if data.x.shape[0] > 0 and data.y <= self.y_max:
+            if data.x.shape[0] > 0:
                 torch.save(data, os.path.join(self.processed_dir, f'data_{i}.pt'))
-        self.valid_files_cache = [f'data_{i}.pt' for i in range(len(self.data_list)) if self.data_list[i].x.shape[0] > 0 and self.data_list[i].y <= self.y_max]
+        self.valid_files_cache = [f'data_{i}.pt' for i in range(len(self.data_list)) if self.data_list[i].x.shape[0] > 0]
         try:
             with open(os.path.join(self.processed_dir, 'valid_files.pkl'), 'wb') as f:
                 pickle.dump((self.valid_files_cache, os.path.getmtime(self.processed_dir)), f)
@@ -155,9 +178,9 @@ class HalideDataset(Dataset):
             return
         self.process()
 
-# Define a hybrid loss combining MAE and relative MAE
+# Define a hybrid loss
 class HybridMAELoss(nn.Module):
-    def __init__(self, alpha=0.7, epsilon=1e-6):
+    def __init__(self, alpha=0.5, epsilon=1e-6):
         super(HybridMAELoss, self).__init__()
         self.alpha = alpha
         self.epsilon = epsilon
@@ -170,24 +193,24 @@ class HybridMAELoss(nn.Module):
         rel_mae = torch.mean(relative_error)
         return self.alpha * mae_loss + (1 - self.alpha) * rel_mae
 
-# Define the GNN+LSTM model with proper batch handling
+# Define the enhanced GNN+LSTM model
 class GNNLSTMModel(nn.Module):
-    def __init__(self, node_dim, edge_dim, seq_dim, hidden_dim=256, lstm_layers=2, dropout=0.3):
+    def __init__(self, node_dim, edge_dim, seq_dim, hidden_dim=256, lstm_layers=2, dropout=0.2):
         super(GNNLSTMModel, self).__init__()
-        self.gnn1 = torch_geometric.nn.GCNConv(node_dim, hidden_dim, node_dim=0)
-        self.gnn2 = torch_geometric.nn.GCNConv(hidden_dim, hidden_dim, node_dim=0)
+        self.gnn1 = torch_geometric.nn.GATConv(node_dim, hidden_dim, heads=4, concat=True, dropout=0.2)
+        self.gnn2 = torch_geometric.nn.GCNConv(hidden_dim * 4, hidden_dim, node_dim=0)
         self.gnn3 = torch_geometric.nn.GCNConv(hidden_dim, hidden_dim, node_dim=0)
-        self.lstm = nn.LSTM(seq_dim, hidden_dim // 2, lstm_layers, batch_first=True)
-        self.fc = nn.Linear(hidden_dim + hidden_dim // 2, 1)
+        self.lstm = nn.LSTM(seq_dim, hidden_dim, lstm_layers, batch_first=True)
+        self.fc = nn.Linear(hidden_dim + hidden_dim, 1)
         self.relu = nn.ReLU()
         self.dropout = nn.Dropout(dropout)
-        self.bn1 = nn.BatchNorm1d(hidden_dim)
+        self.bn1 = nn.BatchNorm1d(hidden_dim * 4)
         self.bn2 = nn.BatchNorm1d(hidden_dim)
-        self.bn3 = nn.BatchNorm1d(hidden_dim // 2)
+        self.bn3 = nn.BatchNorm1d(hidden_dim)
     
     def forward(self, data):
         x, edge_index, edge_attr, node_sequences = data.x, data.edge_index, data.edge_attr, data.node_sequences
-        batch = getattr(data, 'batch', None)  # Batch tensor for graph assignment
+        batch = getattr(data, 'batch', None)
         
         if len(x.shape) != 2:
             raise ValueError(f"Expected x to be 2D [num_nodes, node_dim], got shape {x.shape}")
@@ -217,15 +240,14 @@ class GNNLSTMModel(nn.Module):
         
         combined = torch.cat([gnn_out, lstm_out], dim=1)
         
-        # Aggregate per graph using scatter_mean
         if batch is not None:
-            combined = scatter(combined, batch, dim=0, reduce='mean')  # [num_graphs, hidden_dim + hidden_dim // 2]
+            combined = scatter(combined, batch, dim=0, reduce='mean')
         else:
-            combined = combined.mean(dim=0, keepdim=True)  # [1, hidden_dim + hidden_dim // 2]
+            combined = combined.mean(dim=0, keepdim=True)
         
-        out = self.fc(combined)  # [num_graphs, 1]
-        out = self.relu(out)  # Ensure non-negative
-        return out.squeeze(-1)  # [num_graphs]
+        out = self.fc(combined)
+        out = self.relu(out)
+        return out.squeeze(-1)
 
 # Function to split dataset
 def split_dataset(dataset, num_test=20, val_ratio=0.1):
@@ -249,11 +271,11 @@ def split_dataset(dataset, num_test=20, val_ratio=0.1):
     
     return train_dataset, val_dataset, test_dataset
 
-# Training function
+# Training function with cosine annealing
 def train_model(model, train_loader, val_loader, device, num_epochs=100, lr=0.0005, patience=20):
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
-    criterion = HybridMAELoss(alpha=0.7, epsilon=1e-6)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.3, patience=5)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=5e-5)
+    criterion = HybridMAELoss(alpha=0.5, epsilon=1e-6)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=20, eta_min=1e-6)
     
     train_losses = []
     val_losses = []
@@ -288,7 +310,7 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100, lr=0.00
         
         print(f"Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
         
-        scheduler.step(val_loss)
+        scheduler.step()
         
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -303,8 +325,8 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100, lr=0.00
     
     return train_losses, val_losses
 
-# Testing function with inverse scaling
-def test_model(model, test_loader, device, y_scaler, y_max=1e5):
+# Testing function
+def test_model(model, test_loader, device, y_scaler):
     model.eval()
     predictions = []
     actuals = []
@@ -316,10 +338,10 @@ def test_model(model, test_loader, device, y_scaler, y_max=1e5):
             out = model(data)
             pred_scaled = y_scaler.inverse_transform(out.cpu().numpy().reshape(-1, 1)).flatten()
             pred = np.expm1(pred_scaled)[0]
-            pred = np.clip(pred, 0, y_max)
+            pred = np.clip(pred, 0, 1e6)
             actual_scaled = y_scaler.inverse_transform(data.y.cpu().numpy().reshape(-1, 1)).flatten()
             actual = np.expm1(actual_scaled)[0]
-            actual = np.clip(actual, 0, y_max)
+            actual = np.clip(actual, 0, 1e6)
             predictions.append(pred)
             actuals.append(actual)
             if actual != 0:
@@ -347,7 +369,7 @@ def plot_losses(train_losses, val_losses, save_path='loss_gnn.png'):
 def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    dataset = HalideDataset(root='data_g', y_max=1e5)
+    dataset = HalideDataset(root='data_g')
     if len(dataset) < 20:
         raise ValueError(f"Dataset has only {len(dataset)} samples, need at least 20 for testing.")
     
@@ -362,18 +384,18 @@ def main():
     train_dataset, val_dataset, test_dataset = split_dataset(dataset, num_test=20, val_ratio=0.1)
     print(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}, Test samples: {len(test_dataset)}")
     
-    train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=4, shuffle=False)
+    train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=8, shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
     
-    model = GNNLSTMModel(node_dim=node_dim, edge_dim=edge_dim, seq_dim=seq_dim, hidden_dim=256, dropout=0.3).to(device)
+    model = GNNLSTMModel(node_dim=node_dim, edge_dim=edge_dim, seq_dim=seq_dim, hidden_dim=256, dropout=0.2).to(device)
     
     train_losses, val_losses = train_model(model, train_loader, val_loader, device, num_epochs=100, lr=0.0005, patience=20)
     
     plot_losses(train_losses, val_losses, save_path='loss_gnn.png')
     print("Loss plot saved as 'loss_gnn.png'")
     
-    predictions, actuals, percentage_errors = test_model(model, test_loader, device, dataset.y_scaler, y_max=1e5)
+    predictions, actuals, percentage_errors = test_model(model, test_loader, device, dataset.y_scaler)
     
     print("\nTest Sample Predictions:")
     print("Sample | Predicted (ms) | Actual (ms) | Percentage Error (%)")
