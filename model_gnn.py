@@ -163,7 +163,7 @@ class HalideDataset(Dataset):
 
 # Define the improved GNN+LSTM model with GAT, bidirectional LSTM, and attention
 class GNNLSTMModel(nn.Module):
-    def __init__(self, node_dim, edge_dim, seq_dim, hidden_dim=128, lstm_layers=2, dropout=0.3, heads=4):
+    def __init__(self, node_dim, edge_dim, seq_dim, hidden_dim=256, lstm_layers=3, dropout=0.4, heads=4):
         super(GNNLSTMModel, self).__init__()
         # GAT layers for expressive graph modeling
         self.gnn1 = GATConv(node_dim, hidden_dim // heads, heads=heads, dropout=dropout)
@@ -181,6 +181,7 @@ class GNNLSTMModel(nn.Module):
     
     def forward(self, data):
         x, edge_index, edge_attr, node_sequences = data.x, data.edge_index, data.edge_attr, data.node_sequences
+        batch = data.batch if hasattr(data, 'batch') else torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
         
         # Validate input shapes
         if len(x.shape) != 2:
@@ -204,13 +205,22 @@ class GNNLSTMModel(nn.Module):
         lstm_out = lstm_out.squeeze(0)  # [num_nodes, hidden_dim]
         lstm_out = self.dropout(lstm_out)
         
-        # Attention to combine GNN and LSTM outputs
+        # Combine GNN and LSTM outputs
         combined = torch.cat([gnn_out, lstm_out], dim=1)  # [num_nodes, hidden_dim + hidden_dim]
-        attn_scores = torch.softmax(self.attention(combined), dim=0)  # [num_nodes, 1]
-        combined = (combined * attn_scores).sum(dim=0)  # [hidden_dim + hidden_dim]
         
-        # Final prediction
-        out = self.fc(combined)
+        # Attention per graph in batch
+        out = []
+        for graph_idx in torch.unique(batch):
+            mask = batch == graph_idx
+            graph_combined = combined[mask]
+            if graph_combined.shape[0] == 0:
+                continue
+            attn_scores = torch.softmax(self.attention(graph_combined), dim=0)  # [num_nodes_in_graph, 1]
+            graph_out = (graph_combined * attn_scores).sum(dim=0)  # [hidden_dim + hidden_dim]
+            graph_pred = self.fc(graph_out)  # [1]
+            out.append(graph_pred)
+        
+        out = torch.stack(out)  # [batch_size, 1]
         return out
 
 # Function to apply edge dropout for augmentation
@@ -220,7 +230,7 @@ def apply_edge_dropout(data, drop_prob=0.1):
     keep_mask = torch.rand(num_edges) > drop_prob
     new_edge_index = edge_index[:, keep_mask]
     new_edge_attr = data.edge_attr[keep_mask] if data.edge_attr is not None else None
-    return Data(x=data.x, edge_index=new_edge_index, edge_attr=new_edge_attr, y=data.y, node_sequences=data.node_sequences)
+    return Data(x=data.x, edge_index=new_edge_index, edge_attr=new_edge_attr, y=data.y, node_sequences=data.node_sequences, batch=data.batch if hasattr(data, 'batch') else None)
 
 # Function to split dataset with balanced splits
 def split_dataset(dataset, num_test=20, val_ratio=0.1):
@@ -272,27 +282,31 @@ def train_model(model, train_loader, val_loader, device, num_epochs=200, lr=0.00
     for epoch in range(num_epochs):
         model.train()
         train_loss = 0.0
+        train_samples = 0
         for data in train_loader:
             data = apply_edge_dropout(data, drop_prob=0.1).to(device)
             optimizer.zero_grad()
-            out = model(data)
-            loss = criterion(out, data.y)
+            out = model(data)  # [batch_size, 1]
+            loss = criterion(out.squeeze(), data.y)  # Ensure shapes match
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
             optimizer.step()
-            train_loss += loss.item() * data.num_graphs
-        train_loss /= len(train_loader.dataset)
+            train_loss += loss.item() * data.y.shape[0]
+            train_samples += data.y.shape[0]
+        train_loss /= train_samples
         train_losses.append(train_loss)
         
         model.eval()
         val_loss = 0.0
+        val_samples = 0
         with torch.no_grad():
             for data in val_loader:
                 data = data.to(device)
                 out = model(data)
-                loss = criterion(out, data.y)
-                val_loss += loss.item() * data.num_graphs
-        val_loss /= len(val_loader.dataset)
+                loss = criterion(out.squeeze(), data.y)
+                val_loss += loss.item() * data.y.shape[0]
+                val_samples += data.y.shape[0]
+        val_loss /= val_samples
         val_losses.append(val_loss)
         
         print(f"Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, LR: {scheduler.get_last_lr()[0]:.6f}")
