@@ -16,6 +16,9 @@ class HalideDataset(Dataset):
         self.data_list = data_list if data_list is not None else []
         super(HalideDataset, self).__init__(root)
         os.makedirs(self.processed_dir, exist_ok=True)
+        # Filter out invalid graphs (e.g., empty node features)
+        if self.data_list:
+            self.data_list = [data for data in self.data_list if data.x.shape[0] > 0]
     
     @property
     def processed_file_names(self):
@@ -38,13 +41,17 @@ class HalideDataset(Dataset):
     
     def get(self, idx):
         data = torch.load(os.path.join(self.processed_dir, f'data_{idx}.pt'))
+        # Validate data before returning
+        if data.x.shape[0] == 0:
+            raise ValueError(f"Graph {idx} has empty node features (shape: {data.x.shape})")
         return data
     
     def process(self):
         if not self.data_list:
             return
         for i, data in enumerate(self.data_list):
-            torch.save(data, os.path.join(self.processed_dir, f'data_{i}.pt'))
+            if data.x.shape[0] > 0:  # Only save valid graphs
+                torch.save(data, os.path.join(self.processed_dir, f'data_{i}.pt'))
     
     def _process(self):
         if not self.data_list:
