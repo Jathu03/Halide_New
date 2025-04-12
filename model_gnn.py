@@ -22,18 +22,22 @@ class HalideDataset(Dataset):
         self.y_scaler = StandardScaler()
         self.node_seq_scaler = StandardScaler()
         self.valid_files_cache = None
-        # Fit scalers if data_list is provided
+        # Load or fit scalers
+        self.scaler_cache_path = os.path.join(self.processed_dir, 'scalers.pkl')
         if self.data_list:
             self._fit_scalers()
             self.data_list = [self._normalize_data(data) for data in self.data_list if data.x.shape[0] > 0]
-        self._load_valid_files()
+        else:
+            self._load_valid_files()
+            self._load_or_fit_scalers()
     
     def _fit_scalers(self):
         # Collect data for fitting scalers
         x_data = []
         y_data = []
         node_seq_data = []
-        for data in self.data_list:
+        data_source = self.data_list if self.data_list else [torch.load(os.path.join(self.processed_dir, f)) for f in self.valid_files_cache]
+        for data in data_source:
             if data.x.shape[0] > 0:
                 x_data.append(data.x.numpy())
                 y_data.append(data.y.numpy().reshape(-1, 1))
@@ -42,6 +46,31 @@ class HalideDataset(Dataset):
             self.x_scaler.fit(np.vstack(x_data))
             self.y_scaler.fit(np.vstack(y_data))
             self.node_seq_scaler.fit(np.vstack(node_seq_data))
+            # Save fitted scalers
+            try:
+                with open(self.scaler_cache_path, 'wb') as f:
+                    pickle.dump({
+                        'x_scaler': self.x_scaler,
+                        'y_scaler': self.y_scaler,
+                        'node_seq_scaler': self.node_seq_scaler
+                    }, f)
+            except:
+                pass
+    
+    def _load_or_fit_scalers(self):
+        # Load scalers from cache if available
+        if os.path.exists(self.scaler_cache_path):
+            try:
+                with open(self.scaler_cache_path, 'rb') as f:
+                    scalers = pickle.load(f)
+                self.x_scaler = scalers['x_scaler']
+                self.y_scaler = scalers['y_scaler']
+                self.node_seq_scaler = scalers['node_seq_scaler']
+                return
+            except:
+                pass
+        # Fit scalers if cache is missing or invalid
+        self._fit_scalers()
     
     def _normalize_data(self, data):
         # Normalize x, y, and node_sequences
@@ -103,7 +132,6 @@ class HalideDataset(Dataset):
             if idx >= len(valid_files):
                 raise IndexError(f"Index {idx} out of range for {len(valid_files)} valid graphs")
             data = torch.load(os.path.join(self.processed_dir, valid_files[idx]))
-            # Normalize loaded data
             data = self._normalize_data(data)
         if data.x.shape[0] == 0:
             raise ValueError(f"Graph {idx} has empty node features (shape: {data.x.shape})")
@@ -113,7 +141,7 @@ class HalideDataset(Dataset):
         if not self.data_list:
             return
         for f in os.listdir(self.processed_dir):
-            if f.endswith('.pt') or f == 'valid_files.pkl':
+            if f.endswith('.pt') or f in ['valid_files.pkl', 'scalers.pkl']:
                 os.remove(os.path.join(self.processed_dir, f))
         for i, data in enumerate(self.data_list):
             if data.x.shape[0] > 0:
@@ -194,7 +222,7 @@ def split_dataset(dataset, num_test=20, val_ratio=0.1):
 # Training function with early stopping and LR scheduling
 def train_model(model, train_loader, val_loader, device, num_epochs=100, lr=0.0005, patience=10):
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    criterion = nn.L1Loss()  # Use MAE instead of MSE
+    criterion = nn.L1Loss()
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
     
     train_losses = []
@@ -211,7 +239,7 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100, lr=0.00
             out = model(data)
             loss = criterion(out, data.y)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             train_loss += loss.item() * data.num_graphs
         train_loss /= len(train_loader.dataset)
@@ -230,10 +258,8 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100, lr=0.00
         
         print(f"Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
         
-        # Learning rate scheduling
         scheduler.step(val_loss)
         
-        # Early stopping
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             epochs_no_improve = 0
@@ -258,7 +284,6 @@ def test_model(model, test_loader, device, y_scaler):
         for data in test_loader:
             data = data.to(device)
             out = model(data)
-            # Inverse transform predictions and actuals
             pred = y_scaler.inverse_transform(out.cpu().numpy().reshape(-1, 1)).flatten()[0]
             actual = y_scaler.inverse_transform(data.y.cpu().numpy().reshape(-1, 1)).flatten()[0]
             predictions.append(pred)
