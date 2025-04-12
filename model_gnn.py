@@ -17,12 +17,12 @@ class HalideDataset(Dataset):
         self.data_list = data_list if data_list is not None else []
         super(HalideDataset, self).__init__(root)
         os.makedirs(self.processed_dir, exist_ok=True)
-        # Initialize scalers
         self.x_scaler = RobustScaler()
-        self.y_scaler = None  # Log-scaling for y, no scaler needed
+        self.y_scaler = None
         self.node_seq_scaler = RobustScaler()
         self.valid_files_cache = None
         self.scaler_cache_path = os.path.join(self.processed_dir, 'scalers.pkl')
+        self.y_values = None  # For weighted sampling
         if self.data_list:
             self._fit_scalers()
             self.data_list = [self._normalize_data(data) for data in self.data_list if data.x.shape[0] > 0]
@@ -33,18 +33,17 @@ class HalideDataset(Dataset):
     def _fit_scalers(self):
         x_data = []
         node_seq_data = []
+        y_data = []
         data_source = self.data_list if self.data_list else [torch.load(os.path.join(self.processed_dir, f)) for f in self.valid_files_cache]
         for data in data_source:
             if data.x.shape[0] > 0:
                 x_data.append(data.x.numpy())
                 node_seq_data.append(data.node_sequences.numpy().reshape(-1, data.node_sequences.shape[-1]))
-                # Optional: Filter extreme targets (uncomment to enable)
-                # y = data.y.numpy()
-                # if y > 1e5:
-                #     continue
+                y_data.append(np.log1p(data.y.numpy()))
         if x_data:
             self.x_scaler.fit(np.vstack(x_data))
             self.node_seq_scaler.fit(np.vstack(node_seq_data))
+            self.y_values = np.array(y_data).flatten()
             try:
                 with open(self.scaler_cache_path, 'wb') as f:
                     pickle.dump({
@@ -61,6 +60,9 @@ class HalideDataset(Dataset):
                     scalers = pickle.load(f)
                 self.x_scaler = scalers['x_scaler']
                 self.node_seq_scaler = scalers['node_seq_scaler']
+                # Load y_values for sampling
+                data_source = [torch.load(os.path.join(self.processed_dir, f)) for f in self.valid_files_cache]
+                self.y_values = np.array([np.log1p(data.y.numpy()) for data in data_source if data.x.shape[0] > 0]).flatten()
                 return
             except:
                 pass
@@ -68,7 +70,6 @@ class HalideDataset(Dataset):
     
     def _normalize_data(self, data):
         x = torch.tensor(self.x_scaler.transform(data.x.numpy()), dtype=torch.float)
-        # Log-scale y
         y = torch.tensor(np.log1p(data.y.numpy()), dtype=torch.float)
         node_seq = torch.tensor(self.node_seq_scaler.transform(data.node_sequences.numpy().reshape(-1, data.node_sequences.shape[-1])).reshape(data.node_sequences.shape), dtype=torch.float)
         return Data(x=x, edge_index=data.edge_index, edge_attr=data.edge_attr, y=y, node_sequences=node_seq)
@@ -152,13 +153,15 @@ class HalideDataset(Dataset):
             return
         self.process()
 
-# Define the GNN+LSTM model with increased capacity
+# Define the GNN+LSTM model with GAT and batch norm
 class GNNLSTMModel(nn.Module):
-    def __init__(self, node_dim, edge_dim, seq_dim, hidden_dim=256, lstm_layers=3, dropout=0.3):
+    def __init__(self, node_dim, edge_dim, seq_dim, hidden_dim=256, lstm_layers=3, dropout=0.3, heads=4):
         super(GNNLSTMModel, self).__init__()
-        self.gnn1 = torch_geometric.nn.GCNConv(node_dim, hidden_dim, node_dim=0)
-        self.gnn2 = torch_geometric.nn.GCNConv(hidden_dim, hidden_dim, node_dim=0)
-        self.gnn3 = torch_geometric.nn.GCNConv(hidden_dim, hidden_dim, node_dim=0)  # Added layer
+        self.gnn1 = torch_geometric.nn.GATConv(node_dim, hidden_dim // heads, heads=heads)
+        self.gnn2 = torch_geometric.nn.GATConv(hidden_dim, hidden_dim // heads, heads=heads)
+        self.gnn3 = torch_geometric.nn.GATConv(hidden_dim, hidden_dim, heads=1)
+        self.bn1 = nn.BatchNorm1d(hidden_dim)
+        self.bn2 = nn.BatchNorm1d(hidden_dim)
         self.lstm = nn.LSTM(seq_dim, hidden_dim // 2, lstm_layers, batch_first=True)
         self.fc = nn.Linear(hidden_dim + hidden_dim // 2, 1)
         self.relu = nn.ReLU()
@@ -174,9 +177,11 @@ class GNNLSTMModel(nn.Module):
         
         x = self.gnn1(x, edge_index)
         x = self.relu(x)
+        x = self.bn1(x)
         x = self.dropout(x)
         x = self.gnn2(x, edge_index)
         x = self.relu(x)
+        x = self.bn2(x)
         x = self.dropout(x)
         x = self.gnn3(x, edge_index)
         gnn_out = self.relu(x)
@@ -215,12 +220,12 @@ def split_dataset(dataset, num_test=20, val_ratio=0.1):
     val_dataset = torch.utils.data.Subset(dataset, val_indices)
     test_dataset = torch.utils.data.Subset(dataset, test_indices)
     
-    return train_dataset, val_dataset, test_dataset
+    return train_dataset, val_dataset, test_dataset, train_indices
 
 # Training function with Huber loss
-def train_model(model, train_loader, val_loader, device, num_epochs=100, lr=0.0003, patience=15):
+def train_model(model, train_loader, val_loader, device, num_epochs=100, lr=0.0003, patience=20):
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    criterion = nn.HuberLoss(delta=1.0)  # Robust to outliers
+    criterion = nn.HuberLoss(delta=0.5)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=7)
     
     train_losses = []
@@ -282,7 +287,6 @@ def test_model(model, test_loader, device):
         for data in test_loader:
             data = data.to(device)
             out = model(data)
-            # Inverse transform: expm1 for log1p
             pred = np.expm1(out.cpu().numpy().flatten())[0]
             actual = np.expm1(data.y.cpu().numpy().flatten())[0]
             predictions.append(pred)
@@ -324,16 +328,24 @@ def main():
     edge_dim = metadata['edge_feature_dim']
     seq_dim = metadata['seq_feature_dim']
     
-    train_dataset, val_dataset, test_dataset = split_dataset(dataset, num_test=20, val_ratio=0.1)
+    train_dataset, val_dataset, test_dataset, train_indices = split_dataset(dataset, num_test=20, val_ratio=0.1)
     print(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}, Test samples: {len(test_dataset)}")
     
-    train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False)
+    # Weighted sampler for training
+    if dataset.y_values is not None:
+        weights = 1.0 / (1.0 + np.abs(dataset.y_values[train_indices]))
+        weights = weights / weights.sum() * len(weights)
+        sampler = torch.utils.data.WeightedRandomSampler(weights, len(weights))
+        train_loader = DataLoader(train_dataset, batch_size=16, sampler=sampler)
+    else:
+        train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
+    
+    val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
     
-    model = GNNLSTMModel(node_dim=node_dim, edge_dim=edge_dim, seq_dim=seq_dim, hidden_dim=256, lstm_layers=3, dropout=0.3).to(device)
+    model = GNNLSTMModel(node_dim=node_dim, edge_dim=edge_dim, seq_dim=seq_dim, hidden_dim=256, lstm_layers=3, dropout=0.3, heads=4).to(device)
     
-    train_losses, val_losses = train_model(model, train_loader, val_loader, device, num_epochs=100, lr=0.0003, patience=15)
+    train_losses, val_losses = train_model(model, train_loader, val_loader, device, num_epochs=100, lr=0.0003, patience=20)
     
     plot_losses(train_losses, val_losses, save_path='loss_gnn.png')
     print("Loss plot saved as 'loss_gnn.png'")
