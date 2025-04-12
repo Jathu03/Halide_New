@@ -5,20 +5,20 @@ import torch.nn as nn
 import torch_geometric
 from torch_geometric.data import Data, Dataset
 from torch_geometric.loader import DataLoader
+from torch_geometric.utils import scatter
 import numpy as np
 import matplotlib.pyplot as plt
 import pickle
 from sklearn.metrics import mean_absolute_error
 from sklearn.preprocessing import StandardScaler, RobustScaler
 
-# Define the HalideDataset class with improved outlier handling
+# Define the HalideDataset class with outlier handling
 class HalideDataset(Dataset):
     def __init__(self, data_list=None, root='data_g', y_max=1e5):
         self.data_list = data_list if data_list is not None else []
-        self.y_max = y_max  # Max allowed y value
+        self.y_max = y_max
         super(HalideDataset, self).__init__(root)
         os.makedirs(self.processed_dir, exist_ok=True)
-        # Initialize scalers
         self.x_scaler = StandardScaler()
         self.y_scaler = RobustScaler()
         self.node_seq_scaler = StandardScaler()
@@ -39,7 +39,6 @@ class HalideDataset(Dataset):
         for data in data_source:
             if data.x.shape[0] > 0 and data.y <= self.y_max:
                 x_data.append(data.x.numpy())
-                # Custom log-scaling with clipping
                 y_clipped = np.clip(data.y.numpy(), 1e-6, self.y_max)
                 y_data.append(np.log1p(y_clipped).reshape(-1, 1))
                 node_seq_data.append(data.node_sequences.numpy().reshape(-1, data.node_sequences.shape[-1]))
@@ -158,7 +157,7 @@ class HalideDataset(Dataset):
 
 # Define a hybrid loss combining MAE and relative MAE
 class HybridMAELoss(nn.Module):
-    def __init__(self, alpha=0.5, epsilon=1e-6):
+    def __init__(self, alpha=0.7, epsilon=1e-6):
         super(HybridMAELoss, self).__init__()
         self.alpha = alpha
         self.epsilon = epsilon
@@ -171,7 +170,7 @@ class HybridMAELoss(nn.Module):
         rel_mae = torch.mean(relative_error)
         return self.alpha * mae_loss + (1 - self.alpha) * rel_mae
 
-# Define the GNN+LSTM model
+# Define the GNN+LSTM model with proper batch handling
 class GNNLSTMModel(nn.Module):
     def __init__(self, node_dim, edge_dim, seq_dim, hidden_dim=256, lstm_layers=2, dropout=0.3):
         super(GNNLSTMModel, self).__init__()
@@ -188,6 +187,7 @@ class GNNLSTMModel(nn.Module):
     
     def forward(self, data):
         x, edge_index, edge_attr, node_sequences = data.x, data.edge_index, data.edge_attr, data.node_sequences
+        batch = getattr(data, 'batch', None)  # Batch tensor for graph assignment
         
         if len(x.shape) != 2:
             raise ValueError(f"Expected x to be 2D [num_nodes, node_dim], got shape {x.shape}")
@@ -216,10 +216,16 @@ class GNNLSTMModel(nn.Module):
         lstm_out = self.dropout(lstm_out)
         
         combined = torch.cat([gnn_out, lstm_out], dim=1)
-        out = combined.mean(dim=0)
-        out = self.fc(out)
-        out = self.relu(out)  # Ensure non-negative output
-        return out
+        
+        # Aggregate per graph using scatter_mean
+        if batch is not None:
+            combined = scatter(combined, batch, dim=0, reduce='mean')  # [num_graphs, hidden_dim + hidden_dim // 2]
+        else:
+            combined = combined.mean(dim=0, keepdim=True)  # [1, hidden_dim + hidden_dim // 2]
+        
+        out = self.fc(combined)  # [num_graphs, 1]
+        out = self.relu(out)  # Ensure non-negative
+        return out.squeeze(-1)  # [num_graphs]
 
 # Function to split dataset
 def split_dataset(dataset, num_test=20, val_ratio=0.1):
@@ -243,9 +249,9 @@ def split_dataset(dataset, num_test=20, val_ratio=0.1):
     
     return train_dataset, val_dataset, test_dataset
 
-# Training function with enhanced regularization
+# Training function
 def train_model(model, train_loader, val_loader, device, num_epochs=100, lr=0.0005, patience=20):
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)  # Add weight decay
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
     criterion = HybridMAELoss(alpha=0.7, epsilon=1e-6)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.3, patience=5)
     
@@ -310,7 +316,7 @@ def test_model(model, test_loader, device, y_scaler, y_max=1e5):
             out = model(data)
             pred_scaled = y_scaler.inverse_transform(out.cpu().numpy().reshape(-1, 1)).flatten()
             pred = np.expm1(pred_scaled)[0]
-            pred = np.clip(pred, 0, y_max)  # Clip predictions
+            pred = np.clip(pred, 0, y_max)
             actual_scaled = y_scaler.inverse_transform(data.y.cpu().numpy().reshape(-1, 1)).flatten()
             actual = np.expm1(actual_scaled)[0]
             actual = np.clip(actual, 0, y_max)
@@ -356,7 +362,7 @@ def main():
     train_dataset, val_dataset, test_dataset = split_dataset(dataset, num_test=20, val_ratio=0.1)
     print(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}, Test samples: {len(test_dataset)}")
     
-    train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True)  # Increased batch size
+    train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=4, shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
     
