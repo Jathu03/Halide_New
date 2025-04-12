@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 import pickle
 from sklearn.metrics import mean_absolute_error
 
-# Define the HalideDataset class (from previous code, repeated for completeness)
+# Define the HalideDataset class
 class HalideDataset(Dataset):
     def __init__(self, data_list=None, root='data_g'):
         self.data_list = data_list if data_list is not None else []
@@ -108,10 +108,10 @@ def split_dataset(dataset, num_test=20, val_ratio=0.1):
     val_indices = indices[num_train:num_train + num_val]
     test_indices = indices[num_train + num_val:num_train + num_val + num_test]
     
-    # Create subsets
-    train_dataset = torch_geometric.data.Subset(dataset, train_indices)
-    val_dataset = torch_geometric.data.Subset(dataset, val_indices)
-    test_dataset = torch_geometric.data.Subset(dataset, test_indices)
+    # Create subsets using torch.utils.data.Subset
+    train_dataset = torch.utils.data.Subset(dataset, train_indices)
+    val_dataset = torch.utils.data.Subset(dataset, val_indices)
+    test_dataset = torch.utils.data.Subset(dataset, test_indices)
     
     return train_dataset, val_dataset, test_dataset
 
