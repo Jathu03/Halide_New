@@ -2,7 +2,7 @@ import os
 import torch
 import torch.nn as nn
 import torch_geometric
-from torch_geometric.data import Data, Dataset, Batch
+from torch_geometric.data import Data, Dataset
 from torch_geometric.loader import DataLoader
 from torch_geometric.nn import GATConv
 import numpy as np
@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 import pickle
 from sklearn.preprocessing import StandardScaler
 
-# Define the HalideDataset class with consistent tensor shapes
+# Define the HalideDataset class
 class HalideDataset(Dataset):
     def __init__(self, data_list=None, root='data_g'):
         self.data_list = data_list if data_list is not None else []
@@ -88,9 +88,9 @@ class HalideDataset(Dataset):
         graph_stats = torch.tensor([num_nodes, num_edges, edge_density], dtype=torch.float).repeat(num_nodes, 1)
         x_augmented = np.concatenate([data.x.numpy(), graph_stats.numpy()], axis=1)
         x = torch.tensor(self.x_scaler.transform(x_augmented), dtype=torch.float)
-        y_orig = float(data.y.item() if data.y.dim() > 0 else data.y)  # Ensure scalar
-        y_weight = 1.0 / (1.0 + np.log1p(np.abs(y_orig) / 2e3)) if y_orig > 2e3 else 1.0
-        y = torch.tensor(np.log1p(y_orig), dtype=torch.float).squeeze()  # Scalar tensor
+        y_orig = float(data.y.item() if data.y.dim() > 0 else data.y)
+        y_weight = 1.0 / (1.0 + np.log1p(np.abs(y_orig) / 1e3)) if y_orig > 1e3 else 1.0
+        y = torch.tensor(np.log1p(y_orig), dtype=torch.float).squeeze()
         node_seq = torch.tensor(self.node_seq_scaler.transform(data.node_sequences.numpy().reshape(-1, data.node_sequences.shape[-1])).reshape(data.node_sequences.shape), dtype=torch.float)
         return Data(
             x=x,
@@ -180,24 +180,24 @@ class HalideDataset(Dataset):
             return
         self.process()
 
-# Define the GNN+LSTM model with custom batch norm
+# Define the GNN+LSTM model with batch support
 class GNNLSTMModel(nn.Module):
-    def __init__(self, node_dim, edge_dim, seq_dim, hidden_dim=256, lstm_layers=3, dropout=0.2):
+    def __init__(self, node_dim, edge_dim, seq_dim, hidden_dim=512, lstm_layers=3, dropout=0.2):
         super(GNNLSTMModel, self).__init__()
-        self.gnn1 = GATConv(node_dim, hidden_dim, heads=4, dropout=dropout)
-        self.gnn2 = GATConv(hidden_dim * 4, hidden_dim, heads=1, dropout=dropout)
-        self.gnn3 = GATConv(hidden_dim, hidden_dim, heads=1, dropout=dropout)
-        self.bn1 = nn.BatchNorm1d(hidden_dim * 4)
-        self.bn2 = nn.BatchNorm1d(hidden_dim)
+        self.gnn1 = GATConv(node_dim, hidden_dim // 2, heads=8, dropout=dropout)
+        self.gnn2 = GATConv((hidden_dim // 2) * 8, hidden_dim, heads=4, dropout=dropout)
+        self.gnn3 = GATConv(hidden_dim * 4, hidden_dim, heads=1, dropout=dropout)
+        self.bn1 = nn.BatchNorm1d((hidden_dim // 2) * 8)
+        self.bn2 = nn.BatchNorm1d(hidden_dim * 4)
         self.bn3 = nn.BatchNorm1d(hidden_dim)
         self.lstm = nn.LSTM(seq_dim, hidden_dim // 2, lstm_layers, batch_first=True, dropout=dropout if lstm_layers > 1 else 0)
         self.fc = nn.Linear(hidden_dim + hidden_dim // 2, 1)
         self.relu = nn.ReLU()
         self.dropout = nn.Dropout(dropout)
-        self.residual_proj = nn.Linear(node_dim, hidden_dim * 4) if node_dim != hidden_dim * 4 else None
+        self.residual_proj = nn.Linear(node_dim, (hidden_dim // 2) * 8) if node_dim != (hidden_dim // 2) * 8 else None
     
     def forward(self, data):
-        x, edge_index, edge_attr, node_sequences = data.x, data.edge_index, data.edge_attr, data.node_sequences
+        x, edge_index, edge_attr, node_sequences, batch = data.x, data.edge_index, data.edge_attr, data.node_sequences, data.batch
         
         if len(x.shape) != 2:
             raise ValueError(f"Expected x to be 2D [num_nodes, node_dim], got shape {x.shape}")
@@ -230,9 +230,10 @@ class GNNLSTMModel(nn.Module):
         lstm_out = self.dropout(lstm_out)
         
         combined = torch.cat([gnn_out, lstm_out], dim=1)
-        out = combined.mean(dim=0)
-        out = self.fc(out)
-        return out
+        # Pool per graph in batch
+        out = torch_geometric.nn.global_mean_pool(combined, batch)
+        out = self.fc(out)  # Shape: [batch_size, 1]
+        return out.squeeze(-1)  # Shape: [batch_size]
 
 # Function to split dataset
 def split_dataset(dataset, num_test=20, val_ratio=0.1):
@@ -256,11 +257,26 @@ def split_dataset(dataset, num_test=20, val_ratio=0.1):
     
     return train_dataset, val_dataset, test_dataset
 
-# Training function with gradient accumulation
+# Learning rate scheduler with warmup
+class WarmupLR(torch.optim.lr_scheduler._LRScheduler):
+    def __init__(self, optimizer, warmup_epochs, base_lr, final_lr, last_epoch=-1):
+        self.warmup_epochs = warmup_epochs
+        self.base_lr = base_lr
+        self.final_lr = final_lr
+        super(WarmupLR, self).__init__(optimizer, last_epoch)
+    
+    def get_lr(self):
+        if self.last_epoch < self.warmup_epochs:
+            progress = self.last_epoch / self.warmup_epochs
+            return [self.base_lr + (self.final_lr - self.base_lr) * progress for _ in self.base_groups]
+        return [self.final_lr for _ in self.base_groups]
+
+# Training function with batched loss
 def train_model(model, train_loader, val_loader, device, num_epochs=100, lr=0.0002, patience=15, accum_steps=4):
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     criterion = nn.HuberLoss(delta=0.3, reduction='none')
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=7)
+    warmup_scheduler = WarmupLR(optimizer, warmup_epochs=10, base_lr=lr * 0.1, final_lr=lr)
     
     train_losses = []
     val_losses = []
@@ -274,8 +290,8 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100, lr=0.00
         optimizer.zero_grad()
         for i, data in enumerate(train_loader):
             data = data.to(device)
-            out = model(data)
-            loss = criterion(out, data.y)
+            out = model(data)  # Shape: [batch_size]
+            loss = criterion(out, data.y)  # Both [batch_size]
             weight = data.y_weight if hasattr(data, 'y_weight') else torch.ones_like(loss)
             weighted_loss = (loss * weight).mean() / accum_steps
             weighted_loss.backward()
@@ -288,7 +304,6 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100, lr=0.00
             train_loss += weighted_loss.item() * accum_steps * data.num_graphs
             total_weight += weight.sum().item()
         
-        # Step if remaining gradients
         if len(train_loader) % accum_steps != 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
@@ -315,6 +330,7 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100, lr=0.00
         print(f"Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
         
         scheduler.step(val_loss)
+        warmup_scheduler.step()
         
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -340,8 +356,8 @@ def test_model(model, test_loader, device):
         for data in test_loader:
             data = data.to(device)
             out = model(data)
-            pred = np.expm1(out.cpu().numpy().flatten())[0]
-            actual = np.expm1(data.y.cpu().numpy().item())  # Ensure scalar
+            pred = np.expm1(out.cpu().numpy().item())
+            actual = np.expm1(data.y.cpu().numpy().item())
             predictions.append(pred)
             actuals.append(actual)
             if actual != 0:
@@ -388,7 +404,7 @@ def main():
     val_loader = DataLoader(val_dataset, batch_size=4, shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
     
-    model = GNNLSTMModel(node_dim=node_dim, edge_dim=edge_dim, seq_dim=seq_dim, hidden_dim=256, lstm_layers=3, dropout=0.2).to(device)
+    model = GNNLSTMModel(node_dim=node_dim, edge_dim=edge_dim, seq_dim=seq_dim, hidden_dim=512, lstm_layers=3, dropout=0.2).to(device)
     
     train_losses, val_losses = train_model(model, train_loader, val_loader, device, num_epochs=100, lr=0.0002, patience=15, accum_steps=4)
     
