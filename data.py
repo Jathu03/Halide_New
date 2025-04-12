@@ -151,25 +151,42 @@ def parse_json_file(file_path):
 
 # Define a custom Dataset class
 class HalideDataset(Dataset):
-    def __init__(self, data_list, root='data_g'):
+    def __init__(self, data_list=None, root='data_g'):
+        # Initialize data_list before parent class init
+        self.data_list = data_list if data_list is not None else []
         super(HalideDataset, self).__init__(root)
-        self.data_list = data_list
         self.processed_dir = os.path.join(root, 'processed')
         os.makedirs(self.processed_dir, exist_ok=True)
     
     @property
     def processed_file_names(self):
-        # Define the names of the processed files
-        return [f'data_{i}.pt' for i in range(len(self.data_list))]
+        # If data_list is available, use its length
+        if self.data_list:
+            return [f'data_{i}.pt' for i in range(len(self.data_list))]
+        # Otherwise, infer from existing files in processed_dir
+        if os.path.exists(self.processed_dir):
+            return [f for f in os.listdir(self.processed_dir) if f.endswith('.pt')]
+        return []
+    
+    @property
+    def num_graphs(self):
+        # Return the number of graphs based on processed files or data_list
+        if self.data_list:
+            return len(self.data_list)
+        if os.path.exists(self.processed_dir):
+            return len([f for f in os.listdir(self.processed_dir) if f.endswith('.pt')])
+        return 0
     
     def len(self):
-        return len(self.data_list)
+        return self.num_graphs
     
     def get(self, idx):
         data = torch.load(os.path.join(self.processed_dir, f'data_{idx}.pt'))
         return data
     
     def process(self):
+        if not self.data_list:
+            return  # Skip processing if no data to process
         # Process and save data files
         for i, data in enumerate(self.data_list):
             torch.save(data, os.path.join(self.processed_dir, f'data_{i}.pt'))
