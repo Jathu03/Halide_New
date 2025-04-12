@@ -80,8 +80,11 @@ class GNNLSTMModel(nn.Module):
         gnn_out = self.relu(x)  # [num_nodes, hidden_dim]
         
         # LSTM processing
+        # Ensure node_sequences is [num_nodes, seq_len]
         lstm_out, _ = self.lstm(node_sequences)  # [num_nodes, seq_len, hidden_dim // 2]
-        lstm_out = lstm_out[:, -1, :]  # Take last output: [num_nodes, hidden_dim // 2]
+        
+        # Take the mean over the sequence length to get [num_nodes, hidden_dim // 2]
+        lstm_out = lstm_out.mean(dim=1)  # [num_nodes, hidden_dim // 2]
         
         # Combine GNN and LSTM outputs
         combined = torch.cat([gnn_out, lstm_out], dim=1)  # [num_nodes, hidden_dim + hidden_dim // 2]
