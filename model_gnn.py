@@ -16,61 +16,95 @@ class HalideDataset(Dataset):
         self.data_list = data_list if data_list is not None else []
         super(HalideDataset, self).__init__(root)
         os.makedirs(self.processed_dir, exist_ok=True)
-        # Filter out invalid graphs in data_list
+        # Filter data_list if provided
         if self.data_list:
             self.data_list = [data for data in self.data_list if data.x.shape[0] > 0]
+        # Initialize valid file cache
+        self.valid_files_cache = None
+        self._load_valid_files()
+    
+    def _load_valid_files(self):
+        """Load or generate a list of valid .pt files."""
+        cache_path = os.path.join(self.processed_dir, 'valid_files.pkl')
+        # Check if cache exists and matches current files
+        if os.path.exists(cache_path):
+            try:
+                with open(cache_path, 'rb') as f:
+                    cached_files, cached_mtime = pickle.load(f)
+                # Verify cache is up-to-date
+                current_files = set(f for f in os.listdir(self.processed_dir) if f.endswith('.pt'))
+                if cached_files and all(os.path.getmtime(os.path.join(self.processed_dir, f)) <= cached_mtime for f in cached_files):
+                    self.valid_files_cache = sorted(cached_files)
+                    return
+            except:
+                pass
+        
+        # Generate valid files list
+        valid_files = []
+        for f in sorted(os.listdir(self.processed_dir)):
+            if f.endswith('.pt'):
+                try:
+                    data = torch.load(os.path.join(self.processed_dir, f))
+                    if data.x.shape[0] > 0:
+                        valid_files.append(f)
+                except:
+                    continue
+        
+        self.valid_files_cache = valid_files
+        # Save cache with current timestamp
+        try:
+            with open(cache_path, 'wb') as f:
+                pickle.dump((valid_files, os.path.getmtime(self.processed_dir)), f)
+        except:
+            pass
     
     @property
     def processed_file_names(self):
-        # Return only valid .pt files (non-empty graphs)
+        """Return cached list of valid .pt files."""
         if self.data_list:
             return [f'data_{i}.pt' for i in range(len(self.data_list))]
-        if os.path.exists(self.processed_dir):
-            valid_files = []
-            for f in os.listdir(self.processed_dir):
-                if f.endswith('.pt'):
-                    try:
-                        data = torch.load(os.path.join(self.processed_dir, f))
-                        if data.x.shape[0] > 0:
-                            valid_files.append(f)
-                    except:
-                        continue
-            return valid_files
-        return []
+        return self.valid_files_cache
     
     @property
     def num_graphs(self):
         if self.data_list:
             return len(self.data_list)
-        if os.path.exists(self.processed_dir):
-            return len(self.processed_file_names)  # Use filtered valid files
-        return 0
+        return len(self.processed_file_names)
     
     def len(self):
         return self.num_graphs
     
     def get(self, idx):
-        # Map idx to valid file index
-        valid_files = self.processed_file_names
-        if idx >= len(valid_files):
-            raise IndexError(f"Index {idx} out of range for {len(valid_files)} valid graphs")
-        data = torch.load(os.path.join(self.processed_dir, valid_files[idx]))
-        # Validate data (should be redundant due to processed_file_names filter)
+        if self.data_list:
+            data = self.data_list[idx]
+        else:
+            valid_files = self.processed_file_names
+            if idx >= len(valid_files):
+                raise IndexError(f"Index {idx} out of range for {len(valid_files)} valid graphs")
+            data = torch.load(os.path.join(self.processed_dir, valid_files[idx]))
+        # Validate (should be redundant due to filtering)
         if data.x.shape[0] == 0:
-            raise ValueError(f"Graph {valid_files[idx]} has empty node features (shape: {data.x.shape})")
+            raise ValueError(f"Graph {idx} has empty node features (shape: {data.x.shape})")
         return data
     
     def process(self):
         if not self.data_list:
             return
-        # Clear existing files to avoid stale data
+        # Clear existing files
         for f in os.listdir(self.processed_dir):
-            if f.endswith('.pt'):
+            if f.endswith('.pt') or f == 'valid_files.pkl':
                 os.remove(os.path.join(self.processed_dir, f))
-        # Save only valid graphs
+        # Save valid graphs
         for i, data in enumerate(self.data_list):
             if data.x.shape[0] > 0:
                 torch.save(data, os.path.join(self.processed_dir, f'data_{i}.pt'))
+        # Update cache
+        self.valid_files_cache = [f'data_{i}.pt' for i in range(len(self.data_list)) if self.data_list[i].x.shape[0] > 0]
+        try:
+            with open(os.path.join(self.processed_dir, 'valid_files.pkl'), 'wb') as f:
+                pickle.dump((self.valid_files_cache, os.path.getmtime(self.processed_dir)), f)
+        except:
+            pass
     
     def _process(self):
         if not self.data_list:
@@ -81,48 +115,36 @@ class HalideDataset(Dataset):
 class GNNLSTMModel(nn.Module):
     def __init__(self, node_dim, edge_dim, seq_dim, hidden_dim=64, lstm_layers=2):
         super(GNNLSTMModel, self).__init__()
-        # GNN layers with explicit node_dim
         self.gnn1 = torch_geometric.nn.GCNConv(node_dim, hidden_dim, node_dim=0)
         self.gnn2 = torch_geometric.nn.GCNConv(hidden_dim, hidden_dim, node_dim=0)
-        # LSTM layer
         self.lstm = nn.LSTM(seq_dim, hidden_dim // 2, lstm_layers, batch_first=True)
-        # Fully connected layer
         self.fc = nn.Linear(hidden_dim + hidden_dim // 2, 1)
         self.relu = nn.ReLU()
     
     def forward(self, data):
         x, edge_index, edge_attr, node_sequences = data.x, data.edge_index, data.edge_attr, data.node_sequences
         
-        # Validate input shapes
         if len(x.shape) != 2:
             raise ValueError(f"Expected x to be 2D [num_nodes, node_dim], got shape {x.shape}")
         if len(edge_index.shape) != 2 or edge_index.shape[0] != 2:
             raise ValueError(f"Expected edge_index to be [2, num_edges], got shape {edge_index.shape}")
         
-        # GNN processing
-        x = self.gnn1(x, edge_index)  # [num_nodes, hidden_dim]
+        x = self.gnn1(x, edge_index)
         x = self.relu(x)
-        x = self.gnn2(x, edge_index)  # [num_nodes, hidden_dim]
-        gnn_out = self.relu(x)  # [num_nodes, hidden_dim]
+        x = self.gnn2(x, edge_index)
+        gnn_out = self.relu(x)
         
-        # LSTM processing
-        # node_sequences should be [num_nodes, seq_len]
         if len(node_sequences.shape) == 2:
-            node_sequences = node_sequences.unsqueeze(0)  # [1, num_nodes, seq_len]
-        
-        # Ensure last dim matches seq_dim
+            node_sequences = node_sequences.unsqueeze(0)
         if node_sequences.shape[-1] != self.lstm.input_size:
-            node_sequences = node_sequences.transpose(1, 2)  # [1, seq_len, num_nodes]
+            node_sequences = node_sequences.transpose(1, 2)
         
-        lstm_out, _ = self.lstm(node_sequences)  # [1, num_nodes, hidden_dim // 2]
-        lstm_out = lstm_out.squeeze(0)  # [num_nodes, hidden_dim // 2]
+        lstm_out, _ = self.lstm(node_sequences)
+        lstm_out = lstm_out.squeeze(0)
         
-        # Combine GNN and LSTM outputs
-        combined = torch.cat([gnn_out, lstm_out], dim=1)  # [num_nodes, hidden_dim + hidden_dim // 2]
-        
-        # Global pooling (mean) and prediction
-        out = combined.mean(dim=0)  # [hidden_dim + hidden_dim // 2]
-        out = self.fc(out)  # [1]
+        combined = torch.cat([gnn_out, lstm_out], dim=1)
+        out = combined.mean(dim=0)
+        out = self.fc(out)
         return out
 
 # Function to split dataset
@@ -226,7 +248,7 @@ def main():
     
     dataset = HalideDataset(root='data_g')
     if len(dataset) < 20:
-        raise ValueError(f"Dataset has only {len(dataset)} samples, need at least 20 for testing.")
+        raise ValueError(f"Dataset has only {len(dataset)} samples, need at least {num_test} for testing.")
     
     metadata_path = os.path.join('data_g', 'metadata.pkl')
     with open(metadata_path, 'rb') as f:
