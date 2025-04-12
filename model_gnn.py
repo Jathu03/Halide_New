@@ -80,16 +80,20 @@ class GNNLSTMModel(nn.Module):
         gnn_out = self.relu(x)  # [num_nodes, hidden_dim]
         
         # LSTM processing
-        # Ensure node_sequences is [num_nodes, seq_len]
-        # Add batch dimension if needed: [1, num_nodes, seq_len]
+        # Ensure node_sequences is [num_nodes, seq_len, seq_dim]
         if len(node_sequences.shape) == 2:
+            # Reshape to [1, num_nodes, seq_len] for LSTM
             node_sequences = node_sequences.unsqueeze(0)  # [1, num_nodes, seq_len]
+        elif len(node_sequences.shape) == 3 and node_sequences.shape[0] != 1:
+            # Ensure batch dimension is 1
+            node_sequences = node_sequences[:1]
         
-        lstm_out, _ = self.lstm(node_sequences)  # [1, num_nodes, seq_len, hidden_dim // 2]
+        # LSTM expects [batch_size, seq_len, input_size], so transpose
+        node_sequences = node_sequences.transpose(1, 2)  # [1, seq_len, num_nodes]
+        lstm_out, _ = self.lstm(node_sequences)  # [1, seq_len, hidden_dim // 2]
         
-        # Remove batch dimension and take mean over seq_len
-        lstm_out = lstm_out.squeeze(0)  # [num_nodes, seq_len, hidden_dim // 2]
-        lstm_out = lstm_out.mean(dim=1)  # [num_nodes, hidden_dim // 2]
+        # Reshape to [num_nodes, hidden_dim // 2]
+        lstm_out = lstm_out.transpose(1, 2).squeeze(0)  # [seq_len, num_nodes, hidden_dim // 2] -> [num_nodes, hidden_dim // 2]
         
         # Combine GNN and LSTM outputs
         combined = torch.cat([gnn_out, lstm_out], dim=1)  # [num_nodes, hidden_dim + hidden_dim // 2]
@@ -105,18 +109,16 @@ def split_dataset(dataset, num_test=20, val_ratio=0.1):
     if total_samples < num_test:
         raise ValueError(f"Dataset has only {total_samples} samples, need at least {num_test} for testing.")
     
-    num_test = min(num_test, total_samples)  # Ensure we don't exceed dataset size
+    num_test = min(num_test, total_samples)
     num_train_val = total_samples - num_test
     num_val = int(num_train_val * val_ratio)
     num_train = num_train_val - num_val
     
-    # Shuffle indices
     indices = np.random.permutation(total_samples)
     train_indices = indices[:num_train]
     val_indices = indices[num_train:num_train + num_val]
     test_indices = indices[num_train + num_val:num_train + num_val + num_test]
     
-    # Create subsets using torch.utils.data.Subset
     train_dataset = torch.utils.data.Subset(dataset, train_indices)
     val_dataset = torch.utils.data.Subset(dataset, val_indices)
     test_dataset = torch.utils.data.Subset(dataset, test_indices)
@@ -132,7 +134,6 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100, lr=0.00
     val_losses = []
     
     for epoch in range(num_epochs):
-        # Training
         model.train()
         train_loss = 0.0
         for data in train_loader:
@@ -146,7 +147,6 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100, lr=0.00
         train_loss /= len(train_loader.dataset)
         train_losses.append(train_loss)
         
-        # Validation
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
@@ -177,7 +177,6 @@ def test_model(model, test_loader, device):
             actual = data.y.cpu().numpy().flatten()[0]
             predictions.append(pred)
             actuals.append(actual)
-            # Calculate percentage error
             if actual != 0:
                 perc_error = abs(pred - actual) / actual * 100
             else:
@@ -201,15 +200,12 @@ def plot_losses(train_losses, val_losses, save_path='loss_gnn.png'):
 
 # Main execution
 def main():
-    # Set device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    # Load dataset
     dataset = HalideDataset(root='data_g')
     if len(dataset) < 20:
         raise ValueError(f"Dataset has only {len(dataset)} samples, need at least 20 for testing.")
     
-    # Load metadata for model dimensions
     metadata_path = os.path.join('data_g', 'metadata.pkl')
     with open(metadata_path, 'rb') as f:
         metadata = pickle.load(f)
@@ -218,36 +214,28 @@ def main():
     edge_dim = metadata['edge_feature_dim']
     seq_dim = metadata['seq_feature_dim']
     
-    # Split dataset
     train_dataset, val_dataset, test_dataset = split_dataset(dataset, num_test=20, val_ratio=0.1)
     print(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}, Test samples: {len(test_dataset)}")
     
-    # Create data loaders
     train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
     
-    # Initialize model
     model = GNNLSTMModel(node_dim=node_dim, edge_dim=edge_dim, seq_dim=seq_dim, hidden_dim=64).to(device)
     
-    # Train model
     train_losses, val_losses = train_model(model, train_loader, val_loader, device, num_epochs=100)
     
-    # Plot losses
     plot_losses(train_losses, val_losses, save_path='loss_gnn.png')
     print("Loss plot saved as 'loss_gnn.png'")
     
-    # Test model
     predictions, actuals, percentage_errors = test_model(model, test_loader, device)
     
-    # Print test results
     print("\nTest Sample Predictions:")
     print("Sample | Predicted (ms) | Actual (ms) | Percentage Error (%)")
     print("-" * 60)
     for i, (pred, actual, perc_error) in enumerate(zip(predictions, actuals, percentage_errors)):
         print(f"{i+1:5d} | {pred:13.4f} | {actual:11.4f} | {perc_error:19.4f}")
     
-    # Calculate and print average percentage error
     valid_percentage_errors = [pe for pe in percentage_errors if pe != float('inf')]
     if valid_percentage_errors:
         avg_percentage_error = np.mean(valid_percentage_errors)
