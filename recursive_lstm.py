@@ -303,7 +303,7 @@ class EnhancedRecursiveLSTMModel(nn.Module):
         self.lstm_layers.append(nn.LSTM(seq_input_size, hidden_sizes[0], batch_first=True, bidirectional=True))
         self.ln_layers.append(nn.LayerNorm(hidden_sizes[0] * 2))
         for i in range(1, len(hidden_sizes)):
-            self.lstm_layers.append(nn Neanderthal-LSTM(hidden_sizes[i-1] * 2, hidden_sizes[i], batch_first=True, bidirectional=True))
+            self.lstm_layers.append(nn.LSTM(hidden_sizes[i-1] * 2, hidden_sizes[i], batch_first=True, bidirectional=True))
             self.ln_layers.append(nn.LayerNorm(hidden_sizes[i] * 2))
         
         self.attention = MultiHeadAttention(hidden_sizes[-1] * 2, num_heads, dropout_rate)
