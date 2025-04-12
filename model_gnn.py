@@ -3,7 +3,7 @@ import json
 import torch
 import torch.nn as nn
 import torch_geometric
-from torch_geometric.data import Data, Dataset
+from torch_geometric.data import Data, Dataset, Batch
 from torch_geometric.loader import DataLoader
 import numpy as np
 import matplotlib.pyplot as plt
@@ -22,7 +22,7 @@ class HalideDataset(Dataset):
         self.node_seq_scaler = RobustScaler()
         self.valid_files_cache = None
         self.scaler_cache_path = os.path.join(self.processed_dir, 'scalers.pkl')
-        self.y_values = None  # For weighted sampling
+        self.y_values = None
         if self.data_list:
             self._fit_scalers()
             self.data_list = [self._normalize_data(data) for data in self.data_list if data.x.shape[0] > 0]
@@ -37,6 +37,9 @@ class HalideDataset(Dataset):
         data_source = self.data_list if self.data_list else [torch.load(os.path.join(self.processed_dir, f)) for f in self.valid_files_cache]
         for data in data_source:
             if data.x.shape[0] > 0:
+                # Optional: Filter large graphs (uncomment to enable)
+                # if data.x.shape[0] > 1000:
+                #     continue
                 x_data.append(data.x.numpy())
                 node_seq_data.append(data.node_sequences.numpy().reshape(-1, data.node_sequences.shape[-1]))
                 y_data.append(np.log1p(data.y.numpy()))
@@ -60,7 +63,6 @@ class HalideDataset(Dataset):
                     scalers = pickle.load(f)
                 self.x_scaler = scalers['x_scaler']
                 self.node_seq_scaler = scalers['node_seq_scaler']
-                # Load y_values for sampling
                 data_source = [torch.load(os.path.join(self.processed_dir, f)) for f in self.valid_files_cache]
                 self.y_values = np.array([np.log1p(data.y.numpy()) for data in data_source if data.x.shape[0] > 0]).flatten()
                 return
@@ -155,7 +157,7 @@ class HalideDataset(Dataset):
 
 # Define the GNN+LSTM model with GAT and batch norm
 class GNNLSTMModel(nn.Module):
-    def __init__(self, node_dim, edge_dim, seq_dim, hidden_dim=256, lstm_layers=3, dropout=0.3, heads=4):
+    def __init__(self, node_dim, edge_dim, seq_dim, hidden_dim=256, lstm_layers=3, dropout=0.3, heads=2):
         super(GNNLSTMModel, self).__init__()
         self.gnn1 = torch_geometric.nn.GATConv(node_dim, hidden_dim // heads, heads=heads)
         self.gnn2 = torch_geometric.nn.GATConv(hidden_dim, hidden_dim // heads, heads=heads)
@@ -168,7 +170,7 @@ class GNNLSTMModel(nn.Module):
         self.dropout = nn.Dropout(dropout)
     
     def forward(self, data):
-        x, edge_index, edge_attr, node_sequences = data.x, data.edge_index, data.edge_attr, data.node_sequences
+        x, edge_index, edge_attr, node_sequences, batch = data.x, data.edge_index, data.edge_attr, data.node_sequences, data.batch
         
         if len(x.shape) != 2:
             raise ValueError(f"Expected x to be 2D [num_nodes, node_dim], got shape {x.shape}")
@@ -196,9 +198,10 @@ class GNNLSTMModel(nn.Module):
         lstm_out = self.dropout(lstm_out)
         
         combined = torch.cat([gnn_out, lstm_out], dim=1)
-        out = combined.mean(dim=0)
-        out = self.fc(out)
-        return out
+        # Pool per graph using batch index
+        out = torch_geometric.nn.global_mean_pool(combined, batch)
+        out = self.fc(out)  # [batch_size, 1]
+        return out.squeeze(-1)  # [batch_size]
 
 # Function to split dataset
 def split_dataset(dataset, num_test=20, val_ratio=0.1):
@@ -336,14 +339,14 @@ def main():
         weights = 1.0 / (1.0 + np.abs(dataset.y_values[train_indices]))
         weights = weights / weights.sum() * len(weights)
         sampler = torch.utils.data.WeightedRandomSampler(weights, len(weights))
-        train_loader = DataLoader(train_dataset, batch_size=16, sampler=sampler)
+        train_loader = DataLoader(train_dataset, batch_size=16, sampler=sampler, num_workers=2)
     else:
-        train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
+        train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True, num_workers=2)
     
-    val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False)
+    val_loader = DataLoader(val_dataset, batch_size=16, shuffle=False, num_workers=2)
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
     
-    model = GNNLSTMModel(node_dim=node_dim, edge_dim=edge_dim, seq_dim=seq_dim, hidden_dim=256, lstm_layers=3, dropout=0.3, heads=4).to(device)
+    model = GNNLSTMModel(node_dim=node_dim, edge_dim=edge_dim, seq_dim=seq_dim, hidden_dim=256, lstm_layers=3, dropout=0.3, heads=2).to(device)
     
     train_losses, val_losses = train_model(model, train_loader, val_loader, device, num_epochs=100, lr=0.0003, patience=20)
     
