@@ -27,12 +27,12 @@ def get_execution_time(file_path):
             if isinstance(item, dict) and item.get('name') == 'total_execution_time_ms':
                 execution_time = item.get('value')
                 if execution_time is not None:
+                    print(f"Extracted execution time for {file_path}: {execution_time} ms")
                     return float(execution_time)
         
-        # Fallback: check last schedule's value
         if schedules and isinstance(schedules[-1], dict) and "value" in schedules[-1]:
             execution_time = schedules[-1]["value"]
-            print(f"Warning: 'total_execution_time_ms' not found in 'Schedules' of {file_path}, using last schedule value: {execution_time}")
+            print(f"Warning: 'total_execution_time_ms' not found in 'Schedules' of {file_path}, using last schedule value: {execution_time} ms")
             return float(execution_time)
         
         print(f"Error: No valid execution time found in {file_path}")
@@ -223,6 +223,7 @@ def clean_and_transform_features(train_features, test_features):
     all_features_df = all_features_df.drop(columns=constant_columns)
     print(f"Dropped {len(constant_columns)} constant columns")
     
+    # Always apply log transformation to execution time
     if 'execution_time' in all_features_df.columns:
         all_features_df['execution_time_log'] = np.log1p(all_features_df['execution_time'])
     
@@ -241,16 +242,24 @@ def clean_and_transform_features(train_features, test_features):
 def prepare_data_for_model(train_features, test_features):
     train_df, test_df = clean_and_transform_features(train_features, test_features)
     
+    # Use log-transformed execution time if available
     if 'execution_time_log' in train_df.columns:
         y_train = train_df['execution_time_log'].values.reshape(-1, 1)
         y_test = test_df['execution_time_log'].values.reshape(-1, 1)
         train_df = train_df.drop(['execution_time', 'execution_time_log'], axis=1)
         test_df = test_df.drop(['execution_time', 'execution_time_log'], axis=1)
+        is_log_transformed = True
     else:
         y_train = train_df['execution_time'].values.reshape(-1, 1)
         y_test = test_df['execution_time'].values.reshape(-1, 1)
         train_df = train_df.drop('execution_time', axis=1)
         test_df = test_df.drop('execution_time', axis=1)
+        is_log_transformed = False
+    
+    # Debug: Print raw and transformed target values
+    print("\nDebugging target values in prepare_data_for_model:")
+    print(f"First 5 y_train raw: {y_train[:5].flatten()}")
+    print(f"First 5 y_test raw: {y_test[:5].flatten()}")
     
     scaler_X = StandardScaler()
     scaler_y = StandardScaler()
@@ -260,6 +269,9 @@ def prepare_data_for_model(train_features, test_features):
     X_test_scaled = scaler_X.transform(test_df)
     y_test_scaled = scaler_y.transform(y_test)
     
+    print(f"First 5 y_train scaled: {y_train_scaled[:5].flatten()}")
+    print(f"First 5 y_test scaled: {y_test_scaled[:5].flatten()}")
+    
     X_train_tensor = torch.FloatTensor(X_train_scaled).unsqueeze(1)
     y_train_tensor = torch.FloatTensor(y_train_scaled)
     X_test_tensor = torch.FloatTensor(X_test_scaled).unsqueeze(1)
@@ -268,7 +280,7 @@ def prepare_data_for_model(train_features, test_features):
     print(f"Input feature dimension: {X_train_scaled.shape[1]}")
     
     return (X_train_tensor, y_train_tensor, X_test_tensor, y_test_tensor, 
-            scaler_y, X_train_scaled.shape[1], 'execution_time_log' in train_df.columns)
+            scaler_y, X_train_scaled.shape[1], is_log_transformed)
 
 class EnhancedLSTMModel(nn.Module):
     def __init__(self, input_size, hidden_sizes=[128, 64, 32], output_size=1, dropout_rate=0.3):
@@ -410,7 +422,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
     
     return train_losses, val_losses
 
-def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_transformed=False):
+def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_transformed=False, original_execution_times=None):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.to(device)
     model.eval()
@@ -427,7 +439,7 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_tran
     y_pred_transformed = y_scaler.inverse_transform(y_pred_scaled)
     
     # Debugging: Print transformed values before inverse log
-    print("\nDebugging transformed values:")
+    print("\nDebugging transformed values before inverse log:")
     for i in range(min(5, len(y_test_transformed))):
         print(f"Sample {i}: y_test_transformed={y_test_transformed[i][0]}, y_pred_transformed={y_pred_transformed[i][0]}")
     
@@ -440,9 +452,11 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_tran
         y_pred_actual = y_pred_transformed
     
     # Debugging: Print final actual and predicted values
-    print("\nDebugging final values:")
+    print("\nDebugging final values after all transformations:")
     for i in range(min(5, len(y_test_actual))):
         print(f"Sample {i}: y_test_actual={y_test_actual[i][0]}, y_pred_actual={y_pred_actual[i][0]}")
+        if original_execution_times:
+            print(f"  Original execution time from JSON: {original_execution_times[file_names_test[i]]}")
     
     results_by_subfolder = {}
     for i, file_path in enumerate(file_names_test):
@@ -493,6 +507,11 @@ def main(main_dir):
         print("Error: No valid training or test data found")
         return None
     
+    # Collect original execution times for debugging
+    original_execution_times = {}
+    for feature, fname in zip(test_features, test_file_names):
+        original_execution_times[fname] = feature['execution_time']
+    
     # Prepare data for model
     X_train, y_train, X_test, y_test, y_scaler, input_size, is_log_transformed = prepare_data_for_model(train_features, test_features)
     
@@ -538,7 +557,10 @@ def main(main_dir):
     
     # Evaluate model
     print("\nEvaluating model:")
-    y_test_actual, y_pred_actual = evaluate_model(model, X_test, y_test, y_scaler, test_file_names, is_log_transformed)
+    y_test_actual, y_pred_actual = evaluate_model(
+        model, X_test, y_test, y_scaler, test_file_names, 
+        is_log_transformed, original_execution_times
+    )
     
     # Save the trained model as a .pt file using TorchScript
     print("\nSaving the trained model as 'lstm_model.pt'...")
