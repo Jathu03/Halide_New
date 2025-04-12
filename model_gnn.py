@@ -81,9 +81,14 @@ class GNNLSTMModel(nn.Module):
         
         # LSTM processing
         # Ensure node_sequences is [num_nodes, seq_len]
-        lstm_out, _ = self.lstm(node_sequences)  # [num_nodes, seq_len, hidden_dim // 2]
+        # Add batch dimension if needed: [1, num_nodes, seq_len]
+        if len(node_sequences.shape) == 2:
+            node_sequences = node_sequences.unsqueeze(0)  # [1, num_nodes, seq_len]
         
-        # Take the mean over the sequence length to get [num_nodes, hidden_dim // 2]
+        lstm_out, _ = self.lstm(node_sequences)  # [1, num_nodes, seq_len, hidden_dim // 2]
+        
+        # Remove batch dimension and take mean over seq_len
+        lstm_out = lstm_out.squeeze(0)  # [num_nodes, seq_len, hidden_dim // 2]
         lstm_out = lstm_out.mean(dim=1)  # [num_nodes, hidden_dim // 2]
         
         # Combine GNN and LSTM outputs
