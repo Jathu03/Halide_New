@@ -61,9 +61,9 @@ class HalideDataset(Dataset):
 class GNNLSTMModel(nn.Module):
     def __init__(self, node_dim, edge_dim, seq_dim, hidden_dim=64, lstm_layers=2):
         super(GNNLSTMModel, self).__init__()
-        # GNN layers
-        self.gnn1 = torch_geometric.nn.GCNConv(node_dim, hidden_dim)
-        self.gnn2 = torch_geometric.nn.GCNConv(hidden_dim, hidden_dim)
+        # GNN layers with explicit node_dim
+        self.gnn1 = torch_geometric.nn.GCNConv(node_dim, hidden_dim, node_dim=0)
+        self.gnn2 = torch_geometric.nn.GCNConv(hidden_dim, hidden_dim, node_dim=0)
         # LSTM layer
         self.lstm = nn.LSTM(seq_dim, hidden_dim // 2, lstm_layers, batch_first=True)
         # Fully connected layer
@@ -73,26 +73,28 @@ class GNNLSTMModel(nn.Module):
     def forward(self, data):
         x, edge_index, edge_attr, node_sequences = data.x, data.edge_index, data.edge_attr, data.node_sequences
         
+        # Validate input shapes
+        if len(x.shape) != 2:
+            raise ValueError(f"Expected x to be 2D [num_nodes, node_dim], got shape {x.shape}")
+        if len(edge_index.shape) != 2 or edge_index.shape[0] != 2:
+            raise ValueError(f"Expected edge_index to be [2, num_edges], got shape {edge_index.shape}")
+        
         # GNN processing
-        x = self.gnn1(x, edge_index)
+        x = self.gnn1(x, edge_index)  # [num_nodes, hidden_dim]
         x = self.relu(x)
-        x = self.gnn2(x, edge_index)
+        x = self.gnn2(x, edge_index)  # [num_nodes, hidden_dim]
         gnn_out = self.relu(x)  # [num_nodes, hidden_dim]
         
         # LSTM processing
         # node_sequences should be [num_nodes, seq_len]
-        # Reshape for LSTM: [1, num_nodes, seq_len]
         if len(node_sequences.shape) == 2:
             node_sequences = node_sequences.unsqueeze(0)  # [1, num_nodes, seq_len]
         
-        # LSTM expects [batch_size, num_nodes, seq_dim], so ensure last dim is seq_dim
-        # If seq_len != seq_dim, transpose to treat seq_len as seq_dim
+        # Ensure last dim matches seq_dim
         if node_sequences.shape[-1] != self.lstm.input_size:
             node_sequences = node_sequences.transpose(1, 2)  # [1, seq_len, num_nodes]
         
         lstm_out, _ = self.lstm(node_sequences)  # [1, num_nodes, hidden_dim // 2]
-        
-        # Reshape to [num_nodes, hidden_dim // 2]
         lstm_out = lstm_out.squeeze(0)  # [num_nodes, hidden_dim // 2]
         
         # Combine GNN and LSTM outputs
