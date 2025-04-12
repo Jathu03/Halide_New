@@ -38,17 +38,17 @@ class HalideDataset(Dataset):
     def inverse_transform(self, scaled_values):
         return self.scaler.inverse_transform(scaled_values.reshape(-1, 1)).flatten()
 
-# Recursive LSTM Model with improved graph processing
+# Recursive LSTM Model with improved gradient flow
 class RecursiveLSTM(nn.Module):
     def __init__(self, node_feature_dim, node_seq_dim, edge_feature_dim, edge_seq_dim, hidden_dim=256, lstm_hidden_dim=128):
         super(RecursiveLSTM, self).__init__()
-        self.node_lstm = nn.LSTM(node_seq_dim, lstm_hidden_dim, batch_first=True, num_layers=2, dropout=0.2)
-        self.edge_lstm = nn.LSTM(edge_seq_dim, lstm_hidden_dim, batch_first=True, num_layers=2, dropout=0.2)
-        self.node_fc = nn.Linear(node_feature_dim + lstm_hidden_dim, hidden_dim)
-        self.edge_fc = nn.Linear(edge_feature_dim + lstm_hidden_dim, hidden_dim)
+        self.node_lstm = nn.LSTM(node_seq_dim, lstm_hidden_dim, batch_first=True, num_layers=2, dropout=0.2, bidirectional=True)
+        self.edge_lstm = nn.LSTM(edge_seq_dim, lstm_hidden_dim, batch_first=True, num_layers=2, dropout=0.2, bidirectional=True)
+        self.node_fc = nn.Linear(node_feature_dim + lstm_hidden_dim * 2, hidden_dim)  # *2 for bidirectional
+        self.edge_fc = nn.Linear(edge_feature_dim + lstm_hidden_dim * 2, hidden_dim)  # *2 for bidirectional
         self.graph_fc = nn.Linear(hidden_dim, hidden_dim)
         self.output_fc = nn.Linear(hidden_dim, 1)
-        self.relu = nn.ReLU()
+        self.leaky_relu = nn.LeakyReLU(0.1)
         self.dropout = nn.Dropout(0.2)
 
     def forward(self, adj_list, node_features, node_sequences, edge_features, edge_sequences):
@@ -58,18 +58,18 @@ class RecursiveLSTM(nn.Module):
         for i in range(batch_size):
             # Node processing
             node_seq = node_sequences[i].unsqueeze(0)  # (1, nodes, seq_len)
-            node_seq_out, _ = self.node_lstm(node_seq)  # (1, nodes, lstm_hidden_dim)
+            node_seq_out, _ = self.node_lstm(node_seq)  # (1, nodes, lstm_hidden_dim * 2)
             node_feat = node_features[i]  # (nodes, node_feature_dim)
-            node_combined = torch.cat([node_feat, node_seq_out.squeeze(0)], dim=-1)  # (nodes, node_feature_dim + lstm_hidden_dim)
-            node_out = self.relu(self.node_fc(node_combined))  # (nodes, hidden_dim)
+            node_combined = torch.cat([node_feat, node_seq_out.squeeze(0)], dim=-1)  # (nodes, node_feature_dim + lstm_hidden_dim * 2)
+            node_out = self.leaky_relu(self.node_fc(node_combined))  # (nodes, hidden_dim)
 
             # Edge processing
             edge_seq = edge_sequences[i].unsqueeze(0)  # (1, edges, seq_len)
             if edge_seq.size(1) > 0:
-                edge_seq_out, _ = self.edge_lstm(edge_seq)  # (1, edges, lstm_hidden_dim)
+                edge_seq_out, _ = self.edge_lstm(edge_seq)  # (1, edges, lstm_hidden_dim * 2)
                 edge_feat = edge_features[i]  # (edges, edge_feature_dim)
-                edge_combined = torch.cat([edge_feat, edge_seq_out.squeeze(0)], dim=-1)  # (edges, edge_feature_dim + lstm_hidden_dim)
-                edge_out = self.relu(self.edge_fc(edge_combined))  # (edges, hidden_dim)
+                edge_combined = torch.cat([edge_feat, edge_seq_out.squeeze(0)], dim=-1)  # (edges, edge_feature_dim + lstm_hidden_dim * 2)
+                edge_out = self.leaky_relu(self.edge_fc(edge_combined))  # (edges, hidden_dim)
             else:
                 edge_out = torch.zeros(1, hidden_dim, device=node_out.device)
 
@@ -79,12 +79,12 @@ class RecursiveLSTM(nn.Module):
             for node_idx, neighbors in enumerate(adj):
                 if neighbors:
                     neighbor_outs = node_out[neighbors]  # (num_neighbors, hidden_dim)
-                    node_agg[node_idx] = self.relu(node_out[node_idx] + torch.mean(neighbor_outs, dim=0))
+                    node_agg[node_idx] = self.leaky_relu(node_out[node_idx] + torch.mean(neighbor_outs, dim=0))
 
             # Graph-level aggregation
             node_mean = torch.mean(node_agg, dim=0, keepdim=True)  # (1, hidden_dim)
             edge_mean = torch.mean(edge_out, dim=0, keepdim=True)  # (1, hidden_dim)
-            graph_out = self.dropout(self.relu(self.graph_fc(node_mean + edge_mean)))  # (1, hidden_dim)
+            graph_out = self.dropout(self.leaky_relu(self.graph_fc(node_mean + edge_mean)))  # (1, hidden_dim)
             pred = self.output_fc(graph_out)  # (1, 1)
             graph_outputs.append(pred)
 
@@ -118,10 +118,11 @@ def load_and_split_data(file_path='data_r.pkl'):
     
     return train_dataset, val_dataset, test_dataset
 
-# Training function with early stopping
+# Training function with learning rate scheduler
 def train_model(model, train_loader, val_loader, num_epochs=100, lr=0.001, patience=10):
     criterion = nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)  # L2 regularization
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.to(device)
     
@@ -145,7 +146,7 @@ def train_model(model, train_loader, val_loader, num_epochs=100, lr=0.001, patie
             outputs = model(adj_list, node_features, node_sequences, edge_features, edge_sequences)
             loss = criterion(outputs, targets)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             train_loss += loss.item()
         
@@ -172,18 +173,18 @@ def train_model(model, train_loader, val_loader, num_epochs=100, lr=0.001, patie
         
         print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
         
-        # Early stopping
+        scheduler.step(val_loss)  # Adjust learning rate based on val_loss
+        
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             patience_counter = 0
-            torch.save(model.state_dict(), 'best_model.pt')  # Save best model
+            torch.save(model.state_dict(), 'best_model.pt')
         else:
             patience_counter += 1
             if patience_counter >= patience:
                 print(f"Early stopping triggered after {epoch+1} epochs")
                 break
     
-    # Load best model
     model.load_state_dict(torch.load('best_model.pt'))
     return train_losses, val_losses
 
@@ -239,7 +240,7 @@ if __name__ == "__main__":
     train_dataset, val_dataset, test_dataset = load_and_split_data('data_r.pkl')
     print(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}, Test samples: {len(test_dataset)}")
     
-    train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True, collate_fn=collate_fn)  # Increased batch size
+    train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True, collate_fn=collate_fn)
     val_loader = DataLoader(val_dataset, batch_size=8, shuffle=False, collate_fn=collate_fn)
     test_loader = DataLoader(test_dataset, batch_size=8, shuffle=False, collate_fn=collate_fn)
     
