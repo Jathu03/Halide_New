@@ -11,7 +11,7 @@ import pickle
 from sklearn.metrics import mean_absolute_error
 from sklearn.preprocessing import StandardScaler, RobustScaler
 
-# Define the HalideDataset class with log-scaling and robust scaling
+# Define the HalideDataset class with improved scaling
 class HalideDataset(Dataset):
     def __init__(self, data_list=None, root='data_g'):
         self.data_list = data_list if data_list is not None else []
@@ -19,10 +19,11 @@ class HalideDataset(Dataset):
         os.makedirs(self.processed_dir, exist_ok=True)
         # Initialize scalers
         self.x_scaler = StandardScaler()
-        self.y_scaler = RobustScaler()  # Use RobustScaler for y
+        self.y_scaler = RobustScaler()
         self.node_seq_scaler = StandardScaler()
         self.valid_files_cache = None
         self.scaler_cache_path = os.path.join(self.processed_dir, 'scalers.pkl')
+        self.y_max = 1e5  # Cap for extreme y values
         if self.data_list:
             self._fit_scalers()
             self.data_list = [self._normalize_data(data) for data in self.data_list if data.x.shape[0] > 0]
@@ -38,8 +39,9 @@ class HalideDataset(Dataset):
         for data in data_source:
             if data.x.shape[0] > 0:
                 x_data.append(data.x.numpy())
-                # Apply log1p to y to handle extreme values
-                y_data.append(np.log1p(data.y.numpy().reshape(-1, 1)))
+                # Cap and log1p for scaler fitting only
+                y_capped = np.clip(data.y.numpy(), 0, self.y_max)
+                y_data.append(np.log1p(y_capped.reshape(-1, 1)))
                 node_seq_data.append(data.node_sequences.numpy().reshape(-1, data.node_sequences.shape[-1]))
         if x_data:
             self.x_scaler.fit(np.vstack(x_data))
@@ -70,8 +72,8 @@ class HalideDataset(Dataset):
     
     def _normalize_data(self, data):
         x = torch.tensor(self.x_scaler.transform(data.x.numpy()), dtype=torch.float)
-        # Apply log1p to y before scaling
-        y = torch.tensor(self.y_scaler.transform(np.log1p(data.y.numpy().reshape(-1, 1))).flatten(), dtype=torch.float)
+        # Keep y unscaled for training, but cap it
+        y = torch.tensor(np.clip(data.y.numpy(), 0, self.y_max), dtype=torch.float)
         node_seq = torch.tensor(self.node_seq_scaler.transform(data.node_sequences.numpy().reshape(-1, data.node_sequences.shape[-1])).reshape(data.node_sequences.shape), dtype=torch.float)
         return Data(x=x, edge_index=data.edge_index, edge_attr=data.edge_attr, y=y, node_sequences=node_seq)
     
@@ -154,24 +156,30 @@ class HalideDataset(Dataset):
             return
         self.process()
 
-# Define a custom relative MAE loss
-class RelativeMAELoss(nn.Module):
-    def __init__(self, epsilon=1e-6):
-        super(RelativeMAELoss, self).__init__()
+# Define a custom bounded relative MAE loss
+class BoundedRelativeMAELoss(nn.Module):
+    def __init__(self, epsilon=1e-2, max_y=1e5):
+        super(BoundedRelativeMAELoss, self).__init__()
         self.epsilon = epsilon
+        self.max_y = max_y
     
     def forward(self, pred, target):
+        # Ensure non-negative predictions
+        pred = torch.relu(pred)
+        # Clip target and prediction
+        pred = torch.clamp(pred, 0, self.max_y)
+        target = torch.clamp(target, 0, self.max_y)
         abs_error = torch.abs(pred - target)
-        relative_error = abs_error / (torch.abs(target) + self.epsilon)
+        relative_error = abs_error / (target + self.epsilon)
         return torch.mean(relative_error)
 
-# Define the GNN+LSTM model with enhanced architecture
+# Define the GNN+LSTM model
 class GNNLSTMModel(nn.Module):
     def __init__(self, node_dim, edge_dim, seq_dim, hidden_dim=256, lstm_layers=2, dropout=0.2):
         super(GNNLSTMModel, self).__init__()
         self.gnn1 = torch_geometric.nn.GCNConv(node_dim, hidden_dim, node_dim=0)
         self.gnn2 = torch_geometric.nn.GCNConv(hidden_dim, hidden_dim, node_dim=0)
-        self.gnn3 = torch_geometric.nn.GCNConv(hidden_dim, hidden_dim, node_dim=0)  # Additional GNN layer
+        self.gnn3 = torch_geometric.nn.GCNConv(hidden_dim, hidden_dim, node_dim=0)
         self.lstm = nn.LSTM(seq_dim, hidden_dim // 2, lstm_layers, batch_first=True)
         self.fc = nn.Linear(hidden_dim + hidden_dim // 2, 1)
         self.relu = nn.ReLU()
@@ -237,10 +245,10 @@ def split_dataset(dataset, num_test=20, val_ratio=0.1):
     return train_dataset, val_dataset, test_dataset
 
 # Training function with early stopping and LR scheduling
-def train_model(model, train_loader, val_loader, device, num_epochs=100, lr=0.0003, patience=15):
+def train_model(model, train_loader, val_loader, device, num_epochs=100, lr=0.0005, patience=20):
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    criterion = RelativeMAELoss(epsilon=1e-6)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=7)
+    criterion = BoundedRelativeMAELoss(epsilon=1e-2, max_y=1e5)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
     
     train_losses = []
     val_losses = []
@@ -290,22 +298,22 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100, lr=0.00
     
     return train_losses, val_losses
 
-# Testing function with inverse scaling
-def test_model(model, test_loader, device, y_scaler):
+# Testing function with clipping
+def test_model(model, test_loader, device):
     model.eval()
     predictions = []
     actuals = []
     percentage_errors = []
+    max_y = 1e5
     
     with torch.no_grad():
         for data in test_loader:
             data = data.to(device)
             out = model(data)
-            # Inverse transform predictions and actuals (undo log1p)
-            pred_scaled = y_scaler.inverse_transform(out.cpu().numpy().reshape(-1, 1)).flatten()
-            pred = np.expm1(pred_scaled)[0]  # Inverse of log1p
-            actual_scaled = y_scaler.inverse_transform(data.y.cpu().numpy().reshape(-1, 1)).flatten()
-            actual = np.expm1(actual_scaled)[0]
+            pred = torch.relu(out).cpu().numpy().flatten()[0]  # Ensure non-negative
+            pred = np.clip(pred, 0, max_y)
+            actual = data.y.cpu().numpy().flatten()[0]
+            actual = np.clip(actual, 0, max_y)
             predictions.append(pred)
             actuals.append(actual)
             if actual != 0:
@@ -322,7 +330,7 @@ def plot_losses(train_losses, val_losses, save_path='loss_gnn.png'):
     plt.plot(train_losses, label='Train Loss')
     plt.plot(val_losses, label='Validation Loss')
     plt.xlabel('Epoch')
-    plt.ylabel('Relative MAE Loss')
+    plt.ylabel('Bounded Relative MAE Loss')
     plt.title('Training and Validation Loss')
     plt.legend()
     plt.grid(True)
@@ -348,18 +356,18 @@ def main():
     train_dataset, val_dataset, test_dataset = split_dataset(dataset, num_test=20, val_ratio=0.1)
     print(f"Train samples: {len(train_dataset)}, Val samples: {len(val_dataset)}, Test samples: {len(test_dataset)}")
     
-    train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False)
+    train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=4, shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
     
     model = GNNLSTMModel(node_dim=node_dim, edge_dim=edge_dim, seq_dim=seq_dim, hidden_dim=256, dropout=0.2).to(device)
     
-    train_losses, val_losses = train_model(model, train_loader, val_loader, device, num_epochs=100, lr=0.0003, patience=15)
+    train_losses, val_losses = train_model(model, train_loader, val_loader, device, num_epochs=100, lr=0.0005, patience=20)
     
     plot_losses(train_losses, val_losses, save_path='loss_gnn.png')
     print("Loss plot saved as 'loss_gnn.png'")
     
-    predictions, actuals, percentage_errors = test_model(model, test_loader, device, dataset.y_scaler)
+    predictions, actuals, percentage_errors = test_model(model, test_loader, device)
     
     print("\nTest Sample Predictions:")
     print("Sample | Predicted (ms) | Actual (ms) | Percentage Error (%)")
