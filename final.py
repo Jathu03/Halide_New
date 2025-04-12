@@ -9,7 +9,7 @@ import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 import random
-import matplotlib.pyplot as plt  # Added for plotting
+import matplotlib.pyplot as plt
 
 def get_execution_time(file_path):
     try:
@@ -22,15 +22,21 @@ def get_execution_time(file_path):
             print(f"Error: 'programming_details' key not found in {file_path}")
             return None
         
-        schedules = data["scheduling_data"]
+        schedules = data.get("scheduling_data", [])
         for item in schedules:
             if isinstance(item, dict) and item.get('name') == 'total_execution_time_ms':
                 execution_time = item.get('value')
                 if execution_time is not None:
                     return float(execution_time)
         
-        print(f"Warning: 'total_execution_time_ms' not found in 'Schedules' of {file_path}")
-        return schedules[len(schedules)-1]["value"]
+        # Fallback: check last schedule's value
+        if schedules and isinstance(schedules[-1], dict) and "value" in schedules[-1]:
+            execution_time = schedules[-1]["value"]
+            print(f"Warning: 'total_execution_time_ms' not found in 'Schedules' of {file_path}, using last schedule value: {execution_time}")
+            return float(execution_time)
+        
+        print(f"Error: No valid execution time found in {file_path}")
+        return None
     
     except FileNotFoundError:
         print(f"Error: File {file_path} not found")
@@ -57,11 +63,7 @@ def extract_features_from_file(file_path):
     
     nodes_features = []
     edges_features = []
-    programming_details = None
-    for key, value in data.items():
-        if key == "programming_details":
-            programming_details = value
-            break
+    programming_details = data.get("programming_details")
     
     if programming_details:
         if 'Nodes' in programming_details:
@@ -87,13 +89,9 @@ def extract_features_from_file(file_path):
                 edges_features.append(edge_feature)
     
     scheduling_features = []
-    scheduling_data = None
-    for key, value in data.items():
-        if key == "scheduling_data":
-            scheduling_data = value
-            break
+    scheduling_data = data.get("scheduling_data")
     
-    if not scheduling_data and 'Schedules' in programming_details:
+    if not scheduling_data and programming_details and 'Schedules' in programming_details:
         scheduling_data = programming_details['Schedules']
     
     if scheduling_data:
@@ -145,7 +143,9 @@ def extract_features_from_file(file_path):
         features['total_parallelism'] = total_parallelism
         
         if total_vectors > 0:
-            features['bytes_per_vector'] = total_bytes_at_production / total_vectors if total_vectors > 0 else 0
+            features['bytes_per_vector'] = total_bytes_at_production / total_vectors
+        else:
+            features['bytes_per_vector'] = 0
         
         if 'working_set' in scheduling_features[0] and 'bytes_at_production' in scheduling_features[0]:
             features['memory_pressure'] = scheduling_features[0]['working_set'] / scheduling_features[0]['bytes_at_production'] if scheduling_features[0]['bytes_at_production'] > 0 else 0
@@ -337,7 +337,7 @@ class EnhancedLSTMModel(nn.Module):
         
         return output
 
-def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=32):
+def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=16):
     train_dataset = TensorDataset(X_train, y_train)
     test_dataset = TensorDataset(X_test, y_test)
     
@@ -422,9 +422,16 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_tran
     y_pred_scaled = y_pred_scaled.cpu().numpy()
     y_test = y_test.cpu().numpy()
     
+    # Inverse transform the scaled values
     y_test_transformed = y_scaler.inverse_transform(y_test)
     y_pred_transformed = y_scaler.inverse_transform(y_pred_scaled)
     
+    # Debugging: Print transformed values before inverse log
+    print("\nDebugging transformed values:")
+    for i in range(min(5, len(y_test_transformed))):
+        print(f"Sample {i}: y_test_transformed={y_test_transformed[i][0]}, y_pred_transformed={y_pred_transformed[i][0]}")
+    
+    # Apply inverse log transformation if needed
     if is_log_transformed:
         y_test_actual = np.expm1(y_test_transformed)
         y_pred_actual = np.expm1(y_pred_transformed)
@@ -432,25 +439,34 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_tran
         y_test_actual = y_test_transformed
         y_pred_actual = y_pred_transformed
     
+    # Debugging: Print final actual and predicted values
+    print("\nDebugging final values:")
+    for i in range(min(5, len(y_test_actual))):
+        print(f"Sample {i}: y_test_actual={y_test_actual[i][0]}, y_pred_actual={y_pred_actual[i][0]}")
+    
     results_by_subfolder = {}
     for i, file_path in enumerate(file_names_test):
         subfolder = file_path.split('/')[0]
         if subfolder not in results_by_subfolder:
             results_by_subfolder[subfolder] = []
         
+        actual_val = y_test_actual[i][0]
+        pred_val = y_pred_actual[i][0]
+        error_percentage = abs(actual_val - pred_val) / actual_val * 100 if actual_val > 0 else 0
+        
         results_by_subfolder[subfolder].append({
             'file': file_path,
-            'actual': y_test_actual[i][0],
-            'predicted': y_pred_actual[i][0],
-            'error_percentage': abs(y_test_actual[i][0] - y_pred_actual[i][0]) / y_test_actual[i][0] * 100 if y_test_actual[i][0] > 0 else 0
+            'actual': actual_val,
+            'predicted': pred_val,
+            'error_percentage': error_percentage
         })
     
     for subfolder, results in results_by_subfolder.items():
         print(f"\nResults for {subfolder}:")
         for result in results:
             print(f"File: {result['file']}")
-            print(f"  Actual execution time: {result['actual']:.2f} ms")
-            print(f"  Predicted execution time: {result['predicted']:.2f} ms")
+            print(f"  Actual execution time: {result['actual']} ms")
+            print(f"  Predicted execution time: {result['predicted']} ms")
             print(f"  Error percentage: {result['error_percentage']:.2f}%")
     
     mse = np.mean((y_test_actual - y_pred_actual) ** 2)
@@ -459,9 +475,9 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_tran
     mape = np.mean(np.abs((y_test_actual - y_pred_actual) / (y_test_actual + 1e-8))) * 100
     
     print("\nOverall Model Performance:")
-    print(f"MSE: {mse:.2f}")
-    print(f"RMSE: {rmse:.2f}")
-    print(f"MAE: {mae:.2f}")
+    print(f"MSE: {mse}")
+    print(f"RMSE: {rmse}")
+    print(f"MAE: {mae}")
     print(f"MAPE: {mape:.2f}%")
     
     return y_test_actual, y_pred_actual
@@ -526,20 +542,14 @@ def main(main_dir):
     
     # Save the trained model as a .pt file using TorchScript
     print("\nSaving the trained model as 'lstm_model.pt'...")
-    model.eval()  # Set the model to evaluation mode
+    model.eval()
     
-    # Determine the device the model is on
     device = next(model.parameters()).device
     print(f"Model is on device: {device}")
     
     try:
-        # Create sample input and move it to the same device as the model
-        sample_input = torch.randn(1, 1, input_size).to(device)  # [batch_size, sequence_length, input_size]
-        
-        # Trace the model with the sample input
+        sample_input = torch.randn(1, 1, input_size).to(device)
         traced_model = torch.jit.trace(model, sample_input)
-        
-        # Save the traced model to a .pt file
         traced_model.save("lstm_model.pt")
         print("Model successfully saved as 'lstm_model.pt'")
     except Exception as e:
@@ -548,13 +558,8 @@ def main(main_dir):
     return model, y_scaler, y_test_actual, y_pred_actual
 
 if __name__ == "__main__":
-    # Main directory containing subfolders for each program
     main_dir = "synthetic_data"
-    
-    # Set random seed for reproducibility
     random.seed(42)
-    
-    # Run the main function to train and test
     result = main(main_dir)
     if result is not None:
         model, y_scaler, y_test_actual, y_pred_actual = result
