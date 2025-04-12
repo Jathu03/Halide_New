@@ -89,7 +89,7 @@ class HalideDataset(Dataset):
         x_augmented = np.concatenate([data.x.numpy(), graph_stats.numpy()], axis=1)
         x = torch.tensor(self.x_scaler.transform(x_augmented), dtype=torch.float)
         y_orig = float(data.y.item() if data.y.dim() > 0 else data.y)
-        y_weight = 1.0 / (1.0 + np.log1p(np.abs(y_orig) / 1e3)) if y_orig > 1e3 else 1.0
+        y_weight = 1.0 / (1.0 + np.log1p(np.abs(y_orig) / 500)) if y_orig > 500 else 1.0
         y = torch.tensor(np.log1p(y_orig), dtype=torch.float).squeeze()
         node_seq = torch.tensor(self.node_seq_scaler.transform(data.node_sequences.numpy().reshape(-1, data.node_sequences.shape[-1])).reshape(data.node_sequences.shape), dtype=torch.float)
         return Data(
@@ -180,13 +180,13 @@ class HalideDataset(Dataset):
             return
         self.process()
 
-# Define the GNN+LSTM model with batch support
+# Define the GNN+LSTM model with edge features
 class GNNLSTMModel(nn.Module):
     def __init__(self, node_dim, edge_dim, seq_dim, hidden_dim=512, lstm_layers=3, dropout=0.2):
         super(GNNLSTMModel, self).__init__()
-        self.gnn1 = GATConv(node_dim, hidden_dim // 2, heads=8, dropout=dropout)
-        self.gnn2 = GATConv((hidden_dim // 2) * 8, hidden_dim, heads=4, dropout=dropout)
-        self.gnn3 = GATConv(hidden_dim * 4, hidden_dim, heads=1, dropout=dropout)
+        self.gnn1 = GATConv(node_dim, hidden_dim // 2, heads=8, dropout=dropout, edge_dim=edge_dim)
+        self.gnn2 = GATConv((hidden_dim // 2) * 8, hidden_dim, heads=4, dropout=dropout, edge_dim=edge_dim)
+        self.gnn3 = GATConv(hidden_dim * 4, hidden_dim, heads=1, dropout=dropout, edge_dim=edge_dim)
         self.bn1 = nn.BatchNorm1d((hidden_dim // 2) * 8)
         self.bn2 = nn.BatchNorm1d(hidden_dim * 4)
         self.bn3 = nn.BatchNorm1d(hidden_dim)
@@ -208,15 +208,15 @@ class GNNLSTMModel(nn.Module):
         if self.residual_proj:
             x_residual = self.residual_proj(x)
         
-        x = self.gnn1(x, edge_index)
+        x = self.gnn1(x, edge_index, edge_attr=edge_attr)
         x = self.bn1(x)
         x = self.relu(x + x_residual)
         x = self.dropout(x)
-        x = self.gnn2(x, edge_index)
+        x = self.gnn2(x, edge_index, edge_attr=edge_attr)
         x = self.bn2(x)
         x = self.relu(x)
         x = self.dropout(x)
-        x = self.gnn3(x, edge_index)
+        x = self.gnn3(x, edge_index, edge_attr=edge_attr)
         x = self.bn3(x)
         gnn_out = self.relu(x)
         
@@ -230,10 +230,9 @@ class GNNLSTMModel(nn.Module):
         lstm_out = self.dropout(lstm_out)
         
         combined = torch.cat([gnn_out, lstm_out], dim=1)
-        # Pool per graph in batch
         out = torch_geometric.nn.global_mean_pool(combined, batch)
-        out = self.fc(out)  # Shape: [batch_size, 1]
-        return out.squeeze(-1)  # Shape: [batch_size]
+        out = self.fc(out)
+        return out.squeeze(-1)
 
 # Function to split dataset
 def split_dataset(dataset, num_test=20, val_ratio=0.1):
@@ -268,14 +267,14 @@ class WarmupLR(torch.optim.lr_scheduler._LRScheduler):
     def get_lr(self):
         if self.last_epoch < self.warmup_epochs:
             progress = self.last_epoch / self.warmup_epochs
-            return [self.base_lr + (self.final_lr - self.base_lr) * progress for _ in self.base_groups]
-        return [self.final_lr for _ in self.base_groups]
+            return [self.base_lr + (self.final_lr - self.base_lr) * progress for _ in self.optimizer.param_groups]
+        return [self.final_lr for _ in self.optimizer.param_groups]
 
-# Training function with batched loss
-def train_model(model, train_loader, val_loader, device, num_epochs=100, lr=0.0002, patience=15, accum_steps=4):
+# Training function
+def train_model(model, train_loader, val_loader, device, num_epochs=100, lr=0.0002, patience=15, accum_steps=8):
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     criterion = nn.HuberLoss(delta=0.3, reduction='none')
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=7)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=20, eta_min=lr * 0.1)
     warmup_scheduler = WarmupLR(optimizer, warmup_epochs=10, base_lr=lr * 0.1, final_lr=lr)
     
     train_losses = []
@@ -290,8 +289,8 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100, lr=0.00
         optimizer.zero_grad()
         for i, data in enumerate(train_loader):
             data = data.to(device)
-            out = model(data)  # Shape: [batch_size]
-            loss = criterion(out, data.y)  # Both [batch_size]
+            out = model(data)
+            loss = criterion(out, data.y)
             weight = data.y_weight if hasattr(data, 'y_weight') else torch.ones_like(loss)
             weighted_loss = (loss * weight).mean() / accum_steps
             weighted_loss.backward()
@@ -329,7 +328,8 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100, lr=0.00
         
         print(f"Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
         
-        scheduler.step(val_loss)
+        if epoch >= 10:  # Apply cosine annealing after warmup
+            scheduler.step()
         warmup_scheduler.step()
         
         if val_loss < best_val_loss:
@@ -406,7 +406,7 @@ def main():
     
     model = GNNLSTMModel(node_dim=node_dim, edge_dim=edge_dim, seq_dim=seq_dim, hidden_dim=512, lstm_layers=3, dropout=0.2).to(device)
     
-    train_losses, val_losses = train_model(model, train_loader, val_loader, device, num_epochs=100, lr=0.0002, patience=15, accum_steps=4)
+    train_losses, val_losses = train_model(model, train_loader, val_loader, device, num_epochs=100, lr=0.0002, patience=15, accum_steps=8)
     
     plot_losses(train_losses, val_losses, save_path='loss_gnn.png')
     print("Loss plot saved as 'loss_gnn.png'")
