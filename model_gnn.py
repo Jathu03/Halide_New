@@ -1,18 +1,16 @@
 import os
-import json
 import torch
 import torch.nn as nn
 import torch_geometric
-from torch_geometric.data import Data, Dataset
+from torch_geometric.data import Data, Dataset, Batch
 from torch_geometric.loader import DataLoader
 from torch_geometric.nn import GATConv
 import numpy as np
 import matplotlib.pyplot as plt
 import pickle
-from sklearn.metrics import mean_absolute_error
 from sklearn.preprocessing import StandardScaler
 
-# Define the HalideDataset class with consistent feature handling
+# Define the HalideDataset class with consistent tensor shapes
 class HalideDataset(Dataset):
     def __init__(self, data_list=None, root='data_g'):
         self.data_list = data_list if data_list is not None else []
@@ -23,7 +21,6 @@ class HalideDataset(Dataset):
         self.node_seq_scaler = StandardScaler()
         self.valid_files_cache = None
         self.scaler_cache_path = os.path.join(self.processed_dir, 'scalers.pkl')
-        # Load metadata to get expected node_dim
         self.metadata_path = os.path.join(root, 'metadata.pkl')
         self.expected_node_dim = None
         if os.path.exists(self.metadata_path):
@@ -72,7 +69,6 @@ class HalideDataset(Dataset):
                     scalers = pickle.load(f)
                 self.x_scaler = scalers['x_scaler']
                 self.node_seq_scaler = scalers['node_seq_scaler']
-                # Validate scaler feature count
                 if self.expected_node_dim:
                     expected_features = self.expected_node_dim + 3
                     if hasattr(self.x_scaler, 'n_features_in_') and self.x_scaler.n_features_in_ != expected_features:
@@ -92,11 +88,18 @@ class HalideDataset(Dataset):
         graph_stats = torch.tensor([num_nodes, num_edges, edge_density], dtype=torch.float).repeat(num_nodes, 1)
         x_augmented = np.concatenate([data.x.numpy(), graph_stats.numpy()], axis=1)
         x = torch.tensor(self.x_scaler.transform(x_augmented), dtype=torch.float)
-        y_orig = data.y.numpy()
-        y_weight = 1.0 / (1.0 + np.log1p(np.abs(y_orig) / 5e3)) if y_orig > 5e3 else 1.0
-        y = torch.tensor(np.log1p(y_orig), dtype=torch.float)
+        y_orig = float(data.y.item() if data.y.dim() > 0 else data.y)  # Ensure scalar
+        y_weight = 1.0 / (1.0 + np.log1p(np.abs(y_orig) / 2e3)) if y_orig > 2e3 else 1.0
+        y = torch.tensor(np.log1p(y_orig), dtype=torch.float).squeeze()  # Scalar tensor
         node_seq = torch.tensor(self.node_seq_scaler.transform(data.node_sequences.numpy().reshape(-1, data.node_sequences.shape[-1])).reshape(data.node_sequences.shape), dtype=torch.float)
-        return Data(x=x, edge_index=data.edge_index, edge_attr=data.edge_attr, y=y, node_sequences=node_seq, y_weight=torch.tensor(y_weight, dtype=torch.float))
+        return Data(
+            x=x,
+            edge_index=data.edge_index,
+            edge_attr=data.edge_attr,
+            y=y,
+            node_sequences=node_seq,
+            y_weight=torch.tensor(y_weight, dtype=torch.float).squeeze()
+        )
     
     def _load_valid_files(self):
         cache_path = os.path.join(self.processed_dir, 'valid_files.pkl')
@@ -177,7 +180,7 @@ class HalideDataset(Dataset):
             return
         self.process()
 
-# Define the GNN+LSTM model with residual connections
+# Define the GNN+LSTM model with custom batch norm
 class GNNLSTMModel(nn.Module):
     def __init__(self, node_dim, edge_dim, seq_dim, hidden_dim=256, lstm_layers=3, dropout=0.2):
         super(GNNLSTMModel, self).__init__()
@@ -191,7 +194,6 @@ class GNNLSTMModel(nn.Module):
         self.fc = nn.Linear(hidden_dim + hidden_dim // 2, 1)
         self.relu = nn.ReLU()
         self.dropout = nn.Dropout(dropout)
-        # Residual projection for gnn1 output
         self.residual_proj = nn.Linear(node_dim, hidden_dim * 4) if node_dim != hidden_dim * 4 else None
     
     def forward(self, data):
@@ -202,14 +204,13 @@ class GNNLSTMModel(nn.Module):
         if len(edge_index.shape) != 2 or edge_index.shape[0] != 2:
             raise ValueError(f"Expected edge_index to be [2, num_edges], got shape {edge_index.shape}")
         
-        # Residual connection
         x_residual = x
         if self.residual_proj:
             x_residual = self.residual_proj(x)
         
         x = self.gnn1(x, edge_index)
         x = self.bn1(x)
-        x = self.relu(x + x_residual)  # Residual
+        x = self.relu(x + x_residual)
         x = self.dropout(x)
         x = self.gnn2(x, edge_index)
         x = self.bn2(x)
@@ -255,10 +256,10 @@ def split_dataset(dataset, num_test=20, val_ratio=0.1):
     
     return train_dataset, val_dataset, test_dataset
 
-# Training function with weighted Huber loss
-def train_model(model, train_loader, val_loader, device, num_epochs=100, lr=0.0002, patience=15):
+# Training function with gradient accumulation
+def train_model(model, train_loader, val_loader, device, num_epochs=100, lr=0.0002, patience=15, accum_steps=4):
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    criterion = nn.HuberLoss(delta=0.3, reduction='none')  # Tighter delta
+    criterion = nn.HuberLoss(delta=0.3, reduction='none')
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=7)
     
     train_losses = []
@@ -270,18 +271,29 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100, lr=0.00
         model.train()
         train_loss = 0.0
         total_weight = 0.0
-        for data in train_loader:
+        optimizer.zero_grad()
+        for i, data in enumerate(train_loader):
             data = data.to(device)
-            optimizer.zero_grad()
             out = model(data)
             loss = criterion(out, data.y)
             weight = data.y_weight if hasattr(data, 'y_weight') else torch.ones_like(loss)
-            weighted_loss = (loss * weight).mean()
+            weighted_loss = (loss * weight).mean() / accum_steps
             weighted_loss.backward()
+            
+            if (i + 1) % accum_steps == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                optimizer.zero_grad()
+            
+            train_loss += weighted_loss.item() * accum_steps * data.num_graphs
+            total_weight += weight.sum().item()
+        
+        # Step if remaining gradients
+        if len(train_loader) % accum_steps != 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
-            train_loss += weighted_loss.item() * data.num_graphs
-            total_weight += weight.sum().item()
+            optimizer.zero_grad()
+        
         train_loss /= max(total_weight, 1e-8)
         train_losses.append(train_loss)
         
@@ -317,7 +329,7 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100, lr=0.00
     
     return train_losses, val_losses
 
-# Testing function with inverse log-scaling
+# Testing function
 def test_model(model, test_loader, device):
     model.eval()
     predictions = []
@@ -329,7 +341,7 @@ def test_model(model, test_loader, device):
             data = data.to(device)
             out = model(data)
             pred = np.expm1(out.cpu().numpy().flatten())[0]
-            actual = np.expm1(data.y.cpu().numpy().flatten())[0]
+            actual = np.expm1(data.y.cpu().numpy().item())  # Ensure scalar
             predictions.append(pred)
             actuals.append(actual)
             if actual != 0:
@@ -378,7 +390,7 @@ def main():
     
     model = GNNLSTMModel(node_dim=node_dim, edge_dim=edge_dim, seq_dim=seq_dim, hidden_dim=256, lstm_layers=3, dropout=0.2).to(device)
     
-    train_losses, val_losses = train_model(model, train_loader, val_loader, device, num_epochs=100, lr=0.0002, patience=15)
+    train_losses, val_losses = train_model(model, train_loader, val_loader, device, num_epochs=100, lr=0.0002, patience=15, accum_steps=4)
     
     plot_losses(train_losses, val_losses, save_path='loss_gnn.png')
     print("Loss plot saved as 'loss_gnn.png'")
