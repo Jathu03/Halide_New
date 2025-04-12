@@ -80,20 +80,20 @@ class GNNLSTMModel(nn.Module):
         gnn_out = self.relu(x)  # [num_nodes, hidden_dim]
         
         # LSTM processing
-        # Ensure node_sequences is [num_nodes, seq_len, seq_dim]
+        # node_sequences should be [num_nodes, seq_len]
+        # Reshape for LSTM: [1, num_nodes, seq_len]
         if len(node_sequences.shape) == 2:
-            # Reshape to [1, num_nodes, seq_len] for LSTM
             node_sequences = node_sequences.unsqueeze(0)  # [1, num_nodes, seq_len]
-        elif len(node_sequences.shape) == 3 and node_sequences.shape[0] != 1:
-            # Ensure batch dimension is 1
-            node_sequences = node_sequences[:1]
         
-        # LSTM expects [batch_size, seq_len, input_size], so transpose
-        node_sequences = node_sequences.transpose(1, 2)  # [1, seq_len, num_nodes]
-        lstm_out, _ = self.lstm(node_sequences)  # [1, seq_len, hidden_dim // 2]
+        # LSTM expects [batch_size, num_nodes, seq_dim], so ensure last dim is seq_dim
+        # If seq_len != seq_dim, transpose to treat seq_len as seq_dim
+        if node_sequences.shape[-1] != self.lstm.input_size:
+            node_sequences = node_sequences.transpose(1, 2)  # [1, seq_len, num_nodes]
+        
+        lstm_out, _ = self.lstm(node_sequences)  # [1, num_nodes, hidden_dim // 2]
         
         # Reshape to [num_nodes, hidden_dim // 2]
-        lstm_out = lstm_out.transpose(1, 2).squeeze(0)  # [seq_len, num_nodes, hidden_dim // 2] -> [num_nodes, hidden_dim // 2]
+        lstm_out = lstm_out.squeeze(0)  # [num_nodes, hidden_dim // 2]
         
         # Combine GNN and LSTM outputs
         combined = torch.cat([gnn_out, lstm_out], dim=1)  # [num_nodes, hidden_dim + hidden_dim // 2]
