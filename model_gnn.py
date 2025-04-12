@@ -16,16 +16,26 @@ class HalideDataset(Dataset):
         self.data_list = data_list if data_list is not None else []
         super(HalideDataset, self).__init__(root)
         os.makedirs(self.processed_dir, exist_ok=True)
-        # Filter out invalid graphs (e.g., empty node features)
+        # Filter out invalid graphs in data_list
         if self.data_list:
             self.data_list = [data for data in self.data_list if data.x.shape[0] > 0]
     
     @property
     def processed_file_names(self):
+        # Return only valid .pt files (non-empty graphs)
         if self.data_list:
             return [f'data_{i}.pt' for i in range(len(self.data_list))]
         if os.path.exists(self.processed_dir):
-            return [f for f in os.listdir(self.processed_dir) if f.endswith('.pt')]
+            valid_files = []
+            for f in os.listdir(self.processed_dir):
+                if f.endswith('.pt'):
+                    try:
+                        data = torch.load(os.path.join(self.processed_dir, f))
+                        if data.x.shape[0] > 0:
+                            valid_files.append(f)
+                    except:
+                        continue
+            return valid_files
         return []
     
     @property
@@ -33,35 +43,38 @@ class HalideDataset(Dataset):
         if self.data_list:
             return len(self.data_list)
         if os.path.exists(self.processed_dir):
-            return len([f for f in os.listdir(self.processed_dir) if f.endswith('.pt')])
+            return len(self.processed_file_names)  # Use filtered valid files
         return 0
     
     def len(self):
         return self.num_graphs
     
     def get(self, idx):
-        data = torch.load(os.path.join(self.processed_dir, f'data_{idx}.pt'))
-        # Validate data before returning
+        # Map idx to valid file index
+        valid_files = self.processed_file_names
+        if idx >= len(valid_files):
+            raise IndexError(f"Index {idx} out of range for {len(valid_files)} valid graphs")
+        data = torch.load(os.path.join(self.processed_dir, valid_files[idx]))
+        # Validate data (should be redundant due to processed_file_names filter)
         if data.x.shape[0] == 0:
-            raise ValueError(f"Graph {idx} has empty node features (shape: {data.x.shape})")
+            raise ValueError(f"Graph {valid_files[idx]} has empty node features (shape: {data.x.shape})")
         return data
     
     def process(self):
         if not self.data_list:
             return
+        # Clear existing files to avoid stale data
+        for f in os.listdir(self.processed_dir):
+            if f.endswith('.pt'):
+                os.remove(os.path.join(self.processed_dir, f))
+        # Save only valid graphs
         for i, data in enumerate(self.data_list):
-            if data.x.shape[0] > 0:  # Only save valid graphs
+            if data.x.shape[0] > 0:
                 torch.save(data, os.path.join(self.processed_dir, f'data_{i}.pt'))
     
     def _process(self):
         if not self.data_list:
             return
-        expected_files = set(self.processed_file_names)
-        existing_files = set(f for f in os.listdir(self.processed_dir) if f.endswith('.pt'))
-        if expected_files == existing_files:
-            return
-        for f in existing_files:
-            os.remove(os.path.join(self.processed_dir, f))
         self.process()
 
 # Define the GNN+LSTM model
