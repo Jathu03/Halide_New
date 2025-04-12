@@ -178,7 +178,7 @@ def load_and_split_data(file_path='data_r.pkl'):
     return train_dataset, val_dataset, test_dataset
 
 # Training function
-def train_model(model, train_loader, val_loader, num_epochs=100, lr=0.001, patience=10):
+def train_model(model, train_loader, val_loader, num_epochs=10, lr=0.001, patience=10):
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
@@ -284,7 +284,7 @@ def evaluate_model(model, test_loader, dataset):
     predictions = dataset.inverse_transform_time(np.array(predictions))
     actuals = dataset.inverse_transform_time(np.array(actuals))
     
-    error_percentages = [abs(pred - actual) / actual * 100 for pred, actual in zip(predictions, actuals) if actual != 0]
+    error_percentages = [abs(pred - actual) / actual * 10 for pred, actual in zip(predictions, actuals) if actual != 0]
     mean_error_percentage = np.mean(error_percentages)
     
     print("\nTest Set Predictions vs Actuals:")
@@ -313,6 +313,6 @@ if __name__ == "__main__":
         lstm_hidden_dim=128
     )
     
-    train_losses, val_losses = train_model(model, train_loader, val_loader, num_epochs=100, lr=0.001, patience=10)
+    train_losses, val_losses = train_model(model, train_loader, val_loader, num_epochs=10, lr=0.001, patience=10)
     plot_loss(train_losses, val_losses)
     mean_error_percentage = evaluate_model(model, test_loader, test_dataset)
