@@ -9,20 +9,19 @@ import numpy as np
 import matplotlib.pyplot as plt
 import pickle
 from sklearn.metrics import mean_absolute_error
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import RobustScaler
 
-# Define the HalideDataset class with normalization
+# Define the HalideDataset class with log-scaling and robust scaling
 class HalideDataset(Dataset):
     def __init__(self, data_list=None, root='data_g'):
         self.data_list = data_list if data_list is not None else []
         super(HalideDataset, self).__init__(root)
         os.makedirs(self.processed_dir, exist_ok=True)
         # Initialize scalers
-        self.x_scaler = StandardScaler()
-        self.y_scaler = StandardScaler()
-        self.node_seq_scaler = StandardScaler()
+        self.x_scaler = RobustScaler()
+        self.y_scaler = None  # Log-scaling for y, no scaler needed
+        self.node_seq_scaler = RobustScaler()
         self.valid_files_cache = None
-        # Load or fit scalers
         self.scaler_cache_path = os.path.join(self.processed_dir, 'scalers.pkl')
         if self.data_list:
             self._fit_scalers()
@@ -32,50 +31,45 @@ class HalideDataset(Dataset):
             self._load_or_fit_scalers()
     
     def _fit_scalers(self):
-        # Collect data for fitting scalers
         x_data = []
-        y_data = []
         node_seq_data = []
         data_source = self.data_list if self.data_list else [torch.load(os.path.join(self.processed_dir, f)) for f in self.valid_files_cache]
         for data in data_source:
             if data.x.shape[0] > 0:
                 x_data.append(data.x.numpy())
-                y_data.append(data.y.numpy().reshape(-1, 1))
                 node_seq_data.append(data.node_sequences.numpy().reshape(-1, data.node_sequences.shape[-1]))
+                # Optional: Filter extreme targets (uncomment to enable)
+                # y = data.y.numpy()
+                # if y > 1e5:
+                #     continue
         if x_data:
             self.x_scaler.fit(np.vstack(x_data))
-            self.y_scaler.fit(np.vstack(y_data))
             self.node_seq_scaler.fit(np.vstack(node_seq_data))
-            # Save fitted scalers
             try:
                 with open(self.scaler_cache_path, 'wb') as f:
                     pickle.dump({
                         'x_scaler': self.x_scaler,
-                        'y_scaler': self.y_scaler,
                         'node_seq_scaler': self.node_seq_scaler
                     }, f)
             except:
                 pass
     
     def _load_or_fit_scalers(self):
-        # Load scalers from cache if available
         if os.path.exists(self.scaler_cache_path):
             try:
                 with open(self.scaler_cache_path, 'rb') as f:
                     scalers = pickle.load(f)
                 self.x_scaler = scalers['x_scaler']
-                self.y_scaler = scalers['y_scaler']
                 self.node_seq_scaler = scalers['node_seq_scaler']
                 return
             except:
                 pass
-        # Fit scalers if cache is missing or invalid
         self._fit_scalers()
     
     def _normalize_data(self, data):
-        # Normalize x, y, and node_sequences
         x = torch.tensor(self.x_scaler.transform(data.x.numpy()), dtype=torch.float)
-        y = torch.tensor(self.y_scaler.transform(data.y.numpy().reshape(-1, 1)).flatten(), dtype=torch.float)
+        # Log-scale y
+        y = torch.tensor(np.log1p(data.y.numpy()), dtype=torch.float)
         node_seq = torch.tensor(self.node_seq_scaler.transform(data.node_sequences.numpy().reshape(-1, data.node_sequences.shape[-1])).reshape(data.node_sequences.shape), dtype=torch.float)
         return Data(x=x, edge_index=data.edge_index, edge_attr=data.edge_attr, y=y, node_sequences=node_seq)
     
@@ -158,12 +152,13 @@ class HalideDataset(Dataset):
             return
         self.process()
 
-# Define the GNN+LSTM model with dropout
+# Define the GNN+LSTM model with increased capacity
 class GNNLSTMModel(nn.Module):
-    def __init__(self, node_dim, edge_dim, seq_dim, hidden_dim=128, lstm_layers=2, dropout=0.3):
+    def __init__(self, node_dim, edge_dim, seq_dim, hidden_dim=256, lstm_layers=3, dropout=0.3):
         super(GNNLSTMModel, self).__init__()
         self.gnn1 = torch_geometric.nn.GCNConv(node_dim, hidden_dim, node_dim=0)
         self.gnn2 = torch_geometric.nn.GCNConv(hidden_dim, hidden_dim, node_dim=0)
+        self.gnn3 = torch_geometric.nn.GCNConv(hidden_dim, hidden_dim, node_dim=0)  # Added layer
         self.lstm = nn.LSTM(seq_dim, hidden_dim // 2, lstm_layers, batch_first=True)
         self.fc = nn.Linear(hidden_dim + hidden_dim // 2, 1)
         self.relu = nn.ReLU()
@@ -181,6 +176,9 @@ class GNNLSTMModel(nn.Module):
         x = self.relu(x)
         x = self.dropout(x)
         x = self.gnn2(x, edge_index)
+        x = self.relu(x)
+        x = self.dropout(x)
+        x = self.gnn3(x, edge_index)
         gnn_out = self.relu(x)
         
         if len(node_sequences.shape) == 2:
@@ -219,11 +217,11 @@ def split_dataset(dataset, num_test=20, val_ratio=0.1):
     
     return train_dataset, val_dataset, test_dataset
 
-# Training function with early stopping and LR scheduling
-def train_model(model, train_loader, val_loader, device, num_epochs=100, lr=0.0005, patience=10):
+# Training function with Huber loss
+def train_model(model, train_loader, val_loader, device, num_epochs=100, lr=0.0003, patience=15):
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    criterion = nn.L1Loss()
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
+    criterion = nn.HuberLoss(delta=1.0)  # Robust to outliers
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=7)
     
     train_losses = []
     val_losses = []
@@ -273,8 +271,8 @@ def train_model(model, train_loader, val_loader, device, num_epochs=100, lr=0.00
     
     return train_losses, val_losses
 
-# Testing function with inverse scaling
-def test_model(model, test_loader, device, y_scaler):
+# Testing function with inverse log-scaling
+def test_model(model, test_loader, device):
     model.eval()
     predictions = []
     actuals = []
@@ -284,8 +282,9 @@ def test_model(model, test_loader, device, y_scaler):
         for data in test_loader:
             data = data.to(device)
             out = model(data)
-            pred = y_scaler.inverse_transform(out.cpu().numpy().reshape(-1, 1)).flatten()[0]
-            actual = y_scaler.inverse_transform(data.y.cpu().numpy().reshape(-1, 1)).flatten()[0]
+            # Inverse transform: expm1 for log1p
+            pred = np.expm1(out.cpu().numpy().flatten())[0]
+            actual = np.expm1(data.y.cpu().numpy().flatten())[0]
             predictions.append(pred)
             actuals.append(actual)
             if actual != 0:
@@ -302,7 +301,7 @@ def plot_losses(train_losses, val_losses, save_path='loss_gnn.png'):
     plt.plot(train_losses, label='Train Loss')
     plt.plot(val_losses, label='Validation Loss')
     plt.xlabel('Epoch')
-    plt.ylabel('MAE Loss')
+    plt.ylabel('Huber Loss')
     plt.title('Training and Validation Loss')
     plt.legend()
     plt.grid(True)
@@ -332,14 +331,14 @@ def main():
     val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
     
-    model = GNNLSTMModel(node_dim=node_dim, edge_dim=edge_dim, seq_dim=seq_dim, hidden_dim=128, dropout=0.3).to(device)
+    model = GNNLSTMModel(node_dim=node_dim, edge_dim=edge_dim, seq_dim=seq_dim, hidden_dim=256, lstm_layers=3, dropout=0.3).to(device)
     
-    train_losses, val_losses = train_model(model, train_loader, val_loader, device, num_epochs=100, lr=0.0005, patience=10)
+    train_losses, val_losses = train_model(model, train_loader, val_loader, device, num_epochs=100, lr=0.0003, patience=15)
     
     plot_losses(train_losses, val_losses, save_path='loss_gnn.png')
     print("Loss plot saved as 'loss_gnn.png'")
     
-    predictions, actuals, percentage_errors = test_model(model, test_loader, device, dataset.y_scaler)
+    predictions, actuals, percentage_errors = test_model(model, test_loader, device)
     
     print("\nTest Sample Predictions:")
     print("Sample | Predicted (ms) | Actual (ms) | Percentage Error (%)")
