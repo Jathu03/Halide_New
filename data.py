@@ -155,7 +155,7 @@ class HalideDataset(Dataset):
         # Initialize data_list before parent class init
         self.data_list = data_list if data_list is not None else []
         super(HalideDataset, self).__init__(root)
-        # Use the inherited processed_dir property and ensure directory exists
+        # Ensure processed directory exists
         os.makedirs(self.processed_dir, exist_ok=True)
     
     @property
@@ -190,6 +190,25 @@ class HalideDataset(Dataset):
         # Process and save data files
         for i, data in enumerate(self.data_list):
             torch.save(data, os.path.join(self.processed_dir, f'data_{i}.pt'))
+    
+    def _process(self):
+        # Override to avoid weights_only issue
+        if not self.data_list:
+            return  # Nothing to process
+        # Only process if processed files don't exist or are outdated
+        expected_files = set(self.processed_file_names)
+        existing_files = set(f for f in os.listdir(self.processed_dir) if f.endswith('.pt'))
+        
+        # If the expected files match existing files, skip processing
+        if expected_files == existing_files:
+            return
+        
+        # Clear existing files to avoid inconsistencies
+        for f in existing_files:
+            os.remove(os.path.join(self.processed_dir, f))
+        
+        # Process and save new files
+        self.process()
 
 # Main function to process all files
 def create_dataset(data_dir='synthetic_data', output_dir='data_g'):
@@ -231,40 +250,6 @@ def create_dataset(data_dir='synthetic_data', output_dir='data_g'):
     
     print(f"Dataset saved to {output_dir} with {len(data_list)} graphs")
     return dataset
-
-# Example GNN+LSTM model (for reference, not trained here)
-import torch.nn as nn
-from torch_geometric.nn import GCNConv
-
-class GNNLSTMModel(nn.Module):
-    def __init__(self, node_dim, edge_dim, seq_dim, hidden_dim, lstm_layers=2):
-        super(GNNLSTMModel, self).__init__()
-        self.gnn1 = GCNConv(node_dim, hidden_dim)
-        self.gnn2 = GCNConv(hidden_dim, hidden_dim)
-        self.lstm = nn.LSTM(seq_dim, hidden_dim // 2, lstm_layers, batch_first=True)
-        self.fc = nn.Linear(hidden_dim + hidden_dim // 2, 1)
-        self.relu = nn.ReLU()
-    
-    def forward(self, data):
-        x, edge_index, edge_attr, node_sequences = data.x, data.edge_index, data.edge_attr, data.node_sequences
-        
-        # GNN part
-        x = self.gnn1(x, edge_index)
-        x = self.relu(x)
-        x = self.gnn2(x, edge_index)
-        gnn_out = self.relu(x)  # [num_nodes, hidden_dim]
-        
-        # LSTM part
-        lstm_out, _ = self.lstm(node_sequences)  # [num_nodes, seq_len, hidden_dim // 2]
-        lstm_out = lstm_out[:, -1, :]  # Take last output: [num_nodes, hidden_dim // 2]
-        
-        # Combine
-        combined = torch.cat([gnn_out, lstm_out], dim=1)  # [num_nodes, hidden_dim + hidden_dim // 2]
-        
-        # Global pooling (e.g., mean) and predict
-        out = combined.mean(dim=0)  # [hidden_dim + hidden_dim // 2]
-        out = self.fc(out)  # [1]
-        return out
 
 # Run the dataset creation
 if __name__ == "__main__":
