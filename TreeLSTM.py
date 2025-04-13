@@ -78,7 +78,7 @@ def save_scaler_params(scaler_X, scaler_y, feature_names, is_log_transformed):
         json.dump(scaler_y_data, f, indent=4)
     print("Saved scaler_y parameters to 'scaler_y.json'")
 
-def main(main_dir):
+def main(main_dir="synthetic_data"):
     print(f"Processing main directory: {main_dir}")
     train_features, test_features, test_file_names = process_main_directory(main_dir)
     
