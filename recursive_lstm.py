@@ -18,23 +18,38 @@ def extract_node_features(node):
     mem_features = []
     for pattern in mem_patterns:
         # Convert pattern values to numbers (assuming they are space-separated)
-        values = pattern.split(':')[-1].strip().split()
-        mem_features.extend([float(v) for v in values])
+        try:
+            values = pattern.split(':')[-1].strip().split()
+            mem_features.extend([float(v) for v in values if v.replace('.', '', 1).isdigit()])
+        except Exception as e:
+            print(f"Error parsing memory pattern {pattern}: {e}")
+            mem_features.extend([0.0] * 4)  # Fallback for missing/invalid patterns
     
     # Operation histogram
     op_hist = details.get('Op histogram', [])
     op_features = []
     for op in op_hist:
-        # Extract number after colon
-        value = float(op.split(':')[-1].strip())
-        op_features.append(value)
+        try:
+            value = float(op.split(':')[-1].strip())
+            op_features.append(value)
+        except Exception as e:
+            print(f"Error parsing op histogram {op}: {e}")
+            op_features.append(0.0)
     
-    # Scheduling features (if present)
+    # Scheduling features
     sched_features = details.get('scheduling_feature', {})
-    sched_values = [float(v) for v in sched_features.values() if isinstance(v, (int, float))]
+    sched_values = []
+    for v in sched_features.values():
+        try:
+            sched_values.append(float(v))
+        except (TypeError, ValueError):
+            sched_values.append(0.0)
     
     # Combine all features
-    return np.array(mem_features + op_features + sched_values, dtype=np.float32)
+    feature_vector = mem_features + op_features + sched_values
+    if not feature_vector:
+        feature_vector = [0.0]  # Prevent empty features
+    return np.array(feature_vector, dtype=np.float32)
 
 def extract_edge_features(edge):
     """Extract features from an edge."""
@@ -44,43 +59,59 @@ def extract_edge_features(edge):
     jacobians = details.get('Load Jacobians', [])
     jacobian_features = []
     for row in jacobians:
-        # Parse fractions and numbers
-        values = row.strip().split()
-        parsed = []
-        for v in values:
-            if '/' in v:
-                num, denom = map(float, v.split('/'))
-                parsed.append(num / denom)
-            else:
-                parsed.append(float(v))
-        jacobian_features.extend(parsed)
+        try:
+            values = row.strip().split()
+            parsed = []
+            for v in values:
+                if '/' in v:
+                    try:
+                        num, denom = map(float, v.split('/'))
+                        parsed.append(num / denom)
+                    except:
+                        parsed.append(0.0)
+                else:
+                    try:
+                        parsed.append(float(v))
+                    except:
+                        parsed.append(0.0)
+            jacobian_features.extend(parsed)
+        except Exception as e:
+            print(f"Error parsing Jacobian {row}: {e}")
+            jacobian_features.extend([0.0] * 3)
     
-    # Footprint (simplified: count elements)
+    # Footprint
     footprint = details.get('Footprint', [])
-    footprint_features = [len(footprint)]
+    footprint_features = [float(len(footprint))]
     
     return np.array(jacobian_features + footprint_features, dtype=np.float32)
 
 def build_tree(nodes, edges):
     """Build a tree structure from nodes and edges."""
+    if not nodes:
+        return None
+    
     node_dict = {node['Name']: idx for idx, node in enumerate(nodes)}
     node_features = [extract_node_features(node) for node in nodes]
+    
+    # Ensure all feature vectors have the same length
+    max_len = max(len(f) for f in node_features)
+    node_features = [np.pad(f, (0, max_len - len(f)), mode='constant') for f in node_features]
     
     # Initialize adjacency list
     children = [[] for _ in nodes]
     parents = [-1] * len(nodes)
     
     for edge in edges:
-        from_node = edge['From']
-        to_node = edge['To']
+        from_node = edge.get('From')
+        to_node = edge.get('To')
         if from_node in node_dict and to_node in node_dict:
             from_idx = node_dict[from_node]
             to_idx = node_dict[to_node]
             children[from_idx].append(to_idx)
-            if parents[to_idx] == -1:  # Assign first parent
+            if parents[to_idx] == -1:
                 parents[to_idx] = from_idx
     
-    # Find root (node with no parent)
+    # Find root
     root = next((i for i, p in enumerate(parents) if p == -1), 0)
     
     return {
@@ -96,13 +127,20 @@ class HalideDataset(Dataset):
         self.trees = []
         self.labels = []
         
+        # Check if data_dir exists
+        if not os.path.exists(data_dir):
+            print(f"Directory {data_dir} does not exist.")
+            return
+        
         # Iterate through synthetic_data folder
         for subfolder in tqdm(os.listdir(data_dir), desc="Processing folders"):
             subfolder_path = os.path.join(data_dir, subfolder)
             if not os.path.isdir(subfolder_path):
+                print(f"Skipping {subfolder_path}: not a directory")
                 continue
             for filename in os.listdir(subfolder_path):
                 if not filename.endswith('.json'):
+                    print(f"Skipping {filename}: not a JSON file")
                     continue
                 file_path = os.path.join(subfolder_path, filename)
                 try:
@@ -110,25 +148,55 @@ class HalideDataset(Dataset):
                         data = json.load(f)
                     
                     # Extract programming details
-                    prog_details = data.get('programming_details', {})
-                    nodes = prog_details.get('Nodes', [])
-                    edges = prog_details.get('Edges', [])
+                    prog_details = data.get('programming_details', [])
+                    if not prog_details:
+                        print(f"No programming_details in {file_path}")
+                        continue
                     
-                    # Extract execution time
+                    # Extract nodes and edges
+                    nodes = []
+                    edges = []
                     exec_time = None
-                    for item in prog_details:
-                        if isinstance(item, dict) and item.get('name') == 'total_execution_time_ms':
-                            exec_time = float(item['value'])
-                            break
+                    
+                    # Handle both list and dict formats
+                    if isinstance(prog_details, dict):
+                        nodes = prog_details.get('Nodes', [])
+                        edges = prog_details.get('Edges', [])
+                        # Look for execution time in prog_details
+                        for key, value in prog_details.items():
+                            if key == 'total_execution_time_ms' or (isinstance(value, dict) and value.get('name') == 'total_execution_time_ms'):
+                                exec_time = float(value.get('value', 0.0)) if isinstance(value, dict) else float(value)
+                                break
+                    elif isinstance(prog_details, list):
+                        for item in prog_details:
+                            if isinstance(item, dict):
+                                if item.get('Nodes'):
+                                    nodes = item['Nodes']
+                                if item.get('Edges'):
+                                    edges = item['Edges']
+                                if item.get('name') == 'total_execution_time_ms':
+                                    exec_time = float(item.get('value', 0.0))
+                    
+                    if not nodes or not edges:
+                        print(f"No nodes or edges in {file_path}")
+                        continue
                     if exec_time is None:
+                        print(f"No execution time found in {file_path}")
                         continue
                     
                     # Build tree
                     tree = build_tree(nodes, edges)
+                    if tree is None:
+                        print(f"Failed to build tree for {file_path}")
+                        continue
+                    
                     self.trees.append(tree)
                     self.labels.append(exec_time)
                 except Exception as e:
                     print(f"Error processing {file_path}: {e}")
+        
+        if not self.trees:
+            print("No valid trees were created. Check JSON file structure.")
     
     def __len__(self):
         return len(self.trees)
@@ -147,26 +215,18 @@ class TreeLSTMCell(nn.Module):
         self.input_size = input_size
         self.hidden_size = hidden_size
         
-        # Gates: input, forget, output, cell
         self.W_iou = nn.Linear(input_size, 3 * hidden_size)
         self.U_iou = nn.Linear(hidden_size, 3 * hidden_size)
         self.W_f = nn.Linear(input_size, hidden_size)
         self.U_f = nn.Linear(hidden_size, hidden_size)
     
     def forward(self, x, h_children, c_children):
-        # x: (input_size)
-        # h_children: list of (hidden_size)
-        # c_children: list of (hidden_size)
-        
-        batch_size = 1  # Single node processing
+        batch_size = 1
         iou = self.W_iou(x) + sum(self.U_iou(h) for h in h_children)
         i, o, u = torch.split(iou, self.hidden_size, dim=-1)
         i, o, u = torch.sigmoid(i), torch.sigmoid(o), torch.tanh(u)
         
-        f = []
-        for h in h_children:
-            f.append(torch.sigmoid(self.W_f(x) + self.U_f(h)))
-        
+        f = [torch.sigmoid(self.W_f(x) + self.U_f(h)) for h in h_children]
         c = i * u + sum(f_k * c_k for f_k, c_k in zip(f, c_children))
         h = o * torch.tanh(c)
         
@@ -175,15 +235,14 @@ class TreeLSTMCell(nn.Module):
 class TreeLSTM(nn.Module):
     def __init__(self, input_size, hidden_size):
         super(TreeLSTM, self).__init__()
-        self.cell = TreeLSTMCell(input_size, hidden_size)
-        self.fc = nn.Linear(hidden_size, 1)  # Predict execution time
+        self.cell = Tree  self.cell = TreeLSTMCell(input_size, hidden_size)
+        self.fc = nn.Linear(hidden_size, 1)
     
     def forward(self, tree):
         node_features = tree['node_features']
         children = tree['children']
         root = tree['root']
         
-        # Initialize hidden and cell states
         h = [torch.zeros(1, self.cell.hidden_size) for _ in node_features]
         c = [torch.zeros(1, self.cell.hidden_size) for _ in node_features]
         visited = set()
@@ -193,7 +252,6 @@ class TreeLSTM(nn.Module):
                 return h[idx], c[idx]
             visited.add(idx)
             
-            # Process children
             h_children = []
             c_children = []
             for child_idx in children[idx]:
@@ -201,23 +259,21 @@ class TreeLSTM(nn.Module):
                 h_children.append(h_child)
                 c_children.append(c_child)
             
-            # Convert node features to tensor
             x = torch.tensor(node_features[idx], dtype=torch.float32).unsqueeze(0)
-            
-            # Compute node state
             h[idx], c[idx] = self.cell(x, h_children, c_children)
             return h[idx], c[idx]
         
-        # Process from root
         h_root, _ = process_node(root)
-        
-        # Predict execution time
         output = self.fc(h_root)
         return output.squeeze()
 
 # --- Training ---
 
 def train_model(dataset, input_size, hidden_size=128, num_epochs=50, batch_size=1):
+    if len(dataset) == 0:
+        print("Empty dataset. Cannot train model.")
+        return
+    
     train_size = int(0.8 * len(dataset))
     val_size = len(dataset) - train_size
     train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
@@ -230,7 +286,6 @@ def train_model(dataset, input_size, hidden_size=128, num_epochs=50, batch_size=
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
     
     for epoch in range(num_epochs):
-        # Training
         model.train()
         train_loss = 0.0
         for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}"):
@@ -238,13 +293,12 @@ def train_model(dataset, input_size, hidden_size=128, num_epochs=50, batch_size=
             label = batch['label']
             
             optimizer.zero_grad()
-            output = model(tree[0])  # Process single tree
+            output = model(tree[0])
             loss = criterion(output, label)
             loss.backward()
             optimizer.step()
             train_loss += loss.item()
         
-        # Validation
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
@@ -265,10 +319,10 @@ if __name__ == "__main__":
     # Create dataset
     dataset = HalideDataset(data_dir)
     if len(dataset) == 0:
-        print("No valid data found.")
+        print("No valid data found. Exiting.")
         exit()
     
-    # Determine input size (based on first node's features)
+    # Determine input size
     input_size = len(dataset[0]['tree']['node_features'][0])
     
     # Train the model
