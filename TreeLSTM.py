@@ -356,7 +356,7 @@ def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=8):
     return train_loader, test_loader
 
 def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=200, patience=30):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cpu')
     print(f"Using device: {device}")
     model.to(device)
     
@@ -420,7 +420,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
     return train_losses, val_losses
 
 def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_transformed=False, original_execution_times=None):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cpu')
     model.to(device)
     model.eval()
     
@@ -428,8 +428,8 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_tran
     with torch.no_grad():
         y_pred_scaled = model(X_test)
     
-    y_pred_scaled = y_pred_scaled.cpu().numpy()
-    y_test = y_test.cpu().numpy()
+    y_pred_scaled = y_pred_scaled.numpy()
+    y_test = y_test.numpy()
     
     y_test_transformed = y_scaler.inverse_transform(y_test)
     y_pred_transformed = y_scaler.inverse_transform(y_pred_scaled)
@@ -549,7 +549,8 @@ def main(main_dir):
     
     print("\nSaving the trained model as 'lstm_model.pt'...")
     model.eval()
-    device = next(model.parameters()).device
+    device = torch.device('cpu')
+    model.to(device)
     print(f"Model is on device: {device}")
     
     try:
