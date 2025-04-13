@@ -746,7 +746,7 @@ def main():
     torch.manual_seed(42)
     
     # Data directory
-    main_dir = "data/programs"
+    main_dir = "synthetic_data"
     
     # Process data
     train_features, test_features, test_file_names = process_main_directory(main_dir)
