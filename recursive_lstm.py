@@ -467,12 +467,26 @@ def custom_loss(outputs, targets, huber_delta=0.5, mae_weight=0.3, l1_lambda=1e-
     l1_reg = sum(param.abs().sum() for param in model.parameters()) * l1_lambda
     return huber + mae_weight * mae + l1_reg
 
+def custom_collate_fn(batch):
+    """Custom collate function to handle variable-sized node_features."""
+    return batch
+
 def create_data_loaders(train_features, train_scalar, y_train, test_features, test_scalar, y_test, batch_size=64):
     train_dataset = TreeLSTMDataset(train_features, train_scalar)
     test_dataset = TreeLSTMDataset(test_features, test_scalar)
     
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        collate_fn=custom_collate_fn
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        collate_fn=custom_collate_fn
+    )
     
     return train_loader, test_loader
 
@@ -496,19 +510,25 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
         optimizer.zero_grad()
         
         for i, batch in enumerate(train_loader):
-            scalar_inputs = torch.stack([f['scalar_features'] for f in batch]).to(device)
-            targets = y_train[batch.indices].to(device)
-            
+            # Batch is a list of dictionaries
+            batch_size = len(batch)
             outputs = []
+            targets = []
+            
             for item in batch:
                 node_features = item['node_features'].to(device)
                 children = item['children']
                 roots = item['roots']
                 scalar_input = item['scalar_features'].unsqueeze(0).to(device)
+                target = y_train[item['index']].to(device) if 'index' in item else torch.FloatTensor([item['execution_time']]).to(device)
+                
                 output = model(node_features.unsqueeze(0), [children], [roots], scalar_input)
                 outputs.append(output)
+                targets.append(target)
             
             outputs = torch.cat(outputs)
+            targets = torch.cat(targets)
+            
             loss = criterion(outputs, targets)
             
             if torch.isnan(loss) or torch.isinf(loss):
@@ -523,9 +543,9 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
                 optimizer.step()
                 optimizer.zero_grad()
             
-            running_loss += loss.item() * accumulation_steps * len(batch)
+            running_loss += loss.item() * accumulation_steps * batch_size
         
-        if len(train_loader) % accumulation_steps != 0:
+        if (i + 1) % accumulation_steps != 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             optimizer.zero_grad()
@@ -537,21 +557,26 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
         val_loss = 0.0
         with torch.no_grad():
             for batch in test_loader:
-                scalar_inputs = torch.stack([f['scalar_features'] for f in batch]).to(device)
-                targets = y_test[batch.indices].to(device)
-                
+                batch_size = len(batch)
                 outputs = []
+                targets = []
+                
                 for item in batch:
                     node_features = item['node_features'].to(device)
                     children = item['children']
                     roots = item['roots']
                     scalar_input = item['scalar_features'].unsqueeze(0).to(device)
+                    target = y_test[item['index']].to(device) if 'index' in item else torch.FloatTensor([item['execution_time']]).to(device)
+                    
                     output = model(node_features.unsqueeze(0), [children], [roots], scalar_input)
                     outputs.append(output)
+                    targets.append(target)
                 
                 outputs = torch.cat(outputs)
+                targets = torch.cat(targets)
+                
                 loss = criterion(outputs, targets)
-                val_loss += loss.item() * len(batch)
+                val_loss += loss.item() * batch_size
         
         val_loss /= len(test_loader.dataset)
         val_losses.append(val_loss)
