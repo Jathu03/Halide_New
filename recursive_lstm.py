@@ -27,6 +27,12 @@ important_metrics = [
     'num_scalars', 'num_vectors', 'points_computed_total', 'working_set'
 ]
 
+def to_device(tensor, device):
+    """Helper function to move tensor to specified device."""
+    if isinstance(tensor, (list, tuple)):
+        return [to_device(t, device) for t in tensor]
+    return tensor.to(device)
+
 def get_execution_time(file_path):
     try:
         with open(file_path, 'rb') as f:
@@ -433,7 +439,9 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, schedule
         optimizer.zero_grad()
         
         for i, (seq_inputs, scalar_inputs, targets) in enumerate(train_loader):
-            seq_inputs, scalar_inputs, targets = seq_inputs.to(device), scalar_inputs.to(device), targets.to(device)
+            seq_inputs = to_device(seq_inputs, device)
+            scalar_inputs = to_device(scalar_inputs, device)
+            targets = to_device(targets, device)
             outputs = model(seq_inputs, scalar_inputs)
             loss = criterion(outputs, targets, model)
             
@@ -463,7 +471,9 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, schedule
         val_loss = 0.0
         with torch.no_grad():
             for seq_inputs, scalar_inputs, targets in test_loader:
-                seq_inputs, scalar_inputs, targets = seq_inputs.to(device), scalar_inputs.to(device), targets.to(device)
+                seq_inputs = to_device(seq_inputs, device)
+                scalar_inputs = to_device(scalar_inputs, device)
+                targets = to_device(targets, device)
                 outputs = model(seq_inputs, scalar_inputs)
                 loss = criterion(outputs, targets, model)
                 val_loss += loss.item() * seq_inputs.size(0)
@@ -508,7 +518,10 @@ def evaluate_model(model, X_test_seq, X_test_scalar, y_test, y_scaler, file_name
     model.to(device)
     model.eval()
     
-    X_test_seq, X_test_scalar = X_test_seq.to(device), X_test_scalar.to(device)
+    X_test_seq = to_device(X_test_seq, device)
+    X_test_scalar = to_device(X_test_scalar, device)
+    y_test = to_device(y_test, device)
+    
     with torch.no_grad():
         y_pred_scaled = model(X_test_seq, X_test_scalar)
     
@@ -572,6 +585,7 @@ def evaluate_model(model, X_test_seq, X_test_scalar, y_test, y_scaler, file_name
 def cross_validate_model(features, file_names, seq_input_size, scalar_input_size, k_folds=5):
     kf = KFold(n_splits=k_folds, shuffle=True, random_state=42)
     fold_results = []
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     for fold, (train_idx, val_idx) in enumerate(kf.split(features)):
         print(f"\nTraining Fold {fold + 1}/{k_folds}")
@@ -597,6 +611,7 @@ def cross_validate_model(features, file_names, seq_input_size, scalar_input_size
             num_heads=4
         )
         
+        model.to(device)
         optimizer = optim.AdamW(model.parameters(), lr=0.0001, weight_decay=1e-4)
         scheduler = OneCycleLR(optimizer, max_lr=0.001, epochs=200, steps_per_epoch=len(train_loader))
         
@@ -612,6 +627,8 @@ def cross_validate_model(features, file_names, seq_input_size, scalar_input_size
         
         model.eval()
         with torch.no_grad():
+            val_seq = to_device(val_seq, device)
+            val_scalar = to_device(val_scalar, device)
             y_pred_scaled = model(val_seq, val_scalar).cpu().numpy()
             y_val_scaled = y_val.cpu().numpy()
             y_pred = np.expm1(y_scaler.inverse_transform(y_pred_scaled))
