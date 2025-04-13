@@ -46,23 +46,40 @@ def get_execution_time(file_path):
         return None
 
 def build_tree(nodes, edges):
-    """Convert nodes and edges into a tree structure."""
+    """Convert nodes and edges into a tree structure with validation."""
+    if not nodes:
+        return defaultdict(list), [], {}
+    
     children = defaultdict(list)
     node_indices = {node['Name']: idx for idx, node in enumerate(nodes)}
+    num_nodes = len(nodes)
     
     for edge in edges:
         from_node = edge['From']
         to_node = edge['To']
         if from_node in node_indices and to_node in node_indices:
-            children[node_indices[from_node]].append(node_indices[to_node])
+            parent_idx = node_indices[from_node]
+            child_idx = node_indices[to_node]
+            if 0 <= child_idx < num_nodes:
+                children[parent_idx].append(child_idx)
+            else:
+                print(f"Warning: Invalid child index {child_idx} in edge {from_node} -> {to_node}")
+        else:
+            print(f"Warning: Edge references unknown nodes: {from_node} -> {to_node}")
     
     incoming = set()
     for edge in edges:
         if edge['To'] in node_indices:
             incoming.add(node_indices[edge['To']])
     
-    roots = [i for i in range(len(nodes)) if i not in incoming]
+    roots = [i for i in range(num_nodes) if i not in incoming]
     if not roots:
+        print("Warning: No roots found, defaulting to first node")
+        roots = [0] if num_nodes > 0 else []
+    
+    # Validate roots
+    roots = [r for r in roots if 0 <= r < num_nodes]
+    if not roots and num_nodes > 0:
         roots = [0]
     
     return children, roots, node_indices
@@ -80,30 +97,51 @@ def extract_features_from_file(file_path):
     edges_features = []
     programming_details = data.get("programming_details", None)
     
-    if programming_details:
-        if 'Nodes' in programming_details:
-            for node in programming_details['Nodes']:
-                node_feature = {'Name': node.get('Name', '')}
-                if 'Details' in node and 'Op histogram' in node['Details']:
-                    op_hist = node['Details']['Op histogram']
-                    for op_line in op_hist:
-                        parts = op_line.strip().split(':')
-                        if len(parts) == 2:
-                            op_name = parts[0].strip()
-                            op_count = int(parts[1].strip())
-                            node_feature[f'op_{op_name.lower()}'] = op_count
-                nodes_features.append(node_feature)
-        
-        if 'Edges' in programming_details:
-            for edge in programming_details['Edges']:
-                edge_feature = {
-                    'From': edge.get('From', ''),
-                    'To': edge.get('To', ''),
-                    'Name': edge.get('Name', '')
-                }
-                edges_features.append(edge_feature)
+    if not programming_details:
+        print(f"Warning: No programming_details in {file_path}")
+        return None
+    
+    if 'Nodes' in programming_details:
+        for node in programming_details['Nodes']:
+            node_feature = {'Name': node.get('Name', '')}
+            if 'Details' in node and 'Op histogram' in node['Details']:
+                op_hist = node['Details']['Op histogram']
+                for op_line in op_hist:
+                    parts = op_line.strip().split(':')
+                    if len(parts) == 2:
+                        op_name = parts[0].strip()
+                        op_count = int(parts[1].strip())
+                        node_feature[f'op_{op_name.lower()}'] = op_count
+            nodes_features.append(node_feature)
+    
+    if 'Edges' in programming_details:
+        for edge in programming_details['Edges']:
+            edge_feature = {
+                'From': edge.get('From', ''),
+                'To': edge.get('To', ''),
+                'Name': edge.get('Name', '')
+            }
+            edges_features.append(edge_feature)
+    
+    if not nodes_features:
+        print(f"Warning: No valid nodes in {file_path}")
+        return None
     
     children, roots, node_indices = build_tree(nodes_features, edges_features)
+    
+    # Validate tree structure
+    for parent, child_indices in children.items():
+        if not (0 <= parent < len(nodes_features)):
+            print(f"Warning: Invalid parent index {parent} in {file_path}")
+            return None
+        for child in child_indices:
+            if not (0 <= child < len(nodes_features)):
+                print(f"Warning: Invalid child index {child} for parent {parent} in {file_path}")
+                return None
+    
+    if not roots:
+        print(f"Warning: No valid roots in {file_path}")
+        return None
     
     node_vectors = []
     for node in nodes_features:
@@ -227,13 +265,15 @@ class TreeLSTMDataset(Dataset):
     
     def __getitem__(self, idx):
         feature = self.features[idx]
-        return {
+        item = {
             'node_features': torch.FloatTensor(feature['node_features']),
             'children': feature['children'],
             'roots': feature['roots'],
             'scalar_features': self.scalar_tensor[idx],
-            'execution_time': feature['execution_time']
+            'execution_time': feature['execution_time'],
+            'index': idx  # Store index for target alignment
         }
+        return item
 
 def prepare_data_for_model(train_features, test_features):
     train_scalar_df = pd.DataFrame([f['scalar_features'] for f in train_features])
@@ -380,6 +420,10 @@ class EnhancedTreeLSTMModel(nn.Module):
         self.residual_proj = nn.Linear(combined_size, 64) if combined_size != 64 else None
     
     def process_node(self, node_idx, node_features, children, layer_idx, h_cache, c_cache, device):
+        if not (0 <= node_idx < len(node_features)):
+            print(f"Warning: Invalid node_idx {node_idx}, max index {len(node_features)-1}")
+            return torch.zeros(1, self.hidden_sizes[layer_idx], device=device), torch.zeros(1, self.hidden_sizes[layer_idx], device=device)
+        
         h_children = []
         c_children = []
         for child_idx in children[node_idx]:
@@ -410,16 +454,25 @@ class EnhancedTreeLSTMModel(nn.Module):
             h_last_layer = []
             
             current_features = node_features[b]
-            for layer_idx in range(len(self.tree_lstm_layers)):
-                layer_hiddens = []
-                for root_idx in roots[b]:
-                    h, c = self.process_node(
-                        root_idx, current_features, children[b], layer_idx, h_cache, c_cache, device
-                    )
-                    layer_hiddens.append(h.squeeze(0))
-                
-                current_features = torch.stack(layer_hiddens) if layer_hiddens else torch.zeros(1, self.hidden_sizes[layer_idx], device=device)
-                h_last_layer = current_features
+            if len(current_features) == 0:
+                print("Warning: Empty node_features, skipping tree")
+                h_last_layer = torch.zeros(1, self.hidden_sizes[-1], device=device)
+            else:
+                for layer_idx in range(len(self.tree_lstm_layers)):
+                    layer_hiddens = []
+                    for root_idx in roots[b]:
+                        if 0 <= root_idx < len(current_features):
+                            h, c = self.process_node(
+                                root_idx, current_features, children[b], layer_idx, h_cache, c_cache, device
+                            )
+                            layer_hiddens.append(h.squeeze(0))
+                        else:
+                            print(f"Warning: Invalid root_idx {root_idx}, max {len(current_features)-1}")
+                    
+                    if not layer_hiddens:
+                        layer_hiddens = [torch.zeros(self.hidden_sizes[layer_idx], device=device)]
+                    current_features = torch.stack(layer_hiddens)
+                    h_last_layer = current_features
             
             all_hiddens.append(h_last_layer)
         
@@ -510,7 +563,6 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
         optimizer.zero_grad()
         
         for i, batch in enumerate(train_loader):
-            # Batch is a list of dictionaries
             batch_size = len(batch)
             outputs = []
             targets = []
@@ -520,7 +572,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
                 children = item['children']
                 roots = item['roots']
                 scalar_input = item['scalar_features'].unsqueeze(0).to(device)
-                target = y_train[item['index']].to(device) if 'index' in item else torch.FloatTensor([item['execution_time']]).to(device)
+                target = y_train[item['index']].to(device)
                 
                 output = model(node_features.unsqueeze(0), [children], [roots], scalar_input)
                 outputs.append(output)
@@ -566,7 +618,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
                     children = item['children']
                     roots = item['roots']
                     scalar_input = item['scalar_features'].unsqueeze(0).to(device)
-                    target = y_test[item['index']].to(device) if 'index' in item else torch.FloatTensor([item['execution_time']]).to(device)
+                    target = y_test[item['index']].to(device)
                     
                     output = model(node_features.unsqueeze(0), [children], [roots], scalar_input)
                     outputs.append(output)
