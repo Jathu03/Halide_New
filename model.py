@@ -542,7 +542,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
     train_losses = []
     val_losses = []
     
-    for epoch in range(num_epochs):
+    
     for epoch in range(num_epochs):
         model.train()
         running_loss = 0.0
