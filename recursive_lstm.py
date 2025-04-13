@@ -46,7 +46,7 @@ def extract_features(json_data):
             else:
                 logger.warning("scheduling_data is not a list, setting execution_time to 0")
                 features['execution_time'] = 0
-        # Case 2: json_data is a list (original assumption)
+        # Case 2: json_data is a list
         elif isinstance(json_data, list):
             execution_time = find_execution_time(json_data)
             if execution_time is not None:
@@ -81,12 +81,12 @@ def extract_features(json_data):
     # Node features
     node_features = []
     node_names = []
-    for node in nodes:
+    for node_idx, node in enumerate(nodes):
         try:
             node_name = node.get('Name', '')
             if not node_name:
-                logger.debug(f"Skipping node with no name")
-                continue
+                node_name = f"node_{node_idx}"
+                logger.debug(f"Node {node_idx} has no name, assigned {node_name}")
             node_names.append(node_name)
             details = node.get('Details', {})
             
@@ -97,6 +97,8 @@ def extract_features(json_data):
                 if isinstance(pattern, str):
                     values = [int(x) for x in pattern.split() if x.isdigit()]
                     mem_vector.extend(values)
+            if not mem_vector:
+                logger.debug(f"No memory access patterns for {node_name}")
             
             # Op histogram
             op_hist = details.get('Op histogram', []) or []
@@ -107,26 +109,34 @@ def extract_features(json_data):
                         value = int(op.split(':')[-1].strip())
                         op_vector.append(value)
                     except (ValueError, IndexError):
-                        logger.debug(f"Skipping invalid op histogram entry: {op}")
+                        logger.debug(f"Skipping invalid op histogram entry for {node_name}: {op}")
                         continue
+            if not op_vector:
+                logger.debug(f"No op histogram for {node_name}")
             
             # Scheduling features
             sched_features = details.get('scheduling_feature', {}) or {}
             sched_vector = [float(v) for v in sched_features.values() if isinstance(v, (int, float))] if sched_features else []
+            if not sched_vector:
+                logger.debug(f"No scheduling features for {node_name}")
             
             # Combine features
             node_feature = mem_vector + op_vector + sched_vector
             if not node_feature:
-                logger.debug(f"No features extracted for node {node_name}")
-                continue
+                # Assign default feature vector to avoid empty features
+                node_feature = [0] * 10  # Arbitrary length, adjust as needed
+                logger.debug(f"No features extracted for {node_name}, using default vector")
+            
             node_features.append(node_feature)
         except Exception as e:
-            logger.error(f"Error processing node {node_name}: {e}")
+            logger.error(f"Error processing node {node_name or node_idx}: {e}")
             continue
     
     if not node_features:
-        logger.warning("No valid node features extracted")
-        return None
+        # Create a dummy node if no valid nodes are found
+        logger.warning("No valid node features extracted, creating dummy node")
+        node_names.append("dummy_node")
+        node_features.append([0] * 10)  # Same length as default feature vector
     
     # Pad node features to the same length
     max_len = max(len(f) for f in node_features)
@@ -135,12 +145,12 @@ def extract_features(json_data):
     # Edge features and indices
     edge_index = []
     edge_features = []
-    for edge in edges:
+    for edge_idx, edge in enumerate(edges):
         try:
             from_node = edge.get('From', '')
             to_node = edge.get('To', '')
             if not (from_node and to_node):
-                logger.debug(f"Skipping edge with missing From/To")
+                logger.debug(f"Skipping edge {edge_idx} with missing From/To")
                 continue
             if from_node in node_names and to_node in node_names:
                 from_idx = node_names.index(from_node)
@@ -153,7 +163,7 @@ def extract_features(json_data):
                 jacobian_vector = []
                 for row in jacobians:
                     if not isinstance(row, str):
-                        logger.debug(f"Skipping non-string Jacobian: {row}")
+                        logger.debug(f"Skipping non-string Jacobian in edge {edge_idx}: {row}")
                         continue
                     row = row.strip().split()
                     for val in row:
@@ -167,16 +177,16 @@ def extract_features(json_data):
                             jacobian_vector.append(0.0)
                 edge_features.append(jacobian_vector or [0])
         except Exception as e:
-            logger.error(f"Error processing edge {from_node} -> {to_node}: {e}")
+            logger.error(f"Error processing edge {edge_idx}: {e}")
             continue
     
     # Pad edge features
     max_edge_len = max(len(f) for f in edge_features) if edge_features else 1
     edge_features = [f + [0] * (max_edge_len - len(f)) for f in edge_features]
     
-    # Only return features if we have valid nodes and edges
-    if not (node_features and edge_index):
-        logger.warning("No valid nodes or edges, skipping")
+    # Only return features if we have valid nodes
+    if not node_features:
+        logger.warning("No valid nodes after processing, skipping")
         return None
     
     return {
