@@ -20,18 +20,42 @@ def extract_features(json_data):
     """Extract features from a JSON file."""
     features = {}
     
-    # Extract scheduling data (target)
-    try:
-        for item in json_data:
+    # Helper function to find total_execution_time_ms in a list of dicts
+    def find_execution_time(data_list):
+        for item in data_list:
             if isinstance(item, dict) and item.get('name') == 'total_execution_time_ms':
                 try:
-                    features['execution_time'] = float(item.get('value', 0))
+                    return float(item.get('value', 0))
                 except (ValueError, TypeError):
                     logger.warning("Invalid total_execution_time_ms value, setting to 0")
+                    return 0
+        return None
+    
+    # Extract scheduling data (target)
+    try:
+        # Case 1: json_data is a dict with scheduling_data
+        if isinstance(json_data, dict):
+            scheduling_data = json_data.get('scheduling_data', [])
+            if isinstance(scheduling_data, list):
+                execution_time = find_execution_time(scheduling_data)
+                if execution_time is not None:
+                    features['execution_time'] = execution_time
+                else:
+                    logger.warning("No total_execution_time_ms found in scheduling_data, setting to 0")
                     features['execution_time'] = 0
-                break
+            else:
+                logger.warning("scheduling_data is not a list, setting execution_time to 0")
+                features['execution_time'] = 0
+        # Case 2: json_data is a list (original assumption)
+        elif isinstance(json_data, list):
+            execution_time = find_execution_time(json_data)
+            if execution_time is not None:
+                features['execution_time'] = execution_time
+            else:
+                logger.warning("No total_execution_time_ms found in root list, setting to 0")
+                features['execution_time'] = 0
         else:
-            logger.warning("No total_execution_time_ms found, setting to 0")
+            logger.warning("json_data is neither a dict nor a list, setting execution_time to 0")
             features['execution_time'] = 0
     except Exception as e:
         logger.error(f"Error extracting execution time: {e}")
@@ -39,10 +63,13 @@ def extract_features(json_data):
     
     # Extract programming details
     programming_details = None
-    for item in json_data:
-        if isinstance(item, dict) and 'programming_details' in item:
-            programming_details = item['programming_details']
-            break
+    if isinstance(json_data, dict):
+        programming_details = json_data.get('programming_details', {})
+    elif isinstance(json_data, list):
+        for item in json_data:
+            if isinstance(item, dict) and 'programming_details' in item:
+                programming_details = item['programming_details']
+                break
     
     if not programming_details:
         logger.warning("No programming_details found")
