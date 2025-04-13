@@ -83,49 +83,74 @@ def extract_features(json_data):
     node_names = []
     for node_idx, node in enumerate(nodes):
         try:
-            node_name = node.get('Name', '')
-            if not node_name:
-                node_name = f"node_{node_idx}"
-                logger.debug(f"Node {node_idx} has no name, assigned {node_name}")
+            node_name = node.get('Name', f"node_{node_idx}")
             node_names.append(node_name)
             details = node.get('Details', {})
             
             # Memory access patterns
-            mem_patterns = details.get('Memory access patterns', []) or []
             mem_vector = []
+            mem_patterns = details.get('Memory access patterns', []) or []
+            if isinstance(mem_patterns, str):
+                mem_patterns = [mem_patterns]  # Handle case where it's a single string
             for pattern in mem_patterns:
                 if isinstance(pattern, str):
-                    values = [int(x) for x in pattern.split() if x.isdigit()]
+                    # Extract all numbers, not just digits, to handle decimals
+                    values = []
+                    for x in pattern.split():
+                        try:
+                            values.append(float(x))
+                        except ValueError:
+                            continue
                     mem_vector.extend(values)
+                elif isinstance(pattern, (list, dict)):
+                    logger.debug(f"Unexpected memory pattern format for {node_name}: {pattern}")
             if not mem_vector:
-                logger.debug(f"No memory access patterns for {node_name}")
+                logger.debug(f"No valid memory access patterns for {node_name}")
             
             # Op histogram
-            op_hist = details.get('Op histogram', []) or []
             op_vector = []
+            op_hist = details.get('Op histogram', []) or []
+            if isinstance(op_hist, str):
+                op_hist = [op_hist]  # Handle case where it's a single string
             for op in op_hist:
                 if isinstance(op, str):
                     try:
-                        value = int(op.split(':')[-1].strip())
+                        # Flexible parsing: look for numbers in various formats
+                        parts = op.split(':')
+                        if len(parts) > 1:
+                            value = int(parts[-1].strip())
+                        else:
+                            value = int(op.strip())
                         op_vector.append(value)
                     except (ValueError, IndexError):
                         logger.debug(f"Skipping invalid op histogram entry for {node_name}: {op}")
                         continue
+                elif isinstance(op, (int, float)):
+                    op_vector.append(int(op))
             if not op_vector:
-                logger.debug(f"No op histogram for {node_name}")
+                logger.debug(f"No valid op histogram for {node_name}")
             
             # Scheduling features
+            sched_vector = []
             sched_features = details.get('scheduling_feature', {}) or {}
-            sched_vector = [float(v) for v in sched_features.values() if isinstance(v, (int, float))] if sched_features else []
+            if isinstance(sched_features, list):
+                # Handle case where scheduling_feature is a list
+                sched_vector = [float(v) for v in sched_features if isinstance(v, (int, float))]
+            elif isinstance(sched_features, dict):
+                sched_vector = [float(v) for v in sched_features.values() if isinstance(v, (int, float))]
+            elif isinstance(sched_features, (int, float)):
+                sched_vector = [float(sched_features)]
             if not sched_vector:
-                logger.debug(f"No scheduling features for {node_name}")
+                logger.debug(f"No valid scheduling features for {node_name}")
             
             # Combine features
             node_feature = mem_vector + op_vector + sched_vector
             if not node_feature:
-                # Assign default feature vector to avoid empty features
-                node_feature = [0] * 10  # Arbitrary length, adjust as needed
+                # Assign default feature vector only as a last resort
+                node_feature = [0] * 10
                 logger.debug(f"No features extracted for {node_name}, using default vector")
+            else:
+                logger.debug(f"Extracted features for {node_name}: length {len(node_feature)}")
             
             node_features.append(node_feature)
         except Exception as e:
@@ -133,10 +158,9 @@ def extract_features(json_data):
             continue
     
     if not node_features:
-        # Create a dummy node if no valid nodes are found
         logger.warning("No valid node features extracted, creating dummy node")
         node_names.append("dummy_node")
-        node_features.append([0] * 10)  # Same length as default feature vector
+        node_features.append([0] * 10)
     
     # Pad node features to the same length
     max_len = max(len(f) for f in node_features)
