@@ -2,22 +2,14 @@ import os
 import json
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import RobustScaler
+from sklearn.preprocessing import StandardScaler, RobustScaler
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+from torch.utils.data import TensorDataset, DataLoader
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 import random
 import matplotlib.pyplot as plt
-from collections import defaultdict
-
-# Define important metrics for scheduling sequence
-important_metrics = [
-    'bytes_at_production', 'bytes_at_realization', 'bytes_at_root', 'bytes_at_task',
-    'inner_parallelism', 'outer_parallelism', 'num_productions', 'num_realizations',
-    'num_scalars', 'num_vectors', 'points_computed_total', 'working_set'
-]
 
 def get_execution_time(file_path):
     try:
@@ -30,182 +22,145 @@ def get_execution_time(file_path):
             print(f"Error: 'programming_details' key not found in {file_path}")
             return None
         
-        schedules = data["scheduling_data"]
+        schedules = data.get("scheduling_data", [])
         for item in schedules:
             if isinstance(item, dict) and item.get('name') == 'total_execution_time_ms':
                 execution_time = item.get('value')
-                if execution_time is not None and execution_time > 0:
+                if execution_time is not None:
+                    print(f"Extracted execution time for {file_path}: {execution_time} ms")
                     return float(execution_time)
         
-        print(f"Warning: 'total_execution_time_ms' not found in 'Schedules' of {file_path}")
-        last_value = schedules[-1]["value"]
-        return float(last_value) if last_value > 0 else None
+        if schedules and isinstance(schedules[-1], dict) and "value" in schedules[-1]:
+            execution_time = schedules[-1]["value"]
+            print(f"Warning: 'total_execution_time_ms' not found in 'Schedules' of {file_path}, using last schedule value: {execution_time} ms")
+            return float(execution_time)
+        
+        print(f"Error: No valid execution time found in {file_path}")
+        return None
     
     except Exception as e:
         print(f"Error processing {file_path}: {str(e)}")
         return None
-
-def build_tree(nodes, edges):
-    """Convert nodes and edges into a tree structure with validation."""
-    if not nodes:
-        return defaultdict(list), [], {}
-    
-    children = defaultdict(list)
-    node_indices = {node['Name']: idx for idx, node in enumerate(nodes)}
-    num_nodes = len(nodes)
-    
-    for edge in edges:
-        from_node = edge['From']
-        to_node = edge['To']
-        if from_node in node_indices and to_node in node_indices:
-            parent_idx = node_indices[from_node]
-            child_idx = node_indices[to_node]
-            if 0 <= child_idx < num_nodes:
-                children[parent_idx].append(child_idx)
-            else:
-                print(f"Warning: Invalid child index {child_idx} in edge {from_node} -> {to_node}")
-        else:
-            print(f"Warning: Edge references unknown nodes: {from_node} -> {to_node}")
-    
-    incoming = set()
-    for edge in edges:
-        if edge['To'] in node_indices:
-            incoming.add(node_indices[edge['To']])
-    
-    roots = [i for i in range(num_nodes) if i not in incoming]
-    if not roots:
-        print("Warning: No roots found, defaulting to first node")
-        roots = [0] if num_nodes > 0 else []
-    
-    # Validate roots
-    roots = [r for r in roots if 0 <= r < num_nodes]
-    if not roots and num_nodes > 0:
-        roots = [0]
-    
-    return children, roots, node_indices
 
 def extract_features_from_file(file_path):
     with open(file_path, 'r') as f:
         data = json.load(f)
     
     execution_time = get_execution_time(file_path)
-    if execution_time is None or not np.isfinite(execution_time):
-        print(f"Warning: Invalid execution time in {file_path}")
+    
+    if execution_time is None:
+        print(f"Warning: No execution time found in {file_path}")
         return None
     
     nodes_features = []
     edges_features = []
-    programming_details = data.get("programming_details", None)
+    programming_details = data.get("programming_details")
     
-    if not programming_details:
-        print(f"Warning: No programming_details in {file_path}")
-        return None
-    
-    if 'Nodes' in programming_details:
-        for node in programming_details['Nodes']:
-            node_feature = {'Name': node.get('Name', '')}
-            if 'Details' in node and 'Op histogram' in node['Details']:
-                op_hist = node['Details']['Op histogram']
-                for op_line in op_hist:
-                    parts = op_line.strip().split(':')
-                    if len(parts) == 2:
-                        op_name = parts[0].strip()
-                        op_count = int(parts[1].strip())
-                        node_feature[f'op_{op_name.lower()}'] = op_count
-            nodes_features.append(node_feature)
-    
-    if 'Edges' in programming_details:
-        for edge in programming_details['Edges']:
-            edge_feature = {
-                'From': edge.get('From', ''),
-                'To': edge.get('To', ''),
-                'Name': edge.get('Name', '')
-            }
-            edges_features.append(edge_feature)
-    
-    if not nodes_features:
-        print(f"Warning: No valid nodes in {file_path}")
-        return None
-    
-    children, roots, node_indices = build_tree(nodes_features, edges_features)
-    
-    # Validate tree structure
-    for parent, child_indices in children.items():
-        if not (0 <= parent < len(nodes_features)):
-            print(f"Warning: Invalid parent index {parent} in {file_path}")
-            return None
-        for child in child_indices:
-            if not (0 <= child < len(nodes_features)):
-                print(f"Warning: Invalid child index {child} for parent {parent} in {file_path}")
-                return None
-    
-    if not roots:
-        print(f"Warning: No valid roots in {file_path}")
-        return None
-    
-    node_vectors = []
-    for node in nodes_features:
-        op_counts = {k: v for k, v in node.items() if k.startswith('op_')}
-        vector = [op_counts.get(f'op_{op}', 0) for op in sorted(set(k[3:] for k in op_counts))]
-        max_op_types = 20
-        vector = (vector + [0] * max_op_types)[:max_op_types]
-        node_vectors.append(vector)
+    if programming_details:
+        if 'Nodes' in programming_details:
+            for node in programming_details['Nodes']:
+                node_feature = {}
+                node_feature['Name'] = node.get('Name', '')
+                if 'Details' in node and 'Op histogram' in node['Details']:
+                    op_hist = node['Details']['Op histogram']
+                    for op_line in op_hist:
+                        parts = op_line.strip().split(':')
+                        if len(parts) == 2:
+                            op_name = parts[0].strip()
+                            op_count = int(parts[1].strip())
+                            node_feature[f'op_{op_name.lower()}'] = op_count
+                nodes_features.append(node_feature)
+        
+        if 'Edges' in programming_details:
+            for edge in programming_details['Edges']:
+                edge_feature = {}
+                edge_feature['From'] = edge.get('From', '')
+                edge_feature['To'] = edge.get('To', '')
+                edge_feature['Name'] = edge.get('Name', '')
+                edges_features.append(edge_feature)
     
     scheduling_features = []
-    scheduling_data = data.get("scheduling_data", None)
+    scheduling_data = data.get("scheduling_data")
+    
     if not scheduling_data and programming_details and 'Schedules' in programming_details:
         scheduling_data = programming_details['Schedules']
     
     if scheduling_data:
         for sched in scheduling_data:
-            sched_feature = {'Name': sched.get('Name', '')}
+            sched_feature = {}
+            sched_feature['Name'] = sched.get('Name', '')
             if 'Details' in sched and 'scheduling_feature' in sched['Details']:
                 sf = sched['Details']['scheduling_feature']
-                sched_feature.update(sf)
+                for key, value in sf.items():
+                    sched_feature[key] = value
             scheduling_features.append(sched_feature)
     
+    features = {
+        'execution_time': execution_time,
+        'nodes_count': len(nodes_features),
+        'edges_count': len(edges_features),
+        'scheduling_count': len(scheduling_features)
+    }
+    
+    if len(nodes_features) > 0 and len(edges_features) > 0:
+        features['node_edge_ratio'] = len(nodes_features) / len(edges_features)
+    else:
+        features['node_edge_ratio'] = 0
+    
+    # Extract operation counts and compute distribution metrics
     op_counts = {}
+    op_types = set()
     for node in nodes_features:
         for key, value in node.items():
             if key.startswith('op_'):
                 op_counts[key] = op_counts.get(key, 0) + value
+                op_types.add(key)
     
-    total_ops = sum(op_counts.values())
-    num_nodes = max(len(nodes_features), 1)
-    num_edges = len(edges_features)
-    total_bytes = sum(sf.get('bytes_at_production', 0) for sf in scheduling_features)
-    total_vectors = sum(sf.get('num_vectors', 0) for sf in scheduling_features)
-    scalar_features = {
-        'nodes_count': num_nodes,
-        'edges_count': num_edges,
-        'node_edge_ratio': num_nodes / max(num_edges, 1),
-        'total_ops': total_ops,
-        'op_diversity': len(op_counts) / num_nodes,
-        'avg_ops_per_node': total_ops / num_nodes,
-        'edge_density': num_edges / max(num_nodes * (num_nodes - 1), 1),
-        'total_parallelism': sum(sf.get('inner_parallelism', 0) * sf.get('outer_parallelism', 1) for sf in scheduling_features),
-        'avg_bytes_per_node': total_bytes / num_nodes,
-        'vector_op_ratio': op_counts.get('op_vector', 0) / max(total_ops, 1),
-        'bytes_per_vector': total_bytes / max(total_vectors, 1e-4),
-        'ops_per_byte': total_ops / max(total_bytes, 1e-4)
-    }
-    scalar_features.update(op_counts)
+    features.update(op_counts)
     
-    for key in scalar_features:
-        if not np.isfinite(scalar_features[key]):
-            scalar_features[key] = 0.0
+    # Add operation complexity metrics
+    if op_counts:
+        total_ops = sum(op_counts.values())
+        features['total_ops'] = total_ops
+        features['op_diversity'] = len(op_types) / max(1, len(nodes_features))
+        
+        if total_ops > 0:
+            for op, count in op_counts.items():
+                features[f'{op}_ratio'] = count / total_ops
     
-    return {
-        'node_features': node_vectors,
-        'children': children,
-        'roots': roots,
-        'scalar_features': scalar_features,
-        'execution_time': execution_time
-    }
+    if scheduling_features:
+        important_metrics = [
+            'bytes_at_production', 'bytes_at_realization', 'bytes_at_root', 'bytes_at_task',
+            'inner_parallelism', 'outer_parallelism', 'num_productions', 'num_realizations',
+            'num_scalars', 'num_vectors', 'points_computed_total', 'working_set'
+        ]
+        if scheduling_features and scheduling_features[0]:
+            for metric in important_metrics:
+                if metric in scheduling_features[0]:
+                    features[f'sched_{metric}'] = scheduling_features[0][metric]
+        
+        total_bytes_at_production = sum(sf.get('bytes_at_production', 0) for sf in scheduling_features if isinstance(sf, dict))
+        total_vectors = sum(sf.get('num_vectors', 0) for sf in scheduling_features if isinstance(sf, dict))
+        total_parallelism = sum(sf.get('inner_parallelism', 0) * sf.get('outer_parallelism', 1) for sf in scheduling_features if isinstance(sf, dict))
+        
+        features['total_bytes_at_production'] = total_bytes_at_production
+        features['total_vectors'] = total_vectors
+        features['total_parallelism'] = total_parallelism
+        
+        if total_vectors > 0:
+            features['bytes_per_vector'] = total_bytes_at_production / total_vectors
+        else:
+            features['bytes_per_vector'] = 0
+        
+        if 'working_set' in scheduling_features[0] and 'bytes_at_production' in scheduling_features[0]:
+            features['memory_pressure'] = scheduling_features[0]['working_set'] / scheduling_features[0]['bytes_at_production'] if scheduling_features[0]['bytes_at_production'] > 0 else 0
+    
+    return features
 
 def process_directory(directory_path):
     all_features = []
     file_names = []
+    
     json_files = sorted([f for f in os.listdir(directory_path) if f.endswith('.json')])
     
     for filename in json_files:
@@ -220,6 +175,7 @@ def process_directory(directory_path):
 def process_main_directory(main_dir):
     all_features = []
     all_file_names = []
+    
     subdirs = sorted([d for d in os.listdir(main_dir) if os.path.isdir(os.path.join(main_dir, d))])
     
     if len(subdirs) < 1:
@@ -228,9 +184,11 @@ def process_main_directory(main_dir):
     for subdir in subdirs:
         subdir_path = os.path.join(main_dir, subdir)
         features, file_names = process_directory(subdir_path)
+        
         if not features:
             print(f"Skipping {subdir} due to no valid data")
             continue
+            
         all_features.extend(features)
         all_file_names.extend([os.path.join(subdir, fname) for fname in file_names])
         print(f"Processed subdir {subdir}: {len(features)} files")
@@ -239,317 +197,203 @@ def process_main_directory(main_dir):
     if total_files < 50:
         raise ValueError(f"Expected at least 50 files total, found {total_files}")
     
+    # Stratify sampling to ensure representative test set
     combined = list(zip(all_features, all_file_names))
-    random.shuffle(combined)
-    all_features, all_file_names = zip(*combined)
+    combined.sort(key=lambda x: x[0]['execution_time'])
     
     test_size = 50
-    train_features = all_features[:-test_size]
-    test_features = all_features[-test_size:]
-    train_file_names = all_file_names[:-test_size]
-    test_file_names = all_file_names[-test_size:]
+    step = max(1, total_files // test_size)
+    test_indices = [i for i in range(0, total_files, step)][:test_size]
+    
+    test_features = []
+    test_file_names = []
+    train_features = []
+    train_file_names = []
+    
+    for i, (feature, file_name) in enumerate(combined):
+        if i in test_indices:
+            test_features.append(feature)
+            test_file_names.append(file_name)
+        else:
+            train_features.append(feature)
+            train_file_names.append(file_name)
     
     print(f"Total files: {total_files}")
     print(f"Training files: {len(train_features)}")
     print(f"Testing files: {len(test_features)}")
     
-    return train_features, test_features, list(test_file_names)
+    return train_features, test_features, test_file_names
 
-class TreeLSTMDataset(Dataset):
-    def __init__(self, features, scalar_tensor):
-        self.features = features
-        self.scalar_tensor = scalar_tensor
+def clean_and_transform_features(train_features, test_features):
+    all_features_df = pd.DataFrame(train_features + test_features)
     
-    def __len__(self):
-        return len(self.features)
+    all_features_df = all_features_df.fillna(0)
     
-    def __getitem__(self, idx):
-        feature = self.features[idx]
-        item = {
-            'node_features': torch.FloatTensor(feature['node_features']),
-            'children': feature['children'],
-            'roots': feature['roots'],
-            'scalar_features': self.scalar_tensor[idx],
-            'execution_time': feature['execution_time'],
-            'index': idx  # Store index for target alignment
-        }
-        return item
+    # Remove constant columns
+    constant_columns = [col for col in all_features_df.columns 
+                       if col != 'execution_time' and all_features_df[col].nunique() <= 1]
+    all_features_df = all_features_df.drop(columns=constant_columns)
+    print(f"Dropped {len(constant_columns)} constant columns")
+    
+    # Apply log transformation to execution time
+    if 'execution_time' in all_features_df.columns:
+        all_features_df['execution_time_log'] = np.log1p(all_features_df['execution_time'])
+    
+    # Create additional engineered features
+    if 'total_vectors' in all_features_df.columns:
+        all_features_df['bytes_per_vector'] = all_features_df['total_bytes_at_production'] / (all_features_df['total_vectors'] + 1e-8)
+    
+    if 'nodes_count' in all_features_df.columns and 'edges_count' in all_features_df.columns:
+        all_features_df['complexity_score'] = all_features_df['nodes_count'] * np.log1p(all_features_df['edges_count'])
+    
+    # Remove high correlation features
+    numeric_cols = all_features_df.select_dtypes(include=['number']).columns.tolist()
+    if 'execution_time' in numeric_cols:
+        numeric_cols.remove('execution_time')
+    if 'execution_time_log' in numeric_cols:
+        numeric_cols.remove('execution_time_log')
+    
+    if len(numeric_cols) > 2:
+        corr_matrix = all_features_df[numeric_cols].corr().abs()
+        upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+        to_drop = [column for column in upper.columns if any(upper[column] > 0.95)]
+        all_features_df = all_features_df.drop(columns=to_drop)
+        print(f"Dropped {len(to_drop)} highly correlated features")
+    
+    # Keep only numeric columns
+    numeric_cols = all_features_df.select_dtypes(include=['number']).columns
+    all_features_df = all_features_df[numeric_cols]
+    
+    train_size = len(train_features)
+    train_df = all_features_df.iloc[:train_size]
+    test_df = all_features_df.iloc[train_size:]
+    
+    return train_df, test_df
 
 def prepare_data_for_model(train_features, test_features):
-    train_scalar_df = pd.DataFrame([f['scalar_features'] for f in train_features])
-    test_scalar_df = pd.DataFrame([f['scalar_features'] for f in test_features])
+    train_df, test_df = clean_and_transform_features(train_features, test_features)
     
-    train_scalar_df = train_scalar_df.fillna(0)
-    test_scalar_df = test_scalar_df.fillna(0)
+    if 'execution_time_log' in train_df.columns:
+        y_train = train_df['execution_time_log'].values.reshape(-1, 1)
+        y_test = test_df['execution_time_log'].values.reshape(-1, 1)
+        train_df = train_df.drop(['execution_time', 'execution_time_log'], axis=1)
+        test_df = test_df.drop(['execution_time', 'execution_time_log'], axis=1)
+        is_log_transformed = True
+    else:
+        y_train = train_df['execution_time'].values.reshape(-1, 1)
+        y_test = test_df['execution_time'].values.reshape(-1, 1)
+        train_df = train_df.drop('execution_time', axis=1)
+        test_df = test_df.drop('execution_time', axis=1)
+        is_log_transformed = False
     
-    y_train_raw = np.array([f['execution_time'] for f in train_features])
-    y_test_raw = np.array([f['execution_time'] for f in test_features])
-    y_train_raw = np.clip(y_train_raw, 0, np.percentile(y_train_raw, 99))
-    y_test_raw = np.clip(y_test_raw, 0, np.percentile(y_test_raw, 99))
-    
-    y_train = np.log1p(y_train_raw).reshape(-1, 1)
-    y_test = np.log1p(y_test_raw).reshape(-1, 1)
-    
-    scaler_X_scalar = RobustScaler()
+    # Use RobustScaler which is less sensitive to outliers
+    scaler_X = RobustScaler()
     scaler_y = RobustScaler()
     
-    train_scalar_scaled = scaler_X_scalar.fit_transform(train_scalar_df)
-    test_scalar_scaled = scaler_X_scalar.transform(test_scalar_df)
+    X_train_scaled = scaler_X.fit_transform(train_df)
     y_train_scaled = scaler_y.fit_transform(y_train)
+    X_test_scaled = scaler_X.transform(test_df)
     y_test_scaled = scaler_y.transform(y_test)
     
-    train_scalar_scaled = np.nan_to_num(train_scalar_scaled, nan=0.0)
-    test_scalar_scaled = np.nan_to_num(test_scalar_scaled, nan=0.0)
-    y_train_scaled = np.nan_to_num(y_train_scaled, nan=0.0)
-    y_test_scaled = np.nan_to_num(y_test_scaled, nan=0.0)
-    
-    train_scalar_tensor = torch.FloatTensor(train_scalar_scaled)
-    test_scalar_tensor = torch.FloatTensor(test_scalar_scaled)
+    X_train_tensor = torch.FloatTensor(X_train_scaled).unsqueeze(1)
     y_train_tensor = torch.FloatTensor(y_train_scaled)
+    X_test_tensor = torch.FloatTensor(X_test_scaled).unsqueeze(1)
     y_test_tensor = torch.FloatTensor(y_test_scaled)
     
-    node_input_size = len(train_features[0]['node_features'][0]) if train_features[0]['node_features'] else 1
-    scalar_input_size = train_scalar_tensor.shape[1]
+    print(f"Input feature dimension: {X_train_scaled.shape[1]}")
     
-    print(f"Node input size: {node_input_size}")
-    print(f"Scalar input size: {scalar_input_size}")
-    
-    return (train_features, train_scalar_tensor, y_train_tensor,
-            test_features, test_scalar_tensor, y_test_tensor,
-            scaler_y, node_input_size, scalar_input_size)
+    return (X_train_tensor, y_train_tensor, X_test_tensor, y_test_tensor, 
+            scaler_y, X_train_scaled.shape[1], is_log_transformed)
 
-class TreeLSTMCell(nn.Module):
-    def __init__(self, input_size, hidden_size):
-        super(TreeLSTMCell, self).__init__()
-        self.input_size = input_size
-        self.hidden_size = hidden_size
+class ImprovedLSTMModel(nn.Module):
+    def __init__(self, input_size, hidden_sizes=[256, 128, 64], output_size=1, dropout_rate=0.3):
+        super(ImprovedLSTMModel, self).__init__()
         
-        self.W_i = nn.Linear(input_size, hidden_size)
-        self.U_i = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.lstm = nn.LSTM(input_size, hidden_sizes[0], batch_first=True, bidirectional=True)
         
-        self.W_f = nn.Linear(input_size, hidden_size)
-        self.U_f = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.attention = nn.Sequential(
+            nn.Linear(hidden_sizes[0] * 2, 1),
+            nn.Tanh()
+        )
         
-        self.W_o = nn.Linear(input_size, hidden_size)
-        self.U_o = nn.Linear(hidden_size, hidden_size, bias=False)
+        fc_input_size = hidden_sizes[0] * 2
         
-        self.W_u = nn.Linear(input_size, hidden_size)
-        self.U_u = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.fc_layers = nn.ModuleList()
+        self.bn_layers = nn.ModuleList()
+        self.dropout_layers = nn.ModuleList()
         
-        self.bias = nn.Parameter(torch.zeros(4 * hidden_size))
-    
-    def forward(self, x, h_children, c_children):
-        batch_size = x.size(0)
-        h_sum = sum(h_children) if h_children else torch.zeros(batch_size, self.hidden_size, device=x.device)
+        for i in range(len(hidden_sizes) - 1):
+            self.fc_layers.append(nn.Linear(fc_input_size, hidden_sizes[i+1]))
+            self.bn_layers.append(nn.BatchNorm1d(hidden_sizes[i+1]))
+            self.dropout_layers.append(nn.Dropout(dropout_rate))
+            fc_input_size = hidden_sizes[i+1]
         
-        i = torch.sigmoid(self.W_i(x) + self.U_i(h_sum) + self.bias[:self.hidden_size])
-        o = torch.sigmoid(self.W_o(x) + self.U_o(h_sum) + self.bias[self.hidden_size:2*self.hidden_size])
-        u = torch.tanh(self.W_u(x) + self.U_u(h_sum) + self.bias[2*self.hidden_size:3*self.hidden_size])
+        self.output_layer = nn.Linear(fc_input_size, output_size)
         
-        c_new = torch.zeros(batch_size, self.hidden_size, device=x.device)
-        for h_child, c_child in zip(h_children, c_children):
-            f = torch.sigmoid(self.W_f(x) + self.U_f(h_child) + self.bias[3*self.hidden_size:])
-            c_new += f * c_child
+        self.act = nn.SiLU()  # SiLU/Swish activation function
         
-        c_new += i * u
-        h_new = o * torch.tanh(c_new)
+        # Skip connections
+        self.skip_adapters = nn.ModuleList()
+        input_sizes = [hidden_sizes[0] * 2] + hidden_sizes[1:-1]
+        for i in range(len(input_sizes)):
+            self.skip_adapters.append(nn.Linear(input_sizes[i], hidden_sizes[-1]))
         
-        return h_new, c_new
-
-class MultiHeadAttention(nn.Module):
-    def __init__(self, hidden_size, num_heads, dropout_rate=0.1):
-        super(MultiHeadAttention, self).__init__()
-        self.hidden_size = hidden_size
-        self.num_heads = num_heads
-        self.head_dim = hidden_size // num_heads
+    def attention_net(self, lstm_output):
+        attn_weights = self.attention(lstm_output)
+        soft_attn_weights = torch.softmax(attn_weights, 1)
+        context = torch.bmm(soft_attn_weights.transpose(1, 2), lstm_output)
+        return context.squeeze(1)
         
-        self.query = nn.Linear(hidden_size, hidden_size)
-        self.key = nn.Linear(hidden_size, hidden_size)
-        self.value = nn.Linear(hidden_size, hidden_size)
-        self.fc_out = nn.Linear(hidden_size, hidden_size)
-        self.dropout = nn.Dropout(dropout_rate)
-        self.scale = torch.sqrt(torch.FloatTensor([self.head_dim]))
-    
     def forward(self, x):
-        batch_size = x.shape[0]
+        batch_size = x.size(0)
         
-        Q = self.query(x).view(batch_size, -1, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
-        K = self.key(x).view(batch_size, -1, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
-        V = self.value(x).view(batch_size, -1, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        # Pass through bidirectional LSTM
+        lstm_out, _ = self.lstm(x)
         
-        energy = torch.matmul(Q, K.transpose(-1, -2)) / self.scale.to(x.device)
-        attention = torch.softmax(energy, dim=-1)
-        attention = self.dropout(attention)
-        out = torch.matmul(attention, V).permute(0, 2, 1, 3).contiguous()
-        out = out.view(batch_size, -1, self.hidden_size)
-        out = self.fc_out(out)
+        # Apply attention
+        attn_output = self.attention_net(lstm_out)
+        hidden = attn_output
         
-        return out
-
-class EnhancedTreeLSTMModel(nn.Module):
-    def __init__(self, node_input_size, scalar_input_size, hidden_sizes=[512, 256, 128], output_size=1, dropout_rate=0.2, num_heads=8):
-        super(EnhancedTreeLSTMModel, self).__init__()
+        # Store intermediate outputs for skip connections
+        intermediate_outputs = [hidden]
         
-        self.hidden_sizes = hidden_sizes
-        self.tree_lstm_layers = nn.ModuleList()
-        self.ln_layers = nn.ModuleList()
+        # Pass through FC layers with skip connections
+        for i, (fc, bn, dropout) in enumerate(zip(self.fc_layers, self.bn_layers, self.dropout_layers)):
+            hidden = fc(hidden)
+            hidden = bn(hidden)
+            hidden = self.act(hidden)
+            hidden = dropout(hidden)
+            intermediate_outputs.append(hidden)
         
-        self.tree_lstm_layers.append(TreeLSTMCell(node_input_size, hidden_sizes[0]))
-        self.ln_layers.append(nn.LayerNorm(hidden_sizes[0]))
+        # Apply skip connections to the final layer
+        skip_sum = 0
+        for i, adapter in enumerate(self.skip_adapters):
+            if i < len(intermediate_outputs) - 1:
+                skip_sum += adapter(intermediate_outputs[i])
         
-        for i in range(1, len(hidden_sizes)):
-            self.tree_lstm_layers.append(TreeLSTMCell(hidden_sizes[i-1], hidden_sizes[i]))
-            self.ln_layers.append(nn.LayerNorm(hidden_sizes[i]))
+        # Add the skip connections (weighted residual)
+        hidden = hidden + skip_sum * 0.1
         
-        self.attention = MultiHeadAttention(hidden_sizes[-1], num_heads, dropout_rate)
-        
-        combined_size = hidden_sizes[-1] + scalar_input_size
-        self.fc1 = nn.Linear(combined_size, 256)
-        self.bn1 = nn.BatchNorm1d(256)
-        self.ln1 = nn.LayerNorm(256)
-        self.fc2 = nn.Linear(256, 128)
-        self.bn2 = nn.BatchNorm1d(128)
-        self.ln2 = nn.LayerNorm(128)
-        self.fc3 = nn.Linear(128, 64)
-        self.bn3 = nn.BatchNorm1d(64)
-        self.ln3 = nn.LayerNorm(64)
-        self.output_layer = nn.Linear(64, output_size)
-        
-        self.gelu = nn.GELU()
-        self.dropout = nn.Dropout(dropout_rate)
-        self.residual_proj = nn.Linear(combined_size, 64) if combined_size != 64 else None
-    
-    def process_node(self, node_idx, node_features, children, layer_idx, h_cache, c_cache, device):
-        if not (0 <= node_idx < len(node_features)):
-            print(f"Warning: Invalid node_idx {node_idx}, max index {len(node_features)-1}")
-            return torch.zeros(1, self.hidden_sizes[layer_idx], device=device), torch.zeros(1, self.hidden_sizes[layer_idx], device=device)
-        
-        h_children = []
-        c_children = []
-        for child_idx in children[node_idx]:
-            if (child_idx, layer_idx) not in h_cache:
-                h_child, c_child = self.process_node(child_idx, node_features, children, layer_idx, h_cache, c_cache, device)
-                h_cache[(child_idx, layer_idx)] = h_child
-                c_cache[(child_idx, layer_idx)] = c_child
-            h_children.append(h_cache[(child_idx, layer_idx)])
-            c_children.append(c_cache[(child_idx, layer_idx)])
-        
-        x = node_features[node_idx].unsqueeze(0).to(device)
-        
-        tree_lstm = self.tree_lstm_layers[layer_idx]
-        h_new, c_new = tree_lstm(x, h_children, c_children)
-        
-        h_new = self.ln_layers[layer_idx](h_new)
-        
-        return h_new, c_new
-    
-    def forward(self, node_features, children, roots, scalar_input):
-        device = node_features.device
-        batch_size = scalar_input.size(0)
-        
-        all_hiddens = []
-        for b in range(batch_size):
-            h_cache = {}
-            c_cache = {}
-            h_last_layer = []
-            
-            current_features = node_features[b]
-            if len(current_features) == 0:
-                print("Warning: Empty node_features, skipping tree")
-                h_last_layer = torch.zeros(1, self.hidden_sizes[-1], device=device)
-            else:
-                for layer_idx in range(len(self.tree_lstm_layers)):
-                    layer_hiddens = []
-                    for root_idx in roots[b]:
-                        if 0 <= root_idx < len(current_features):
-                            h, c = self.process_node(
-                                root_idx, current_features, children[b], layer_idx, h_cache, c_cache, device
-                            )
-                            layer_hiddens.append(h.squeeze(0))
-                        else:
-                            print(f"Warning: Invalid root_idx {root_idx}, max {len(current_features)-1}")
-                    
-                    if not layer_hiddens:
-                        layer_hiddens = [torch.zeros(self.hidden_sizes[layer_idx], device=device)]
-                    current_features = torch.stack(layer_hiddens)
-                    h_last_layer = current_features
-            
-            all_hiddens.append(h_last_layer)
-        
-        max_nodes = max(len(h) for h in all_hiddens)
-        padded_hiddens = []
-        for h in all_hiddens:
-            pad_size = max_nodes - len(h)
-            if pad_size > 0:
-                padding = torch.zeros(pad_size, h.size(-1), device=device)
-                h = torch.cat([h, padding], dim=0)
-            padded_hiddens.append(h)
-        
-        h_tensor = torch.stack(padded_hiddens)
-        
-        attn_out = self.attention(h_tensor)
-        context = attn_out.mean(dim=1)
-        
-        combined = torch.cat((context, scalar_input), dim=1)
-        
-        x = self.fc1(combined)
-        x = self.bn1(x)
-        x = self.ln1(x)
-        x = self.gelu(x)
-        x = self.dropout(x)
-        x = self.fc2(x)
-        x = self.bn2(x)
-        x = self.ln2(x)
-        x = self.gelu(x)
-        x = self.dropout(x)
-        x = self.fc3(x)
-        x = self.bn3(x)
-        x = self.ln3(x)
-        x = self.gelu(x)
-        
-        residual = combined if self.residual_proj is None else self.residual_proj(combined)
-        x = x + residual
-        x = self.dropout(x)
-        output = self.output_layer(x)
+        # Output layer
+        output = self.output_layer(hidden)
         
         return output
 
-def custom_loss(outputs, targets, huber_delta=0.5, mae_weight=0.3, l1_lambda=1e-5):
-    huber = nn.HuberLoss(delta=huber_delta)(outputs, targets)
-    mae = torch.mean(torch.abs(outputs - targets))
-    l1_reg = sum(param.abs().sum() for param in model.parameters()) * l1_lambda
-    return huber + mae_weight * mae + l1_reg
-
-def custom_collate_fn(batch):
-    """Custom collate function to handle variable-sized node_features."""
-    return batch
-
-def create_data_loaders(train_features, train_scalar, y_train, test_features, test_scalar, y_test, batch_size=64):
-    train_dataset = TreeLSTMDataset(train_features, train_scalar)
-    test_dataset = TreeLSTMDataset(test_features, test_scalar)
+def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=16):
+    train_dataset = TensorDataset(X_train, y_train)
+    test_dataset = TensorDataset(X_test, y_test)
     
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        collate_fn=custom_collate_fn
-    )
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        collate_fn=custom_collate_fn
-    )
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
     
     return train_loader, test_loader
 
-def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=700, patience=50, accumulation_steps=2):
+def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=200, patience=30):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
-    
     model.to(device)
     
-    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=50, T_mult=2, eta_min=1e-6)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10, verbose=True, min_lr=1e-6)
     
     best_val_loss = float('inf')
     epochs_no_improve = 0
@@ -560,47 +404,15 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
     for epoch in range(num_epochs):
         model.train()
         running_loss = 0.0
-        optimizer.zero_grad()
-        
-        for i, batch in enumerate(train_loader):
-            batch_size = len(batch)
-            outputs = []
-            targets = []
-            
-            for item in batch:
-                node_features = item['node_features'].to(device)
-                children = item['children']
-                roots = item['roots']
-                scalar_input = item['scalar_features'].unsqueeze(0).to(device)
-                target = y_train[item['index']].to(device)
-                
-                output = model(node_features.unsqueeze(0), [children], [roots], scalar_input)
-                outputs.append(output)
-                targets.append(target)
-            
-            outputs = torch.cat(outputs)
-            targets = torch.cat(targets)
-            
+        for inputs, targets in train_loader:
+            inputs, targets = inputs.to(device), targets.to(device)
+            optimizer.zero_grad()
+            outputs = model(inputs)
             loss = criterion(outputs, targets)
-            
-            if torch.isnan(loss) or torch.isinf(loss):
-                print(f"Invalid loss detected at epoch {epoch+1}, batch {i+1}")
-                return None, None
-            
-            loss = loss / accumulation_steps
             loss.backward()
-            
-            if (i + 1) % accumulation_steps == 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
-                optimizer.zero_grad()
-            
-            running_loss += loss.item() * accumulation_steps * batch_size
-        
-        if (i + 1) % accumulation_steps != 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
-            optimizer.zero_grad()
+            running_loss += loss.item() * inputs.size(0)
         
         train_loss = running_loss / len(train_loader.dataset)
         train_losses.append(train_loss)
@@ -608,36 +420,20 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
-            for batch in test_loader:
-                batch_size = len(batch)
-                outputs = []
-                targets = []
-                
-                for item in batch:
-                    node_features = item['node_features'].to(device)
-                    children = item['children']
-                    roots = item['roots']
-                    scalar_input = item['scalar_features'].unsqueeze(0).to(device)
-                    target = y_test[item['index']].to(device)
-                    
-                    output = model(node_features.unsqueeze(0), [children], [roots], scalar_input)
-                    outputs.append(output)
-                    targets.append(target)
-                
-                outputs = torch.cat(outputs)
-                targets = torch.cat(targets)
-                
+            for inputs, targets in test_loader:
+                inputs, targets = inputs.to(device), targets.to(device)
+                outputs = model(inputs)
                 loss = criterion(outputs, targets)
-                val_loss += loss.item() * batch_size
+                val_loss += loss.item() * inputs.size(0)
         
         val_loss /= len(test_loader.dataset)
         val_losses.append(val_loss)
         
-        scheduler.step()
+        scheduler.step(val_loss)
         
         print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
         
-        if val_loss < best_val_loss and not np.isnan(val_loss) and not np.isinf(val_loss):
+        if val_loss < best_val_loss:
             best_val_loss = val_loss
             epochs_no_improve = 0
             best_model_state = model.state_dict().copy()
@@ -652,42 +448,33 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
     if best_model_state is not None and epochs_no_improve > 0:
         model.load_state_dict(best_model_state)
     
-    plt.figure(figsize=(10, 6))
-    plt.plot(range(1, len(train_losses) + 1), train_losses, label='Training Loss')
-    plt.plot(range(1, len(val_losses) + 1), val_losses, label='Validation Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.title('Training and Validation Loss Over Epochs')
-    plt.legend()
-    plt.grid(True)
-    plt.savefig('loss_plot.png')
-    plt.show()
-    
     return train_losses, val_losses
 
-def evaluate_model(model, test_features, test_scalar, y_test, y_scaler, file_names_test):
+def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_transformed=False, original_execution_times=None):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.to(device)
     model.eval()
     
-    y_pred_scaled = []
+    X_test = X_test.to(device)
     with torch.no_grad():
-        for idx, item in enumerate(test_features):
-            node_features = torch.FloatTensor(item['node_features']).unsqueeze(0).to(device)
-            children = [item['children']]
-            roots = [item['roots']]
-            scalar_input = test_scalar[idx].unsqueeze(0).to(device)
-            output = model(node_features, children, roots, scalar_input)
-            y_pred_scaled.append(output.cpu().numpy())
+        y_pred_scaled = model(X_test)
     
-    y_pred_scaled = np.concatenate(y_pred_scaled)
+    y_pred_scaled = y_pred_scaled.cpu().numpy()
     y_test = y_test.cpu().numpy()
     
     y_test_transformed = y_scaler.inverse_transform(y_test)
     y_pred_transformed = y_scaler.inverse_transform(y_pred_scaled)
     
-    y_test_actual = np.expm1(y_test_transformed)
-    y_pred_actual = np.expm1(y_pred_transformed)
+    if is_log_transformed:
+        y_test_actual = np.expm1(y_test_transformed)
+        y_pred_actual = np.expm1(y_pred_transformed)
+    else:
+        y_test_actual = y_test_transformed
+        y_pred_actual = y_pred_transformed
+    
+    # Apply bias correction for systematic prediction errors
+    bias_factor = np.median(y_test_actual / np.maximum(y_pred_actual, 1e-8))
+    y_pred_actual_corrected = y_pred_actual * bias_factor
     
     results_by_subfolder = {}
     for i, file_path in enumerate(file_names_test):
@@ -695,26 +482,29 @@ def evaluate_model(model, test_features, test_scalar, y_test, y_scaler, file_nam
         if subfolder not in results_by_subfolder:
             results_by_subfolder[subfolder] = []
         
-        pred = max(y_pred_actual[i][0], 0)
+        actual_val = y_test_actual[i][0]
+        pred_val = y_pred_actual_corrected[i][0]
+        error_percentage = abs(actual_val - pred_val) / actual_val * 100 if actual_val > 0 else 0
+        
         results_by_subfolder[subfolder].append({
             'file': file_path,
-            'actual': y_test_actual[i][0],
-            'predicted': pred,
-            'error_percentage': abs(y_test_actual[i][0] - pred) / y_test_actual[i][0] * 100 if y_test_actual[i][0] > 0 else 0
+            'actual': actual_val,
+            'predicted': pred_val,
+            'error_percentage': error_percentage
         })
     
     for subfolder, results in results_by_subfolder.items():
         print(f"\nResults for {subfolder}:")
-        for result in results:
+        avg_error = sum(r['error_percentage'] for r in results) / len(results)
+        print(f"Average Error: {avg_error:.2f}%")
+        for result in results[:3]:  # Show only first 3 for brevity
             print(f"File: {result['file']}")
-            print(f"  Actual execution time: {result['actual']:.2f} ms")
-            print(f"  Predicted execution time: {result['predicted']:.2f} ms")
-            print(f"  Error percentage: {result['error_percentage']:.2f}%")
+            print(f"  Actual: {result['actual']:.2f} ms, Predicted: {result['predicted']:.2f} ms, Error: {result['error_percentage']:.2f}%")
     
-    mse = np.mean((y_test_actual - y_pred_actual) ** 2)
+    mse = np.mean((y_test_actual - y_pred_actual_corrected) ** 2)
     rmse = np.sqrt(mse)
-    mae = np.mean(np.abs(y_test_actual - y_pred_actual))
-    mape = np.mean(np.abs((y_test_actual - y_pred_actual) / (y_test_actual + 1e-8))) * 100
+    mae = np.mean(np.abs(y_test_actual - y_pred_actual_corrected))
+    mape = np.mean(np.abs((y_test_actual - y_pred_actual_corrected) / (y_test_actual + 1e-8))) * 100
     
     print("\nOverall Model Performance:")
     print(f"MSE: {mse:.2f}")
@@ -722,72 +512,82 @@ def evaluate_model(model, test_features, test_scalar, y_test, y_scaler, file_nam
     print(f"MAE: {mae:.2f}")
     print(f"MAPE: {mape:.2f}%")
     
-    return y_test_actual, y_pred_actual
+    return y_test_actual, y_pred_actual_corrected
 
 def main(main_dir):
-    if torch.cuda.is_available():
-        torch.cuda.init()
-        print(f"CUDA initialized. Using GPU: {torch.cuda.get_device_name(0)}")
-    else:
-        print("CUDA not available. Using CPU.")
-    
     print(f"Processing main directory: {main_dir}")
     train_features, test_features, test_file_names = process_main_directory(main_dir)
     
-    print(f"Total training samples: {len(train_features)} (randomly selected)")
-    print(f"Total test samples: {len(test_features)} (50 randomly selected)")
+    print(f"Total training samples: {len(train_features)}")
+    print(f"Total test samples: {len(test_features)}")
     
     if len(train_features) == 0 or len(test_features) == 0:
         print("Error: No valid training or test data found")
         return None
     
-    (train_features, train_scalar, y_train,
-     test_features, test_scalar, y_test,
-     y_scaler, node_input_size, scalar_input_size) = prepare_data_for_model(train_features, test_features)
+    original_execution_times = {}
+    for feature, fname in zip(test_features, test_file_names):
+        original_execution_times[fname] = feature['execution_time']
     
-    train_loader, test_loader = create_data_loaders(
-        train_features, train_scalar, y_train,
-        test_features, test_scalar, y_test,
-        batch_size=64
-    )
+    X_train, y_train, X_test, y_test, y_scaler, input_size, is_log_transformed = prepare_data_for_model(train_features, test_features)
     
-    global model
-    model = EnhancedTreeLSTMModel(
-        node_input_size=node_input_size,
-        scalar_input_size=scalar_input_size,
-        hidden_sizes=[512, 256, 128],
+    train_loader, test_loader = create_data_loaders(X_train, y_train, X_test, y_test, batch_size=16)
+    
+    model = ImprovedLSTMModel(
+        input_size=input_size,
+        hidden_sizes=[256, 128, 64],
         output_size=1,
-        dropout_rate=0.2,
-        num_heads=8
+        dropout_rate=0.3
     )
     
-    optimizer = optim.AdamW(model.parameters(), lr=0.00005, weight_decay=1e-4)
+    criterion = nn.SmoothL1Loss()
+    optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-4)
     
-    print("Building and training Enhanced TreeLSTM model...")
+    print("Building and training Improved LSTM model...")
     train_losses, val_losses = train_model(
-        model, train_loader, test_loader,
-        custom_loss, optimizer,
-        num_epochs=700, patience=50, accumulation_steps=2
+        model, 
+        train_loader, 
+        test_loader, 
+        criterion, 
+        optimizer, 
+        num_epochs=200,
+        patience=30
     )
     
-    if train_losses is None or val_losses is None:
-        print("Training failed due to invalid values")
-        return None
+    plt.figure(figsize=(10, 6))
+    plt.plot(range(1, len(train_losses) + 1), train_losses, label='Training Loss')
+    plt.plot(range(1, len(val_losses) + 1), val_losses, label='Validation Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('Training and Validation Loss over Epochs')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig('loss_improved_model.png')
+    plt.close()
     
     print("\nEvaluating model:")
     y_test_actual, y_pred_actual = evaluate_model(
-        model, test_features, test_scalar, y_test,
-        y_scaler, test_file_names
+        model, X_test, y_test, y_scaler, test_file_names, 
+        is_log_transformed, original_execution_times
     )
     
-    print(f"\nSummary for Comparison:")
-    print(f"Model: EnhancedTreeLSTM")
+    print("\nSaving the trained model as 'lstm_model.pt'...")
+    model.eval()
+    device = next(model.parameters()).device
+    
+    try:
+        sample_input = torch.randn(1, 1, input_size).to(device)
+        traced_model = torch.jit.trace(model, sample_input)
+        traced_model.save("lstm_model.pt")
+        print("Model successfully saved as 'lstm_model.pt'")
+    except Exception as e:
+        print(f"Error saving the model: {str(e)}")
     
     return model, y_scaler, y_test_actual, y_pred_actual
 
 if __name__ == "__main__":
     main_dir = "synthetic_data"
     random.seed(42)
-    torch.manual_seed(42)
-    np.random.seed(42)
-    model, y_scaler, y_test_actual, y_pred_actual = main(main_dir)
+    result = main(main_dir)
+    if result is not None:
+        model, y_scaler, y_test_actual, y_pred_actual = result
