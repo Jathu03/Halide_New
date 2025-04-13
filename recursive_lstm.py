@@ -9,6 +9,11 @@ from torch_geometric.nn import GCNConv
 from sklearn.preprocessing import StandardScaler
 import glob
 from tqdm import tqdm
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 # Step 1: Feature Extraction
 def extract_features(json_data):
@@ -16,85 +21,114 @@ def extract_features(json_data):
     features = {}
     
     # Extract scheduling data (target)
-    for item in json_data:
-        if isinstance(item, dict) and item.get('name') == 'total_execution_time_ms':
-            features['execution_time'] = item['value']
-    
-    # Extract programming details
-    programming_details = next((item for item in json_data if 'programming_details' in item), None)
-    if not programming_details:
+    try:
+        for item in json_data:
+            if isinstance(item, dict) and item.get('name') == 'total_execution_time_ms':
+                features['execution_time'] = float(item.get('value', 0))
+                break
+        else:
+            logger.warning("No total_execution_time_ms found")
+            return None
+    except Exception as e:
+        logger.error(f"Error extracting execution time: {e}")
         return None
     
-    edges = programming_details['programming_details'].get('Edges', [])
-    nodes = programming_details['programming_details'].get('Nodes', [])
+    # Extract programming details
+    programming_details = None
+    for item in json_data:
+        if isinstance(item, dict) and 'programming_details' in item:
+            programming_details = item['programming_details']
+            break
+    
+    if not programming_details:
+        logger.warning("No programming_details found")
+        return None
+    
+    edges = programming_details.get('Edges', [])
+    nodes = programming_details.get('Nodes', [])
     
     # Node features
     node_features = []
     node_names = []
     for node in nodes:
-        node_name = node['Name']
-        node_names.append(node_name)
-        details = node.get('Details', {})
-        
-        # Memory access patterns
-        mem_patterns = details.get('Memory access patterns', [])
-        mem_vector = []
-        for pattern in mem_patterns:
-            if isinstance(pattern, str):
-                values = [int(x) for x in pattern.split() if x.isdigit()]
-                mem_vector.extend(values)
-        
-        # Op histogram
-        op_hist = details.get('Op histogram', [])
-        op_vector = []
-        for op in op_hist:
-            if isinstance(op, str):
-                try:
-                    value = int(op.split(':')[-1].strip())
-                    op_vector.append(value)
-                except:
-                    continue
-        
-        # Scheduling features
-        sched_features = details.get('scheduling_feature', {})
-        sched_vector = [float(v) for v in sched_features.values()] if sched_features else []
-        
-        # Combine features
-        node_feature = mem_vector + op_vector + sched_vector
-        node_features.append(node_feature)
+        try:
+            node_name = node.get('Name', '')
+            if not node_name:
+                continue
+            node_names.append(node_name)
+            details = node.get('Details', {})
+            
+            # Memory access patterns
+            mem_patterns = details.get('Memory access patterns', [])
+            mem_vector = []
+            for pattern in mem_patterns:
+                if isinstance(pattern, str):
+                    values = [int(x) for x in pattern.split() if x.isdigit()]
+                    mem_vector.extend(values)
+            
+            # Op histogram
+            op_hist = details.get('Op histogram', [])
+            op_vector = []
+            for op in op_hist:
+                if isinstance(op, str):
+                    try:
+                        value = int(op.split(':')[-1].strip())
+                        op_vector.append(value)
+                    except (ValueError, IndexError):
+                        continue
+            
+            # Scheduling features
+            sched_features = details.get('scheduling_feature', {})
+            sched_vector = [float(v) for v in sched_features.values() if isinstance(v, (int, float))] if sched_features else []
+            
+            # Combine features
+            node_feature = mem_vector + op_vector + sched_vector
+            node_features.append(node_feature)
+        except Exception as e:
+            logger.error(f"Error processing node {node_name}: {e}")
+            continue
+    
+    if not node_features:
+        logger.warning("No valid node features extracted")
+        return None
     
     # Pad node features to the same length
-    max_len = max(len(f) for f in node_features) if node_features else 1
+    max_len = max(len(f) for f in node_features)
     node_features = [f + [0] * (max_len - len(f)) for f in node_features]
     
     # Edge features and indices
     edge_index = []
     edge_features = []
     for edge in edges:
-        from_node = edge.get('From')
-        to_node = edge.get('To')
-        if from_node in node_names and to_node in node_names:
-            from_idx = node_names.index(from_node)
-            to_idx = node_names.index(to_node)
-            edge_index.append([from_idx, to_idx])
-            
-            # Extract Load Jacobians
-            details = edge.get('Details', {})
-            jacobians = details.get('Load Jacobians', [])
-            jacobian_vector = []
-            for row in jacobians:
-                row = row.strip().split()
-                for val in row:
-                    try:
-                        # Handle fractions and numbers
-                        if '/' in val:
-                            num, denom = val.split('/')
-                            jacobian_vector.append(float(num) / float(denom))
-                        else:
-                            jacobian_vector.append(float(val))
-                    except:
-                        jacobian_vector.append(0.0)
-            edge_features.append(jacobian_vector)
+        try:
+            from_node = edge.get('From', '')
+            to_node = edge.get('To', '')
+            if from_node in node_names and to_node in node_names:
+                from_idx = node_names.index(from_node)
+                to_idx = node_names.index(to_node)
+                edge_index.append([from_idx, to_idx])
+                
+                # Extract Load Jacobians
+                details = edge.get('Details', {})
+                jacobians = details.get('Load Jacobians', [])
+                jacobian_vector = []
+                for row in jacobians:
+                    if not isinstance(row, str):
+                        continue
+                    row = row.strip().split()
+                    for val in row:
+                        try:
+                            if '/' in val:
+                                num, denom = val.split('/')
+                                jacobian_vector.append(float(num) / float(denom))
+                            else:
+                                jacobian_vector.append(float(val))
+                        except (ValueError, ZeroDivisionError):
+                            jacobian_vector.append(0.0)
+                edge_features.append(jacobian_vector)
+        except Exception as e:
+            logger.error(f"Error processing edge {from_node} -> {to_node}: {e}")
+            continue
     
     # Pad edge features
     max_edge_len = max(len(f) for f in edge_features) if edge_features else 1
@@ -126,8 +160,13 @@ def create_dataset(data_dir):
             features = extract_features(json_data)
             if features and features['node_features'] and features['edge_index']:
                 raw_features.append(features)
+            else:
+                logger.warning(f"Skipping {json_file}: No valid features")
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON decode error in {json_file}: {e}")
+            continue
         except Exception as e:
-            print(f"Error processing {json_file}: {e}")
+            logger.error(f"Error processing {json_file}: {e}")
             continue
     
     # Normalize node features
@@ -135,23 +174,31 @@ def create_dataset(data_dir):
     for features in raw_features:
         all_node_features.extend(features['node_features'])
     if all_node_features:
-        scaler.fit(all_node_features)
+        try:
+            scaler.fit(all_node_features)
+        except Exception as e:
+            logger.error(f"Error fitting scaler: {e}")
+            return []
     
     # Create PyG Data objects
     for features in tqdm(raw_features, desc="Creating Data objects"):
-        node_features = scaler.transform(features['node_features']).astype(np.float32)
-        edge_index = np.array(features['edge_index'], dtype=np.int64).T
-        edge_features = np.array(features['edge_features'], dtype=np.float32)
-        y = np.array([features['execution_time']], dtype=np.float32)
-        
-        # Create PyG Data object
-        data = Data(
-            x=torch.tensor(node_features, dtype=torch.float),
-            edge_index=torch.tensor(edge_index, dtype=torch.long),
-            edge_attr=torch.tensor(edge_features, dtype=torch.float),
-            y=torch.tensor(y, dtype=torch.float)
-        )
-        dataset.append(data)
+        try:
+            node_features = scaler.transform(features['node_features']).astype(np.float32)
+            edge_index = np.array(features['edge_index'], dtype=np.int64).T
+            edge_features = np.array(features['edge_features'], dtype=np.float32)
+            y = np.array([features['execution_time']], dtype=np.float32)
+            
+            # Create PyG Data object
+            data = Data(
+                x=torch.tensor(node_features, dtype=torch.float),
+                edge_index=torch.tensor(edge_index, dtype=torch.long),
+                edge_attr=torch.tensor(edge_features, dtype=torch.float),
+                y=torch.tensor(y, dtype=torch.float)
+            )
+            dataset.append(data)
+        except Exception as e:
+            logger.error(f"Error creating Data object: {e}")
+            continue
     
     return dataset
 
@@ -191,6 +238,10 @@ class DAGLSTM(nn.Module):
 # Step 4: Training Loop
 def train_model(dataset, batch_size=32, epochs=100, hidden_dim=64, num_layers=2):
     """Train the DAG-LSTM model."""
+    if not dataset:
+        logger.error("Empty dataset provided")
+        return None
+    
     # Split dataset
     train_size = int(0.8 * len(dataset))
     train_dataset = dataset[:train_size]
@@ -200,8 +251,13 @@ def train_model(dataset, batch_size=32, epochs=100, hidden_dim=64, num_layers=2)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
     
     # Initialize model
-    input_dim = dataset[0].x.size(1)
-    edge_dim = dataset[0].edge_attr.size(1) if dataset[0].edge_attr is not None else 0
+    try:
+        input_dim = dataset[0].x.size(1)
+        edge_dim = dataset[0].edge_attr.size(1) if dataset[0].edge_attr is not None else 0
+    except IndexError:
+        logger.error("No valid data to initialize model")
+        return None
+    
     model = DAGLSTM(input_dim, hidden_dim, edge_dim, num_layers)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
     criterion = nn.MSELoss()
@@ -214,27 +270,35 @@ def train_model(dataset, batch_size=32, epochs=100, hidden_dim=64, num_layers=2)
         model.train()
         train_loss = 0
         for batch in train_loader:
-            batch = batch.to(device)
-            optimizer.zero_grad()
-            out = model(batch)
-            loss = criterion(out, batch.y)
-            loss.backward()
-            optimizer.step()
-            train_loss += loss.item() * batch.num_graphs
-        train_loss /= len(train_loader.dataset)
+            try:
+                batch = batch.to(device)
+                optimizer.zero_grad()
+                out = model(batch)
+                loss = criterion(out, batch.y)
+                loss.backward()
+                optimizer.step()
+                train_loss += loss.item() * batch.num_graphs
+            except Exception as e:
+                logger.error(f"Error in training batch: {e}")
+                continue
+        train_loss /= len(train_loader.dataset) if train_loader.dataset else 1
         
         # Validation
         model.eval()
         val_loss = 0
         with torch.no_grad():
             for batch in val_loader:
-                batch = batch.to(device)
-                out = model(batch)
-                loss = criterion(out, batch.y)
-                val_loss += loss.item() * batch.num_graphs
-        val_loss /= len(val_loader.dataset)
+                try:
+                    batch = batch.to(device)
+                    out = model(batch)
+                    loss = criterion(out, batch.y)
+                    val_loss += loss.item() * batch.num_graphs
+                except Exception as e:
+                    logger.error(f"Error in validation batch: {e}")
+                    continue
+        val_loss /= len(val_loader.dataset) if val_loader.dataset else 1
         
-        print(f"Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
+        logger.info(f"Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
     
     return model
 
@@ -242,14 +306,20 @@ def train_model(dataset, batch_size=32, epochs=100, hidden_dim=64, num_layers=2)
 if __name__ == "__main__":
     data_dir = "synthetic_data"
     if not os.path.exists(data_dir):
-        raise FileNotFoundError(f"Directory {data_dir} does not exist.")
+        logger.error(f"Directory {data_dir} does not exist")
+        raise FileNotFoundError(f"Directory {data_dir} does not exist")
     
-    print("Creating dataset...")
+    logger.info("Creating dataset...")
     dataset = create_dataset(data_dir)
-    if not dataset:
-        raise ValueError("No valid data found in the dataset.")
+    logger.info(f"Dataset size: {len(dataset)}")
     
-    print(f"Dataset size: {len(dataset)}")
-    print("Training model...")
+    if not dataset:
+        logger.error("No valid data found in the dataset")
+        raise ValueError("No valid data found in the dataset")
+    
+    logger.info("Training model...")
     model = train_model(dataset)
-    print("Training completed.")
+    if model:
+        logger.info("Training completed")
+    else:
+        logger.error("Training failed")
