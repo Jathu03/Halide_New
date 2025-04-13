@@ -7,7 +7,6 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
-from torch.nn.utils.rnn import pad_sequence
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 import random
 import matplotlib.pyplot as plt
@@ -48,7 +47,6 @@ def get_execution_time(file_path):
 
 def build_tree(nodes, edges):
     """Convert nodes and edges into a tree structure."""
-    # Create adjacency list for children
     children = defaultdict(list)
     node_indices = {node['Name']: idx for idx, node in enumerate(nodes)}
     
@@ -56,10 +54,8 @@ def build_tree(nodes, edges):
         from_node = edge['From']
         to_node = edge['To']
         if from_node in node_indices and to_node in node_indices:
-            # Assume edges represent parent -> child relationships
             children[node_indices[from_node]].append(node_indices[to_node])
     
-    # Identify root nodes (nodes with no incoming edges)
     incoming = set()
     for edge in edges:
         if edge['To'] in node_indices:
@@ -67,7 +63,6 @@ def build_tree(nodes, edges):
     
     roots = [i for i in range(len(nodes)) if i not in incoming]
     if not roots:
-        # Fallback: assume first node is root if no clear root
         roots = [0]
     
     return children, roots, node_indices
@@ -108,20 +103,16 @@ def extract_features_from_file(file_path):
                 }
                 edges_features.append(edge_feature)
     
-    # Build tree structure
     children, roots, node_indices = build_tree(nodes_features, edges_features)
     
-    # Extract node features for TreeLSTM
     node_vectors = []
     for node in nodes_features:
         op_counts = {k: v for k, v in node.items() if k.startswith('op_')}
         vector = [op_counts.get(f'op_{op}', 0) for op in sorted(set(k[3:] for k in op_counts))]
-        # Pad or truncate to ensure consistent feature size
-        max_op_types = 20  # Adjust based on data
+        max_op_types = 20
         vector = (vector + [0] * max_op_types)[:max_op_types]
         node_vectors.append(vector)
     
-    # Scheduling features (used as additional node features or scalar features)
     scheduling_features = []
     scheduling_data = data.get("scheduling_data", None)
     if not scheduling_data and programming_details and 'Schedules' in programming_details:
@@ -135,7 +126,6 @@ def extract_features_from_file(file_path):
                 sched_feature.update(sf)
             scheduling_features.append(sched_feature)
     
-    # Aggregate scheduling features into scalar features
     op_counts = {}
     for node in nodes_features:
         for key, value in node.items():
@@ -228,8 +218,9 @@ def process_main_directory(main_dir):
     return train_features, test_features, list(test_file_names)
 
 class TreeLSTMDataset(Dataset):
-    def __init__(self, features):
+    def __init__(self, features, scalar_tensor):
         self.features = features
+        self.scalar_tensor = scalar_tensor
     
     def __len__(self):
         return len(self.features)
@@ -240,12 +231,11 @@ class TreeLSTMDataset(Dataset):
             'node_features': torch.FloatTensor(feature['node_features']),
             'children': feature['children'],
             'roots': feature['roots'],
-            'scalar_features': feature['scalar_features'],
+            'scalar_features': self.scalar_tensor[idx],
             'execution_time': feature['execution_time']
         }
 
 def prepare_data_for_model(train_features, test_features):
-    # Scalar features
     train_scalar_df = pd.DataFrame([f['scalar_features'] for f in train_features])
     test_scalar_df = pd.DataFrame([f['scalar_features'] for f in test_features])
     
@@ -278,7 +268,6 @@ def prepare_data_for_model(train_features, test_features):
     y_train_tensor = torch.FloatTensor(y_train_scaled)
     y_test_tensor = torch.FloatTensor(y_test_scaled)
     
-    # Compute input sizes
     node_input_size = len(train_features[0]['node_features'][0]) if train_features[0]['node_features'] else 1
     scalar_input_size = train_scalar_tensor.shape[1]
     
@@ -295,19 +284,15 @@ class TreeLSTMCell(nn.Module):
         self.input_size = input_size
         self.hidden_size = hidden_size
         
-        # Input gate
         self.W_i = nn.Linear(input_size, hidden_size)
         self.U_i = nn.Linear(hidden_size, hidden_size, bias=False)
         
-        # Forget gate (one per child)
         self.W_f = nn.Linear(input_size, hidden_size)
         self.U_f = nn.Linear(hidden_size, hidden_size, bias=False)
         
-        # Output gate
         self.W_o = nn.Linear(input_size, hidden_size)
         self.U_o = nn.Linear(hidden_size, hidden_size, bias=False)
         
-        # Cell update
         self.W_u = nn.Linear(input_size, hidden_size)
         self.U_u = nn.Linear(hidden_size, hidden_size, bias=False)
         
@@ -317,25 +302,16 @@ class TreeLSTMCell(nn.Module):
         batch_size = x.size(0)
         h_sum = sum(h_children) if h_children else torch.zeros(batch_size, self.hidden_size, device=x.device)
         
-        # Input gate
         i = torch.sigmoid(self.W_i(x) + self.U_i(h_sum) + self.bias[:self.hidden_size])
-        
-        # Output gate
         o = torch.sigmoid(self.W_o(x) + self.U_o(h_sum) + self.bias[self.hidden_size:2*self.hidden_size])
-        
-        # Cell update
         u = torch.tanh(self.W_u(x) + self.U_u(h_sum) + self.bias[2*self.hidden_size:3*self.hidden_size])
         
-        # Forget gates for each child
         c_new = torch.zeros(batch_size, self.hidden_size, device=x.device)
         for h_child, c_child in zip(h_children, c_children):
             f = torch.sigmoid(self.W_f(x) + self.U_f(h_child) + self.bias[3*self.hidden_size:])
             c_new += f * c_child
         
-        # Update cell state
         c_new += i * u
-        
-        # Hidden state
         h_new = o * torch.tanh(c_new)
         
         return h_new, c_new
@@ -378,11 +354,9 @@ class EnhancedTreeLSTMModel(nn.Module):
         self.tree_lstm_layers = nn.ModuleList()
         self.ln_layers = nn.ModuleList()
         
-        # First TreeLSTM layer
         self.tree_lstm_layers.append(TreeLSTMCell(node_input_size, hidden_sizes[0]))
         self.ln_layers.append(nn.LayerNorm(hidden_sizes[0]))
         
-        # Subsequent TreeLSTM layers
         for i in range(1, len(hidden_sizes)):
             self.tree_lstm_layers.append(TreeLSTMCell(hidden_sizes[i-1], hidden_sizes[i]))
             self.ln_layers.append(nn.LayerNorm(hidden_sizes[i]))
@@ -406,7 +380,6 @@ class EnhancedTreeLSTMModel(nn.Module):
         self.residual_proj = nn.Linear(combined_size, 64) if combined_size != 64 else None
     
     def process_node(self, node_idx, node_features, children, layer_idx, h_cache, c_cache, device):
-        # Get children states
         h_children = []
         c_children = []
         for child_idx in children[node_idx]:
@@ -417,14 +390,11 @@ class EnhancedTreeLSTMModel(nn.Module):
             h_children.append(h_cache[(child_idx, layer_idx)])
             c_children.append(c_cache[(child_idx, layer_idx)])
         
-        # Current node input
         x = node_features[node_idx].unsqueeze(0).to(device)
         
-        # Apply TreeLSTM
         tree_lstm = self.tree_lstm_layers[layer_idx]
         h_new, c_new = tree_lstm(x, h_children, c_children)
         
-        # Apply layer normalization
         h_new = self.ln_layers[layer_idx](h_new)
         
         return h_new, c_new
@@ -433,14 +403,12 @@ class EnhancedTreeLSTMModel(nn.Module):
         device = node_features.device
         batch_size = scalar_input.size(0)
         
-        # Process each tree in the batch
         all_hiddens = []
         for b in range(batch_size):
             h_cache = {}
             c_cache = {}
             h_last_layer = []
             
-            # Process through each TreeLSTM layer
             current_features = node_features[b]
             for layer_idx in range(len(self.tree_lstm_layers)):
                 layer_hiddens = []
@@ -450,13 +418,11 @@ class EnhancedTreeLSTMModel(nn.Module):
                     )
                     layer_hiddens.append(h.squeeze(0))
                 
-                # Prepare features for next layer
                 current_features = torch.stack(layer_hiddens) if layer_hiddens else torch.zeros(1, self.hidden_sizes[layer_idx], device=device)
                 h_last_layer = current_features
             
             all_hiddens.append(h_last_layer)
         
-        # Pad hiddens to max number of nodes
         max_nodes = max(len(h) for h in all_hiddens)
         padded_hiddens = []
         for h in all_hiddens:
@@ -468,14 +434,11 @@ class EnhancedTreeLSTMModel(nn.Module):
         
         h_tensor = torch.stack(padded_hiddens)
         
-        # Apply attention
         attn_out = self.attention(h_tensor)
         context = attn_out.mean(dim=1)
         
-        # Combine with scalar features
         combined = torch.cat((context, scalar_input), dim=1)
         
-        # Feedforward layers
         x = self.fc1(combined)
         x = self.bn1(x)
         x = self.ln1(x)
@@ -505,11 +468,11 @@ def custom_loss(outputs, targets, huber_delta=0.5, mae_weight=0.3, l1_lambda=1e-
     return huber + mae_weight * mae + l1_reg
 
 def create_data_loaders(train_features, train_scalar, y_train, test_features, test_scalar, y_test, batch_size=64):
-    train_dataset = TreeLSTMDataset(train_features)
-    test_dataset = TreeLSTMDataset(test_features)
+    train_dataset = TreeLSTMDataset(train_features, train_scalar)
+    test_dataset = TreeLSTMDataset(test_features, test_scalar)
     
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=lambda x: x)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=lambda x: x)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
     
     return train_loader, test_loader
 
@@ -533,16 +496,15 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
         optimizer.zero_grad()
         
         for i, batch in enumerate(train_loader):
-            scalar_inputs = torch.stack([torch.FloatTensor(f['scalar_features']) for f in batch]).to(device)
-            targets = torch.FloatTensor([f['execution_time'] for f in batch]).view(-1, 1).to(device)
+            scalar_inputs = torch.stack([f['scalar_features'] for f in batch]).to(device)
+            targets = y_train[batch.indices].to(device)
             
-            # Process each tree in the batch
             outputs = []
             for item in batch:
                 node_features = item['node_features'].to(device)
                 children = item['children']
                 roots = item['roots']
-                scalar_input = torch.FloatTensor(item['scalar_features']).unsqueeze(0).to(device)
+                scalar_input = item['scalar_features'].unsqueeze(0).to(device)
                 output = model(node_features.unsqueeze(0), [children], [roots], scalar_input)
                 outputs.append(output)
             
@@ -575,15 +537,15 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
         val_loss = 0.0
         with torch.no_grad():
             for batch in test_loader:
-                scalar_inputs = torch.stack([torch.FloatTensor(f['scalar_features']) for f in batch]).to(device)
-                targets = torch.FloatTensor([f['execution_time'] for f in batch]).view(-1, 1).to(device)
+                scalar_inputs = torch.stack([f['scalar_features'] for f in batch]).to(device)
+                targets = y_test[batch.indices].to(device)
                 
                 outputs = []
                 for item in batch:
                     node_features = item['node_features'].to(device)
                     children = item['children']
                     roots = item['roots']
-                    scalar_input = torch.FloatTensor(item['scalar_features']).unsqueeze(0).to(device)
+                    scalar_input = item['scalar_features'].unsqueeze(0).to(device)
                     output = model(node_features.unsqueeze(0), [children], [roots], scalar_input)
                     outputs.append(output)
                 
@@ -633,11 +595,11 @@ def evaluate_model(model, test_features, test_scalar, y_test, y_scaler, file_nam
     
     y_pred_scaled = []
     with torch.no_grad():
-        for item in test_features:
+        for idx, item in enumerate(test_features):
             node_features = torch.FloatTensor(item['node_features']).unsqueeze(0).to(device)
             children = [item['children']]
             roots = [item['roots']]
-            scalar_input = torch.FloatTensor(item['scalar_features']).unsqueeze(0).to(device)
+            scalar_input = test_scalar[idx].unsqueeze(0).to(device)
             output = model(node_features, children, roots, scalar_input)
             y_pred_scaled.append(output.cpu().numpy())
     
