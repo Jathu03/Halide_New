@@ -17,13 +17,12 @@ def extract_node_features(node):
     mem_patterns = details.get('Memory access patterns', [])
     mem_features = []
     for pattern in mem_patterns:
-        # Convert pattern values to numbers (assuming they are space-separated)
         try:
             values = pattern.split(':')[-1].strip().split()
             mem_features.extend([float(v) for v in values if v.replace('.', '', 1).isdigit()])
         except Exception as e:
             print(f"Error parsing memory pattern {pattern}: {e}")
-            mem_features.extend([0.0] * 4)  # Fallback for missing/invalid patterns
+            mem_features.extend([0.0] * 4)
     
     # Operation histogram
     op_hist = details.get('Op histogram', [])
@@ -48,7 +47,7 @@ def extract_node_features(node):
     # Combine all features
     feature_vector = mem_features + op_features + sched_values
     if not feature_vector:
-        feature_vector = [0.0]  # Prevent empty features
+        feature_vector = [0.0]
     return np.array(feature_vector, dtype=np.float32)
 
 def extract_edge_features(edge):
@@ -127,12 +126,10 @@ class HalideDataset(Dataset):
         self.trees = []
         self.labels = []
         
-        # Check if data_dir exists
         if not os.path.exists(data_dir):
             print(f"Directory {data_dir} does not exist.")
             return
         
-        # Iterate through synthetic_data folder
         for subfolder in tqdm(os.listdir(data_dir), desc="Processing folders"):
             subfolder_path = os.path.join(data_dir, subfolder)
             if not os.path.isdir(subfolder_path):
@@ -147,22 +144,18 @@ class HalideDataset(Dataset):
                     with open(file_path, 'r') as f:
                         data = json.load(f)
                     
-                    # Extract programming details
                     prog_details = data.get('programming_details', [])
                     if not prog_details:
                         print(f"No programming_details in {file_path}")
                         continue
                     
-                    # Extract nodes and edges
                     nodes = []
                     edges = []
                     exec_time = None
                     
-                    # Handle both list and dict formats
                     if isinstance(prog_details, dict):
                         nodes = prog_details.get('Nodes', [])
                         edges = prog_details.get('Edges', [])
-                        # Look for execution time in prog_details
                         for key, value in prog_details.items():
                             if key == 'total_execution_time_ms' or (isinstance(value, dict) and value.get('name') == 'total_execution_time_ms'):
                                 exec_time = float(value.get('value', 0.0)) if isinstance(value, dict) else float(value)
@@ -174,7 +167,7 @@ class HalideDataset(Dataset):
                                     nodes = item['Nodes']
                                 if item.get('Edges'):
                                     edges = item['Edges']
-                                if item.get('name') == 'total_execution_time_ms':
+                                if item.get('name') == 'total_execution_time_ms'):
                                     exec_time = float(item.get('value', 0.0))
                     
                     if not nodes or not edges:
@@ -184,7 +177,6 @@ class HalideDataset(Dataset):
                         print(f"No execution time found in {file_path}")
                         continue
                     
-                    # Build tree
                     tree = build_tree(nodes, edges)
                     if tree is None:
                         print(f"Failed to build tree for {file_path}")
@@ -235,7 +227,7 @@ class TreeLSTMCell(nn.Module):
 class TreeLSTM(nn.Module):
     def __init__(self, input_size, hidden_size):
         super(TreeLSTM, self).__init__()
-        self.cell = Tree  self.cell = TreeLSTMCell(input_size, hidden_size)
+        self.cell = TreeLSTMCell(input_size, hidden_size)
         self.fc = nn.Linear(hidden_size, 1)
     
     def forward(self, tree):
