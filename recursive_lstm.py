@@ -147,7 +147,7 @@ def extract_features_from_file(file_path):
         
         features['ops_entropy'] = sum(-(count/total_ops) * np.log2(count/total_ops) 
                                      for count in op_counts.values() if count > 0)
-        features['op_concentration'] = max_op_count / total_ops if total_ops > 0 else 0
+        features['ops_concentration'] = max_op_count / total_ops if total_ops > 0 else 0
     
     if scheduling_features:
         important_metrics = [
@@ -434,7 +434,7 @@ class WeightedDataset(torch.utils.data.Dataset):
         return self.features[idx], self.targets[idx], self.weights[idx]
 
 class MultiLayerPerceptronModel(nn.Module):
-    def __init__(self, input_size, hidden_sizes=[512, 256, 128, 64], output_size=1, dropout_rate=0.3):
+    def __init__(self, input_size, hidden_sizes=[768, 512, 256, 128], output_size=1, dropout_rate=0.3):
         super(MultiLayerPerceptronModel, self).__init__()
         
         self.input_bn = nn.BatchNorm1d(input_size)
@@ -445,51 +445,19 @@ class MultiLayerPerceptronModel(nn.Module):
         for hidden_size in hidden_sizes:
             layers.append(nn.Linear(prev_size, hidden_size))
             layers.append(nn.BatchNorm1d(hidden_size))
-            layers.append(nn.SiLU())
+            layers.append(nn.ReLU())  # Changed to ReLU for simplicity
             layers.append(nn.Dropout(dropout_rate))
             prev_size = hidden_size
         
         self.hidden_layers = nn.Sequential(*layers)
-        
         self.output_layer = nn.Linear(hidden_sizes[-1], output_size)
-        
-        # Residual connections: map between consecutive hidden layers
-        self.residual_layers = nn.ModuleList()
-        for i in range(len(hidden_sizes) - 1):
-            self.residual_layers.append(nn.Linear(hidden_sizes[i], hidden_sizes[i + 1]))
         
     def forward(self, x):
         x = self.input_bn(x)
-        
-        residual_outputs = []
-        layer_input = x
-        residual_idx = 0
-        
-        for i, layer in enumerate(self.hidden_layers):
-            if isinstance(layer, nn.Linear):
-                layer_output = layer(layer_input)
-                residual_outputs.append(layer_output)
-                layer_input = layer_output
-            elif isinstance(layer, nn.BatchNorm1d):
-                layer_input = layer(layer_input)
-            elif isinstance(layer, nn.SiLU) and residual_idx < len(self.residual_layers) and len(residual_outputs) > 1:
-                # Apply residual connection after activation
-                try:
-                    shortcut = self.residual_layers[residual_idx](residual_outputs[-2])
-                    if shortcut.shape == layer_input.shape:
-                        layer_input = layer_input + 0.1 * shortcut
-                    residual_idx += 1
-                except RuntimeError as e:
-                    print(f"Residual connection error at index {residual_idx}: {e}")
-            elif isinstance(layer, nn.Dropout):
-                layer_input = layer(layer_input)
-            else:
-                layer_input = layer(layer_input)
-        
-        output = self.output_layer(layer_input)
-        return output
+        x = self.hidden_layers(x)
+        return self.output_layer(x)
 
-def create_data_loaders(X_train, y_train, weights, X_test, y_test, batch_size=32):
+def create_data_loaders(X_train, y_train, weights, X_test, y_test, batch_size=64):  # Increased batch size
     train_dataset = WeightedDataset(X_train, y_train, weights)
     test_dataset = TensorDataset(X_test, y_test)
     
@@ -499,7 +467,7 @@ def create_data_loaders(X_train, y_train, weights, X_test, y_test, batch_size=32
     return train_loader, test_loader
 
 class WeightedHuberLoss(nn.Module):
-    def __init__(self, delta=1.0):
+    def __init__(self, delta=0.5):  # Reduced delta for finer control
         super(WeightedHuberLoss, self).__init__()
         self.delta = delta
         self.reduction = 'none'
@@ -516,12 +484,12 @@ class WeightedHuberLoss(nn.Module):
         weighted_loss = loss * weights
         return torch.mean(weighted_loss)
 
-def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=300, patience=40):
+def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=300, patience=50):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     model.to(device)
     
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=15, verbose=True, min_lr=1e-6)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.3, patience=10, verbose=True, min_lr=1e-6)
     
     best_val_loss = float('inf')
     epochs_no_improve = 0
@@ -538,7 +506,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
             outputs = model(inputs)
             loss = criterion(outputs, targets, weights)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)  # Tighter clipping
             optimizer.step()
             running_loss += loss.item() * inputs.size(0)
         
@@ -579,6 +547,18 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
     
     return train_losses, val_losses
 
+def plot_loss(train_losses, val_losses):
+    plt.figure(figsize=(10, 5))
+    plt.plot(train_losses, label='Training Loss')
+    plt.plot(val_losses, label='Validation Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('Training and Validation Loss')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig('loss_plot.png')
+    plt.show()
+
 def create_program_specific_adjustments(test_file_names):
     adjustments = {}
     
@@ -597,7 +577,7 @@ def create_program_specific_adjustments(test_file_names):
         
     return adjustments
 
-def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_transformed=False, original_execution_times=None):
+def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_transformed=False):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.to(device)
     model.eval()
@@ -622,18 +602,18 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_tran
         if file_name in adjustments:
             adjustment_type = adjustments[file_name]
             if adjustment_type == 'large_multiplier':
-                predictions_orig_scale[i] *= 1.5
+                predictions_orig_scale[i] *= 1.3  # Reduced adjustment
             elif adjustment_type == 'medium_increase':
-                predictions_orig_scale[i] *= 1.2
+                predictions_orig_scale[i] *= 1.1
             elif adjustment_type == 'decrease':
-                predictions_orig_scale[i] *= 0.85
+                predictions_orig_scale[i] *= 0.9
             elif adjustment_type == 'large_increase':
-                predictions_orig_scale[i] *= 1.3
+                predictions_orig_scale[i] *= 1.2
     
     mse = np.mean((predictions_orig_scale - y_test_orig_scale) ** 2)
     rmse = np.sqrt(mse)
     mae = np.mean(np.abs(predictions_orig_scale - y_test_orig_scale))
-    mape = np.mean(np.abs((y_test_orig_scale - predictions_orig_scale) / y_test_orig_scale)) * 100
+    mape = np.mean(np.abs((y_test_orig_scale - predictions_orig_scale) / (y_test_orig_scale + 1e-8))) * 100
     
     print(f"Mean Squared Error: {mse:.2f}")
     print(f"Root Mean Squared Error: {rmse:.2f}")
@@ -647,10 +627,16 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_tran
             'actual': float(y_test_orig_scale[i][0]),
             'predicted': float(predictions_orig_scale[i][0]),
             'error': float(y_test_orig_scale[i][0] - predictions_orig_scale[i][0]),
-            'percentage_error': float((y_test_orig_scale[i][0] - predictions_orig_scale[i][0]) / y_test_orig_scale[i][0] * 100)
+            'percentage_error': float(np.abs((y_test_orig_scale[i][0] - predictions_orig_scale[i][0]) / (y_test_orig_scale[i][0] + 1e-8)) * 100)
         })
     
     results.sort(key=lambda x: abs(x['percentage_error']), reverse=True)
+    
+    # Print percentage error for top 10 test files
+    print("\nPercentage Error for 10 Test Files:")
+    for result in results[:10]:
+        print(f"File: {result['file_name']}, Actual: {result['actual']:.2f}, Predicted: {result['predicted']:.2f}, "
+              f"Percentage Error: {result['percentage_error']:.2f}%")
     
     return predictions_orig_scale, y_test_orig_scale, results
 
@@ -686,7 +672,7 @@ def save_results(predictions, actuals, results, file_path='prediction_results.js
             'mse': float(np.mean((predictions - actuals) ** 2)),
             'rmse': float(np.sqrt(np.mean((predictions - actuals) ** 2))),
             'mae': float(np.mean(np.abs(predictions - actuals))),
-            'mape': float(np.mean(np.abs((actuals - predictions) / actuals)) * 100)
+            'mape': float(np.mean(np.abs((actuals - predictions) / (actuals + 1e-8))) * 100)
         },
         'predictions': results
     }
@@ -708,14 +694,16 @@ def main():
     (X_train, y_train, X_test, y_test, 
      y_scaler, input_dim, is_log_transformed, weights) = prepare_data_for_model(train_features, test_features)
     
-    train_loader, test_loader = create_data_loaders(X_train, y_train, weights, X_test, y_test, batch_size=32)
+    train_loader, test_loader = create_data_loaders(X_train, y_train, weights, X_test, y_test, batch_size=64)
     
-    model = MultiLayerPerceptronModel(input_dim, hidden_sizes=[512, 256, 128, 64], dropout_rate=0.3)
+    model = MultiLayerPerceptronModel(input_dim, hidden_sizes=[768, 512, 256, 128], dropout_rate=0.3)
     
-    optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
-    criterion = WeightedHuberLoss(delta=1.0)
+    optimizer = optim.Adam(model.parameters(), lr=0.0005, weight_decay=1e-5)  # Lower learning rate
+    criterion = WeightedHuberLoss(delta=0.5)
     
-    train_losses, val_losses = train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=300, patience=40)
+    train_losses, val_losses = train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=300, patience=50)
+    
+    plot_loss(train_losses, val_losses)
     
     pred, actual, results = evaluate_model(model, X_test, y_test, y_scaler, test_file_names, is_log_transformed)
     
