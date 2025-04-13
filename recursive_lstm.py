@@ -167,7 +167,7 @@ class HalideDataset(Dataset):
                                     nodes = item['Nodes']
                                 if item.get('Edges'):
                                     edges = item['Edges']
-                                if item.get('name') == 'total_execution_time_ms'):
+                                if item.get('name') == 'total_execution_time_ms':
                                     exec_time = float(item.get('value', 0.0))
                     
                     if not nodes or not edges:
