@@ -390,7 +390,7 @@ class EnhancedRecursiveLSTMModel(nn.Module):
         
         return output
 
-def custom_loss(outputs, targets, huber_delta=0.5, mae_weight=0.5, l1_lambda=1e-6):
+def custom_loss(outputs, targets, model, huber_delta=0.5, mae_weight=0.5, l1_lambda=1e-6):
     huber = nn.HuberLoss(delta=huber_delta)(outputs, targets)
     mae = torch.mean(torch.abs(outputs - targets))
     # Weight loss for smaller targets
@@ -435,7 +435,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, schedule
         for i, (seq_inputs, scalar_inputs, targets) in enumerate(train_loader):
             seq_inputs, scalar_inputs, targets = seq_inputs.to(device), scalar_inputs.to(device), targets.to(device)
             outputs = model(seq_inputs, scalar_inputs)
-            loss = criterion(outputs, targets)
+            loss = criterion(outputs, targets, model)
             
             if torch.isnan(loss) or torch.isinf(loss):
                 print(f"Invalid loss detected at epoch {epoch+1}, batch {i+1}")
@@ -465,7 +465,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, schedule
             for seq_inputs, scalar_inputs, targets in test_loader:
                 seq_inputs, scalar_inputs, targets = seq_inputs.to(device), scalar_inputs.to(device), targets.to(device)
                 outputs = model(seq_inputs, scalar_inputs)
-                loss = criterion(outputs, targets)
+                loss = criterion(outputs, targets, model)
                 val_loss += loss.item() * seq_inputs.size(0)
         
         val_loss /= len(test_loader.dataset)
