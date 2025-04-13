@@ -521,7 +521,7 @@ def main(main_dir):
     return model, train_dataset.scaler_y, y_test_actual, y_pred_actual
 
 if __name__ == "__main__":
-    main_dir = "Tiramisu"
+    main_dir = "synthetic_data"
     result = main(main_dir)
     if result is not None:
         model, y_scaler, y_test_actual, y_pred_actual = result
