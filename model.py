@@ -79,7 +79,7 @@ class EnhancedLSTMModel(nn.Module):
         fc_out = self.bn_layers[1](fc_out)
         fc_out = self.leaky_relu(fc_out)
         
-        fc_out = fc_out + residual  # Residual connection
+        fc_out = fc_out + residual
         
         output = self.output_layer(fc_out)
         
@@ -543,6 +543,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
     val_losses = []
     
     for epoch in range(num_epochs):
+    for epoch in range(num_epochs):
         model.train()
         running_loss = 0.0
         for inputs, targets in train_loader:
@@ -758,6 +759,7 @@ def main(main_dir):
     print("\nSaving trained models...")
     device = torch.device('cpu')
     
+    # Save LSTM model using tracing
     try:
         lstm_model.eval()
         lstm_model.to(device)
@@ -768,13 +770,15 @@ def main(main_dir):
     except Exception as e:
         print(f"Error saving LSTM model: {str(e)}")
     
+    # Save Transformer model using state_dict to avoid tracing issues
     try:
         transformer_model.eval()
         transformer_model.to(device)
-        transformer_sample_input = torch.randn(1, 1, input_size).to(device)
-        transformer_traced_model = torch.jit.trace(transformer_model, transformer_sample_input)
-        transformer_traced_model.save("transformer_model.pt")
-        print("Transformer model successfully saved as 'transformer_model.pt'")
+        torch.save(transformer_model.state_dict(), "transformer_model.pth")
+        print("Transformer model successfully saved as 'transformer_model.pth'")
+        print("Note: To load the Transformer model, instantiate EnhancedTransformerModel with the same parameters and load the state_dict:")
+        print("  model = EnhancedTransformerModel(input_size=<input_size>, hidden_size=128, num_heads=4, num_layers=3, dropout_rate=0.2, output_size=1)")
+        print("  model.load_state_dict(torch.load('transformer_model.pth'))")
     except Exception as e:
         print(f"Error saving Transformer model: {str(e)}")
     
