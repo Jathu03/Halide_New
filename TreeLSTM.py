@@ -673,7 +673,7 @@ def plot_predictions(y_true, y_pred):
     plt.title('Residual Plot')
     
     plt.tight_layout()
-    plt.savefig,'prediction_plots.png')
+    plt.savefig('prediction_plots.png')
     plt.show()
 
 def save_results(predictions, actuals, results, file_path='prediction_results.json'):
