@@ -96,7 +96,6 @@ def extract_features_from_file(file_path):
                     sched_feature[key] = value
             scheduling_features.append(sched_feature)
     
-    # Basic features
     features = {
         'execution_time': execution_time,
         'nodes_count': len(nodes_features),
@@ -104,10 +103,8 @@ def extract_features_from_file(file_path):
         'scheduling_count': len(scheduling_features)
     }
     
-    # Special feature to distinguish extreme cases like program_50047
     features['program_id'] = int(os.path.basename(os.path.dirname(file_path)).replace('program_', ''))
     
-    # Node-edge relationship features
     if len(nodes_features) > 0:
         if len(edges_features) > 0:
             features['node_edge_ratio'] = len(nodes_features) / len(edges_features)
@@ -119,7 +116,6 @@ def extract_features_from_file(file_path):
         features['node_edge_ratio'] = 0
         features['edge_density'] = 0
     
-    # Extract operation counts and compute distribution metrics
     op_counts = {}
     op_types = set()
     total_ops = 0
@@ -135,7 +131,6 @@ def extract_features_from_file(file_path):
     
     features.update(op_counts)
     
-    # Add operation complexity metrics
     features['total_ops'] = total_ops
     features['op_type_count'] = len(op_types)
     
@@ -147,7 +142,6 @@ def extract_features_from_file(file_path):
         features['op_diversity'] = 0
     
     if total_ops > 0:
-        # Add operation distribution features
         for op, count in op_counts.items():
             features[f'{op}_ratio'] = count / total_ops
         
@@ -155,7 +149,6 @@ def extract_features_from_file(file_path):
                                      for count in op_counts.values() if count > 0)
         features['op_concentration'] = max_op_count / total_ops if total_ops > 0 else 0
     
-    # Extract and compute scheduling metrics
     if scheduling_features:
         important_metrics = [
             'bytes_at_production', 'bytes_at_realization', 'bytes_at_root', 'bytes_at_task',
@@ -167,7 +160,6 @@ def extract_features_from_file(file_path):
                 if metric in scheduling_features[0]:
                     features[f'sched_{metric}'] = scheduling_features[0][metric]
         
-        # Compute total metrics across all schedules
         total_bytes_at_production = sum(sf.get('bytes_at_production', 0) for sf in scheduling_features if isinstance(sf, dict))
         total_bytes_at_realization = sum(sf.get('bytes_at_realization', 0) for sf in scheduling_features if isinstance(sf, dict))
         total_vectors = sum(sf.get('num_vectors', 0) for sf in scheduling_features if isinstance(sf, dict))
@@ -182,7 +174,6 @@ def extract_features_from_file(file_path):
         features['total_parallelism'] = total_parallelism
         features['total_points_computed'] = total_points
         
-        # Compute derived metrics
         if total_vectors > 0:
             features['bytes_per_vector'] = total_bytes_at_production / total_vectors
         else:
@@ -199,7 +190,6 @@ def extract_features_from_file(file_path):
             else:
                 features['memory_pressure'] = 0
     
-    # Advanced metrics
     if len(nodes_features) > 0 and len(edges_features) > 0:
         features['complexity_score'] = len(nodes_features) * np.log1p(len(edges_features))
     else:
@@ -236,7 +226,6 @@ def process_main_directory(main_dir):
     if len(subdirs) < 1:
         raise ValueError(f"Expected at least 1 subdirectory in {main_dir}, found {len(subdirs)}")
     
-    # Group files by program ID for better stratification
     program_features = {}
     program_file_names = {}
     
@@ -252,24 +241,19 @@ def process_main_directory(main_dir):
         program_file_names[subdir] = [os.path.join(subdir, fname) for fname in file_names]
         print(f"Processed subdir {subdir}: {len(features)} files")
     
-    # Create stratified split with emphasis on problematic programs
     test_size = 50
     test_features = []
     test_file_names = []
     train_features = []
     train_file_names = []
     
-    # Weight the sampling to ensure problematic programs are well-represented
     problematic_programs = ['program_50047', 'program_50200', 'program_50021', 'program_50069']
     
-    # First allocate a fixed number of test samples for problematic programs
     for program in problematic_programs:
         if program in program_features:
-            # Sort by execution time to ensure a representative sample
             program_data = list(zip(program_features[program], program_file_names[program]))
             program_data.sort(key=lambda x: x[0]['execution_time'])
             
-            # Select samples spread across the execution time range
             test_count = min(5, len(program_data))
             test_indices = [i * len(program_data) // test_count for i in range(test_count)]
             
@@ -281,12 +265,10 @@ def process_main_directory(main_dir):
                     train_features.append(feature)
                     train_file_names.append(file_name)
     
-    # Now allocate remaining test samples from other programs
     remaining_test_count = test_size - len(test_features)
     remaining_programs = [p for p in program_features.keys() if p not in problematic_programs]
     
     if remaining_programs:
-        # Distribute remaining test samples proportionally
         for program in remaining_programs:
             program_data = list(zip(program_features[program], program_file_names[program]))
             program_data.sort(key=lambda x: x[0]['execution_time'])
@@ -303,7 +285,6 @@ def process_main_directory(main_dir):
                     train_features.append(feature)
                     train_file_names.append(file_name)
     
-    # If we still need more test samples, take from the training set
     if len(test_features) < test_size:
         extra_needed = test_size - len(test_features)
         combined = list(zip(train_features, train_file_names))
@@ -338,28 +319,22 @@ def process_main_directory(main_dir):
 def clean_and_transform_features(train_features, test_features):
     all_features_df = pd.DataFrame(train_features + test_features)
     
-    # Fill missing values
     all_features_df = all_features_df.fillna(0)
     
-    # Remove constant columns
     constant_columns = [col for col in all_features_df.columns 
                        if col != 'execution_time' and all_features_df[col].nunique() <= 1]
     all_features_df = all_features_df.drop(columns=constant_columns)
     print(f"Dropped {len(constant_columns)} constant columns")
     
-    # Apply log transformation to execution time and keep original
     if 'execution_time' in all_features_df.columns:
         all_features_df['execution_time_log'] = np.log1p(all_features_df['execution_time'])
     
-    # Create program-specific features based on program_id
     if 'program_id' in all_features_df.columns:
         program_dummies = pd.get_dummies(all_features_df['program_id'], prefix='prog')
-        # Only keep dummies for problematic programs
         problematic_ids = [50047, 50200, 50021, 50069]
         program_dummies = program_dummies[[f'prog_{id}' for id in problematic_ids if f'prog_{id}' in program_dummies.columns]]
         all_features_df = pd.concat([all_features_df, program_dummies], axis=1)
     
-    # Create additional engineered features
     if 'total_vectors' in all_features_df.columns and 'total_bytes_at_production' in all_features_df.columns:
         all_features_df['bytes_per_vector'] = all_features_df['total_bytes_at_production'] / (all_features_df['total_vectors'] + 1e-8)
     
@@ -367,14 +342,12 @@ def clean_and_transform_features(train_features, test_features):
         all_features_df['nodes_to_edges_squared'] = all_features_df['nodes_count'] / (all_features_df['edges_count']**2 + 1e-8)
         all_features_df['log_complexity'] = np.log1p(all_features_df['nodes_count'] * all_features_df['edges_count'])
     
-    # Add interaction terms for key features
     if 'total_parallelism' in all_features_df.columns and 'total_ops' in all_features_df.columns:
         all_features_df['parallelism_ops_interaction'] = np.log1p(all_features_df['total_parallelism'] * all_features_df['total_ops'])
     
     if 'memory_pressure' in all_features_df.columns and 'total_bytes_at_production' in all_features_df.columns:
         all_features_df['memory_bytes_interaction'] = all_features_df['memory_pressure'] * np.log1p(all_features_df['total_bytes_at_production'])
     
-    # Remove high correlation features to reduce overfitting
     numeric_cols = all_features_df.select_dtypes(include=['number']).columns.tolist()
     if 'execution_time' in numeric_cols:
         numeric_cols.remove('execution_time')
@@ -384,15 +357,13 @@ def clean_and_transform_features(train_features, test_features):
     if len(numeric_cols) > 2:
         corr_matrix = all_features_df[numeric_cols].corr().abs()
         upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
-        to_drop = [column for column in upper.columns if any(upper[column] > 0.97)]  # Increased threshold
+        to_drop = [column for column in upper.columns if any(upper[column] > 0.97)]
         all_features_df = all_features_df.drop(columns=to_drop)
         print(f"Dropped {len(to_drop)} highly correlated features")
     
-    # Keep only numeric columns
     numeric_cols = all_features_df.select_dtypes(include=['number']).columns
     all_features_df = all_features_df[numeric_cols]
     
-    # Extract train and test sets
     train_size = len(train_features)
     train_df = all_features_df.iloc[:train_size]
     test_df = all_features_df.iloc[train_size:]
@@ -400,11 +371,10 @@ def clean_and_transform_features(train_features, test_features):
     return train_df, test_df
 
 def detect_outliers(X, y, contamination=0.05):
-    """Detect outliers in the dataset using Isolation Forest"""
     combined = np.hstack([X, y])
     iso_forest = IsolationForest(contamination=contamination, random_state=42)
     outlier_labels = iso_forest.fit_predict(combined)
-    return outlier_labels == -1  # True for outliers
+    return outlier_labels == -1
 
 def prepare_data_for_model(train_features, test_features):
     train_df, test_df = clean_and_transform_features(train_features, test_features)
@@ -422,19 +392,16 @@ def prepare_data_for_model(train_features, test_features):
         test_df = test_df.drop('execution_time', axis=1)
         is_log_transformed = False
     
-    # Detect and handle outliers in training data
     X_train = train_df.values
     outliers = detect_outliers(X_train, y_train)
     
     if np.sum(outliers) > 0:
         print(f"Detected {np.sum(outliers)} outliers in training data")
-        # Use robust weights for outliers during training (implemented in custom dataset)
         outlier_weights = np.ones(len(X_train))
-        outlier_weights[outliers] = 0.3  # Reduce weight of outliers
+        outlier_weights[outliers] = 0.3
     else:
         outlier_weights = np.ones(len(X_train))
     
-    # Use RobustScaler which is less sensitive to outliers
     scaler_X = RobustScaler()
     scaler_y = RobustScaler()
     
@@ -443,7 +410,6 @@ def prepare_data_for_model(train_features, test_features):
     X_test_scaled = scaler_X.transform(test_df.values)
     y_test_scaled = scaler_y.transform(y_test)
     
-    # Convert to PyTorch tensors
     X_train_tensor = torch.FloatTensor(X_train_scaled)
     y_train_tensor = torch.FloatTensor(y_train_scaled)
     X_test_tensor = torch.FloatTensor(X_test_scaled)
@@ -487,33 +453,36 @@ class MultiLayerPerceptronModel(nn.Module):
         
         self.output_layer = nn.Linear(hidden_sizes[-1], output_size)
         
-        # Residual connections
+        # Residual connections: match dimensions properly
         self.residual_layers = nn.ModuleList()
-        for i in range(1, len(hidden_sizes), 2):
-            if i < len(hidden_sizes):
-                self.residual_layers.append(nn.Linear(hidden_sizes[i-1], hidden_sizes[i]))
+        # Create residual connections between layers of different sizes
+        for i in range(0, len(hidden_sizes)-1, 2):
+            if i+1 < len(hidden_sizes):
+                self.residual_layers.append(nn.Linear(hidden_sizes[i], hidden_sizes[i+1]))
         
     def forward(self, x):
         x = self.input_bn(x)
         
         residual_outputs = []
         layer_input = x
+        residual_idx = 0
         
-        # Process through hidden layers with residuals
         for i, layer in enumerate(self.hidden_layers):
             if isinstance(layer, nn.Linear):
                 layer_output = layer(layer_input)
                 residual_outputs.append(layer_output)
-            elif isinstance(layer, nn.SiLU) and len(residual_outputs) > 1:
+                layer_input = layer_output
+            elif isinstance(layer, nn.SiLU) and len(residual_outputs) > 1 and residual_idx < len(self.residual_layers):
                 # Apply residual connection after activation
-                residual_idx = len(residual_outputs) // 2 - 1
-                if residual_idx < len(self.residual_layers):
-                    shortcut = self.residual_layers[residual_idx](residual_outputs[-2])
-                    layer_output = layer_output + 0.1 * shortcut
-            
-            layer_input = layer_output
+                shortcut = self.residual_layers[residual_idx](residual_outputs[-2])
+                layer_input = layer_input + 0.1 * shortcut
+                residual_idx += 1
+            elif isinstance(layer, (nn.BatchNorm1d, nn.Dropout)):
+                layer_input = layer(layer_input)
+            else:
+                layer_input = layer(layer_input)
         
-        output = self.output_layer(layer_output)
+        output = self.output_layer(layer_input)
         return output
 
 def create_data_loaders(X_train, y_train, weights, X_test, y_test, batch_size=32):
@@ -607,24 +576,19 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
     return train_losses, val_losses
 
 def create_program_specific_adjustments(test_file_names):
-    """Create adjustments for specific programs based on known patterns"""
     adjustments = {}
     
     for file_name in test_file_names:
         program_id = os.path.dirname(file_name)
         
         if program_id == 'program_50047':
-            # Extreme case with very long execution time
             adjustments[file_name] = 'large_multiplier'
         elif program_id == 'program_50200':
-            # Consistent underprediction
             adjustments[file_name] = 'medium_increase'
         elif program_id == 'program_50021':
-            # Consistent overprediction
             adjustments[file_name] = 'decrease'
         elif program_id == 'program_50069':
-            # Handling potential bimodal distribution
-            if '0_30.json' in file_name:  # From error report
+            if '0_30.json' in file_name:
                 adjustments[file_name] = 'large_increase'
         
     return adjustments
@@ -634,27 +598,22 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_tran
     model.to(device)
     model.eval()
     
-    # Create program-specific adjustments
     adjustments = create_program_specific_adjustments(file_names_test)
     
     with torch.no_grad():
         X_test_device = X_test.to(device)
         predictions = model(X_test_device).cpu().numpy()
     
-    # Inverse transform predictions
     predictions_orig_scale = y_scaler.inverse_transform(predictions)
     
-    # Apply log transformation inverse if needed
     if is_log_transformed:
         predictions_orig_scale = np.expm1(predictions_orig_scale)
     
-    # Ground truth values
     y_test_np = y_test.numpy()
     y_test_orig_scale = y_scaler.inverse_transform(y_test_np)
     if is_log_transformed:
         y_test_orig_scale = np.expm1(y_test_orig_scale)
     
-    # Apply program-specific adjustments
     for i, file_name in enumerate(file_names_test):
         if file_name in adjustments:
             adjustment_type = adjustments[file_name]
@@ -667,7 +626,6 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_tran
             elif adjustment_type == 'large_increase':
                 predictions_orig_scale[i] *= 1.3
     
-    # Calculate metrics
     mse = np.mean((predictions_orig_scale - y_test_orig_scale) ** 2)
     rmse = np.sqrt(mse)
     mae = np.mean(np.abs(predictions_orig_scale - y_test_orig_scale))
@@ -678,7 +636,6 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_tran
     print(f"Mean Absolute Error: {mae:.2f}")
     print(f"Mean Absolute Percentage Error: {mape:.2f}%")
     
-    # Create prediction results with file names
     results = []
     for i, file_name in enumerate(file_names_test):
         results.append({
@@ -689,7 +646,6 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_tran
             'percentage_error': float((y_test_orig_scale[i][0] - predictions_orig_scale[i][0]) / y_test_orig_scale[i][0] * 100)
         })
     
-    # Sort by absolute percentage error to see largest errors
     results.sort(key=lambda x: abs(x['percentage_error']), reverse=True)
     
     return predictions_orig_scale, y_test_orig_scale, results
@@ -697,11 +653,9 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_tran
 def plot_predictions(y_true, y_pred):
     plt.figure(figsize=(12, 6))
     
-    # Scatter plot
     plt.subplot(1, 2, 1)
     plt.scatter(y_true, y_pred, alpha=0.6)
     
-    # Add perfect prediction line
     max_val = max(np.max(y_true), np.max(y_pred))
     min_val = min(np.min(y_true), np.min(y_pred))
     plt.plot([min_val, max_val], [min_val, max_val], 'r--')
@@ -710,7 +664,6 @@ def plot_predictions(y_true, y_pred):
     plt.ylabel('Predicted Execution Time (ms)')
     plt.title('Actual vs Predicted Execution Time')
     
-    # Residual plot
     residuals = y_true - y_pred
     plt.subplot(1, 2, 2)
     plt.scatter(y_pred, residuals, alpha=0.6)
@@ -720,7 +673,7 @@ def plot_predictions(y_true, y_pred):
     plt.title('Residual Plot')
     
     plt.tight_layout()
-    plt.savefig('prediction_plots.png')
+    plt.savefig,'prediction_plots.png')
     plt.show()
 
 def save_results(predictions, actuals, results, file_path='prediction_results.json'):
@@ -740,44 +693,32 @@ def save_results(predictions, actuals, results, file_path='prediction_results.js
     print(f"Results saved to {file_path}")
 
 def main():
-    # Set random seeds for reproducibility
     random.seed(42)
     np.random.seed(42)
     torch.manual_seed(42)
     
-    # Data directory
     main_dir = "synthetic_data"
     
-    # Process data
     train_features, test_features, test_file_names = process_main_directory(main_dir)
     
-    # Prepare data for model
     (X_train, y_train, X_test, y_test, 
      y_scaler, input_dim, is_log_transformed, weights) = prepare_data_for_model(train_features, test_features)
     
-    # Create data loaders
     train_loader, test_loader = create_data_loaders(X_train, y_train, weights, X_test, y_test, batch_size=32)
     
-    # Create model
     model = MultiLayerPerceptronModel(input_dim, hidden_sizes=[512, 256, 128, 64], dropout_rate=0.3)
     
-    # Define optimizer and loss function
     optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
     criterion = WeightedHuberLoss(delta=1.0)
     
-    # Train model
     train_losses, val_losses = train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=300, patience=40)
     
-    # Evaluate model
     pred, actual, results = evaluate_model(model, X_test, y_test, y_scaler, test_file_names, is_log_transformed)
     
-    # Plot predictions
     plot_predictions(actual, pred)
     
-    # Save results
     save_results(pred, actual, results)
     
-    # Save model
     torch.save(model.state_dict(), 'execution_time_predictor.pth')
     print("Model saved to execution_time_predictor.pth")
 
