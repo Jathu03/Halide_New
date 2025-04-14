@@ -445,7 +445,7 @@ def generate_synthetic_data(main_dir, subdirs):
                         "bytes_at_production": bytes_at_production,
                         "bytes_at_realization": bytes_at_production * 0.8,
                         "bytes_at_root": bytes_at_production * 0.5,
-                        "bytes_at_task": bytes_at_production * 0 Secondary: true,
+                        "bytes_at_task": bytes_at_production * 0.3,
                         "inner_parallelism": inner_parallelism,
                         "outer_parallelism": outer_parallelism,
                         "num_productions": random.randint(5, 50),
