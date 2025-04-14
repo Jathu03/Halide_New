@@ -2,12 +2,14 @@ import os
 import json
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import RobustScaler
+from sklearn.feature_selection import SelectKBest, f_regression
+from sklearn.model_selection import KFold
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.optim.lr_scheduler import CosineAnnealingLR
 import random
 import matplotlib.pyplot as plt
 from typing import Dict, List, Tuple, Optional, Any, Union
@@ -16,19 +18,22 @@ class EnhancedLSTMModel(nn.Module):
     """
     Enhanced LSTM model with attention mechanism and residual connections.
     """
-    def __init__(self, input_size: int, hidden_sizes: List[int] = [256, 128, 64, 32], 
-                 output_size: int = 1, dropout_rate: float = 0.2):
+    def __init__(self, input_size: int, hidden_sizes: List[int] = [512, 256, 128, 64], 
+                 output_size: int = 1, dropout_rate: float = 0.3):
         super(EnhancedLSTMModel, self).__init__()
         
         self.lstm_layers = nn.ModuleList()
         self.dropout_layers = nn.ModuleList()
+        self.ln_layers = nn.ModuleList()  # Added layer normalization
         
         self.lstm_layers.append(nn.LSTM(input_size, hidden_sizes[0], batch_first=True))
         self.dropout_layers.append(nn.Dropout(dropout_rate))
+        self.ln_layers.append(nn.LayerNorm(hidden_sizes[0]))
         
         for i in range(1, len(hidden_sizes)):
             self.lstm_layers.append(nn.LSTM(hidden_sizes[i-1], hidden_sizes[i], batch_first=True))
             self.dropout_layers.append(nn.Dropout(dropout_rate))
+            self.ln_layers.append(nn.LayerNorm(hidden_sizes[i]))
         
         self.attention = nn.Linear(hidden_sizes[-1], 1)
         
@@ -60,8 +65,9 @@ class EnhancedLSTMModel(nn.Module):
     def forward(self, x):
         """Forward pass through the network."""
         lstm_out = x
-        for i, (lstm, dropout) in enumerate(zip(self.lstm_layers, self.dropout_layers)):
+        for i, (lstm, dropout, ln) in enumerate(zip(self.lstm_layers, self.dropout_layers, self.ln_layers)):
             lstm_out, _ = lstm(lstm_out)
+            lstm_out = ln(lstm_out)
             if i < len(self.lstm_layers) - 1:
                 lstm_out = dropout(lstm_out)
         
@@ -89,8 +95,8 @@ class EnhancedTransformerModel(nn.Module):
     """
     Enhanced Transformer model for execution time prediction.
     """
-    def __init__(self, input_size: int, hidden_size: int = 128, num_heads: int = 4, 
-                 num_layers: int = 3, dropout_rate: float = 0.2, output_size: int = 1):
+    def __init__(self, input_size: int, hidden_size: int = 256, num_heads: int = 8, 
+                 num_layers: int = 4, dropout_rate: float = 0.3, output_size: int = 1):
         super(EnhancedTransformerModel, self).__init__()
         
         self.input_projection = nn.Linear(input_size, hidden_size)
@@ -119,7 +125,7 @@ class EnhancedTransformerModel(nn.Module):
             nn.Linear(hidden_size // 2, hidden_size // 4),
             nn.LayerNorm(hidden_size // 4),
             nn.GELU(),
-            nn.Dropout(dropout_rate // 2)
+            nn.Dropout(dropout_rate / 2)
         )
         
         self.output_layer = nn.Linear(hidden_size // 4, output_size)
@@ -240,6 +246,9 @@ def extract_features_from_file(file_path):
         'edges_count': len(edges_features),
         'scheduling_count': len(scheduling_features)
     }
+    
+    # Add interaction terms
+    features['nodes_edges_interaction'] = features['nodes_count'] * features['edges_count']
     
     if len(nodes_features) > 0 and len(edges_features) > 0:
         features['node_edge_ratio'] = len(nodes_features) / len(edges_features)
@@ -457,21 +466,34 @@ def generate_synthetic_data(main_dir, subdirs):
 def clean_and_transform_features(train_features, test_features):
     all_features_df = pd.DataFrame(train_features + test_features)
     
-    all_features_df = all_features_df.fillna(0)
+    # Impute missing values with median
+    numeric_cols = all_features_df.select_dtypes(include=['number']).columns
+    all_features_df[numeric_cols] = all_features_df[numeric_cols].fillna(all_features_df[numeric_cols].median())
     
+    # Drop constant columns
     constant_columns = [col for col in all_features_df.columns 
                        if col != 'execution_time' and all_features_df[col].nunique() == 1]
     all_features_df = all_features_df.drop(columns=constant_columns)
     print(f"Dropped {len(constant_columns)} constant columns")
     
+    # Apply log transformation to execution time
     if 'execution_time' in all_features_df.columns:
         all_features_df['execution_time_log'] = np.log1p(all_features_df['execution_time'])
     
+    # Normalize bytes_per_vector
     if 'total_vectors' in all_features_df.columns and all_features_df['total_vectors'].max() > 0:
         all_features_df['bytes_per_vector'] = all_features_df['total_bytes_at_production'] / (all_features_df['total_vectors'] + 1e-8)
     
+    # Select only numeric columns
     numeric_cols = all_features_df.select_dtypes(include=['number']).columns
     all_features_df = all_features_df[numeric_cols]
+    
+    # Remove highly correlated features
+    corr_matrix = all_features_df.corr().abs()
+    upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+    to_drop = [column for column in upper.columns if any(upper[column] > 0.8)]
+    all_features_df = all_features_df.drop(columns=to_drop)
+    print(f"Dropped {len(to_drop)} highly correlated columns")
     
     train_size = len(train_features)
     train_df = all_features_df.iloc[:train_size]
@@ -480,6 +502,9 @@ def clean_and_transform_features(train_features, test_features):
     return train_df, test_df
 
 def prepare_data_for_model(train_features, test_features):
+    if not train_features or not test_features:
+        raise ValueError("Empty training or test features provided")
+    
     train_df, test_df = clean_and_transform_features(train_features, test_features)
     
     if 'execution_time_log' in train_df.columns:
@@ -499,12 +524,17 @@ def prepare_data_for_model(train_features, test_features):
     print(f"First 5 y_train raw: {y_train[:5].flatten()}")
     print(f"First 5 y_test raw: {y_test[:5].flatten()}")
     
-    scaler_X = StandardScaler()
-    scaler_y = StandardScaler()
+    # Feature selection
+    selector = SelectKBest(score_func=f_regression, k=min(20, train_df.shape[1]))
+    X_train_selected = selector.fit_transform(train_df, y_train.ravel())
+    X_test_selected = selector.transform(test_df)
     
-    X_train_scaled = scaler_X.fit_transform(train_df)
+    scaler_X = RobustScaler()
+    scaler_y = RobustScaler()
+    
+    X_train_scaled = scaler_X.fit_transform(X_train_selected)
     y_train_scaled = scaler_y.fit_transform(y_train)
-    X_test_scaled = scaler_X.transform(test_df)
+    X_test_scaled = scaler_X.transform(X_test_selected)
     y_test_scaled = scaler_y.transform(y_test)
     
     print(f"First 5 y_train scaled: {y_train_scaled[:5].flatten()}")
@@ -520,7 +550,7 @@ def prepare_data_for_model(train_features, test_features):
     return (X_train_tensor, y_train_tensor, X_test_tensor, y_test_tensor, 
             scaler_y, X_train_scaled.shape[1], is_log_transformed)
 
-def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=8):
+def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=16):
     train_dataset = TensorDataset(X_train, y_train)
     test_dataset = TensorDataset(X_test, y_test)
     
@@ -529,19 +559,18 @@ def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=8):
     
     return train_loader, test_loader
 
-def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=200, patience=30, model_name="model"):
-    device = torch.device('cpu')
+def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=300, patience=50, model_name="model"):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     model.to(device)
     
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10, verbose=True)
+    scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs)
     
     best_val_loss = float('inf')
     epochs_no_improve = 0
     best_model_state = None
     train_losses = []
     val_losses = []
-    
     
     for epoch in range(num_epochs):
         model.train()
@@ -553,7 +582,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
             loss = criterion(outputs, targets)
             loss.backward()
             
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
             
             optimizer.step()
             running_loss += loss.item() * inputs.size(0)
@@ -573,7 +602,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
         val_loss /= len(test_loader.dataset)
         val_losses.append(val_loss)
         
-        scheduler.step(val_loss)
+        scheduler.step()
         
         print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
         
@@ -607,7 +636,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
     return train_losses, val_losses
 
 def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_transformed=False, original_execution_times=None, model_name="model"):
-    device = torch.device('cpu')
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.to(device)
     model.eval()
     
@@ -615,8 +644,8 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_tran
     with torch.no_grad():
         y_pred_scaled = model(X_test)
     
-    y_pred_scaled = y_pred_scaled.numpy()
-    y_test = y_test.numpy()
+    y_pred_scaled = y_pred_scaled.cpu().numpy()
+    y_test = y_test.cpu().numpy()
     
     y_test_transformed = y_scaler.inverse_transform(y_test)
     y_pred_transformed = y_scaler.inverse_transform(y_pred_scaled)
@@ -693,18 +722,18 @@ def main(main_dir):
     
     X_train, y_train, X_test, y_test, y_scaler, input_size, is_log_transformed = prepare_data_for_model(train_features, test_features)
     
-    train_loader, test_loader = create_data_loaders(X_train, y_train, X_test, y_test, batch_size=8)
+    train_loader, test_loader = create_data_loaders(X_train, y_train, X_test, y_test, batch_size=16)
     
     # Train and evaluate LSTM model
     lstm_model = EnhancedLSTMModel(
         input_size=input_size,
-        hidden_sizes=[256, 128, 64, 32],
+        hidden_sizes=[512, 256, 128, 64],
         output_size=1,
-        dropout_rate=0.2
+        dropout_rate=0.3
     )
     
     lstm_criterion = nn.HuberLoss(delta=0.5)
-    lstm_optimizer = optim.AdamW(lstm_model.parameters(), lr=0.0005, weight_decay=1e-5)
+    lstm_optimizer = optim.AdamW(lstm_model.parameters(), lr=0.0001, weight_decay=1e-4)
     
     print("\nBuilding and training Enhanced LSTM model...")
     lstm_train_losses, lstm_val_losses = train_model(
@@ -713,8 +742,8 @@ def main(main_dir):
         test_loader, 
         lstm_criterion, 
         lstm_optimizer, 
-        num_epochs=200,
-        patience=30,
+        num_epochs=300,
+        patience=50,
         model_name="lstm_model"
     )
     
@@ -727,15 +756,15 @@ def main(main_dir):
     # Train and evaluate Transformer model
     transformer_model = EnhancedTransformerModel(
         input_size=input_size,
-        hidden_size=128,
-        num_heads=4,
-        num_layers=3,
-        dropout_rate=0.2,
+        hidden_size=256,
+        num_heads=8,
+        num_layers=4,
+        dropout_rate=0.3,
         output_size=1
     )
     
     transformer_criterion = nn.HuberLoss(delta=0.5)
-    transformer_optimizer = optim.AdamW(transformer_model.parameters(), lr=0.0005, weight_decay=1e-5)
+    transformer_optimizer = optim.AdamW(transformer_model.parameters(), lr=0.0001, weight_decay=1e-4)
     
     print("\nBuilding and training Enhanced Transformer model...")
     transformer_train_losses, transformer_val_losses = train_model(
@@ -744,8 +773,8 @@ def main(main_dir):
         test_loader, 
         transformer_criterion, 
         transformer_optimizer, 
-        num_epochs=200,
-        patience=30,
+        num_epochs=300,
+        patience=50,
         model_name="transformer_model"
     )
     
@@ -759,7 +788,7 @@ def main(main_dir):
     print("\nSaving trained models...")
     device = torch.device('cpu')
     
-    # Save LSTM model using tracing
+    # Save LSTM model
     try:
         lstm_model.eval()
         lstm_model.to(device)
@@ -770,14 +799,14 @@ def main(main_dir):
     except Exception as e:
         print(f"Error saving LSTM model: {str(e)}")
     
-    # Save Transformer model using state_dict to avoid tracing issues
+    # Save Transformer model
     try:
         transformer_model.eval()
         transformer_model.to(device)
         torch.save(transformer_model.state_dict(), "transformer_model.pth")
         print("Transformer model successfully saved as 'transformer_model.pth'")
         print("Note: To load the Transformer model, instantiate EnhancedTransformerModel with the same parameters and load the state_dict:")
-        print("  model = EnhancedTransformerModel(input_size=<input_size>, hidden_size=128, num_heads=4, num_layers=3, dropout_rate=0.2, output_size=1)")
+        print("  model = EnhancedTransformerModel(input_size=<input_size>, hidden_size=256, num_heads=8, num_layers=4, dropout_rate=0.3, output_size=1)")
         print("  model.load_state_dict(torch.load('transformer_model.pth'))")
     except Exception as e:
         print(f"Error saving Transformer model: {str(e)}")
@@ -795,6 +824,8 @@ def main(main_dir):
 if __name__ == "__main__":
     main_dir = "synthetic_data"
     random.seed(42)
+    torch.manual_seed(42)
+    np.random.seed(42)
     result = main(main_dir)
     if result is not None:
         lstm_model = result['lstm_model']
