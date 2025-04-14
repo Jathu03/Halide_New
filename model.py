@@ -920,4 +920,4 @@ if __name__ == "__main__":
         transformer_model = result['transformer_model']
         ensemble_model = result['ensemble_model']
         y_scaler = result['y_scaler']
-        lstm_y_test_actual = result['lstm_y_test_actual/'
+        lstm_y_test_actual = result['lstm_y_test_actual']
