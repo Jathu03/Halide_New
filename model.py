@@ -469,14 +469,14 @@ def generate_synthetic_data(main_dir, subdirs):
 def clean_and_transform_features(train_features, test_features):
     all_features_df = pd.DataFrame(train_features + test_features)
     
+    # Impute missing values with median for numeric columns first
+    numeric_cols = all_features_df.select_dtypes(include=['number']).columns
+    all_features_df[numeric_cols] = all_features_df[numeric_cols].fillna(all_features_df[numeric_cols].median())
+    
     # Outlier detection
     iso_forest = IsolationForest(contamination=0.1, random_state=42)
     outliers = iso_forest.fit_predict(all_features_df.select_dtypes(include=['number']))
     all_features_df = all_features_df[outliers == 1]
-    
-    # Impute missing values with median
-    numeric_cols = all_features_df.select_dtypes(include=['number']).columns
-    all_features_df[numeric_cols] = all_features_df[numeric_cols].fillna(all_features_df[numeric_cols].median())
     
     # Drop constant columns
     constant_columns = [col for col in all_features_df.columns 
@@ -920,9 +920,4 @@ if __name__ == "__main__":
         transformer_model = result['transformer_model']
         ensemble_model = result['ensemble_model']
         y_scaler = result['y_scaler']
-        lstm_y_test_actual = result['lstm_y_test_actual']
-        lstm_y_pred_actual = result['lstm_y_pred_actual']
-        transformer_y_test_actual = result['transformer_y_test_actual']
-        transformer_y_pred_actual = result['transformer_y_pred_actual']
-        ensemble_y_test_actual = result['ensemble_y_test_actual']
-        ensemble_y_pred_actual = result['ensemble_y_pred_actual']
+        lstm_y_test_actual = result['lstm_y_test_actual/'
