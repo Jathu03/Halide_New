@@ -4,7 +4,9 @@ import numpy as np
 import pandas as pd
 from sklearn.preprocessing import RobustScaler
 from sklearn.feature_selection import SelectKBest, f_regression
+from sklearn.ensemble import IsolationForest
 from sklearn.model_selection import KFold
+from sklearn.preprocessing import PolynomialFeatures
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -16,7 +18,7 @@ from typing import Dict, List, Tuple, Optional, Any, Union
 
 class EnhancedLSTMModel(nn.Module):
     """
-    Enhanced LSTM model with attention mechanism and residual connections.
+    Enhanced LSTM model with attention and residual connections.
     """
     def __init__(self, input_size: int, hidden_sizes: List[int] = [512, 256, 128, 64], 
                  output_size: int = 1, dropout_rate: float = 0.3):
@@ -24,43 +26,32 @@ class EnhancedLSTMModel(nn.Module):
         
         self.lstm_layers = nn.ModuleList()
         self.dropout_layers = nn.ModuleList()
-        self.ln_layers = nn.ModuleList()  # Added layer normalization
+        self.ln_layers = nn.ModuleList()
         
-        self.lstm_layers.append(nn.LSTM(input_size, hidden_sizes[0], batch_first=True))
+        self.lstm_layers.append(nn.LSTM(input_size, hidden_sizes[0], batch_first=True, bidirectional=True))
         self.dropout_layers.append(nn.Dropout(dropout_rate))
-        self.ln_layers.append(nn.LayerNorm(hidden_sizes[0]))
+        self.ln_layers.append(nn.LayerNorm(hidden_sizes[0] * 2))  # Bidirectional doubles size
         
         for i in range(1, len(hidden_sizes)):
-            self.lstm_layers.append(nn.LSTM(hidden_sizes[i-1], hidden_sizes[i], batch_first=True))
+            self.lstm_layers.append(nn.LSTM(hidden_sizes[i-1] * 2, hidden_sizes[i], batch_first=True, bidirectional=True))
             self.dropout_layers.append(nn.Dropout(dropout_rate))
-            self.ln_layers.append(nn.LayerNorm(hidden_sizes[i]))
+            self.ln_layers.append(nn.LayerNorm(hidden_sizes[i] * 2))
         
-        self.attention = nn.Linear(hidden_sizes[-1], 1)
+        self.attention = nn.MultiheadAttention(hidden_sizes[-1] * 2, num_heads=8, dropout=dropout_rate, batch_first=True)
         
         self.fc_layers = nn.ModuleList()
         self.bn_layers = nn.ModuleList()
         
+        self.fc_layers.append(nn.Linear(hidden_sizes[-1] * 2, hidden_sizes[-1]))
+        self.bn_layers.append(nn.BatchNorm1d(hidden_sizes[-1]))
+        
         self.fc_layers.append(nn.Linear(hidden_sizes[-1], hidden_sizes[-1] // 2))
         self.bn_layers.append(nn.BatchNorm1d(hidden_sizes[-1] // 2))
         
-        self.fc_layers.append(nn.Linear(hidden_sizes[-1] // 2, hidden_sizes[-1] // 4))
-        self.bn_layers.append(nn.BatchNorm1d(hidden_sizes[-1] // 4))
-        
-        self.output_layer = nn.Linear(hidden_sizes[-1] // 4, output_size)
+        self.output_layer = nn.Linear(hidden_sizes[-1] // 2, output_size)
         
         self.relu = nn.ReLU()
         self.leaky_relu = nn.LeakyReLU(0.1)
-        
-        self.has_residual = (hidden_sizes[-1] // 4 == hidden_sizes[-1] // 2)
-        if not self.has_residual:
-            self.residual_adapter = nn.Linear(hidden_sizes[-1] // 2, hidden_sizes[-1] // 4)
-        
-    def attention_net(self, lstm_output):
-        """Apply attention mechanism to LSTM output."""
-        attn_weights = self.attention(lstm_output).squeeze(2)
-        soft_attn_weights = torch.softmax(attn_weights, 1)
-        context = torch.bmm(soft_attn_weights.unsqueeze(1), lstm_output).squeeze(1)
-        return context
         
     def forward(self, x):
         """Forward pass through the network."""
@@ -68,24 +59,18 @@ class EnhancedLSTMModel(nn.Module):
         for i, (lstm, dropout, ln) in enumerate(zip(self.lstm_layers, self.dropout_layers, self.ln_layers)):
             lstm_out, _ = lstm(lstm_out)
             lstm_out = ln(lstm_out)
-            if i < len(self.lstm_layers) - 1:
-                lstm_out = dropout(lstm_out)
+            lstm_out = dropout(lstm_out)
         
-        attn_output = self.attention_net(lstm_out)
+        attn_output, _ = self.attention(lstm_out, lstm_out, lstm_out)
+        attn_output = attn_output[:, -1, :]  # Take the last timestep
         
         fc_out = self.fc_layers[0](attn_output)
         fc_out = self.bn_layers[0](fc_out)
         fc_out = self.leaky_relu(fc_out)
         
-        residual = fc_out
-        if not self.has_residual:
-            residual = self.residual_adapter(residual)
-        
         fc_out = self.fc_layers[1](fc_out)
         fc_out = self.bn_layers[1](fc_out)
         fc_out = self.leaky_relu(fc_out)
-        
-        fc_out = fc_out + residual
         
         output = self.output_layer(fc_out)
         
@@ -112,11 +97,6 @@ class EnhancedTransformerModel(nn.Module):
         
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         
-        self.global_attention = nn.Sequential(
-            nn.Linear(hidden_size, 1),
-            nn.Softmax(dim=1)
-        )
-        
         self.fc_layers = nn.Sequential(
             nn.Linear(hidden_size, hidden_size // 2),
             nn.LayerNorm(hidden_size // 2),
@@ -132,20 +112,32 @@ class EnhancedTransformerModel(nn.Module):
     
     def forward(self, x):
         """Forward pass through the transformer network."""
-        batch_size, seq_len, _ = x.size()
-        
         x = self.input_projection(x)
-        
         transformer_output = self.transformer_encoder(x)
-        
-        attention_weights = self.global_attention(transformer_output)
-        context = torch.bmm(attention_weights.transpose(1, 2), transformer_output).squeeze(1)
-        
-        output = self.fc_layers(context)
-        
+        output = transformer_output[:, -1, :]  # Take the last timestep
+        output = self.fc_layers(output)
         output = self.output_layer(output)
-        
         return output
+
+class EnsembleModel:
+    """
+    Ensemble model combining LSTM and Transformer predictions.
+    """
+    def __init__(self, lstm_model, transformer_model, weight_lstm=0.5):
+        self.lstm_model = lstm_model
+        self.transformer_model = transformer_model
+        self.weight_lstm = weight_lstm
+        self.weight_transformer = 1.0 - weight_lstm
+    
+    def predict(self, X, device):
+        self.lstm_model.eval()
+        self.transformer_model.eval()
+        with torch.no_grad():
+            lstm_pred = self.lstm_model(X.to(device))
+            transformer_pred = self.transformer_model(X.to(device))
+            ensemble_pred = (self.weight_lstm * lstm_pred + 
+                           self.weight_transformer * transformer_pred)
+        return ensemble_pred
 
 def get_execution_time(file_path):
     try:
@@ -247,8 +239,10 @@ def extract_features_from_file(file_path):
         'scheduling_count': len(scheduling_features)
     }
     
-    # Add interaction terms
+    # Advanced feature engineering
     features['nodes_edges_interaction'] = features['nodes_count'] * features['edges_count']
+    features['nodes_count_log'] = np.log1p(features['nodes_count'])
+    features['edges_count_log'] = np.log1p(features['edges_count'])
     
     if len(nodes_features) > 0 and len(edges_features) > 0:
         features['node_edge_ratio'] = len(nodes_features) / len(edges_features)
@@ -256,11 +250,16 @@ def extract_features_from_file(file_path):
         features['node_edge_ratio'] = 0
     
     op_counts = {}
+    op_complexity = {'add': 1, 'mul': 2, 'div': 3, 'sub': 1, 'conv': 5, 'relu': 2, 'sigmoid': 3, 'tanh': 3}
+    total_complexity = 0
     for node in nodes_features:
         for key, value in node.items():
             if key.startswith('op_'):
                 op_counts[key] = op_counts.get(key, 0) + value
+                op_name = key.replace('op_', '')
+                total_complexity += value * op_complexity.get(op_name, 1)
     features.update(op_counts)
+    features['avg_op_complexity'] = total_complexity / len(nodes_features) if nodes_features else 0
     
     if scheduling_features:
         important_metrics = [
@@ -272,6 +271,7 @@ def extract_features_from_file(file_path):
             for metric in important_metrics:
                 if metric in scheduling_features[0]:
                     features[f'sched_{metric}'] = scheduling_features[0][metric]
+                    features[f'sched_{metric}_log'] = np.log1p(scheduling_features[0][metric])
         
         total_bytes_at_production = sum(sf.get('bytes_at_production', 0) for sf in scheduling_features if isinstance(sf, dict))
         total_vectors = sum(sf.get('num_vectors', 0) for sf in scheduling_features if isinstance(sf, dict))
@@ -280,11 +280,14 @@ def extract_features_from_file(file_path):
         features['total_bytes_at_production'] = total_bytes_at_production
         features['total_vectors'] = total_vectors
         features['total_parallelism'] = total_parallelism
+        features['total_bytes_at_production_log'] = np.log1p(total_bytes_at_production)
         
         if total_vectors > 0:
             features['bytes_per_vector'] = total_bytes_at_production / total_vectors
+            features['bytes_per_vector_log'] = np.log1p(features['bytes_per_vector'])
         else:
             features['bytes_per_vector'] = 0
+            features['bytes_per_vector_log'] = 0
         
         if 'working_set' in scheduling_features[0] and 'bytes_at_production' in scheduling_features[0]:
             features['memory_pressure'] = scheduling_features[0]['working_set'] / scheduling_features[0]['bytes_at_production'] if scheduling_features[0]['bytes_at_production'] > 0 else 0
@@ -292,7 +295,7 @@ def extract_features_from_file(file_path):
     if len(nodes_features) > 0:
         op_types = sum(1 for k in op_counts.keys())
         features['avg_ops_per_node'] = sum(op_counts.values()) / len(nodes_features)
-        features['op_diversity'] = op_types / len(nodes_features) if len(nodes_features) > 0 else 0
+        features['op_diversity'] = op_types / len(nodes_features)
     
     return features
 
@@ -442,7 +445,7 @@ def generate_synthetic_data(main_dir, subdirs):
                         "bytes_at_production": bytes_at_production,
                         "bytes_at_realization": bytes_at_production * 0.8,
                         "bytes_at_root": bytes_at_production * 0.5,
-                        "bytes_at_task": bytes_at_production * 0.3,
+                        "bytes_at_task": bytes_at_production * 0 Secondary: true,
                         "inner_parallelism": inner_parallelism,
                         "outer_parallelism": outer_parallelism,
                         "num_productions": random.randint(5, 50),
@@ -466,13 +469,18 @@ def generate_synthetic_data(main_dir, subdirs):
 def clean_and_transform_features(train_features, test_features):
     all_features_df = pd.DataFrame(train_features + test_features)
     
+    # Outlier detection
+    iso_forest = IsolationForest(contamination=0.1, random_state=42)
+    outliers = iso_forest.fit_predict(all_features_df.select_dtypes(include=['number']))
+    all_features_df = all_features_df[outliers == 1]
+    
     # Impute missing values with median
     numeric_cols = all_features_df.select_dtypes(include=['number']).columns
     all_features_df[numeric_cols] = all_features_df[numeric_cols].fillna(all_features_df[numeric_cols].median())
     
     # Drop constant columns
     constant_columns = [col for col in all_features_df.columns 
-                       if col != 'execution_time' and all_features_df[col].nunique() == 1]
+                       if col != 'execution_time' and all_features_df[col].nunique() <= 1]
     all_features_df = all_features_df.drop(columns=constant_columns)
     print(f"Dropped {len(constant_columns)} constant columns")
     
@@ -480,18 +488,24 @@ def clean_and_transform_features(train_features, test_features):
     if 'execution_time' in all_features_df.columns:
         all_features_df['execution_time_log'] = np.log1p(all_features_df['execution_time'])
     
-    # Normalize bytes_per_vector
-    if 'total_vectors' in all_features_df.columns and all_features_df['total_vectors'].max() > 0:
-        all_features_df['bytes_per_vector'] = all_features_df['total_bytes_at_production'] / (all_features_df['total_vectors'] + 1e-8)
+    # Polynomial features
+    poly = PolynomialFeatures(degree=2, include_bias=False, interaction_only=True)
+    poly_cols = [col for col in all_features_df.columns if col not in ['execution_time', 'execution_time_log']]
+    if poly_cols:
+        poly_features = poly.fit_transform(all_features_df[poly_cols])
+        poly_feature_names = poly.get_feature_names_out(poly_cols)
+        poly_df = pd.DataFrame(poly_features, columns=poly_feature_names, index=all_features_df.index)
+        all_features_df = all_features_df.drop(columns=poly_cols).join(poly_df)
     
-    # Select only numeric columns
-    numeric_cols = all_features_df.select_dtypes(include=['number']).columns
-    all_features_df = all_features_df[numeric_cols]
+    # Clip extreme values
+    for col in all_features_df.select_dtypes(include=['number']).columns:
+        all_features_df[col] = all_features_df[col].clip(lower=all_features_df[col].quantile(0.01),
+                                                        upper=all_features_df[col].quantile(0.99))
     
     # Remove highly correlated features
     corr_matrix = all_features_df.corr().abs()
     upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
-    to_drop = [column for column in upper.columns if any(upper[column] > 0.8)]
+    to_drop = [column for column in upper.columns if any(upper[column] > 0.75)]
     all_features_df = all_features_df.drop(columns=to_drop)
     print(f"Dropped {len(to_drop)} highly correlated columns")
     
@@ -510,14 +524,14 @@ def prepare_data_for_model(train_features, test_features):
     if 'execution_time_log' in train_df.columns:
         y_train = train_df['execution_time_log'].values.reshape(-1, 1)
         y_test = test_df['execution_time_log'].values.reshape(-1, 1)
-        train_df = train_df.drop(['execution_time', 'execution_time_log'], axis=1)
-        test_df = test_df.drop(['execution_time', 'execution_time_log'], axis=1)
+        train_df = train_df.drop(['execution_time', 'execution_time_log'], axis=1, errors='ignore')
+        test_df = test_df.drop(['execution_time', 'execution_time_log'], axis=1, errors='ignore')
         is_log_transformed = True
     else:
         y_train = train_df['execution_time'].values.reshape(-1, 1)
         y_test = test_df['execution_time'].values.reshape(-1, 1)
-        train_df = train_df.drop('execution_time', axis=1)
-        test_df = test_df.drop('execution_time', axis=1)
+        train_df = train_df.drop('execution_time', axis=1, errors='ignore')
+        test_df = test_df.drop('execution_time', axis=1, errors='ignore')
         is_log_transformed = False
     
     print("\nDebugging target values in prepare_data_for_model:")
@@ -525,7 +539,7 @@ def prepare_data_for_model(train_features, test_features):
     print(f"First 5 y_test raw: {y_test[:5].flatten()}")
     
     # Feature selection
-    selector = SelectKBest(score_func=f_regression, k=min(20, train_df.shape[1]))
+    selector = SelectKBest(score_func=f_regression, k=min(30, train_df.shape[1]))
     X_train_selected = selector.fit_transform(train_df, y_train.ravel())
     X_test_selected = selector.transform(test_df)
     
@@ -550,7 +564,7 @@ def prepare_data_for_model(train_features, test_features):
     return (X_train_tensor, y_train_tensor, X_test_tensor, y_test_tensor, 
             scaler_y, X_train_scaled.shape[1], is_log_transformed)
 
-def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=16):
+def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=32):
     train_dataset = TensorDataset(X_train, y_train)
     test_dataset = TensorDataset(X_test, y_test)
     
@@ -559,7 +573,7 @@ def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=16):
     
     return train_loader, test_loader
 
-def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=300, patience=50, model_name="model"):
+def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=400, patience=75, model_name="model"):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     model.to(device)
@@ -572,7 +586,16 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
     train_losses = []
     val_losses = []
     
+    # Learning rate warmup
+    warmup_epochs = 10
+    initial_lr = optimizer.param_groups[0]['lr'] / 10
+    
     for epoch in range(num_epochs):
+        if epoch < warmup_epochs:
+            lr = initial_lr + (optimizer.param_groups[0]['lr'] - initial_lr) * epoch / warmup_epochs
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = lr
+        
         model.train()
         running_loss = 0.0
         for inputs, targets in train_loader:
@@ -582,7 +605,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
             loss = criterion(outputs, targets)
             loss.backward()
             
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.3)
             
             optimizer.step()
             running_loss += loss.item() * inputs.size(0)
@@ -618,7 +641,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
             model.load_state_dict(best_model_state)
             break
     
-    if best_model_state is not None and epochs_no_improve > 0:
+    if best_model_state is not None:
         model.load_state_dict(best_model_state)
     
     plt.figure(figsize=(10, 6))
@@ -703,6 +726,19 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_tran
     print(f"MAE: {mae:.2f}")
     print(f"MAPE: {mape:.2f}%")
     
+    # Residual analysis
+    residuals = y_test_actual - y_pred_actual
+    plt.figure(figsize=(10, 6))
+    plt.scatter(y_test_actual, residuals, alpha=0.5)
+    plt.axhline(y=0, color='r', linestyle='--')
+    plt.xlabel('Actual Execution Time')
+    plt.ylabel('Residuals')
+    plt.title(f'Residual Plot - {model_name}')
+    plt.grid(True)
+    plt.savefig(f'residuals_{model_name}.png')
+    plt.close()
+    print(f"Residual plot saved as 'residuals_{model_name}.png'")
+    
     return y_test_actual, y_pred_actual
 
 def main(main_dir):
@@ -722,7 +758,7 @@ def main(main_dir):
     
     X_train, y_train, X_test, y_test, y_scaler, input_size, is_log_transformed = prepare_data_for_model(train_features, test_features)
     
-    train_loader, test_loader = create_data_loaders(X_train, y_train, X_test, y_test, batch_size=16)
+    train_loader, test_loader = create_data_loaders(X_train, y_train, X_test, y_test, batch_size=32)
     
     # Train and evaluate LSTM model
     lstm_model = EnhancedLSTMModel(
@@ -733,7 +769,7 @@ def main(main_dir):
     )
     
     lstm_criterion = nn.HuberLoss(delta=0.5)
-    lstm_optimizer = optim.AdamW(lstm_model.parameters(), lr=0.0001, weight_decay=1e-4)
+    lstm_optimizer = optim.AdamW(lstm_model.parameters(), lr=0.00005, weight_decay=1e-4)
     
     print("\nBuilding and training Enhanced LSTM model...")
     lstm_train_losses, lstm_val_losses = train_model(
@@ -742,8 +778,8 @@ def main(main_dir):
         test_loader, 
         lstm_criterion, 
         lstm_optimizer, 
-        num_epochs=300,
-        patience=50,
+        num_epochs=400,
+        patience=75,
         model_name="lstm_model"
     )
     
@@ -764,7 +800,7 @@ def main(main_dir):
     )
     
     transformer_criterion = nn.HuberLoss(delta=0.5)
-    transformer_optimizer = optim.AdamW(transformer_model.parameters(), lr=0.0001, weight_decay=1e-4)
+    transformer_optimizer = optim.AdamW(transformer_model.parameters(), lr=0.00005, weight_decay=1e-4)
     
     print("\nBuilding and training Enhanced Transformer model...")
     transformer_train_losses, transformer_val_losses = train_model(
@@ -773,8 +809,8 @@ def main(main_dir):
         test_loader, 
         transformer_criterion, 
         transformer_optimizer, 
-        num_epochs=300,
-        patience=50,
+        num_epochs=400,
+        patience=75,
         model_name="transformer_model"
     )
     
@@ -784,11 +820,61 @@ def main(main_dir):
         is_log_transformed, original_execution_times, model_name="transformer_model"
     )
     
+    # Ensemble model
+    print("\nEvaluating Ensemble model...")
+    ensemble_model = EnsembleModel(lstm_model, transformer_model, weight_lstm=0.4)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    with torch.no_grad():
+        ensemble_pred_scaled = ensemble_model.predict(X_test, device)
+    
+    ensemble_pred_scaled = ensemble_pred_scaled.cpu().numpy()
+    ensemble_y_test_actual = y_scaler.inverse_transform(y_test.cpu().numpy())
+    ensemble_y_pred_actual = y_scaler.inverse_transform(ensemble_pred_scaled)
+    
+    if is_log_transformed:
+        ensemble_y_test_actual = np.expm1(ensemble_y_test_actual)
+        ensemble_y_pred_actual = np.expm1(ensemble_y_pred_actual)
+    
+    results_by_subfolder = {}
+    for i, file_path in enumerate(test_file_names):
+        subfolder = file_path.split('/')[0]
+        if subfolder not in results_by_subfolder:
+            results_by_subfolder[subfolder] = []
+        
+        actual_val = ensemble_y_test_actual[i][0]
+        pred_val = ensemble_y_pred_actual[i][0]
+        error_percentage = abs(actual_val - pred_val) / actual_val * 100 if actual_val > 0 else 0
+        
+        results_by_subfolder[subfolder].append({
+            'file': file_path,
+            'actual': actual_val,
+            'predicted': pred_val,
+            'error_percentage': error_percentage
+        })
+    
+    for subfolder, results in results_by_subfolder.items():
+        print(f"\nResults for {subfolder} (ensemble_model):")
+        for result in results:
+            print(f"File: {result['file']}")
+            print(f"  Actual execution time: {result['actual']:.2f} ms")
+            print(f"  Predicted execution time: {result['predicted']:.2f} ms")
+            print(f"  Error percentage: {result['error_percentage']:.2f}%")
+    
+    mse = np.mean((ensemble_y_test_actual - ensemble_y_pred_actual) ** 2)
+    rmse = np.sqrt(mse)
+    mae = np.mean(np.abs(ensemble_y_test_actual - ensemble_y_pred_actual))
+    mape = np.mean(np.abs((ensemble_y_test_actual - ensemble_y_pred_actual) / (ensemble_y_test_actual + 1e-8))) * 100
+    
+    print(f"\nOverall Model Performance (ensemble_model):")
+    print(f"MSE: {mse:.2f}")
+    print(f"RMSE: {rmse:.2f}")
+    print(f"MAE: {mae:.2f}")
+    print(f"MAPE: {mape:.2f}%")
+    
     # Save models
     print("\nSaving trained models...")
     device = torch.device('cpu')
     
-    # Save LSTM model
     try:
         lstm_model.eval()
         lstm_model.to(device)
@@ -799,7 +885,6 @@ def main(main_dir):
     except Exception as e:
         print(f"Error saving LSTM model: {str(e)}")
     
-    # Save Transformer model
     try:
         transformer_model.eval()
         transformer_model.to(device)
@@ -814,11 +899,14 @@ def main(main_dir):
     return {
         'lstm_model': lstm_model,
         'transformer_model': transformer_model,
+        'ensemble_model': ensemble_model,
         'y_scaler': y_scaler,
         'lstm_y_test_actual': lstm_y_test_actual,
         'lstm_y_pred_actual': lstm_y_pred_actual,
         'transformer_y_test_actual': transformer_y_test_actual,
-        'transformer_y_pred_actual': transformer_y_pred_actual
+        'transformer_y_pred_actual': transformer_y_pred_actual,
+        'ensemble_y_test_actual': ensemble_y_test_actual,
+        'ensemble_y_pred_actual': ensemble_y_pred_actual
     }
 
 if __name__ == "__main__":
@@ -830,8 +918,11 @@ if __name__ == "__main__":
     if result is not None:
         lstm_model = result['lstm_model']
         transformer_model = result['transformer_model']
+        ensemble_model = result['ensemble_model']
         y_scaler = result['y_scaler']
         lstm_y_test_actual = result['lstm_y_test_actual']
         lstm_y_pred_actual = result['lstm_y_pred_actual']
         transformer_y_test_actual = result['transformer_y_test_actual']
         transformer_y_pred_actual = result['transformer_y_pred_actual']
+        ensemble_y_test_actual = result['ensemble_y_test_actual']
+        ensemble_y_pred_actual = result['ensemble_y_pred_actual']
