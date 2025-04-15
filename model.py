@@ -50,8 +50,12 @@ class HalideDataset(Dataset):
         node_tensor = (item["node_tensor"] - self.node_mean) / self.node_std
         edge_tensor = (item["edge_tensor"] - self.edge_mean) / self.edge_std
         exec_time = (item["execution_time"].item() - self.time_mean) / self.time_std
-        # Ensure tensors are returned with proper shape
-        return node_tensor, edge_tensor, torch.tensor([exec_time], dtype=torch.float32)
+        # Return tensors with explicit shapes
+        return (
+            node_tensor,  # [MAX_NODES, NODE_FEATURE_DIM]
+            edge_tensor,  # [MAX_EDGES, EDGE_FEATURE_DIM]
+            torch.tensor([exec_time], dtype=torch.float32)  # [1]
+        )
 
 class ExecutionTimeLSTM(nn.Module):
     """
@@ -73,30 +77,31 @@ class ExecutionTimeLSTM(nn.Module):
         self.relu = nn.ReLU()
         
     def forward(self, node_tensor, edge_tensor):
-        # Ensure input is batched (add batch dim if needed)
+        # Ensure input is batched
         if node_tensor.dim() == 2:
             node_tensor = node_tensor.unsqueeze(0)  # [1, MAX_NODES, NODE_FEATURE_DIM]
             edge_tensor = edge_tensor.unsqueeze(0)  # [1, MAX_EDGES, EDGE_FEATURE_DIM]
+        elif node_tensor.dim() != 3:
+            raise ValueError(f"Expected 3D node_tensor, got shape {node_tensor.shape}")
         
         batch_size = node_tensor.size(0)
         
-        # Initialize hidden states dynamically
+        # Initialize hidden states
         h0 = torch.zeros(self.num_layers, batch_size, self.hidden_dim).to(node_tensor.device)
         c0 = torch.zeros(self.num_layers, batch_size, self.hidden_dim).to(node_tensor.device)
         
         # Node LSTM
         node_out, _ = self.node_lstm(node_tensor, (h0, c0))
-        # Take the last hidden state (shape: [batch_size, hidden_dim])
-        node_repr = node_out[:, -1, :]
+        node_repr = node_out[:, -1, :]  # [batch_size, hidden_dim]
         
         # Edge LSTM
         edge_out, _ = self.edge_lstm(edge_tensor, (h0, c0))
-        edge_repr = edge_out[:, -1, :]
+        edge_repr = edge_out[:, -1, :]  # [batch_size, hidden_dim]
         
         # Combine representations
         combined = torch.cat((node_repr, edge_repr), dim=1)
         x = self.relu(self.fc1(combined))
-        x = self.fc2(x)  # Output scalar
+        x = self.fc2(x)
         return x.squeeze(-1)
 
 def train_model(model, train_loader, val_loader, criterion, optimizer, epochs, model_path="best_model.pth"):
@@ -109,8 +114,10 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, epochs, m
         train_loss = 0.0
         for node_tensor, edge_tensor, exec_time in train_loader:
             node_tensor, edge_tensor, exec_time = node_tensor.to(DEVICE), edge_tensor.to(DEVICE), exec_time.to(DEVICE)
-            # Ensure exec_time is squeezed to match output shape
-            exec_time = exec_time.squeeze(-1)
+            # Log shapes for debugging
+            logging.debug(f"Batch shapes - Node: {node_tensor.shape}, Edge: {edge_tensor.shape}, Exec: {exec_time.shape}")
+            
+            exec_time = exec_time.squeeze(-1)  # [batch_size]
             
             optimizer.zero_grad()
             output = model(node_tensor, edge_tensor)
@@ -191,7 +198,7 @@ def main():
     val_dataset = HalideDataset(train_data)  # Use train stats for consistency
     test_dataset = HalideDataset(test_data)
     
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE)
     test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE)
     
