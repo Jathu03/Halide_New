@@ -55,7 +55,7 @@ class HalideDataset(Dataset):
         return (
             node_tensor,  # [MAX_NODES, NODE_FEATURE_DIM]
             edge_tensor,  # [MAX_EDGES, EDGE_FEATURE_DIM]
-            torch.tensor(exec_time, dtype=torch.float32)  # Scalar
+            torch.tensor([exec_time], dtype=torch.float32)  # [1]
         )
 
 class ExecutionTimeLSTM(nn.Module):
@@ -123,7 +123,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, epochs, m
             
             optimizer.zero_grad()
             output = model(node_tensor, edge_tensor)
-            loss = criterion(output, exec_time)
+            loss = criterion(output, exec_time.squeeze(-1))
             loss.backward()
             optimizer.step()
             train_loss += loss.item() * node_tensor.size(0)
@@ -135,9 +135,9 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, epochs, m
         val_loss = 0.0
         with torch.no_grad():
             for node_tensor, edge_tensor, exec_time in val_loader:
-                node_tensor, edge_tensor, exec_time = node_tensor.to(DEVICE), exec_time.to(DEVICE)
+                node_tensor, edge_tensor, exec_time = node_tensor.to(DEVICE), edge_tensor.to(DEVICE), exec_time.to(DEVICE)
                 output = model(node_tensor, edge_tensor)
-                loss = criterion(output, exec_time)
+                loss = criterion(output, exec_time.squeeze(-1))
                 val_loss += loss.item() * node_tensor.size(0)
         
         val_loss /= len(val_loader.dataset)
@@ -167,7 +167,7 @@ def evaluate_model(model, test_loader, dataset, model_path="best_model.pth"):
             output = model(node_tensor, edge_tensor)
             # Denormalize predictions
             output = output * dataset.time_std + dataset.time_mean
-            exec_time = exec_time * dataset.time_std + dataset.time_mean
+            exec_time = exec_time.squeeze(-1) * dataset.time_std + dataset.time_mean
             predictions.extend(output.cpu().numpy())
             actuals.extend(exec_time.cpu().numpy())
             mse += ((output - exec_time) ** 2).sum().item()
