@@ -11,10 +11,11 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # Constants
 MAX_NODES = 50
 MAX_EDGES = 50
-NODE_FEATURE_DIM = 70  # Expanded: 24 ops + 8 access patterns + 35 scheduling + 3 graph props
+NODE_FEATURE_DIM = 67  # 24 ops + 8 access patterns + 35 scheduling (match model)
 EDGE_FEATURE_DIM = 80  # 16 footprint + 64 Jacobian
 DATA_DIR = "synthetic_data"
 OUTPUT_PATH = "representation_halide_v2.pkl"
+DEFAULT_EXEC_TIME = 1.0  # Fallback for debugging
 
 def initialize_operation_histogram():
     """Initialize a dictionary for operation types."""
@@ -50,18 +51,7 @@ def initialize_scheduling_features():
         "fusion_levels": [0] * 5
     }
 
-def compute_graph_properties(tree, node_id):
-    """Compute graph properties: degree, depth, is_leaf."""
-    degree = len(tree.get("dependencies", []))
-    depth = 0
-    current = node_id
-    while current in tree.get("parent", {}):
-        depth += 1
-        current = tree["parent"][current]
-    is_leaf = 1 if degree == 0 else 0
-    return degree, depth, is_leaf
-
-def extract_features_from_node(node, tree, node_id):
+def extract_features_from_node(node):
     """Extract features for a single node."""
     op_histogram = initialize_operation_histogram()
     access_patterns = [0] * 8
@@ -71,38 +61,43 @@ def extract_features_from_node(node, tree, node_id):
     op_type = node.get("operation", "unknown")
     if op_type in op_histogram:
         op_histogram[op_type] = 1
+    else:
+        logging.debug(f"Unknown operation type: {op_type}")
     
-    # Access patterns (simplified)
+    # Access patterns
     memory_access = node.get("memory_access", {})
-    access_patterns[0] = memory_access.get("read_count", 0)
-    access_patterns[1] = memory_access.get("write_count", 0)
-    access_patterns[2] = memory_access.get("stride_x", 0)
-    access_patterns[3] = memory_access.get("stride_y", 0)
-    access_patterns[4] = memory_access.get("extent_x", 0)
-    access_patterns[5] = memory_access.get("extent_y", 0)
-    access_patterns[6] = memory_access.get("is_contiguous", 0)
-    access_patterns[7] = memory_access.get("is_aligned", 0)
+    try:
+        access_patterns[0] = float(memory_access.get("read_count", 0))
+        access_patterns[1] = float(memory_access.get("write_count", 0))
+        access_patterns[2] = float(memory_access.get("stride_x", 0))
+        access_patterns[3] = float(memory_access.get("stride_y", 0))
+        access_patterns[4] = float(memory_access.get("extent_x", 0))
+        access_patterns[5] = float(memory_access.get("extent_y", 0))
+        access_patterns[6] = float(memory_access.get("is_contiguous", 0))
+        access_patterns[7] = float(memory_access.get("is_aligned", 0))
+    except (TypeError, ValueError) as e:
+        logging.debug(f"Invalid memory_access in node: {e}")
     
     # Scheduling features
     schedule = node.get("schedule", {})
-    scheduling_features["parallelized"] = schedule.get("parallelized", 0)
-    scheduling_features["vectorized"] = schedule.get("vectorized", 0)
-    scheduling_features["unrolled"] = schedule.get("unrolled", 0)
-    scheduling_features["tiled"] = schedule.get("tiled", 0)
-    scheduling_features["fused"] = schedule.get("fused", 0)
-    scheduling_features["reordered"] = schedule.get("reordered", 0)
-    scheduling_features["split"] = schedule.get("split", 0)
-    scheduling_features["inlined"] = schedule.get("inlined", 0)
-    scheduling_features["memoized"] = schedule.get("memoized", 0)
-    scheduling_features["loop_nest_depth"] = schedule.get("loop_nest_depth", 0)
-    scheduling_features["num_parallel_tasks"] = schedule.get("num_parallel_tasks", 0)
-    scheduling_features["tile_size_x"] = schedule.get("tile_size_x", 0)
-    scheduling_features["tile_size_y"] = schedule.get("tile_size_y", 0)
-    scheduling_features["vector_width"] = schedule.get("vector_width", 0)
-    scheduling_features["unroll_factor"] = schedule.get("unroll_factor", 0)
-    
-    # Graph properties
-    degree, depth, is_leaf = compute_graph_properties(tree, node_id)
+    try:
+        scheduling_features["parallelized"] = float(schedule.get("parallelized", 0))
+        scheduling_features["vectorized"] = float(schedule.get("vectorized", 0))
+        scheduling_features["unrolled"] = float(schedule.get("unrolled", 0))
+        scheduling_features["tiled"] = float(schedule.get("tiled", 0))
+        scheduling_features["fused"] = float(schedule.get("fused", 0))
+        scheduling_features["reordered"] = float(schedule.get("reordered", 0))
+        scheduling_features["split"] = float(schedule.get("split", 0))
+        scheduling_features["inlined"] = float(schedule.get("inlined", 0))
+        scheduling_features["memoized"] = float(schedule.get("memoized", 0))
+        scheduling_features["loop_nest_depth"] = float(schedule.get("loop_nest_depth", 0))
+        scheduling_features["num_parallel_tasks"] = float(schedule.get("num_parallel_tasks", 0))
+        scheduling_features["tile_size_x"] = float(schedule.get("tile_size_x", 0))
+        scheduling_features["tile_size_y"] = float(schedule.get("tile_size_y", 0))
+        scheduling_features["vector_width"] = float(schedule.get("vector_width", 0))
+        scheduling_features["unroll_factor"] = float(schedule.get("unroll_factor", 0))
+    except (TypeError, ValueError) as e:
+        logging.debug(f"Invalid schedule in node: {e}")
     
     # Combine features
     node_features = (
@@ -127,8 +122,7 @@ def extract_features_from_node(node, tree, node_id):
         ] +
         scheduling_features["split_factors"] +
         scheduling_features["reorder_indices"] +
-        scheduling_features["fusion_levels"] +
-        [degree, depth, is_leaf]
+        scheduling_features["fusion_levels"]
     )
     
     return torch.tensor(node_features, dtype=torch.float32)
@@ -137,35 +131,50 @@ def extract_edge_features(edge):
     """Extract features for an edge."""
     footprint = edge.get("footprint", {})
     jacobian = edge.get("jacobian", [0] * 64)
-    edge_features = (
-        [
-            footprint.get("min_x", 0),
-            footprint.get("max_x", 0),
-            footprint.get("min_y", 0),
-            footprint.get("max_y", 0),
-            footprint.get("min_z", 0),
-            footprint.get("max_z", 0),
-            footprint.get("min_t", 0),
-            footprint.get("max_t", 0),
-            footprint.get("extent_x", 0),
-            footprint.get("extent_y", 0),
-            footprint.get("extent_z", 0),
-            footprint.get("extent_t", 0),
-            footprint.get("stride_x", 0),
-            footprint.get("stride_y", 0),
-            footprint.get("stride_z", 0),
-            footprint.get("stride_t", 0)
-        ] +
-        jacobian[:64]
-    )
+    try:
+        edge_features = (
+            [
+                float(footprint.get("min_x", 0)),
+                float(footprint.get("max_x", 0)),
+                float(footprint.get("min_y", 0)),
+                float(footprint.get("max_y", 0)),
+                float(footprint.get("min_z", 0)),
+                float(footprint.get("max_z", 0)),
+                float(footprint.get("min_t", 0)),
+                float(footprint.get("max_t", 0)),
+                float(footprint.get("extent_x", 0)),
+                float(footprint.get("extent_y", 0)),
+                float(footprint.get("extent_z", 0)),
+                float(footprint.get("extent_t", 0)),
+                float(footprint.get("stride_x", 0)),
+                float(footprint.get("stride_y", 0)),
+                float(footprint.get("stride_z", 0)),
+                float(footprint.get("stride_t", 0))
+            ] +
+            [float(x) for x in jacobian[:64]]
+        )
+    except (TypeError, ValueError) as e:
+        logging.debug(f"Invalid edge features: {e}")
+        edge_features = [0.0] * EDGE_FEATURE_DIM
+    
     return torch.tensor(edge_features, dtype=torch.float32)
 
 def create_representation(data_dir):
     """Create dataset from JSON files."""
+    # Verify directory
+    if not os.path.isdir(data_dir):
+        logging.error(f"Directory {data_dir} does not exist.")
+        return []
+    
+    json_files = [f for f in os.listdir(data_dir) if f.endswith(".json")]
+    if not json_files:
+        logging.error(f"No JSON files found in {data_dir}.")
+        return []
+    
+    logging.info(f"Found {len(json_files)} JSON files in {data_dir}")
+    
     dataset = []
-    for filename in os.listdir(data_dir):
-        if not filename.endswith(".json"):
-            continue
+    for filename in json_files:
         file_path = os.path.join(data_dir, filename)
         try:
             with open(file_path, "r") as f:
@@ -174,35 +183,67 @@ def create_representation(data_dir):
             logging.error(f"Failed to load {file_path}: {e}")
             continue
         
-        # Extract execution time
-        execution_time = next(
-            (float(entry["value"]) for entry in prog_details.get("Metrics", [])
-             if entry["name"] == "total_execution_time_ms" and float(entry["value"]) > 0.0),
-            None
-        )
-        if execution_time is None:
-            logging.warning(f"No valid execution time in {file_path}. Skipping.")
+        # Validate structure
+        if not isinstance(prog_details, dict):
+            logging.warning(f"Invalid JSON structure in {file_path}. Skipping.")
             continue
+        
+        # Extract execution time
+        metrics = prog_details.get("Metrics", [])
+        execution_time = None
+        for entry in metrics:
+            if entry.get("name") == "total_execution_time_ms":
+                try:
+                    value = float(entry.get("value", 0))
+                    if value > 0.0:
+                        execution_time = value
+                        break
+                except (TypeError, ValueError):
+                    logging.debug(f"Invalid execution time in {file_path}: {entry.get('value')}")
+        
+        if execution_time is None:
+            logging.warning(f"No valid execution time in {file_path}. Using default: {DEFAULT_EXEC_TIME}")
+            execution_time = DEFAULT_EXEC_TIME
         
         # Build tree and tensors
         tree = prog_details.get("ComputationGraph", {})
         nodes = tree.get("nodes", {})
         edges = tree.get("edges", [])
         
+        if not nodes:
+            logging.warning(f"No nodes in {file_path}. Skipping.")
+            continue
+        
         node_tensor = torch.zeros((MAX_NODES, NODE_FEATURE_DIM))
         edge_tensor = torch.zeros((MAX_EDGES, EDGE_FEATURE_DIM))
         
         # Process nodes
-        for i, (node_id, node_data) in enumerate(nodes.items()):
-            if i >= MAX_NODES:
+        node_count = 0
+        for node_id, node_data in nodes.items():
+            if node_count >= MAX_NODES:
                 break
-            node_tensor[i] = extract_features_from_node(node_data, tree, node_id)
+            try:
+                node_tensor[node_count] = extract_features_from_node(node_data)
+                node_count += 1
+            except Exception as e:
+                logging.debug(f"Failed to process node {node_id} in {file_path}: {e}")
         
         # Process edges
-        for i, edge in enumerate(edges):
-            if i >= MAX_EDGES:
+        edge_count = 0
+        for edge in edges:
+            if edge_count >= MAX_EDGES:
                 break
-            edge_tensor[i] = extract_edge_features(edge)
+            try:
+                edge_tensor[edge_count] = extract_edge_features(edge)
+                edge_count += 1
+            except Exception as e:
+                logging.debug(f"Failed to process edge in {file_path}: {e}")
+        
+        # Log sample features
+        if node_count > 0:
+            logging.debug(f"Sample node features from {file_path}: {node_tensor[0][:10].tolist()}")
+        if edge_count > 0:
+            logging.debug(f"Sample edge features from {file_path}: {edge_tensor[0][:10].tolist()}")
         
         # Store representation
         dataset.append({
@@ -215,12 +256,18 @@ def create_representation(data_dir):
     
     # Validate dataset
     if not dataset:
-        logging.error("No valid samples created. Check JSON files.")
+        logging.error("No valid samples created. Check JSON files for valid 'Metrics' and 'ComputationGraph'.")
         return []
     
     exec_times = torch.tensor([d["execution_time"].item() for d in dataset])
-    logging.info(f"Dataset stats - Samples: {len(dataset)}, Exec time Mean: {exec_times.mean():.4f}, "
-                 f"Std: {exec_times.std():.4f}, Min: {exec_times.min():.4f}, Max: {exec_times.max():.4f}")
+    node_features = torch.stack([d["node_tensor"] for d in dataset])
+    edge_features = torch.stack([d["edge_tensor"] for d in dataset])
+    
+    logging.info(f"Dataset stats - Samples: {len(dataset)}, "
+                 f"Exec time Mean: {exec_times.mean():.4f}, Std: {exec_times.std():.4f}, "
+                 f"Min: {exec_times.min():.4f}, Max: {exec_times.max():.4f}")
+    logging.info(f"Node feature variance (first 5): {node_features.std(dim=(0, 1))[:5].tolist()}")
+    logging.info(f"Edge feature variance (first 5): {edge_features.std(dim=(0, 1))[:5].tolist()}")
     
     return dataset
 
