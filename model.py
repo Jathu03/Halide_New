@@ -7,6 +7,8 @@ import numpy as np
 from sklearn.model_selection import train_test_split
 import logging
 import os
+from torch_geometric.data import Batch, Data
+from torch_geometric.nn import GCNConv, global_mean_pool
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -14,20 +16,20 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # Constants
 MAX_NODES = 50
 MAX_EDGES = 50
-NODE_FEATURE_DIM = 67  # 24 ops + 8 access patterns + 35 scheduling features
-EDGE_FEATURE_DIM = 80  # 16 footprint + 64 Jacobian
-HIDDEN_DIM = 256  # Increased for better capacity
-NUM_LAYERS = 2
+NODE_FEATURE_DIM = 70  # Updated
+EDGE_FEATURE_DIM = 80
+HIDDEN_DIM = 256
+NUM_LAYERS = 3
 BATCH_SIZE = 32
-EPOCHS = 50
-LEARNING_RATE = 0.0005  # Reduced to stabilize training
-PATIENCE = 10  # For early stopping
-DROPOUT = 0.3  # To prevent overfitting
+EPOCHS = 100
+LEARNING_RATE = 0.0005
+PATIENCE = 10
+DROPOUT = 0.3
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class HalideDataset(Dataset):
     """
-    Custom Dataset for loading representation_halide.pkl.
+    Custom Dataset for loading representation_halide_v2.pkl.
     """
     def __init__(self, data):
         self.data = data
@@ -43,6 +45,12 @@ class HalideDataset(Dataset):
         self.time_mean = exec_times.mean()
         self.time_std = exec_times.std() + 1e-6
         
+        # Feature selection: keep features with std > 0.01
+        self.node_mask = self.node_std.squeeze() > 0.01
+        self.edge_mask = self.edge_std.squeeze() > 0.01
+        logging.info(f"Selected {self.node_mask.sum().item()}/{NODE_FEATURE_DIM} node features, "
+                     f"{self.edge_mask.sum().item()}/{EDGE_FEATURE_DIM} edge features")
+        
         # Log execution time stats
         logging.info(f"Exec time stats - Mean: {self.time_mean:.4f}, Std: {self.time_std:.4f}, "
                      f"Min: {exec_times.min():.4f}, Max: {exec_times.max():.4f}")
@@ -52,62 +60,80 @@ class HalideDataset(Dataset):
 
     def __getitem__(self, idx):
         item = self.data[idx]
-        # Normalize inputs
+        # Normalize and select features
         node_tensor = (item["node_tensor"] - self.node_mean) / self.node_std
         edge_tensor = (item["edge_tensor"] - self.edge_mean) / self.edge_std
+        node_tensor = node_tensor[:, self.node_mask]
+        edge_tensor = edge_tensor[:, self.edge_mask]
         exec_time = (item["execution_time"].item() - self.time_mean) / self.time_std
-        return (
-            node_tensor,  # [MAX_NODES, NODE_FEATURE_DIM]
-            edge_tensor,  # [MAX_EDGES, EDGE_FEATURE_DIM]
-            torch.tensor([exec_time], dtype=torch.float32)  # [1]
-        )
-
-class ExecutionTimeLSTM(nn.Module):
-    """
-    LSTM model to predict execution time from node and edge tensors.
-    """
-    def __init__(self, node_input_dim=NODE_FEATURE_DIM, edge_input_dim=EDGE_FEATURE_DIM,
-                 hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS, dropout=DROPOUT):
-        super(ExecutionTimeLSTM, self).__init__()
-        self.hidden_dim = hidden_dim
-        self.num_layers = num_layers
         
-        # Node LSTM
-        self.node_lstm = nn.LSTM(node_input_dim, hidden_dim, num_layers, batch_first=True, dropout=dropout)
-        # Edge LSTM
-        self.edge_lstm = nn.LSTM(edge_input_dim, hidden_dim, num_layers, batch_first=True, dropout=dropout)
-        # Fully connected layers
+        # Build edge_index from tree
+        tree = item["tree"]
+        edges = tree.get("edges", [])
+        edge_index = []
+        for edge in edges:
+            src = edge.get("source_id", 0)
+            dst = edge.get("target_id", 0)
+            if isinstance(src, str) and isinstance(dst, str):
+                edge_index.append([int(src.split("_")[-1]), int(dst.split("_")[-1])])
+        edge_index = torch.tensor(edge_index, dtype=torch.long).t().contiguous()
+        
+        # Create PyTorch Geometric Data object
+        data = Data(
+            x=node_tensor,  # [MAX_NODES, selected_node_features]
+            edge_index=edge_index,  # [2, num_edges]
+            edge_attr=edge_tensor,  # [MAX_EDGES, selected_edge_features]
+            y=torch.tensor([exec_time], dtype=torch.float32)  # [1]
+        )
+        return data
+
+class ExecutionTimeGNN(nn.Module):
+    """
+    GNN model to predict execution time.
+    """
+    def __init__(self, node_input_dim, edge_input_dim, hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS, dropout=DROPOUT):
+        super(ExecutionTimeGNN, self).__init__()
+        self.convs = nn.ModuleList()
+        self.bns = nn.ModuleList()
+        current_dim = node_input_dim
+        
+        # GCN layers
+        for _ in range(num_layers):
+            self.convs.append(GCNConv(current_dim, hidden_dim))
+            self.bns.append(nn.BatchNorm1d(hidden_dim))
+            current_dim = hidden_dim
+        
+        # Edge feature processing
+        self.edge_mlp = nn.Sequential(
+            nn.Linear(edge_input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout)
+        )
+        
+        # Final layers
         self.fc1 = nn.Linear(hidden_dim * 2, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, 1)
         self.relu = nn.ReLU()
         self.dropout = nn.Dropout(dropout)
         
-    def forward(self, node_tensor, edge_tensor):
-        # Handle unexpected dimensions
-        if node_tensor.dim() == 4 and node_tensor.size(1) == 1:
-            node_tensor = node_tensor.squeeze(1)
-            edge_tensor = edge_tensor.squeeze(1)
-        elif node_tensor.dim() == 2:
-            node_tensor = node_tensor.unsqueeze(0)
-            edge_tensor = edge_tensor.unsqueeze(0)
-        elif node_tensor.dim() != 3:
-            raise ValueError(f"Expected 3D node_tensor after correction, got shape {node_tensor.shape}")
+    def forward(self, data):
+        x, edge_index, edge_attr, batch = data.x, data.edge_index, data.edge_attr, data.batch
         
-        batch_size = node_tensor.size(0)
+        # Node feature processing
+        for conv, bn in zip(self.convs, self.bns):
+            x = conv(x, edge_index)
+            x = bn(x)
+            x = self.relu(x)
+            x = self.dropout(x)
         
-        # Initialize hidden states
-        h0 = torch.zeros(self.num_layers, batch_size, self.hidden_dim).to(node_tensor.device)
-        c0 = torch.zeros(self.num_layers, batch_size, self.hidden_dim).to(node_tensor.device)
+        # Global pooling
+        node_repr = global_mean_pool(x, batch)
         
-        # Node LSTM
-        node_out, _ = self.node_lstm(node_tensor, (h0, c0))
-        node_repr = node_out[:, -1, :]
+        # Edge feature processing
+        edge_repr = self.edge_mlp(edge_attr)
+        edge_repr = edge_repr.mean(dim=1)  # [batch_size, hidden_dim]
         
-        # Edge LSTM
-        edge_out, _ = self.edge_lstm(edge_tensor, (h0, c0))
-        edge_repr = edge_out[:, -1, :]
-        
-        # Combine representations
+        # Combine
         combined = torch.cat((node_repr, edge_repr), dim=1)
         x = self.relu(self.fc1(combined))
         x = self.dropout(x)
@@ -116,7 +142,7 @@ class ExecutionTimeLSTM(nn.Module):
 
 def train_model(model, train_loader, val_loader, criterion, optimizer, epochs, patience=PATIENCE, model_path="best_model.pth"):
     """
-    Train the LSTM model with early stopping and save the best model.
+    Train the GNN model with early stopping.
     """
     best_val_loss = float("inf")
     patience_counter = 0
@@ -124,22 +150,20 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, epochs, p
         model.train()
         train_loss = 0.0
         train_orig_loss = 0.0
-        for node_tensor, edge_tensor, exec_time in train_loader:
-            node_tensor, edge_tensor, exec_time = node_tensor.to(DEVICE), edge_tensor.to(DEVICE), exec_time.to(DEVICE)
-            exec_time_norm = exec_time.squeeze(-1)
-            
+        for data in train_loader:
+            data = data.to(DEVICE)
             optimizer.zero_grad()
-            output = model(node_tensor, edge_tensor)
-            loss = criterion(output, exec_time_norm)
+            output = model(data)
+            loss = criterion(output, data.y.squeeze(-1))
             loss.backward()
             optimizer.step()
-            train_loss += loss.item() * node_tensor.size(0)
+            train_loss += loss.item() * data.num_graphs
             
-            # Compute loss in original scale
+            # Original scale loss
             output_orig = output * train_loader.dataset.time_std + train_loader.dataset.time_mean
-            exec_time_orig = exec_time_norm * train_loader.dataset.time_std + train_loader.dataset.time_mean
-            orig_loss = criterion(output_orig, exec_time_orig)
-            train_orig_loss += orig_loss.item() * node_tensor.size(0)
+            y_orig = data.y.squeeze(-1) * train_loader.dataset.time_std + train_loader.dataset.time_mean
+            orig_loss = criterion(output_orig, y_orig)
+            train_orig_loss += orig_loss.item() * data.num_graphs
         
         train_loss /= len(train_loader.dataset)
         train_orig_loss /= len(train_loader.dataset)
@@ -149,18 +173,16 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, epochs, p
         val_loss = 0.0
         val_orig_loss = 0.0
         with torch.no_grad():
-            for node_tensor, edge_tensor, exec_time in val_loader:
-                node_tensor, edge_tensor, exec_time = node_tensor.to(DEVICE), edge_tensor.to(DEVICE), exec_time.to(DEVICE)
-                exec_time_norm = exec_time.squeeze(-1)
-                output = model(node_tensor, edge_tensor)
-                loss = criterion(output, exec_time_norm)
-                val_loss += loss.item() * node_tensor.size(0)
+            for data in val_loader:
+                data = data.to(DEVICE)
+                output = model(data)
+                loss = criterion(output, data.y.squeeze(-1))
+                val_loss += loss.item() * data.num_graphs
                 
-                # Original scale loss
                 output_orig = output * val_loader.dataset.time_std + val_loader.dataset.time_mean
-                exec_time_orig = exec_time_norm * val_loader.dataset.time_std + val_loader.dataset.time_mean
-                orig_loss = criterion(output_orig, exec_time_orig)
-                val_orig_loss += orig_loss.item() * node_tensor.size(0)
+                y_orig = data.y.squeeze(-1) * val_loader.dataset.time_std + val_loader.dataset.time_mean
+                orig_loss = criterion(output_orig, y_orig)
+                val_orig_loss += orig_loss.item() * data.num_graphs
         
         val_loss /= len(val_loader.dataset)
         val_orig_loss /= len(val_loader.dataset)
@@ -192,29 +214,26 @@ def evaluate_model(model, test_loader, dataset, model_path="best_model.pth"):
     mae = 0.0
     
     with torch.no_grad():
-        for node_tensor, edge_tensor, exec_time in test_loader:
-            node_tensor, edge_tensor = node_tensor.to(DEVICE), edge_tensor.to(DEVICE)
-            exec_time_norm = exec_time.squeeze(-1)
-            output = model(node_tensor, edge_tensor)
-            # Denormalize
+        for data in test_loader:
+            data = data.to(DEVICE)
+            output = model(data)
             output_orig = output * dataset.time_std + dataset.time_mean
-            exec_time_orig = exec_time_norm * dataset.time_std + dataset.time_mean
+            y_orig = data.y.squeeze(-1) * dataset.time_std + dataset.time_mean
             predictions.extend(output_orig.cpu().numpy())
-            actuals.extend(exec_time_orig.cpu().numpy())
-            mse += ((output_orig - exec_time_orig) ** 2).sum().item()
-            mae += torch.abs(output_orig - exec_time_orig).sum().item()
+            actuals.extend(y_orig.cpu().numpy())
+            mse += ((output_orig - y_orig) ** 2).sum().item()
+            mae += torch.abs(output_orig - y_orig).sum().item()
     
     mse /= len(test_loader.dataset)
     mae /= len(test_loader.dataset)
     logging.info(f"Test MSE: {mse:.6f}, Test MAE: {mae:.6f}")
-    # Log sample predictions
     for i in range(min(5, len(predictions))):
         logging.info(f"Sample {i+1}: Predicted {predictions[i]:.2f} ms, Actual {actuals[i]:.2f} ms")
     return predictions, actuals
 
 def main():
     # Load dataset
-    dataset_path = "representation_halide.pkl"
+    dataset_path = "representation_halide_v2.pkl"
     if not os.path.exists(dataset_path):
         logging.error(f"Dataset {dataset_path} does not exist.")
         return
@@ -226,22 +245,24 @@ def main():
     
     # Split data
     train_data, test_data = train_test_split(data, test_size=0.2, random_state=42)
-    train_data, val_data = train_test_split(train_data, test_size=0.25, random_state=42)  # 60% train, 20% val, 20% test
+    train_data, val_data = train_test_split(train_data, test_size=0.25, random_state=42)
     
     train_dataset = HalideDataset(train_data)
-    val_dataset = HalideDataset(val_data)  # Use separate validation data
+    val_dataset = HalideDataset(val_data)
     test_dataset = HalideDataset(test_data)
     
-    # Check for low variance
     if train_dataset.time_std < 1e-4:
-        logging.warning("Execution time variance is very low. Model may not learn meaningful patterns.")
+        logging.error("Execution time variance too low. Check dataset creation.")
+        return
     
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE)
     test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE)
     
     # Initialize model
-    model = ExecutionTimeLSTM().to(DEVICE)
+    node_input_dim = train_dataset.node_mask.sum().item()
+    edge_input_dim = train_dataset.edge_mask.sum().item()
+    model = ExecutionTimeGNN(node_input_dim, edge_input_dim).to(DEVICE)
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
     
