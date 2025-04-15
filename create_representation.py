@@ -11,7 +11,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # Constants
 MAX_NODES = 50
 MAX_EDGES = 50
-NODE_FEATURE_DIM = 67  # 24 ops + 8 access patterns + 35 scheduling (match model)
+NODE_FEATURE_DIM = 67  # 24 ops + 8 access patterns + 35 scheduling
 EDGE_FEATURE_DIM = 80  # 16 footprint + 64 Jacobian
 DATA_DIR = "synthetic_data"
 OUTPUT_PATH = "representation_halide_v2.pkl"
@@ -49,7 +49,7 @@ def initialize_scheduling_features():
         "split_factors": [0] * 10,
         "reorder_indices": [0] * 5,
         "fusion_levels": [0] * 5
-    }
+    })
 
 def extract_features_from_node(node):
     """Extract features for a single node."""
@@ -160,22 +160,27 @@ def extract_edge_features(edge):
     return torch.tensor(edge_features, dtype=torch.float32)
 
 def create_representation(data_dir):
-    """Create dataset from JSON files."""
+    """Create dataset from JSON files in subfolders."""
     # Verify directory
     if not os.path.isdir(data_dir):
         logging.error(f"Directory {data_dir} does not exist.")
         return []
     
-    json_files = [f for f in os.listdir(data_dir) if f.endswith(".json")]
+    json_files = []
+    for root, _, files in os.walk(data_dir):
+        for file in files:
+            if file.endswith(".json"):
+                json_files.append(os.path.join(root, file))
+    
     if not json_files:
-        logging.error(f"No JSON files found in {data_dir}.")
+        logging.error(f"No JSON files found in {data_dir} or its subfolders.")
         return []
     
-    logging.info(f"Found {len(json_files)} JSON files in {data_dir}")
+    logging.info(f"Found {len(json_files)} JSON files across subfolders in {data_dir}")
     
     dataset = []
-    for filename in json_files:
-        file_path = os.path.join(data_dir, filename)
+    for file_path in json_files:
+        program_id = os.path.basename(os.path.dirname(file_path))  # e.g., "program1"
         try:
             with open(file_path, "r") as f:
                 prog_details = json.load(f)
@@ -251,7 +256,8 @@ def create_representation(data_dir):
             "node_tensor": node_tensor,
             "edge_tensor": edge_tensor,
             "execution_time": torch.tensor(execution_time, dtype=torch.float32),
-            "file_path": file_path
+            "file_path": file_path,
+            "program_id": program_id
         })
     
     # Validate dataset
@@ -271,7 +277,27 @@ def create_representation(data_dir):
     
     return dataset
 
+def inspect_json(data_dir):
+    """Inspect a few JSON files for debugging."""
+    json_files = []
+    for root, _, files in os.walk(data_dir):
+        for file in files:
+            if file.endswith(".json"):
+                json_files.append(os.path.join(root, file))
+    
+    for file_path in json_files[:3]:  # Inspect first 3 files
+        try:
+            with open(file_path, "r") as f:
+                data = json.load(f)
+            metrics = data.get("Metrics", [])
+            exec_time = next((entry["value"] for entry in metrics if entry.get("name") == "total_execution_time_ms"), "Missing")
+            nodes = data.get("ComputationGraph", {}).get("nodes", {})
+            logging.info(f"{file_path} - Exec time: {exec_time}, Nodes: {len(nodes)}")
+        except Exception as e:
+            logging.error(f"Failed to inspect {file_path}: {e}")
+
 def main():
+    inspect_json(DATA_DIR)
     dataset = create_representation(DATA_DIR)
     if dataset:
         with open(OUTPUT_PATH, "wb") as f:
