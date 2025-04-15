@@ -8,7 +8,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 def parse_json_file(file_path: str) -> Optional[Dict]:
     """
-    Parse a JSON file and extract execution time and nodes.
+    Parse a JSON file and extract all relevant details.
     Returns a dictionary with parsed data or None if invalid.
     """
     try:
@@ -19,12 +19,13 @@ def parse_json_file(file_path: str) -> Optional[Dict]:
         execution_time = None
         if 'total_execution_time_ms' in data:
             execution_time = data['total_execution_time_ms']
-            if not isinstance(execution_time, (int, float)) or execution_time <= 0:
-                logging.warning(f"Invalid execution time {execution_time} in {file_path}. Using default: 1.0")
-                execution_time = 1.0
-        else:
-            logging.warning(f"No 'total_execution_time_ms' found in {file_path}. Using default: 1.0")
+        elif 'Metrics' in data and 'total_execution_time_ms' in data['Metrics']:
+            execution_time = data['Metrics']['total_execution_time_ms']
+        if execution_time is None or not isinstance(execution_time, (int, float)) or execution_time <= 0:
+            logging.warning(f"Invalid or missing execution time in {file_path}. Using default: 1.0")
             execution_time = 1.0
+        else:
+            logging.debug(f"Found execution time: {execution_time} ms in {file_path}")
 
         # Extract nodes
         nodes = []
@@ -37,19 +38,32 @@ def parse_json_file(file_path: str) -> Optional[Dict]:
             logging.warning(f"No 'programming_details.Nodes' found in {file_path}.")
             return None
 
-        if not nodes:
-            logging.warning(f"Skipping {file_path} due to empty nodes list.")
-            return None
-
-        # Extract edges (optional)
+        # Extract edges
         edges = data.get('programming_details', {}).get('Edges', [])
 
-        return {
+        # Extract additional node details (e.g., Details, scheduling_feature)
+        node_details = []
+        for node in nodes:
+            node_info = {
+                'name': node.get('name', ''),
+                'Details': node.get('Details', {}),
+                'scheduling_feature': node.get('scheduling_feature', None),
+                # Add other node fields as needed
+            }
+            node_details.append(node_info)
+
+        # Store all extracted data
+        sample = {
+            'file_path': file_path,
             'execution_time_ms': execution_time,
-            'nodes': nodes,
+            'nodes': node_details,
+            'node_count': len(nodes),
             'edges': edges,
-            'file_path': file_path
+            'edge_count': len(edges),
+            'raw_data': data  # Store raw JSON for debugging or additional fields
         }
+
+        return sample
 
     except json.JSONDecodeError as e:
         logging.error(f"Failed to parse JSON in {file_path}: {e}")
@@ -67,7 +81,7 @@ def find_json_files(root_dir: str) -> List[str]:
         for file in files:
             if file.endswith('.json'):
                 json_files.append(os.path.join(root, file))
-    return json_files
+    return sorted(json_files)  # Sort for consistent processing
 
 def create_dataset(root_dir: str) -> List[Dict]:
     """
@@ -85,8 +99,8 @@ def create_dataset(root_dir: str) -> List[Dict]:
         sample = parse_json_file(file_path)
         if sample:
             dataset.append(sample)
-            logging.info(f"Processed {file_path}: {len(sample['nodes'])} nodes, "
-                         f"execution time {sample['execution_time_ms']} ms")
+            logging.info(f"Processed {file_path}: {sample['node_count']} nodes, "
+                         f"{sample['edge_count']} edges, execution time {sample['execution_time_ms']} ms")
         else:
             logging.warning(f"Skipped invalid sample: {file_path}")
 
@@ -97,17 +111,31 @@ def create_dataset(root_dir: str) -> List[Dict]:
     logging.info(f"Created dataset with {len(dataset)} valid samples.")
     return dataset
 
+def save_dataset(dataset: List[Dict], output_file: str):
+    """
+    Save the dataset to a JSON file and a summary to a text file.
+    """
+    # Save full dataset as JSON
+    with open(output_file, 'w') as f:
+        json.dump(dataset, f, indent=2)
+    logging.info(f"Dataset saved to {output_file}")
+
+    # Save summary to text file
+    summary_file = "dataset_summary.txt"
+    with open(summary_file, "w") as f:
+        for sample in dataset:
+            f.write(f"File: {sample['file_path']}, Nodes: {sample['node_count']}, "
+                    f"Edges: {sample['edge_count']}, Execution Time: {sample['execution_time_ms']} ms\n")
+    logging.info(f"Dataset summary saved to {summary_file}")
+
 if __name__ == "__main__":
     # Define the root directory
     root_dir = "synthetic_data"
+    output_file = "synthetic_dataset.json"
+    
     try:
         dataset = create_dataset(root_dir)
-        # Optionally, save the dataset to a file or process further
-        with open("dataset_summary.txt", "w") as f:
-            for sample in dataset:
-                f.write(f"File: {sample['file_path']}, Nodes: {len(sample['nodes'])}, "
-                        f"Execution Time: {sample['execution_time_ms']} ms\n")
-        logging.info("Dataset summary saved to dataset_summary.txt")
+        save_dataset(dataset, output_file)
     except ValueError as e:
         logging.error(f"Dataset creation failed: {e}")
     except Exception as e:
