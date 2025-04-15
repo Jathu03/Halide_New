@@ -49,7 +49,7 @@ def initialize_scheduling_features():
         "split_factors": [0] * 10,
         "reorder_indices": [0] * 5,
         "fusion_levels": [0] * 5
-    })
+    }
 
 def extract_features_from_node(node):
     """Extract features for a single node."""
