@@ -21,13 +21,51 @@ MAX_SCHED_FEATURES = 35
 MAX_FOOTPRINT_LEN = 16
 MAX_JACOBIAN_SIZE = 64
 
-# Assumed dimension sizes for defaults (based on common image processing bounds)
-DIM_SIZES = [2000, 2000, 3, 1, 1, 1, 1, 1]  # Adjust based on domain knowledge
+# Refined dimension sizes (tuned for image processing)
+DIM_SIZES = [512, 512, 3, 1, 1, 1, 1, 1]  # Adjusted from 2000 to 512 based on '511' in logs
 
 # Device for tensors
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def parse_footprint(footprint):
+def extract_constant(value, is_max):
+    """
+    Extract a numerical constant from a complex expression (e.g., 'max(min(..., 511), 0)').
+    Returns a float or None if no constant is found.
+    """
+    # Find all numbers in the expression
+    numbers = re.findall(r'-?\d*\.?\d+', value)
+    if not numbers:
+        return None
+    
+    # Convert to floats and filter out irrelevant values (e.g., negative bounds for max)
+    numbers = [float(n) for n in numbers]
+    valid_numbers = [n for n in numbers if n >= 0 or not is_max]
+    
+    if not valid_numbers:
+        return None
+    
+    # For max, take the largest; for min, take the smallest non-negative if available
+    return max(valid_numbers) if is_max else min([n for n in valid_numbers if n >= 0] or valid_numbers)
+
+def get_default_bound(json_data, dim_idx, is_max):
+    """
+    Get a default bound from scheduling features or DIM_SIZES.
+    """
+    try:
+        sched = json_data.get("programming_details", {}).get("Schedule", [])
+        for entry in sched:
+            details = entry.get("Details", {})
+            if "loop_extent" in details:
+                return float(details["loop_extent"]) if is_max else 0.0
+            if "points_computed_total" in details:
+                # Rough estimate: assume square image for dim 0/1
+                size = float(details["points_computed_total"]) ** 0.5
+                return size if is_max else 0.0
+    except Exception:
+        pass
+    return DIM_SIZES[dim_idx] if is_max else 0.0
+
+def parse_footprint(footprint, json_data):
     """
     Parse footprint into a numerical vector of min/max bounds.
     Returns a vector of length MAX_FOOTPRINT_LEN.
@@ -39,40 +77,39 @@ def parse_footprint(footprint):
             value = entry.split(":")[-1].strip()
             value = value.replace("(", "").replace(")", "")
             
-            # Determine dimension and min/max from entry name (e.g., 'Min 1', 'Max 2')
+            # Determine dimension and min/max
             dim_match = re.search(r'(Min|Max)\s*(\d+)', entry)
-            is_max = dim_match.group(1) == "Max" if dim_match else False
+            is_max = dim_match.group(1) == "Max" if dim_match else (i % 2 == 1)
             dim_idx = int(dim_match.group(2)) if dim_match else i // 2
             
             # Handle numerical values or fractions
             if re.match(r'^-?\d*\.?\d+$', value):
                 bounds[i] = float(value)
-            elif "/" in value and not value.startswith("select"):
+            elif "/" in value and not value.startswith("select") and not any(op in value for op in ["min", "max"]):
                 num, denom = value.split("/")
                 bounds[i] = float(num.strip()) / float(denom.strip())
             elif value in ["0", "1"]:
                 bounds[i] = float(value)
             else:
-                # Handle complex expressions like select/min/max
-                num_match = re.search(r'\b(\d+)\b', value)
-                if num_match and "select" in value:
-                    # Extract constant from select/min/max (e.g., 1999, 2)
-                    num = float(num_match.group(1))
+                # Handle complex expressions (min, max, select) or symbolic values
+                constant = extract_constant(value, is_max)
+                if constant is not None:
+                    # Adjust based on min/max context
                     if "min(" in value and is_max:
-                        bounds[i] = num  # e.g., min(..., 1999) for max
+                        bounds[i] = constant
                     elif "max(" in value and not is_max:
-                        bounds[i] = 0.0  # e.g., max(..., 0) for min
+                        bounds[i] = 0.0
                     else:
-                        bounds[i] = num if is_max else 0.0
+                        bounds[i] = constant if is_max else 0.0
                 else:
-                    # Symbolic or unresolved (e.g., 'lambda_0._0.min')
-                    default = DIM_SIZES[dim_idx] if is_max else 0.0
+                    # Symbolic (e.g., 'lambda_6._0.min') or unresolved arithmetic (e.g., 'x/8')
+                    default = get_default_bound(json_data, dim_idx, is_max)
                     bounds[i] = default
                     logging.warning(f"Non-numeric footprint entry '{entry}', assigned {default}")
         except Exception as e:
             dim_idx = i // 2
             is_max = (i % 2) == 1
-            default = DIM_SIZES[dim_idx] if is_max else 0.0
+            default = get_default_bound(json_data, dim_idx, is_max)
             bounds[i] = default
             logging.warning(f"Failed to parse footprint entry '{entry}': {e}, assigned {default}")
     return bounds
@@ -80,7 +117,6 @@ def parse_footprint(footprint):
 def parse_jacobian(jacobian):
     """
     Parse load Jacobian into a flattened vector.
-    Returns a vector of length MAX_JACOBIAN_SIZE.
     """
     flat_jacobian = [0.0] * MAX_JACOBIAN_SIZE
     try:
@@ -209,12 +245,12 @@ def get_node_representation(node, node_indices):
     node_vec = op_hist + mem_access + sched_features
     return node_vec
 
-def get_edge_representation(edge):
+def get_edge_representation(edge, json_data):
     """
     Create a feature vector for an edge.
     """
     details = edge.get("Details", {})
-    footprint = parse_footprint(details.get("Footprint", []))
+    footprint = parse_footprint(details.get("Footprint", []), json_data)
     jacobian = parse_jacobian(details.get("Load Jacobians", []))
     
     edge_vec = footprint + jacobian
@@ -245,7 +281,7 @@ def create_representation(json_data, file_path):
         node_features = node_features[:MAX_NODES]
         node_tensor = torch.tensor(node_features, dtype=torch.float32, device=DEVICE)
         
-        edge_features = [get_edge_representation(edge) for edge in edges]
+        edge_features = [get_edge_representation(edge, json_data) for edge in edges]
         while len(edge_features) < MAX_EDGES:
             edge_features.append([0.0] * (MAX_FOOTPRINT_LEN + MAX_JACOBIAN_SIZE))
         edge_features = edge_features[:MAX_EDGES]
