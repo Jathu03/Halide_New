@@ -6,19 +6,20 @@ from copy import deepcopy
 from collections import defaultdict
 import pickle
 import logging
+import re
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Constants for padding
-MAX_NODES = 50  # Maximum number of nodes in a graph
-MAX_EDGES = 50  # Maximum number of edges
-MAX_DIMS = 8    # Increased to handle larger Jacobians
-MAX_OPS = 24    # Number of operation types in op_histogram
-MAX_ACCESS_PATTERNS = 8  # Number of memory access patterns
-MAX_SCHED_FEATURES = 35  # Number of scheduling features
-MAX_FOOTPRINT_LEN = 16   # Increased to match MAX_DIMS * 2
-MAX_JACOBIAN_SIZE = 64   # Increased to MAX_DIMS * MAX_DIMS
+MAX_NODES = 50
+MAX_EDGES = 50
+MAX_DIMS = 8
+MAX_OPS = 24
+MAX_ACCESS_PATTERNS = 8
+MAX_SCHED_FEATURES = 35
+MAX_FOOTPRINT_LEN = 16
+MAX_JACOBIAN_SIZE = 64
 
 # Device for tensors
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -31,17 +32,24 @@ def parse_footprint(footprint):
     bounds = [0.0] * MAX_FOOTPRINT_LEN
     for i, entry in enumerate(footprint[:MAX_FOOTPRINT_LEN]):
         try:
-            # Extract numerical value from min/max expression
+            # Extract the value after the colon
             value = entry.split(":")[-1].strip()
-            # Handle simple numerical values
             value = value.replace("(", "").replace(")", "")
-            if "/" in value:
-                num, denom = value.split("/")
-                bounds[i] = float(num) / float(denom)
-            else:
+            
+            # Handle numerical values, fractions, or expressions
+            if re.match(r'^-?\d*\.?\d+$', value):  # Integer or float
                 bounds[i] = float(value)
+            elif "/" in value:  # Fraction
+                num, denom = value.split("/")
+                bounds[i] = float(num.strip()) / float(denom.strip())
+            elif value in ["0", "1"]:  # Single digits
+                bounds[i] = float(value)
+            else:
+                # Non-numeric or symbolic value (e.g., 'all_r$1._0.max')
+                logging.warning(f"Non-numeric footprint entry '{entry}', assigning 0.0")
+                bounds[i] = 0.0
         except Exception as e:
-            logging.warning(f"Failed to parse footprint entry {entry}: {e}")
+            logging.warning(f"Failed to parse footprint entry '{entry}': {e}")
             bounds[i] = 0.0
     return bounds
 
@@ -60,14 +68,13 @@ def parse_jacobian(jacobian):
                     logging.warning(f"Jacobian index {idx} exceeds MAX_JACOBIAN_SIZE {MAX_JACOBIAN_SIZE}")
                     continue
                 try:
-                    # Handle fractions and numerical values
                     if "/" in val:
                         num, denom = val.split("/")
                         flat_jacobian[idx] = float(num) / float(denom)
                     else:
                         flat_jacobian[idx] = float(val)
                 except Exception as e:
-                    logging.warning(f"Failed to parse Jacobian value {val}: {e}")
+                    logging.warning(f"Failed to parse Jacobian value '{val}': {e}")
                     flat_jacobian[idx] = 0.0
     except Exception as e:
         logging.error(f"Error parsing Jacobian {jacobian}: {e}")
@@ -93,7 +100,7 @@ def parse_op_histogram(op_hist):
                 idx = op_names.index(op_name)
                 op_counts[idx] = count
         except Exception as e:
-            logging.warning(f"Failed to parse op_histogram entry {entry}: {e}")
+            logging.warning(f"Failed to parse op_histogram entry '{entry}': {e}")
     return op_counts
 
 def parse_memory_access(access_patterns):
@@ -112,7 +119,7 @@ def parse_memory_access(access_patterns):
                 idx = pattern_names.index(pattern)
                 access_vec[idx] = sum(values) / len(values) if values else 0.0
         except Exception as e:
-            logging.warning(f"Failed to parse memory access entry {entry}: {e}")
+            logging.warning(f"Failed to parse memory access entry '{entry}': {e}")
     return access_vec
 
 def parse_scheduling_features(sched_features):
@@ -141,18 +148,16 @@ def parse_scheduling_features(sched_features):
             if fname in sched_features:
                 feature_vec[i] = float(sched_features[fname])
         except Exception as e:
-            logging.warning(f"Failed to parse scheduling feature {fname}: {e}")
+            logging.warning(f"Failed to parse scheduling feature '{fname}': {e}")
     return feature_vec
 
 def build_graph_tree(nodes, edges):
     """
     Build a tree-like representation of the graph based on dependencies.
-    Returns a dictionary representing the tree and node indices.
     """
     node_indices = {node["Name"]: i for i, node in enumerate(nodes)}
     tree = {"nodes": [], "children": defaultdict(list)}
     
-    # Initialize nodes
     for node in nodes:
         tree["nodes"].append({
             "name": node["Name"],
@@ -160,7 +165,6 @@ def build_graph_tree(nodes, edges):
             "has_computation": "update" not in node["Name"]
         })
     
-    # Build dependencies
     for edge in edges:
         from_node = edge["From"]
         to_node = edge["To"]
@@ -172,7 +176,6 @@ def build_graph_tree(nodes, edges):
 def get_node_representation(node, node_indices):
     """
     Create a feature vector for a node.
-    Includes op_histogram, memory access patterns, and scheduling features.
     """
     details = node.get("Details", {})
     op_hist = parse_op_histogram(details.get("Op histogram", []))
@@ -185,7 +188,6 @@ def get_node_representation(node, node_indices):
 def get_edge_representation(edge):
     """
     Create a feature vector for an edge.
-    Includes footprint bounds and load Jacobian.
     """
     details = edge.get("Details", {})
     footprint = parse_footprint(details.get("Footprint", []))
@@ -197,7 +199,6 @@ def get_edge_representation(edge):
 def create_representation(json_data, file_path):
     """
     Create a representation for a single JSON file.
-    Returns a tuple: (tree, node_tensor, edge_tensor, execution_time).
     """
     try:
         prog_details = json_data.get("programming_details", {})
@@ -212,34 +213,20 @@ def create_representation(json_data, file_path):
             0.0
         )
         
-        # Build graph tree
         tree, node_indices = build_graph_tree(nodes, edges)
         
-        # Node representations
-        node_features = []
-        for node in nodes:
-            node_vec = get_node_representation(node, node_indices)
-            node_features.append(node_vec)
-        
-        # Pad node features
+        node_features = [get_node_representation(node, node_indices) for node in nodes]
         while len(node_features) < MAX_NODES:
             node_features.append([0.0] * (MAX_OPS + MAX_ACCESS_PATTERNS + MAX_SCHED_FEATURES))
         node_features = node_features[:MAX_NODES]
         node_tensor = torch.tensor(node_features, dtype=torch.float32, device=DEVICE)
         
-        # Edge representations
-        edge_features = []
-        for edge in edges:
-            edge_vec = get_edge_representation(edge)
-            edge_features.append(edge_vec)
-        
-        # Pad edge features
+        edge_features = [get_edge_representation(edge) for edge in edges]
         while len(edge_features) < MAX_EDGES:
             edge_features.append([0.0] * (MAX_FOOTPRINT_LEN + MAX_JACOBIAN_SIZE))
         edge_features = edge_features[:MAX_EDGES]
         edge_tensor = torch.tensor(edge_features, dtype=torch.float32, device=DEVICE)
         
-        # Execution time
         exec_time_tensor = torch.tensor([execution_time], dtype=torch.float32, device=DEVICE)
         
         return {
@@ -256,7 +243,6 @@ def create_representation(json_data, file_path):
 def process_directory(root_dir):
     """
     Process all JSON files in the synthetic_data directory.
-    Returns a list of representations.
     """
     dataset = []
     for program_folder in os.listdir(root_dir):
@@ -299,7 +285,7 @@ def main():
     save_dataset(dataset, output_path)
     
     logging.info(f"Processed {len(dataset)} files.")
-    for rep in dataset[:5]:  # Print sample for verification
+    for rep in dataset[:5]:
         logging.info(f"File: {rep['file_path']}, Nodes: {rep['node_tensor'].shape}, "
                      f"Edges: {rep['edge_tensor'].shape}, Exec Time: {rep['execution_time'].item()}")
 
