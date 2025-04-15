@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 from typing import Dict, List, Optional
 
 # Configure logging
@@ -31,6 +32,7 @@ def parse_json_file(file_path: str) -> Optional[Dict]:
             nodes = data['programming_details']['Nodes']
             if not nodes:
                 logging.warning(f"No nodes found in 'programming_details.Nodes' for {file_path}.")
+                return None
         else:
             logging.warning(f"No 'programming_details.Nodes' found in {file_path}.")
             return None
@@ -39,7 +41,7 @@ def parse_json_file(file_path: str) -> Optional[Dict]:
             logging.warning(f"Skipping {file_path} due to empty nodes list.")
             return None
 
-        # Extract edges (optional, for completeness)
+        # Extract edges (optional)
         edges = data.get('programming_details', {}).get('Edges', [])
 
         return {
@@ -56,18 +58,37 @@ def parse_json_file(file_path: str) -> Optional[Dict]:
         logging.error(f"Unexpected error processing {file_path}: {e}")
         return None
 
-def create_dataset(json_files: List[str]) -> List[Dict]:
+def find_json_files(root_dir: str) -> List[str]:
     """
-    Create a dataset from a list of JSON files.
+    Recursively find all JSON files in the given directory and its subfolders.
+    """
+    json_files = []
+    for root, _, files in os.walk(root_dir):
+        for file in files:
+            if file.endswith('.json'):
+                json_files.append(os.path.join(root, file))
+    return json_files
+
+def create_dataset(root_dir: str) -> List[Dict]:
+    """
+    Create a dataset from all JSON files in subfolders of the given directory.
     Returns a list of valid samples.
     """
+    # Find all JSON files
+    json_files = find_json_files(root_dir)
+    if not json_files:
+        logging.error(f"No JSON files found in {root_dir} or its subfolders.")
+        raise ValueError("Dataset creation failed: No JSON files found.")
+
     dataset = []
     for file_path in json_files:
         sample = parse_json_file(file_path)
         if sample:
             dataset.append(sample)
+            logging.info(f"Processed {file_path}: {len(sample['nodes'])} nodes, "
+                         f"execution time {sample['execution_time_ms']} ms")
         else:
-            logging.warning(f"Skipping invalid sample: {file_path}")
+            logging.warning(f"Skipped invalid sample: {file_path}")
 
     if not dataset:
         logging.error("No valid samples created. Check JSON files for valid 'Nodes' and 'execution_time_ms'.")
@@ -76,16 +97,18 @@ def create_dataset(json_files: List[str]) -> List[Dict]:
     logging.info(f"Created dataset with {len(dataset)} valid samples.")
     return dataset
 
-# Example usage
 if __name__ == "__main__":
-    json_files = [
-        "synthetic_data/program_50077/0_15.json",
-        # Add other JSON files as needed
-    ]
+    # Define the root directory
+    root_dir = "synthetic_data"
     try:
-        dataset = create_dataset(json_files)
-        for sample in dataset:
-            logging.info(f"Processed {sample['file_path']}: {len(sample['nodes'])} nodes, "
-                         f"execution time {sample['execution_time_ms']} ms")
+        dataset = create_dataset(root_dir)
+        # Optionally, save the dataset to a file or process further
+        with open("dataset_summary.txt", "w") as f:
+            for sample in dataset:
+                f.write(f"File: {sample['file_path']}, Nodes: {len(sample['nodes'])}, "
+                        f"Execution Time: {sample['execution_time_ms']} ms\n")
+        logging.info("Dataset summary saved to dataset_summary.txt")
     except ValueError as e:
         logging.error(f"Dataset creation failed: {e}")
+    except Exception as e:
+        logging.error(f"Unexpected error: {e}")
