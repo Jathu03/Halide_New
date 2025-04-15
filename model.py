@@ -11,16 +11,18 @@ import os
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Constants (must match dataset creation)
+# Constants
 MAX_NODES = 50
 MAX_EDGES = 50
 NODE_FEATURE_DIM = 67  # 24 ops + 8 access patterns + 35 scheduling features
 EDGE_FEATURE_DIM = 80  # 16 footprint + 64 Jacobian
-HIDDEN_DIM = 128
+HIDDEN_DIM = 256  # Increased for better capacity
 NUM_LAYERS = 2
 BATCH_SIZE = 32
 EPOCHS = 50
-LEARNING_RATE = 0.001
+LEARNING_RATE = 0.0005  # Reduced to stabilize training
+PATIENCE = 10  # For early stopping
+DROPOUT = 0.3  # To prevent overfitting
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class HalideDataset(Dataset):
@@ -40,6 +42,10 @@ class HalideDataset(Dataset):
         self.edge_std = edge_tensors.std(dim=(0, 1), keepdim=True) + 1e-6
         self.time_mean = exec_times.mean()
         self.time_std = exec_times.std() + 1e-6
+        
+        # Log execution time stats
+        logging.info(f"Exec time stats - Mean: {self.time_mean:.4f}, Std: {self.time_std:.4f}, "
+                     f"Min: {exec_times.min():.4f}, Max: {exec_times.max():.4f}")
 
     def __len__(self):
         return len(self.data)
@@ -50,8 +56,6 @@ class HalideDataset(Dataset):
         node_tensor = (item["node_tensor"] - self.node_mean) / self.node_std
         edge_tensor = (item["edge_tensor"] - self.edge_mean) / self.edge_std
         exec_time = (item["execution_time"].item() - self.time_mean) / self.time_std
-        # Ensure correct shapes
-        logging.debug(f"__getitem__ shapes - Node: {node_tensor.shape}, Edge: {edge_tensor.shape}")
         return (
             node_tensor,  # [MAX_NODES, NODE_FEATURE_DIM]
             edge_tensor,  # [MAX_EDGES, EDGE_FEATURE_DIM]
@@ -63,28 +67,29 @@ class ExecutionTimeLSTM(nn.Module):
     LSTM model to predict execution time from node and edge tensors.
     """
     def __init__(self, node_input_dim=NODE_FEATURE_DIM, edge_input_dim=EDGE_FEATURE_DIM,
-                 hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS):
+                 hidden_dim=HIDDEN_DIM, num_layers=NUM_LAYERS, dropout=DROPOUT):
         super(ExecutionTimeLSTM, self).__init__()
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         
         # Node LSTM
-        self.node_lstm = nn.LSTM(node_input_dim, hidden_dim, num_layers, batch_first=True)
+        self.node_lstm = nn.LSTM(node_input_dim, hidden_dim, num_layers, batch_first=True, dropout=dropout)
         # Edge LSTM
-        self.edge_lstm = nn.LSTM(edge_input_dim, hidden_dim, num_layers, batch_first=True)
+        self.edge_lstm = nn.LSTM(edge_input_dim, hidden_dim, num_layers, batch_first=True, dropout=dropout)
         # Fully connected layers
         self.fc1 = nn.Linear(hidden_dim * 2, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, 1)
         self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(dropout)
         
     def forward(self, node_tensor, edge_tensor):
         # Handle unexpected dimensions
         if node_tensor.dim() == 4 and node_tensor.size(1) == 1:
-            node_tensor = node_tensor.squeeze(1)  # [batch_size, 1, MAX_NODES, NODE_FEATURE_DIM] -> [batch_size, MAX_NODES, NODE_FEATURE_DIM]
-            edge_tensor = edge_tensor.squeeze(1)  # [batch_size, 1, MAX_EDGES, EDGE_FEATURE_DIM] -> [batch_size, MAX_EDGES, EDGE_FEATURE_DIM]
+            node_tensor = node_tensor.squeeze(1)
+            edge_tensor = edge_tensor.squeeze(1)
         elif node_tensor.dim() == 2:
-            node_tensor = node_tensor.unsqueeze(0)  # [MAX_NODES, NODE_FEATURE_DIM] -> [1, MAX_NODES, NODE_FEATURE_DIM]
-            edge_tensor = edge_tensor.unsqueeze(0)  # [MAX_EDGES, EDGE_FEATURE_DIM] -> [1, MAX_EDGES, EDGE_FEATURE_DIM]
+            node_tensor = node_tensor.unsqueeze(0)
+            edge_tensor = edge_tensor.unsqueeze(0)
         elif node_tensor.dim() != 3:
             raise ValueError(f"Expected 3D node_tensor after correction, got shape {node_tensor.shape}")
         
@@ -96,59 +101,84 @@ class ExecutionTimeLSTM(nn.Module):
         
         # Node LSTM
         node_out, _ = self.node_lstm(node_tensor, (h0, c0))
-        node_repr = node_out[:, -1, :]  # [batch_size, hidden_dim]
+        node_repr = node_out[:, -1, :]
         
         # Edge LSTM
         edge_out, _ = self.edge_lstm(edge_tensor, (h0, c0))
-        edge_repr = edge_out[:, -1, :]  # [batch_size, hidden_dim]
+        edge_repr = edge_out[:, -1, :]
         
         # Combine representations
         combined = torch.cat((node_repr, edge_repr), dim=1)
         x = self.relu(self.fc1(combined))
+        x = self.dropout(x)
         x = self.fc2(x)
         return x.squeeze(-1)
 
-def train_model(model, train_loader, val_loader, criterion, optimizer, epochs, model_path="best_model.pth"):
+def train_model(model, train_loader, val_loader, criterion, optimizer, epochs, patience=PATIENCE, model_path="best_model.pth"):
     """
-    Train the LSTM model and save the best model based on validation loss.
+    Train the LSTM model with early stopping and save the best model.
     """
     best_val_loss = float("inf")
+    patience_counter = 0
     for epoch in range(epochs):
         model.train()
         train_loss = 0.0
+        train_orig_loss = 0.0
         for node_tensor, edge_tensor, exec_time in train_loader:
             node_tensor, edge_tensor, exec_time = node_tensor.to(DEVICE), edge_tensor.to(DEVICE), exec_time.to(DEVICE)
-            # Log shapes for debugging
-            logging.debug(f"Batch shapes - Node: {node_tensor.shape}, Edge: {edge_tensor.shape}, Exec: {exec_time.shape}")
+            exec_time_norm = exec_time.squeeze(-1)
             
             optimizer.zero_grad()
             output = model(node_tensor, edge_tensor)
-            loss = criterion(output, exec_time.squeeze(-1))
+            loss = criterion(output, exec_time_norm)
             loss.backward()
             optimizer.step()
             train_loss += loss.item() * node_tensor.size(0)
+            
+            # Compute loss in original scale
+            output_orig = output * train_loader.dataset.time_std + train_loader.dataset.time_mean
+            exec_time_orig = exec_time_norm * train_loader.dataset.time_std + train_loader.dataset.time_mean
+            orig_loss = criterion(output_orig, exec_time_orig)
+            train_orig_loss += orig_loss.item() * node_tensor.size(0)
         
         train_loss /= len(train_loader.dataset)
+        train_orig_loss /= len(train_loader.dataset)
         
         # Validation
         model.eval()
         val_loss = 0.0
+        val_orig_loss = 0.0
         with torch.no_grad():
             for node_tensor, edge_tensor, exec_time in val_loader:
                 node_tensor, edge_tensor, exec_time = node_tensor.to(DEVICE), edge_tensor.to(DEVICE), exec_time.to(DEVICE)
+                exec_time_norm = exec_time.squeeze(-1)
                 output = model(node_tensor, edge_tensor)
-                loss = criterion(output, exec_time.squeeze(-1))
+                loss = criterion(output, exec_time_norm)
                 val_loss += loss.item() * node_tensor.size(0)
+                
+                # Original scale loss
+                output_orig = output * val_loader.dataset.time_std + val_loader.dataset.time_mean
+                exec_time_orig = exec_time_norm * val_loader.dataset.time_std + val_loader.dataset.time_mean
+                orig_loss = criterion(output_orig, exec_time_orig)
+                val_orig_loss += orig_loss.item() * node_tensor.size(0)
         
         val_loss /= len(val_loader.dataset)
+        val_orig_loss /= len(val_loader.dataset)
         
-        logging.info(f"Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}")
+        logging.info(f"Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.6f}, Train Orig Loss (ms): {train_orig_loss:.6f}, "
+                     f"Val Loss: {val_loss:.6f}, Val Orig Loss (ms): {val_orig_loss:.6f}")
         
         # Save best model
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             torch.save(model.state_dict(), model_path)
             logging.info(f"Saved best model with Val Loss: {val_loss:.6f}")
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                logging.info(f"Early stopping at epoch {epoch+1}")
+                break
 
 def evaluate_model(model, test_loader, dataset, model_path="best_model.pth"):
     """
@@ -164,18 +194,22 @@ def evaluate_model(model, test_loader, dataset, model_path="best_model.pth"):
     with torch.no_grad():
         for node_tensor, edge_tensor, exec_time in test_loader:
             node_tensor, edge_tensor = node_tensor.to(DEVICE), edge_tensor.to(DEVICE)
+            exec_time_norm = exec_time.squeeze(-1)
             output = model(node_tensor, edge_tensor)
-            # Denormalize predictions
-            output = output * dataset.time_std + dataset.time_mean
-            exec_time = exec_time.squeeze(-1) * dataset.time_std + dataset.time_mean
-            predictions.extend(output.cpu().numpy())
-            actuals.extend(exec_time.cpu().numpy())
-            mse += ((output - exec_time) ** 2).sum().item()
-            mae += torch.abs(output - exec_time).sum().item()
+            # Denormalize
+            output_orig = output * dataset.time_std + dataset.time_mean
+            exec_time_orig = exec_time_norm * dataset.time_std + dataset.time_mean
+            predictions.extend(output_orig.cpu().numpy())
+            actuals.extend(exec_time_orig.cpu().numpy())
+            mse += ((output_orig - exec_time_orig) ** 2).sum().item()
+            mae += torch.abs(output_orig - exec_time_orig).sum().item()
     
     mse /= len(test_loader.dataset)
     mae /= len(test_loader.dataset)
     logging.info(f"Test MSE: {mse:.6f}, Test MAE: {mae:.6f}")
+    # Log sample predictions
+    for i in range(min(5, len(predictions))):
+        logging.info(f"Sample {i+1}: Predicted {predictions[i]:.2f} ms, Actual {actuals[i]:.2f} ms")
     return predictions, actuals
 
 def main():
@@ -195,8 +229,12 @@ def main():
     train_data, val_data = train_test_split(train_data, test_size=0.25, random_state=42)  # 60% train, 20% val, 20% test
     
     train_dataset = HalideDataset(train_data)
-    val_dataset = HalideDataset(train_data)  # Use train stats for consistency
+    val_dataset = HalideDataset(val_data)  # Use separate validation data
     test_dataset = HalideDataset(test_data)
+    
+    # Check for low variance
+    if train_dataset.time_std < 1e-4:
+        logging.warning("Execution time variance is very low. Model may not learn meaningful patterns.")
     
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
     val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE)
@@ -214,10 +252,6 @@ def main():
     # Evaluate
     logging.info("Evaluating model...")
     predictions, actuals = evaluate_model(model, test_loader, test_dataset)
-    
-    # Example predictions
-    for i in range(min(5, len(predictions))):
-        logging.info(f"Sample {i+1}: Predicted {predictions[i]:.2f} ms, Actual {actuals[i]:.2f} ms")
 
 if __name__ == "__main__":
     main()
