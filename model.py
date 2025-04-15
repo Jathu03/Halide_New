@@ -50,7 +50,8 @@ class HalideDataset(Dataset):
         node_tensor = (item["node_tensor"] - self.node_mean) / self.node_std
         edge_tensor = (item["edge_tensor"] - self.edge_mean) / self.edge_std
         exec_time = (item["execution_time"].item() - self.time_mean) / self.time_std
-        return node_tensor, edge_tensor, torch.tensor(exec_time, dtype=torch.float32)
+        # Ensure tensors are returned with proper shape
+        return node_tensor, edge_tensor, torch.tensor([exec_time], dtype=torch.float32)
 
 class ExecutionTimeLSTM(nn.Module):
     """
@@ -72,11 +73,16 @@ class ExecutionTimeLSTM(nn.Module):
         self.relu = nn.ReLU()
         
     def forward(self, node_tensor, edge_tensor):
+        # Ensure input is batched (add batch dim if needed)
+        if node_tensor.dim() == 2:
+            node_tensor = node_tensor.unsqueeze(0)  # [1, MAX_NODES, NODE_FEATURE_DIM]
+            edge_tensor = edge_tensor.unsqueeze(0)  # [1, MAX_EDGES, EDGE_FEATURE_DIM]
+        
         batch_size = node_tensor.size(0)
         
-        # Initialize hidden states
-        h0 = torch.zeros(self.num_layers, batch_size, self.hidden_dim).to(DEVICE)
-        c0 = torch.zeros(self.num_layers, batch_size, self.hidden_dim).to(DEVICE)
+        # Initialize hidden states dynamically
+        h0 = torch.zeros(self.num_layers, batch_size, self.hidden_dim).to(node_tensor.device)
+        c0 = torch.zeros(self.num_layers, batch_size, self.hidden_dim).to(node_tensor.device)
         
         # Node LSTM
         node_out, _ = self.node_lstm(node_tensor, (h0, c0))
@@ -103,6 +109,8 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, epochs, m
         train_loss = 0.0
         for node_tensor, edge_tensor, exec_time in train_loader:
             node_tensor, edge_tensor, exec_time = node_tensor.to(DEVICE), edge_tensor.to(DEVICE), exec_time.to(DEVICE)
+            # Ensure exec_time is squeezed to match output shape
+            exec_time = exec_time.squeeze(-1)
             
             optimizer.zero_grad()
             output = model(node_tensor, edge_tensor)
@@ -119,6 +127,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, epochs, m
         with torch.no_grad():
             for node_tensor, edge_tensor, exec_time in val_loader:
                 node_tensor, edge_tensor, exec_time = node_tensor.to(DEVICE), edge_tensor.to(DEVICE), exec_time.to(DEVICE)
+                exec_time = exec_time.squeeze(-1)
                 output = model(node_tensor, edge_tensor)
                 loss = criterion(output, exec_time)
                 val_loss += loss.item() * node_tensor.size(0)
@@ -147,6 +156,7 @@ def evaluate_model(model, test_loader, dataset, model_path="best_model.pth"):
     with torch.no_grad():
         for node_tensor, edge_tensor, exec_time in test_loader:
             node_tensor, edge_tensor = node_tensor.to(DEVICE), edge_tensor.to(DEVICE)
+            exec_time = exec_time.squeeze(-1)
             output = model(node_tensor, edge_tensor)
             # Denormalize predictions
             output = output * dataset.time_std + dataset.time_mean
