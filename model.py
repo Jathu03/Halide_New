@@ -50,11 +50,12 @@ class HalideDataset(Dataset):
         node_tensor = (item["node_tensor"] - self.node_mean) / self.node_std
         edge_tensor = (item["edge_tensor"] - self.edge_mean) / self.edge_std
         exec_time = (item["execution_time"].item() - self.time_mean) / self.time_std
-        # Return tensors with explicit shapes
+        # Ensure correct shapes
+        logging.debug(f"__getitem__ shapes - Node: {node_tensor.shape}, Edge: {edge_tensor.shape}")
         return (
             node_tensor,  # [MAX_NODES, NODE_FEATURE_DIM]
             edge_tensor,  # [MAX_EDGES, EDGE_FEATURE_DIM]
-            torch.tensor([exec_time], dtype=torch.float32)  # [1]
+            torch.tensor(exec_time, dtype=torch.float32)  # Scalar
         )
 
 class ExecutionTimeLSTM(nn.Module):
@@ -77,12 +78,15 @@ class ExecutionTimeLSTM(nn.Module):
         self.relu = nn.ReLU()
         
     def forward(self, node_tensor, edge_tensor):
-        # Ensure input is batched
-        if node_tensor.dim() == 2:
-            node_tensor = node_tensor.unsqueeze(0)  # [1, MAX_NODES, NODE_FEATURE_DIM]
-            edge_tensor = edge_tensor.unsqueeze(0)  # [1, MAX_EDGES, EDGE_FEATURE_DIM]
+        # Handle unexpected dimensions
+        if node_tensor.dim() == 4 and node_tensor.size(1) == 1:
+            node_tensor = node_tensor.squeeze(1)  # [batch_size, 1, MAX_NODES, NODE_FEATURE_DIM] -> [batch_size, MAX_NODES, NODE_FEATURE_DIM]
+            edge_tensor = edge_tensor.squeeze(1)  # [batch_size, 1, MAX_EDGES, EDGE_FEATURE_DIM] -> [batch_size, MAX_EDGES, EDGE_FEATURE_DIM]
+        elif node_tensor.dim() == 2:
+            node_tensor = node_tensor.unsqueeze(0)  # [MAX_NODES, NODE_FEATURE_DIM] -> [1, MAX_NODES, NODE_FEATURE_DIM]
+            edge_tensor = edge_tensor.unsqueeze(0)  # [MAX_EDGES, EDGE_FEATURE_DIM] -> [1, MAX_EDGES, EDGE_FEATURE_DIM]
         elif node_tensor.dim() != 3:
-            raise ValueError(f"Expected 3D node_tensor, got shape {node_tensor.shape}")
+            raise ValueError(f"Expected 3D node_tensor after correction, got shape {node_tensor.shape}")
         
         batch_size = node_tensor.size(0)
         
@@ -117,8 +121,6 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, epochs, m
             # Log shapes for debugging
             logging.debug(f"Batch shapes - Node: {node_tensor.shape}, Edge: {edge_tensor.shape}, Exec: {exec_time.shape}")
             
-            exec_time = exec_time.squeeze(-1)  # [batch_size]
-            
             optimizer.zero_grad()
             output = model(node_tensor, edge_tensor)
             loss = criterion(output, exec_time)
@@ -133,8 +135,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, epochs, m
         val_loss = 0.0
         with torch.no_grad():
             for node_tensor, edge_tensor, exec_time in val_loader:
-                node_tensor, edge_tensor, exec_time = node_tensor.to(DEVICE), edge_tensor.to(DEVICE), exec_time.to(DEVICE)
-                exec_time = exec_time.squeeze(-1)
+                node_tensor, edge_tensor, exec_time = node_tensor.to(DEVICE), exec_time.to(DEVICE)
                 output = model(node_tensor, edge_tensor)
                 loss = criterion(output, exec_time)
                 val_loss += loss.item() * node_tensor.size(0)
@@ -163,7 +164,6 @@ def evaluate_model(model, test_loader, dataset, model_path="best_model.pth"):
     with torch.no_grad():
         for node_tensor, edge_tensor, exec_time in test_loader:
             node_tensor, edge_tensor = node_tensor.to(DEVICE), edge_tensor.to(DEVICE)
-            exec_time = exec_time.squeeze(-1)
             output = model(node_tensor, edge_tensor)
             # Denormalize predictions
             output = output * dataset.time_std + dataset.time_mean
