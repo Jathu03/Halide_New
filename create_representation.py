@@ -180,6 +180,8 @@ def normalize_features(sequences):
     """
     Normalize feature sequences.
     """
+    if len(sequences) == 0:
+        return np.array([]), None  # Return empty array and None scaler if no sequences
     scaler = StandardScaler()
     flattened = sequences.reshape(-1, sequences.shape[-1])
     normalized = scaler.fit_transform(flattened)
@@ -247,10 +249,11 @@ def prepare_dataset(synthetic_data_dir):
         'scaler': scaler
     }
     
-    # Save dataset
-    np.savez('halide_data.npz', 
-             sequences=dataset['sequences'], 
-             execution_times=dataset['execution_times'])
+    # Save dataset only if there is data
+    if len(all_sequences) > 0:
+        np.savez('halide_data.npz', 
+                 sequences=dataset['sequences'], 
+                 execution_times=dataset['execution_times'])
     
     return dataset
 
@@ -259,5 +262,5 @@ if __name__ == "__main__":
     synthetic_data_dir = "synthetic_data"
     dataset = prepare_dataset(synthetic_data_dir)
     print(f"Dataset created with {len(dataset['execution_times'])} samples")
-    print(f"Sequence shape: {dataset['sequences'].shape}")
-    print(f"Execution times shape: {dataset['execution_times'].shape}")
+    print(f"Sequence shape: {dataset['sequences'].shape if len(dataset['sequences']) > 0 else 'No valid data'}")
+    print(f"Execution times shape: {dataset['execution_times'].shape if len(dataset['execution_times']) > 0 else 'No valid data'}")
