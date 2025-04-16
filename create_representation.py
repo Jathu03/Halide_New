@@ -10,12 +10,16 @@ def parse_json_data(json_data):
     """
     Parse the JSON data to extract program and schedule features.
     """
+    # Debug: Print top-level keys to understand JSON structure
+    print(f"Debug: Top-level JSON keys: {list(json_data.keys())}")
+    
     # Check for programming_details
     if 'programming_details' not in json_data:
-        print(f"Debug: No 'programming_details' key found. Top-level keys: {list(json_data.keys())}")
+        print(f"Debug: No 'programming_details' key found.")
         return None, None, None, None
     
     prog_data = json_data['programming_details']
+    print(f"Debug: programming_details keys: {list(prog_data.keys())}")
     
     # Extract nodes
     nodes = prog_data.get('Nodes', [])
@@ -29,19 +33,33 @@ def parse_json_data(json_data):
         print(f"Debug: No valid edges found in programming_details. Edges: {edges}")
         return None, None, None, None
     
-    # Extract execution time
+    # Extract execution time from scheduling_data
     execution_time = None
-    for item in prog_data:
-        if isinstance(item, dict) and item.get('name') == 'total_execution_time_ms':
+    
+    # Check scheduling_data at root level
+    if 'scheduling_data' in json_data:
+        sched_data = json_data['scheduling_data']
+        print(f"Debug: Found scheduling_data at root. Keys: {list(sched_data.keys()) if isinstance(sched_data, dict) else 'Not a dict'}")
+        if isinstance(sched_data, dict) and sched_data.get('name') == 'total_execution_time_ms':
             try:
-                execution_time = float(item.get('value'))
-                print(f"Debug: Execution time found: {execution_time} ms")
-                break
+                execution_time = float(sched_data.get('value'))
+                print(f"Debug: Execution time found in scheduling_data (root): {execution_time} ms")
             except (ValueError, TypeError):
-                continue
+                print("Debug: Invalid execution time value in scheduling_data (root)")
+    
+    # Check scheduling_data within programming_details
+    if execution_time is None and 'scheduling_data' in prog_data:
+        sched_data = prog_data['scheduling_data']
+        print(f"Debug: Found scheduling_data in programming_details. Keys: {list(sched_data.keys()) if isinstance(sched_data, dict) else 'Not a dict'}")
+        if isinstance(sched_data, dict) and sched_data.get('name') == 'total_execution_time_ms':
+            try:
+                execution_time = float(sched_data.get('value'))
+                print(f"Debug: Execution time found in scheduling_data (programming_details): {execution_time} ms")
+            except (ValueError, TypeError):
+                print("Debug: Invalid execution time value in scheduling_data (programming_details)")
     
     if execution_time is None:
-        print("Debug: No execution time found in programming_details")
+        print("Debug: No execution time found in scheduling_data")
         execution_time = 0.0
     
     # Initialize graph
