@@ -230,28 +230,35 @@ def parse_json_data(json_data):
     
     return G, node_features, edge_features, execution_time
 
-def create_sequence_representation(G, node_features, edge_features, max_nodes):
+def create_sequence_representation(G, node_features, edge_features, max_nodes, max_node_len, max_edge_len):
     """
     Create a sequential representation of the DAG for LSTM input, padded to max_nodes.
     """
     topo_order = list(nx.topological_sort(G))
     
     sequence = []
-    max_node_len = max(len(f) for f in node_features.values()) if node_features else 1
-    max_edge_len = max(len(f) for f in edge_features.values()) if edge_features else 1
     
     for node in topo_order[:max_nodes]:
         node_vec = node_features.get(node, [0.0] * max_node_len)
         if len(node_vec) < max_node_len:
             node_vec.extend([0.0] * (max_node_len - len(node_vec)))
+        elif len(node_vec) > max_node_len:
+            node_vec = node_vec[:max_node_len]
         
         edge_vec = [0.0] * max_edge_len
         predecessors = list(G.predecessors(node))
         if predecessors:
             incoming_edges = [(pred, node) for pred in predecessors if (pred, node) in edge_features]
             if incoming_edges:
-                edge_vecs = [edge_features[edge] for edge in incoming_edges]
-                edge_vec = np.mean([ev + [0.0] * (max_edge_len - len(ev)) for ev in edge_vecs], axis=0).tolist()
+                edge_vecs = []
+                for edge in incoming_edges:
+                    ev = edge_features[edge]
+                    if len(ev) < max_edge_len:
+                        ev = ev + [0.0] * (max_edge_len - len(ev))
+                    elif len(ev) > max_edge_len:
+                        ev = ev[:max_edge_len]
+                    edge_vecs.append(ev)
+                edge_vec = np.mean(edge_vecs, axis=0).tolist()
         
         combined = node_vec + edge_vec
         sequence.append(combined)
@@ -278,6 +285,8 @@ def prepare_dataset(synthetic_data_dir):
     """
     dataset = []
     max_nodes = 0
+    max_node_len = 0
+    max_edge_len = 0
     all_sequences = []
     execution_times = []
     
@@ -287,6 +296,7 @@ def prepare_dataset(synthetic_data_dir):
             if file.endswith('.json'):
                 json_files.append(os.path.join(root, file))
     
+    # First pass: Determine max dimensions
     for json_file in json_files:
         with open(json_file, 'r') as f:
             try:
@@ -295,12 +305,20 @@ def prepare_dataset(synthetic_data_dir):
                 print(f"Skipping invalid JSON file: {json_file}")
                 continue
                 
-        G, _, _, exec_time = parse_json_data(json_data)
+        G, node_features, edge_features, exec_time = parse_json_data(json_data)
         if G is None:
             print(f"Skipping file with missing or invalid data: {json_file}")
             continue
+        
         max_nodes = max(max_nodes, G.number_of_nodes())
+        if node_features:
+            max_node_len = max(max_node_len, max(len(f) for f in node_features.values()))
+        if edge_features:
+            max_edge_len = max(max_edge_len, max(len(f) for f in edge_features.values()))
     
+    print(f"Debug: Max nodes: {max_nodes}, Max node feature length: {max_node_len}, Max edge feature length: {max_edge_len}")
+    
+    # Second pass: Create sequences
     for json_file in json_files:
         with open(json_file, 'r') as f:
             try:
@@ -312,11 +330,19 @@ def prepare_dataset(synthetic_data_dir):
         if G is None:
             continue
         
-        sequence = create_sequence_representation(G, node_features, edge_features, max_nodes)
+        sequence = create_sequence_representation(G, node_features, edge_features, max_nodes, max_node_len, max_edge_len)
+        print(f"Debug: Sequence shape for {json_file}: {sequence.shape}")
         all_sequences.append(sequence)
         execution_times.append(execution_time)
     
-    all_sequences = np.array(all_sequences)
+    # Convert to NumPy array
+    try:
+        all_sequences = np.array(all_sequences)
+    except ValueError as e:
+        print(f"Error: Failed to convert sequences to array: {e}")
+        for i, seq in enumerate(all_sequences):
+            print(f"Sequence {i} shape: {np.array(seq).shape}")
+        raise
     
     normalized_sequences, scaler = normalize_features(all_sequences)
     
