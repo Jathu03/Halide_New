@@ -12,7 +12,7 @@ def parse_json_data(json_data):
     """
     # Extract execution time
     execution_time = next(
-        (item['value'] for item in json_data['programming_details'] if item.get('name') == 'total_execution_time_ms'),
+        (item['value'] for item in json_data['programming_details'] if isinstance(item, dict) and item.get('name') == 'total_execution_time_ms'),
         None
     )
     if execution_time is None:
@@ -24,7 +24,7 @@ def parse_json_data(json_data):
     edge_features = {}
     
     # Process nodes
-    nodes = [item for item in json_data['programming_details'] if 'Name' in item]
+    nodes = [item for item in json_data['programming_details'] if isinstance(item, dict) and 'Name' in item]
     for node in nodes:
         name = node['Name']
         details = node['Details']
