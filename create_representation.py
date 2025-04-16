@@ -3,6 +3,8 @@ import numpy as np
 from collections import defaultdict
 import networkx as nx
 from sklearn.preprocessing import StandardScaler
+import os
+import glob
 
 def parse_json_data(json_data):
     """
@@ -13,6 +15,8 @@ def parse_json_data(json_data):
         (item['value'] for item in json_data['programming_details'] if item.get('name') == 'total_execution_time_ms'),
         None
     )
+    if execution_time is None:
+        return None, None, None, None  # Skip files with missing execution time
     
     # Initialize graph
     G = nx.DiGraph()
@@ -134,9 +138,9 @@ def parse_json_data(json_data):
     
     return G, node_features, edge_features, execution_time
 
-def create_sequence_representation(G, node_features, edge_features):
+def create_sequence_representation(G, node_features, edge_features, max_nodes):
     """
-    Create a sequential representation of the DAG for LSTM input.
+    Create a sequential representation of the DAG for LSTM input, padded to max_nodes.
     """
     # Perform topological sort to ensure consistent ordering
     topo_order = list(nx.topological_sort(G))
@@ -146,7 +150,7 @@ def create_sequence_representation(G, node_features, edge_features):
     max_node_len = max(len(f) for f in node_features.values()) if node_features else 1
     max_edge_len = max(len(f) for f in edge_features.values()) if edge_features else 1
     
-    for node in topo_order:
+    for node in topo_order[:max_nodes]:  # Limit to max_nodes
         # Get node features
         node_vec = node_features.get(node, [0.0] * max_node_len)
         if len(node_vec) < max_node_len:
@@ -166,6 +170,10 @@ def create_sequence_representation(G, node_features, edge_features):
         combined = node_vec + edge_vec
         sequence.append(combined)
     
+    # Pad sequence if fewer than max_nodes
+    while len(sequence) < max_nodes:
+        sequence.append([0.0] * (max_node_len + max_edge_len))
+    
     return np.array(sequence)
 
 def normalize_features(sequences):
@@ -177,28 +185,79 @@ def normalize_features(sequences):
     normalized = scaler.fit_transform(flattened)
     return normalized.reshape(sequences.shape), scaler
 
-def prepare_lstm_input(json_file_path):
+def prepare_dataset(synthetic_data_dir):
     """
-    Main function to prepare data for LSTM model.
+    Process all JSON files in synthetic_data directory and create halide_data dataset.
     """
-    with open(json_file_path, 'r') as f:
-        json_data = json.load(f)
+    dataset = []
+    max_nodes = 0
+    all_sequences = []
+    execution_times = []
     
-    # Parse JSON to extract features
-    G, node_features, edge_features, execution_time = parse_json_data(json_data)
+    # Collect all JSON files
+    json_files = []
+    for root, _, files in os.walk(synthetic_data_dir):
+        for file in files:
+            if file.endswith('.json'):
+                json_files.append(os.path.join(root, file))
     
-    # Create sequence representation
-    sequence = create_sequence_representation(G, node_features, edge_features)
+    # Determine max_nodes across all graphs
+    for json_file in json_files:
+        with open(json_file, 'r') as f:
+            try:
+                json_data = json.load(f)
+            except json.JSONDecodeError:
+                print(f"Skipping invalid JSON file: {json_file}")
+                continue
+                
+        G, _, _, exec_time = parse_json_data(json_data)
+        if G is None or exec_time is None:
+            print(f"Skipping file with missing data: {json_file}")
+            continue
+        max_nodes = max(max_nodes, G.number_of_nodes())
+    
+    # Process each JSON file
+    for json_file in json_files:
+        with open(json_file, 'r') as f:
+            try:
+                json_data = json.load(f)
+            except json.JSONDecodeError:
+                continue
+                
+        # Parse JSON to extract features
+        G, node_features, edge_features, execution_time = parse_json_data(json_data)
+        if G is None or execution_time is None:
+            continue
+        
+        # Create sequence representation
+        sequence = create_sequence_representation(G, node_features, edge_features, max_nodes)
+        all_sequences.append(sequence)
+        execution_times.append(execution_time)
+    
+    # Convert to numpy arrays
+    all_sequences = np.array(all_sequences)
     
     # Normalize features
-    normalized_sequence, scaler = normalize_features(sequence)
+    normalized_sequences, scaler = normalize_features(all_sequences)
     
-    return normalized_sequence, execution_time, scaler
+    # Create dataset
+    dataset = {
+        'sequences': normalized_sequences,
+        'execution_times': np.array(execution_times),
+        'scaler': scaler
+    }
+    
+    # Save dataset
+    np.savez('halide_data.npz', 
+             sequences=dataset['sequences'], 
+             execution_times=dataset['execution_times'])
+    
+    return dataset
 
 # Example usage
 if __name__ == "__main__":
-    # Replace with actual JSON file path
-    json_file_path = "synthetic_data/program_50001/0_15.json"
-    sequence, exec_time, scaler = prepare_lstm_input(json_file_path)
-    print(f"Sequence shape: {sequence.shape}")
-    print(f"Execution time: {exec_time} ms")
+    synthetic_data_dir = "synthetic_data"
+    dataset = prepare_dataset(synthetic_data_dir)
+    print(f"Dataset created with {len(dataset['execution_times'])} samples")
+    print(f"Sequence shape: {dataset['sequences'].shape}")
+    print(f"Execution times shape: {dataset['execution_times'].shape}")
