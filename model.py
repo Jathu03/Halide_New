@@ -12,6 +12,7 @@ import pickle
 from torch.optim.lr_scheduler import OneCycleLR
 from torch.cuda.amp import autocast, GradScaler
 from torch_geometric.data import Data, Batch
+from collections import defaultdict
 from tqdm import tqdm
 
 # Set random seeds
@@ -75,7 +76,7 @@ class HalideGraphDataset(Dataset):
     def _create_graph(self, sequence, idx):
         x = torch.FloatTensor(sequence)
         
-        # Create edges based on sequential order and feature similarity
+        # Create edges based on sequential order
         edges = []
         for i in range(self.seq_len - 1):
             edges.append((i, i + 1))
@@ -179,7 +180,7 @@ class GraphLSTM(nn.Module):
         # Process each node sequentially
         outputs = []
         for t in range(self.seq_len):
-            node_features = x[t::self.seq_len]  # Select features for current timestep across graphs
+            node_features = x[t::self.seq_len]
             for layer in range(self.num_layers):
                 h_prev = h[layer][:, t::self.seq_len]
                 c_prev = c[layer][:, t::self.seq_len]
@@ -187,7 +188,6 @@ class GraphLSTM(nn.Module):
                 new_c = []
                 
                 for node_idx in range(node_features.size(0)):
-                    # Gather neighbor hidden states
                     global_idx = node_idx * self.seq_len + t
                     neighbors = adj_list.get(global_idx, [])
                     neighbors_h = [h[layer][0, n % self.seq_len] for n in neighbors if n // self.seq_len == global_idx // self.seq_len]
@@ -198,7 +198,7 @@ class GraphLSTM(nn.Module):
                         c_prev[node_idx], 
                         neighbors_h
                     )
-                    new_h.append(h_t)
+                    new_h.append(hExpr_t)
                     new_c.append(c_t)
                 
                 h[layer][:, t::self.seq_len] = torch.stack(new_h)
