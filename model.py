@@ -109,18 +109,28 @@ class GraphLSTMCell(nn.Module):
     def __init__(self, input_dim, hidden_dim):
         super(GraphLSTMCell, self).__init__()
         self.hidden_dim = hidden_dim
+        self.input_dim = input_dim
+        
+        # Verify input dimensions
+        expected_input = input_dim + hidden_dim
+        self.expected_input = expected_input
         
         # Input, forget, cell, output gates
-        self.W_i = nn.Linear(input_dim + hidden_dim, hidden_dim)
-        self.W_f = nn.Linear(input_dim + hidden_dim, hidden_dim)
-        self.W_c = nn.Linear(input_dim + hidden_dim, hidden_dim)
-        self.W_o = nn.Linear(input_dim + hidden_dim, hidden_dim)
+        self.W_i = nn.Linear(expected_input, hidden_dim)
+        self.W_f = nn.Linear(expected_input, hidden_dim)
+        self.W_c = nn.Linear(expected_input, hidden_dim)
+        self.W_o = nn.Linear(expected_input, hidden_dim)
         
         # Neighbor aggregation
         self.W_n = nn.Linear(hidden_dim, hidden_dim)
 
     def forward(self, x, h_prev, c_prev, neighbors_h):
+        # Assert shapes
+        assert x.shape[-1] == self.input_dim, f"Expected x dim {self.input_dim}, got {x.shape[-1]}"
+        assert h_prev.shape[-1] == self.hidden_dim, f"Expected h_prev dim {self.hidden_dim}, got {h_prev.shape[-1]}"
+        
         combined = torch.cat([x, h_prev], dim=-1)
+        assert combined.shape[-1] == self.expected_input, f"Expected combined dim {self.expected_input}, got {combined.shape[-1]}"
         
         i = torch.sigmoid(self.W_i(combined))
         f = torch.sigmoid(self.W_f(combined))
@@ -147,6 +157,7 @@ class GraphLSTM(nn.Module):
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         self.seq_len = seq_len
+        self.input_dim = input_dim
         
         self.cells = nn.ModuleList([
             GraphLSTMCell(input_dim if i == 0 else hidden_dim, hidden_dim)
@@ -198,7 +209,7 @@ class GraphLSTM(nn.Module):
                     # Get global index for node at timestep t in graph b
                     global_idx = b * self.seq_len + t
                     neighbors = adj_list[b].get(t, [])  # Neighbors for node t in graph b
-                    # Convert neighbor indices to global indices and get hidden states
+                    # Convert neighbor indices to local indices
                     neighbors_h = [
                         h[layer][b, n % self.seq_len]
                         for n in neighbors
