@@ -10,23 +10,37 @@ def parse_json_data(json_data):
     """
     Parse the JSON data to extract program and schedule features.
     """
-    # Possible keys for program data
-    possible_data_keys = ['programming_details', 'program_data', 'details', 'schedule', 'pipeline']
+    # Possible keys for program data, prioritizing scheduling_data
+    possible_data_keys = ['scheduling_data', 'programming_details', 'program_data', 'details', 'pipeline']
     
     programming_details = None
+    selected_key = None
     for key in possible_data_keys:
         if key in json_data and isinstance(json_data[key], list):
             programming_details = json_data[key]
-            break
+            selected_key = key
+            # Verify the list contains dictionaries with expected keys
+            if any(isinstance(item, dict) and any(k in item for k in ['Name', 'From', 'name']) for item in programming_details):
+                break
+            else:
+                programming_details = None  # Reset if no valid dictionaries found
+                selected_key = None
     
     if programming_details is None:
+        # Log sample content for debugging
+        debug_info = {}
+        for key in ['scheduling_data', 'programming_details']:
+            if key in json_data:
+                sample = json_data[key][:2] if isinstance(json_data[key], list) else json_data[key]
+                debug_info[key] = sample
         print(f"Debug: No valid program data key found. Top-level keys: {list(json_data.keys())}")
+        print(f"Debug: Sample content: {debug_info}")
         return None, None, None, None
     
     # Check if programming_details contains only strings
     if all(isinstance(item, str) for item in programming_details):
-        print(f"Debug: {key} contains only strings: {[type(item) for item in programming_details]}")
-        print(f"Debug: Top-level keys: {list(json_data.keys())}")
+        print(f"Debug: {selected_key} contains only strings: {[type(item) for item in programming_details]}")
+        print(f"Debug: Sample content: {programming_details[:2]}")
         return None, None, None, None
     
     # Extract execution time
@@ -43,9 +57,23 @@ def parse_json_data(json_data):
                 break
     
     if execution_time is None:
+        # Try alternative execution time fields
+        for item in programming_details:
+            if isinstance(item, dict):
+                for time_key in possible_time_keys:
+                    if time_key in item:
+                        try:
+                            execution_time = float(item[time_key])
+                            break
+                        except (ValueError, TypeError):
+                            continue
+            if execution_time is not None:
+                break
+    
+    if execution_time is None:
         # Log keys of programming_details items for debugging
         keys = [list(item.keys()) if isinstance(item, dict) else type(item) for item in programming_details]
-        print(f"Debug: No execution time found in {key}. Keys in {key}: {keys}")
+        print(f"Debug: No execution time found in {selected_key}. Keys in {selected_key}: {keys}")
         execution_time = 0.0
     
     # Initialize graph
@@ -57,7 +85,7 @@ def parse_json_data(json_data):
     nodes = [item for item in programming_details if isinstance(item, dict) and 'Name' in item]
     for node in nodes:
         name = node['Name']
-        details = node['Details']
+        details = node.get('Details', {})
         
         # Extract node features
         feature_vector = []
@@ -75,8 +103,11 @@ def parse_json_data(json_data):
             op_hist = details['Op histogram']
             for op in op_hist:
                 if isinstance(op, str):
-                    value = float(op.split(':')[-1].strip())
-                    feature_vector.append(value)
+                    try:
+                        value = float(op.split(':')[-1].strip())
+                        feature_vector.append(value)
+                    except (ValueError, IndexError):
+                        continue
         
         # Scheduling features
         if 'scheduling_feature' in details:
@@ -128,7 +159,7 @@ def parse_json_data(json_data):
     for edge in edges:
         from_node = edge['From']
         to_node = edge['To']
-        details = edge['Details']
+        details = edge.get('Details', {})
         
         # Extract edge features
         edge_vector = []
@@ -153,7 +184,7 @@ def parse_json_data(json_data):
                         edge_vector.append(result)
                     else:
                         edge_vector.append(float(value))
-                except (ValueError, ZeroDivisionError):
+                except (ValueError, ZeroDivisionError, IndexError):
                     edge_vector.append(0.0)
         
         # Load Jacobians
@@ -179,6 +210,7 @@ def parse_json_data(json_data):
     
     # Return None if no valid graph data
     if not node_features and not edge_features:
+        print(f"Debug: No valid nodes or edges found in {selected_key}")
         return None, None, None, None
     
     return G, node_features, edge_features, execution_time
