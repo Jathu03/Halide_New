@@ -14,15 +14,24 @@ def parse_json_data(json_data):
     execution_time = None
     programming_details = json_data.get('programming_details', [])
     
+    # Possible keys for execution time
+    possible_time_keys = ['total_execution_time_ms', 'execution_time_ms', 'total_time_ms', 'runtime_ms']
+    
     for item in programming_details:
-        if isinstance(item, dict) and item.get('name') == 'total_execution_time_ms':
-            execution_time = item.get('value')
-            break
+        if isinstance(item, dict):
+            for key in possible_time_keys:
+                if item.get('name') == key:
+                    execution_time = item.get('value')
+                    break
+            if execution_time is not None:
+                break
     
     if execution_time is None:
-        # Debug: Print structure of programming_details to understand why execution_time is missing
-        print(f"Debug: No 'total_execution_time_ms' found. programming_details content: {programming_details}")
-        return None, None, None, None  # Skip files with missing execution time
+        # Log keys of programming_details items for debugging
+        keys = [list(item.keys()) if isinstance(item, dict) else type(item) for item in programming_details]
+        print(f"Debug: No execution time found. Keys in programming_details: {keys}")
+        # Proceed with default execution time to collect graph data
+        execution_time = 0.0
     
     # Initialize graph
     G = nx.DiGraph()
@@ -142,6 +151,10 @@ def parse_json_data(json_data):
         edge_features[(from_node, to_node)] = edge_vector
         G.add_edge(from_node, to_node)
     
+    # Return None if no valid graph data
+    if not node_features and not edge_features:
+        return None, None, None, None
+    
     return G, node_features, edge_features, execution_time
 
 def create_sequence_representation(G, node_features, edge_features, max_nodes):
@@ -219,8 +232,8 @@ def prepare_dataset(synthetic_data_dir):
                 continue
                 
         G, _, _, exec_time = parse_json_data(json_data)
-        if G is None or exec_time is None:
-            print(f"Skipping file with missing data: {json_file}")
+        if G is None:
+            print(f"Skipping file with missing or invalid data: {json_file}")
             continue
         max_nodes = max(max_nodes, G.number_of_nodes())
     
@@ -234,7 +247,7 @@ def prepare_dataset(synthetic_data_dir):
                 
         # Parse JSON to extract features
         G, node_features, edge_features, execution_time = parse_json_data(json_data)
-        if G is None or execution_time is None:
+        if G is None:
             continue
         
         # Create sequence representation
