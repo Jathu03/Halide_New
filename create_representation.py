@@ -198,7 +198,7 @@ def prepare_lstm_input(json_file_path):
 # Example usage
 if __name__ == "__main__":
     # Replace with actual JSON file path
-    json_file_path = "0_15.json"
+    json_file_path = "synthetic_data/program_50001/0_15.json"
     sequence, exec_time, scaler = prepare_lstm_input(json_file_path)
     print(f"Sequence shape: {sequence.shape}")
     print(f"Execution time: {exec_time} ms")
