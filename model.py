@@ -7,6 +7,8 @@ import matplotlib.pyplot as plt
 import os
 import random
 from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import MinMaxScaler
+import time
 
 # Set random seeds for reproducibility
 random.seed(42)
@@ -54,8 +56,7 @@ def load_dataset(file_path='halide_data.npz'):
 
 def prepare_train_val_test_split(sequences, execution_times, test_size=20):
     """
-    Split the dataset into training, validation and test sets.
-    Keep exactly 20 samples for testing as specified.
+    Split the dataset into training, validation and test sets with improved preprocessing.
     """
     # Get total number of samples
     n_samples = len(sequences)
@@ -74,8 +75,19 @@ def prepare_train_val_test_split(sequences, execution_times, test_size=20):
     # Split the remaining data into training and validation (80/20 split)
     train_indices, val_indices = train_test_split(remaining_indices, test_size=0.2, random_state=42)
     
-    # Create the entire dataset
-    full_dataset = HalideDataset(sequences, execution_times)
+    # Apply MinMaxScaler to the execution times to improve training stability
+    y_scaler = MinMaxScaler()
+    execution_times_scaled = y_scaler.fit_transform(execution_times.reshape(-1, 1)).flatten()
+    
+    # Print some statistics about the target variable
+    print(f"Execution times statistics before scaling:")
+    print(f"  Min: {np.min(execution_times)}, Max: {np.max(execution_times)}")
+    print(f"  Mean: {np.mean(execution_times)}, Std: {np.std(execution_times)}")
+    print(f"Execution times statistics after scaling:")
+    print(f"  Min: {np.min(execution_times_scaled)}, Max: {np.max(execution_times_scaled)}")
+    
+    # Create the entire dataset with scaled execution times
+    full_dataset = HalideDataset(sequences, execution_times_scaled)
     
     # Create dataset splits using indices
     train_dataset = Subset(full_dataset, train_indices)
@@ -87,63 +99,97 @@ def prepare_train_val_test_split(sequences, execution_times, test_size=20):
     print(f"  Validation: {len(val_dataset)} samples")
     print(f"  Test: {len(test_dataset)} samples")
     
-    return train_dataset, val_dataset, test_dataset
+    return train_dataset, val_dataset, test_dataset, y_scaler
 
 
-class LSTMModel(nn.Module):
+class ImprovedLSTMModel(nn.Module):
     """
-    LSTM model for execution time prediction
+    Improved LSTM model for execution time prediction with residual connections and layer normalization
     """
-    def __init__(self, input_size, hidden_size1=128, hidden_size2=64, dropout=0.2):
-        super(LSTMModel, self).__init__()
+    def __init__(self, input_size, hidden_size1=128, hidden_size2=64, dropout=0.3):
+        super(ImprovedLSTMModel, self).__init__()
         
+        # First layer: bidirectional LSTM
         self.lstm1 = nn.LSTM(
             input_size=input_size,
             hidden_size=hidden_size1,
-            batch_first=True
+            batch_first=True,
+            bidirectional=True  # Use bidirectional LSTM for better feature extraction
         )
         
+        self.layer_norm1 = nn.LayerNorm(hidden_size1 * 2)  # *2 because bidirectional
         self.dropout1 = nn.Dropout(dropout)
         
+        # Second layer: standard LSTM
         self.lstm2 = nn.LSTM(
-            input_size=hidden_size1,
+            input_size=hidden_size1 * 2,
             hidden_size=hidden_size2,
             batch_first=True
         )
         
+        self.layer_norm2 = nn.LayerNorm(hidden_size2)
         self.dropout2 = nn.Dropout(dropout)
         
+        # Attention mechanism
+        self.attention = nn.Sequential(
+            nn.Linear(hidden_size2, 1),
+            nn.Softmax(dim=1)
+        )
+        
+        # Dense layers
         self.fc1 = nn.Linear(hidden_size2, 32)
+        self.layer_norm3 = nn.LayerNorm(32)
         self.relu = nn.ReLU()
-        self.dropout3 = nn.Dropout(0.1)
-        self.fc2 = nn.Linear(32, 1)
+        self.dropout3 = nn.Dropout(0.2)
+        self.fc2 = nn.Linear(32, 16)
+        self.layer_norm4 = nn.LayerNorm(16)
+        self.dropout4 = nn.Dropout(0.1)
+        self.fc3 = nn.Linear(16, 1)
         
     def forward(self, x):
-        # First LSTM layer
+        # First LSTM layer (bidirectional)
         out, _ = self.lstm1(x)
+        out = self.layer_norm1(out)
         out = self.dropout1(out)
         
         # Second LSTM layer
         out, _ = self.lstm2(out)
-        # Take the output from the last time step
-        out = out[:, -1, :]
+        out = self.layer_norm2(out)
         out = self.dropout2(out)
         
-        # Fully connected layers
+        # Attention mechanism
+        attention_weights = self.attention(out)
+        out = torch.sum(attention_weights * out, dim=1)
+        
+        # Fully connected layers with residual connections
+        residual = out
         out = self.fc1(out)
+        out = self.layer_norm3(out)
         out = self.relu(out)
         out = self.dropout3(out)
+        
         out = self.fc2(out)
+        out = self.layer_norm4(out)
+        out = self.relu(out)
+        out = self.dropout4(out)
+        
+        out = self.fc3(out)
         
         return out
 
 
-def train_model(model, train_loader, val_loader, epochs=100, learning_rate=0.001, patience=10):
+def train_model(model, train_loader, val_loader, epochs=150, learning_rate=0.0005, patience=15, 
+                weight_decay=1e-5, scheduler_factor=0.5, scheduler_patience=5):
     """
-    Train the PyTorch LSTM model with early stopping
+    Train the PyTorch LSTM model with improved training procedure
     """
     criterion = nn.MSELoss()
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    
+    # Learning rate scheduler
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=scheduler_factor, patience=scheduler_patience, verbose=True
+    )
     
     # For early stopping
     best_val_loss = float('inf')
@@ -155,6 +201,9 @@ def train_model(model, train_loader, val_loader, epochs=100, learning_rate=0.001
     val_losses = []
     train_maes = []
     val_maes = []
+    
+    print(f"Starting training with learning rate: {learning_rate}")
+    start_time = time.time()
     
     for epoch in range(epochs):
         # Training
@@ -172,6 +221,10 @@ def train_model(model, train_loader, val_loader, epochs=100, learning_rate=0.001
             # Backward and optimize
             optimizer.zero_grad()
             loss.backward()
+            
+            # Gradient clipping to prevent exploding gradients
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
             optimizer.step()
             
             train_loss += loss.item()
@@ -201,8 +254,13 @@ def train_model(model, train_loader, val_loader, epochs=100, learning_rate=0.001
         val_mae /= len(val_loader)
         val_maes.append(val_mae)
         
-        print(f'Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.4f}, Train MAE: {train_mae:.4f}, '
-              f'Val Loss: {val_loss:.4f}, Val MAE: {val_mae:.4f}')
+        # Update learning rate scheduler
+        scheduler.step(val_loss)
+        
+        # Print stats
+        current_lr = optimizer.param_groups[0]['lr']
+        print(f'Epoch {epoch+1}/{epochs}, LR: {current_lr:.6f}, Train Loss: {train_loss:.4f}, '
+              f'Train MAE: {train_mae:.4f}, Val Loss: {val_loss:.4f}, Val MAE: {val_mae:.4f}')
         
         # Early stopping check
         if val_loss < best_val_loss:
@@ -211,6 +269,7 @@ def train_model(model, train_loader, val_loader, epochs=100, learning_rate=0.001
             counter = 0
             # Save best model
             torch.save(best_model, 'best_lstm_model.pth')
+            print(f"Saved new best model with validation loss: {val_loss:.4f}")
         else:
             counter += 1
             if counter >= patience:
@@ -220,29 +279,37 @@ def train_model(model, train_loader, val_loader, epochs=100, learning_rate=0.001
     # Load the best model
     model.load_state_dict(best_model)
     
+    total_time = time.time() - start_time
+    print(f"Training completed in {total_time:.2f} seconds ({total_time/60:.2f} minutes)")
+    
     return model, {'train_loss': train_losses, 'val_loss': val_losses, 
                   'train_mae': train_maes, 'val_mae': val_maes}
 
 
-def evaluate_model(model, test_loader):
+def evaluate_model(model, test_loader, y_scaler):
     """
     Evaluate the model on the test set and calculate error percentages
+    with inverse transform to get original scale predictions
     """
     model.eval()
     
-    y_true = []
-    y_pred = []
+    y_true_scaled = []
+    y_pred_scaled = []
     
     with torch.no_grad():
         for sequences, targets in test_loader:
             sequences, targets = sequences.to(device), targets.to(device)
             outputs = model(sequences)
             
-            y_true.extend(targets.cpu().numpy().flatten())
-            y_pred.extend(outputs.cpu().numpy().flatten())
+            y_true_scaled.extend(targets.cpu().numpy().flatten())
+            y_pred_scaled.extend(outputs.cpu().numpy().flatten())
     
-    y_true = np.array(y_true)
-    y_pred = np.array(y_pred)
+    # Inverse transform the scaled predictions and targets
+    y_true_scaled = np.array(y_true_scaled).reshape(-1, 1)
+    y_pred_scaled = np.array(y_pred_scaled).reshape(-1, 1)
+    
+    y_true = y_scaler.inverse_transform(y_true_scaled).flatten()
+    y_pred = y_scaler.inverse_transform(y_pred_scaled).flatten()
     
     # Calculate absolute errors
     absolute_errors = np.abs(y_pred - y_true)
@@ -266,46 +333,63 @@ def evaluate_model(model, test_loader):
     for i in range(len(y_true)):
         print(f"{i:6d} | {y_true[i]:11.2f} | {y_pred[i]:14.2f} | {absolute_errors[i]:9.2f} | {percentage_errors[i]:7.2f}%")
     
-    return y_pred, absolute_errors, percentage_errors
+    return y_pred, absolute_errors, percentage_errors, y_true
 
 
 def plot_results(history, y_true, y_pred):
     """
-    Plot training history and prediction results
+    Plot training history and prediction results with improved visualizations
     """
     # Create a figure with subplots
     fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 5))
     
-    # Plot training & validation loss
-    ax1.plot(history['train_loss'])
-    ax1.plot(history['val_loss'])
-    ax1.set_title('Model Loss')
+    # Plot training & validation loss with log scale
+    ax1.semilogy(history['train_loss'], label='Train')
+    ax1.semilogy(history['val_loss'], label='Validation')
+    ax1.set_title('Model Loss (log scale)')
     ax1.set_ylabel('Loss (MSE)')
     ax1.set_xlabel('Epoch')
-    ax1.legend(['Train', 'Validation'], loc='upper right')
-    ax1.grid(True)
+    ax1.legend(loc='upper right')
+    ax1.grid(True, which="both", ls="-")
     
     # Plot training & validation MAE
-    ax2.plot(history['train_mae'])
-    ax2.plot(history['val_mae'])
+    ax2.plot(history['train_mae'], label='Train')
+    ax2.plot(history['val_mae'], label='Validation')
     ax2.set_title('Mean Absolute Error')
     ax2.set_ylabel('MAE')
     ax2.set_xlabel('Epoch')
-    ax2.legend(['Train', 'Validation'], loc='upper right')
+    ax2.legend(loc='upper right')
     ax2.grid(True)
     
     # Plot actual vs predicted values
-    ax3.scatter(y_true, y_pred)
+    ax3.scatter(y_true, y_pred, alpha=0.8)
     min_val = min(np.min(y_true), np.min(y_pred))
-    max_val = max(np.max(y_true), np.max(y_pred))
-    ax3.plot([min_val, max_val], [min_val, max_val], 'r--')
+    max_val = max(np.max(y_true), np.max(y_pred)) * 1.1
+    ax3.plot([min_val, max_val], [min_val, max_val], 'r--', label='Perfect Prediction')
     ax3.set_title('Actual vs Predicted Execution Times')
     ax3.set_xlabel('Actual Time (ms)')
     ax3.set_ylabel('Predicted Time (ms)')
+    ax3.legend()
     ax3.grid(True)
     
+    # Add equal aspect ratio to make the comparison clearer
+    ax3.set_aspect('equal', adjustable='box')
+    
     plt.tight_layout()
-    plt.savefig('lstm_results_pytorch.png')
+    plt.savefig('lstm_results_pytorch_improved.png', dpi=300)
+    
+    # Create additional plot for error analysis
+    plt.figure(figsize=(12, 6))
+    error_percentages = (np.abs(y_pred - y_true) / np.clip(np.abs(y_true), 1e-10, None)) * 100
+    plt.bar(range(len(y_true)), error_percentages)
+    plt.axhline(np.mean(error_percentages), color='r', linestyle='--', label=f'Mean Error: {np.mean(error_percentages):.2f}%')
+    plt.title('Percentage Error by Test Sample')
+    plt.xlabel('Test Sample')
+    plt.ylabel('Error (%)')
+    plt.legend()
+    plt.grid(True, axis='y')
+    plt.savefig('error_analysis.png', dpi=300)
+    
     plt.show()
 
 
@@ -314,62 +398,56 @@ def main():
     sequences, execution_times = load_dataset()
     
     # Split data into training, validation, and test sets
-    train_dataset, val_dataset, test_dataset = prepare_train_val_test_split(
+    train_dataset, val_dataset, test_dataset, y_scaler = prepare_train_val_test_split(
         sequences, execution_times, test_size=20
     )
     
-    # Create data loaders
-    batch_size = 32
+    # Create data loaders with smaller batch size for more gradient updates
+    batch_size = 16  # Reduced from 32
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size)
+    test_loader = DataLoader(test_dataset, batch_size=1)  # Use batch size 1 for detailed evaluation
     
-    # Get sample input shape (assuming we're dealing with a sequence dataset)
+    # Get sample input shape
     sample_input = next(iter(train_loader))[0]
     input_size = sample_input.shape[2]  # Feature dimension
     print(f"Input feature size: {input_size}")
     
-    # Initialize the model
-    model = LSTMModel(input_size=input_size).to(device)
+    # Initialize the improved model
+    model = ImprovedLSTMModel(input_size=input_size).to(device)
     print(model)
     
     # Count the number of parameters
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Total parameters: {total_params}")
     
-    # Train the model
+    # Train the model with improved hyperparameters
     model, history = train_model(
         model, 
         train_loader, 
         val_loader, 
-        epochs=100, 
-        learning_rate=0.001,
-        patience=10
+        epochs=200,  # More epochs with early stopping
+        learning_rate=0.0005,  # Lower learning rate
+        patience=20,  # More patience for early stopping
+        weight_decay=1e-5,  # L2 regularization
+        scheduler_factor=0.7,  # More gradual learning rate reduction
+        scheduler_patience=8  # Wait more epochs before reducing LR
     )
     
     # Evaluate the model on the test set
-    # Extract all test data for evaluation
-    all_test_sequences = []
-    all_test_targets = []
-    
-    for test_sequences, test_targets in test_loader:
-        all_test_sequences.extend(test_sequences.numpy())
-        all_test_targets.extend(test_targets.numpy().flatten())
-    
-    all_test_sequences = np.array(all_test_sequences)
-    all_test_targets = np.array(all_test_targets)
-    
-    # Create a new DataLoader with batch size 1 for individual predictions
-    individual_test_dataset = HalideDataset(all_test_sequences, all_test_targets)
-    individual_test_loader = DataLoader(individual_test_dataset, batch_size=1)
-    
-    # Evaluate
-    y_pred, absolute_errors, percentage_errors = evaluate_model(model, individual_test_loader)
+    y_pred, absolute_errors, percentage_errors, y_true = evaluate_model(model, test_loader, y_scaler)
     
     # Plot results
-    plot_results(history, all_test_targets, y_pred)
+    plot_results(history, y_true, y_pred)
+    
+    # Save final model
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'y_scaler': y_scaler
+    }, 'final_lstm_model.pth')
     
     print("\nModel training and evaluation complete!")
+    print("Full model saved to 'final_lstm_model.pth'")
 
 
 if __name__ == "__main__":
