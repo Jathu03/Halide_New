@@ -1,102 +1,277 @@
 import numpy as np
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
+import json
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import TensorDataset, DataLoader
+from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
 import matplotlib.pyplot as plt
 import os
+import glob
+from collections import defaultdict
 
-class Attention(nn.Module):
+class ChildSumTreeLSTM(nn.Module):
     """
-    Attention mechanism to weigh LSTM outputs.
+    Child-Sum Tree-LSTM for graph-structured data.
     """
-    def __init__(self, hidden_dim):
-        super(Attention, self).__init__()
-        self.attention = nn.Linear(hidden_dim, 1)
-
-    def forward(self, lstm_out):
-        # lstm_out: (batch_size, seq_len, hidden_dim)
-        attn_weights = torch.softmax(self.attention(lstm_out).squeeze(-1), dim=1)  # (batch_size, seq_len)
-        context = torch.bmm(attn_weights.unsqueeze(1), lstm_out).squeeze(1)  # (batch_size, hidden_dim)
-        return context, attn_weights
-
-class EnhancedExecutionTimeLSTM(nn.Module):
-    """
-    Enhanced LSTM model with bidirectional LSTM, attention, and normalization.
-    """
-    def __init__(self, input_dim, hidden_dim=512, num_layers=4, dropout=0.4):
-        super(EnhancedExecutionTimeLSTM, self).__init__()
+    def __init__(self, input_dim, hidden_dim=256, dropout=0.3):
+        super(ChildSumTreeLSTM, self).__init__()
         self.hidden_dim = hidden_dim
-        self.num_layers = num_layers
+        self.input_dim = input_dim
         
-        self.lstm = nn.LSTM(
-            input_size=input_dim,
-            hidden_size=hidden_dim,
-            num_layers=num_layers,
-            batch_first=True,
-            bidirectional=True,
-            dropout=dropout if num_layers > 1 else 0
-        )
-        self.ln = nn.LayerNorm(hidden_dim * 2)  # For bidirectional output
-        self.attention = Attention(hidden_dim * 2)
+        # Tree-LSTM parameters
+        self.W_iou = nn.Linear(input_dim, 3 * hidden_dim)
+        self.U_iou = nn.Linear(hidden_dim, 3 * hidden_dim, bias=False)
+        self.W_f = nn.Linear(input_dim, hidden_dim)
+        self.U_f = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        
+        self.dropout = nn.Dropout(dropout)
         self.fc = nn.Sequential(
-            nn.Linear(hidden_dim * 2, 256),
+            nn.Linear(hidden_dim, 128),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.LayerNorm(256),
-            nn.Linear(256, 128),
+            nn.Linear(128, 64),
             nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(128, 1)
+            nn.Linear(64, 1)
         )
 
-    def forward(self, x):
-        # x: (batch_size, seq_len, input_dim)
-        lstm_out, _ = self.lstm(x)  # (batch_size, seq_len, hidden_dim * 2)
-        lstm_out = self.ln(lstm_out)
-        context, _ = self.attention(lstm_out)  # (batch_size, hidden_dim * 2)
-        output = self.fc(context)  # (batch_size, 1)
-        return output.squeeze(-1)  # (batch_size,)
+    def forward(self, node_features, adj_list, node_order):
+        """
+        Forward pass for Tree-LSTM over the graph.
+        node_features: (num_nodes, input_dim)
+        adj_list: dict mapping node_idx -> list of child indices
+        node_order: list of node indices in processing order (bottom-up)
+        """
+        h = torch.zeros(node_features.size(0), self.hidden_dim, device=node_features.device)
+        c = torch.zeros(node_features.size(0), self.hidden_dim, device=node_features.device)
+        
+        for node_idx in node_order:
+            # Gather children hidden states
+            child_h = []
+            child_c = []
+            for child_idx in adj_list.get(node_idx, []):
+                child_h.append(h[child_idx])
+                child_c.append(c[child_idx])
+            
+            child_h_sum = sum(child_h) if child_h else torch.zeros(self.hidden_dim, device=h.device)
+            child_h = torch.stack(child_h) if child_h else torch.zeros(0, self.hidden_dim, device=h.device)
+            
+            # Input features for current node
+            x = node_features[node_idx]
+            
+            # Tree-LSTM computations
+            iou = self.W_iou(x) + self.U_iou(child_h_sum)
+            i, o, u = torch.split(iou, self.hidden_dim, dim=-1)
+            i, o, u = torch.sigmoid(i), torch.sigmoid(o), torch.tanh(u)
+            
+            f = torch.sigmoid(self.W_f(x).unsqueeze(0).repeat(len(child_h), 1) + self.U_f(child_h)) if child_h.size(0) > 0 else torch.zeros(0, self.hidden_dim, device=h.device)
+            c_tilde = sum(f * c_child for f, c_child in zip(f, child_c)) if child_c else torch.zeros(self.hidden_dim, device=c.device)
+            
+            c[node_idx] = i * u + c_tilde
+            h[node_idx] = o * torch.tanh(c[node_idx])
+        
+        # Aggregate root node’s hidden state
+        root_h = h[0]  # Assume node 0 is a root or use last processed node
+        output = self.fc(self.dropout(root_h))
+        return output.squeeze()
 
-def load_dataset(file_path='halide_data.npz'):
+class GraphDataset(Dataset):
     """
-    Load the dataset from the .npz file.
+    Dataset for graphs with node features and adjacency lists.
     """
-    data = np.load(file_path)
-    sequences = data['sequences'].astype(np.float32)
-    execution_times = data['execution_times'].astype(np.float32)
-    return sequences, execution_times
+    def __init__(self, graphs, execution_times):
+        self.graphs = graphs  # List of (node_features, adj_list, node_order)
+        self.execution_times = execution_times
 
-def split_data(sequences, execution_times, test_size=20, val_split=0.2, random_state=42):
+    def __len__(self):
+        return len(self.graphs)
+
+    def __getitem__(self, idx):
+        node_features, adj_list, node_order = self.graphs[idx]
+        return {
+            'node_features': torch.tensor(node_features, dtype=torch.float32),
+            'adj_list': adj_list,
+            'node_order': node_order,
+            'execution_time': torch.tensor(self.execution_times[idx], dtype=torch.float32)
+        }
+
+def parse_graph_data(json_data):
+    """
+    Parse JSON to extract node features, adjacency list, and execution time.
+    """
+    if 'programming_details' not in json_data:
+        return None, None, None, None
+    
+    prog_data = json_data['programming_details']
+    nodes = prog_data.get('Nodes', [])
+    edges = prog_data.get('Edges', [])
+    
+    if not nodes or not edges:
+        return None, None, None, None
+    
+    # Extract execution time from scheduling_data
+    execution_time = None
+    if 'scheduling_data' in json_data and isinstance(json_data['scheduling_data'], list):
+        for item in json_data['scheduling_data']:
+            if isinstance(item, dict) and item.get('name') == 'total_execution_time_ms':
+                try:
+                    execution_time = float(item.get('value'))
+                    break
+                except (ValueError, TypeError):
+                    continue
+    if execution_time is None:
+        execution_time = 0.0
+    
+    # Build node features
+    node_features = []
+    node_index = {}
+    for idx, node in enumerate(nodes):
+        if not isinstance(node, dict) or 'Name' not in node:
+            continue
+        name = node['Name']
+        node_index[name] = idx
+        details = node.get('Details', {})
+        
+        feature_vector = []
+        if 'Memory access patterns' in details:
+            mem_patterns = details['Memory access patterns']
+            for pattern in mem_patterns:
+                if isinstance(pattern, str):
+                    values = [float(v) for v in pattern.split() if v.replace('.', '').replace('-', '').isdigit()]
+                    feature_vector.extend(values)
+        
+        if 'Op histogram' in details:
+            op_hist = details['Op histogram']
+            for op in op_hist:
+                if isinstance(op, str):
+                    try:
+                        value = float(op.split(':')[-1].strip())
+                        feature_vector.append(value)
+                    except (ValueError, IndexError):
+                        continue
+        
+        if 'scheduling_feature' in details:
+            sched = details['scheduling_feature']
+            sched_features = [
+                sched.get('allocation_bytes_read_per_realization', 0.0),
+                sched.get('bytes_at_production', 0.0),
+                sched.get('bytes_at_realization', 0.0),
+                sched.get('bytes_at_root', 0.0),
+                sched.get('bytes_at_task', 0.0),
+                sched.get('inlined_calls', 0.0),
+                sched.get('inner_parallelism', 0.0),
+                sched.get('innermost_bytes_at_production', 0.0),
+                sched.get('innermost_bytes_at_realization', 0.0),
+                sched.get('innermost_bytes_at_root', 0.0),
+                sched.get('innermost_bytes_at_task', 0.0),
+                sched.get('innermost_loop_extent', 0.0),
+                sched.get('innermost_pure_loop_extent', 0.0),
+                sched.get('native_vector_size', 0.0),
+                sched.get('num_productions', 0.0),
+                sched.get('num_realizations', 0.0),
+                sched.get('num_scalars', 0.0),
+                sched.get('num_vectors', 0.0),
+                sched.get('outer_parallelism', 0.0),
+                sched.get('points_computed_minimum', 0.0),
+                sched.get('points_computed_per_production', 0.0),
+                sched.get('points_computed_per_realization', 0.0),
+                sched.get('points_computed_total', 0.0),
+                sched.get('scalar_loads_per_scalar', 0.0),
+                sched.get('scalar_loads_per_vector', 0.0),
+                sched.get('unique_bytes_read_per_realization', 0.0),
+                sched.get('unique_lines_read_per_realization', 0.0),
+                sched.get('unrolled_loop_extent', 0.0),
+                sched.get('vector_loads_per_vector', 0.0),
+                sched.get('vector_size', 0.0),
+                sched.get('working_set', 0.0),
+                sched.get('working_set_at_production', 0.0),
+                sched.get('working_set_at_realization', 0.0),
+                sched.get('working_set_at_root', 0.0),
+                sched.get('working_set_at_task', 0.0),
+            ]
+            feature_vector.extend(sched_features)
+        
+        node_features.append(feature_vector)
+    
+    if not node_features:
+        return None, None, None, None
+    
+    # Pad node features to max length
+    max_feature_len = max(len(f) for f in node_features)
+    node_features = [f + [0.0] * (max_feature_len - len(f)) for f in node_features]
+    node_features = np.array(node_features, dtype=np.float32)
+    
+    # Build adjacency list (children of each node)
+    adj_list = defaultdict(list)
+    for edge in edges:
+        if not isinstance(edge, dict) or 'From' not in edge or 'To' not in edge:
+            continue
+        from_node = edge['From']
+        to_node = edge['To']
+        if from_node in node_index and to_node in node_index:
+            adj_list[node_index[to_node]].append(node_index[from_node])
+    
+    # Compute bottom-up processing order (leaf to root)
+    import networkx as nx
+    G = nx.DiGraph()
+    for node in node_index.values():
+        G.add_node(node)
+    for edge in edges:
+        if edge['From'] in node_index and edge['To'] in node_index:
+            G.add_edge(node_index[edge['From']], node_index[edge['To']])
+    
+    try:
+        node_order = list(nx.topological_sort(G))[::-1]  # Reverse for bottom-up
+    except nx.NetworkXUnfeasible:
+        return None, None, None, None
+    
+    return node_features, adj_list, node_order, execution_time
+
+def prepare_graph_dataset(synthetic_data_dir):
+    """
+    Process JSON files to create graph dataset.
+    """
+    graphs = []
+    execution_times = []
+    
+    json_files = glob.glob(os.path.join(synthetic_data_dir, '**/*.json'), recursive=True)
+    
+    for json_file in json_files:
+        with open(json_file, 'r') as f:
+            try:
+                json_data = json.load(f)
+            except json.JSONDecodeError:
+                continue
+                
+        node_features, adj_list, node_order, execution_time = parse_graph_data(json_data)
+        if node_features is None:
+            continue
+        
+        graphs.append((node_features, adj_list, node_order))
+        execution_times.append(execution_time)
+    
+    return graphs, np.array(execution_times, dtype=np.float32)
+
+def split_data(graphs, execution_times, test_size=20, val_split=0.2, random_state=42):
     """
     Split data into train, validation, and test sets.
     """
     X_temp, X_test, y_temp, y_test = train_test_split(
-        sequences, execution_times, test_size=test_size, random_state=random_state
+        graphs, execution_times, test_size=test_size, random_state=random_state
     )
     X_train, X_val, y_train, y_val = train_test_split(
         X_temp, y_temp, test_size=val_split, random_state=random_state
     )
     return X_train, X_val, X_test, y_train, y_val, y_test
 
-def create_dataloaders(X_train, y_train, X_val, y_val, X_test, y_test, batch_size=32):
+def create_dataloaders(X_train, y_train, X_val, y_val, X_test, y_test, batch_size=1):
     """
-    Create PyTorch DataLoaders for training, validation, and testing.
+    Create DataLoaders. Batch size=1 due to variable graph sizes.
     """
-    train_dataset = TensorDataset(
-        torch.tensor(X_train, dtype=torch.float32),
-        torch.tensor(y_train, dtype=torch.float32)
-    )
-    val_dataset = TensorDataset(
-        torch.tensor(X_val, dtype=torch.float32),
-        torch.tensor(y_val, dtype=torch.float32)
-    )
-    test_dataset = TensorDataset(
-        torch.tensor(X_test, dtype=torch.float32),
-        torch.tensor(y_test, dtype=torch.float32)
-    )
+    train_dataset = GraphDataset(X_train, y_train)
+    val_dataset = GraphDataset(X_val, y_val)
+    test_dataset = GraphDataset(X_test, y_test)
     
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
@@ -104,9 +279,9 @@ def create_dataloaders(X_train, y_train, X_val, y_val, X_test, y_test, batch_siz
     
     return train_loader, val_loader, test_loader
 
-def train_model(model, train_loader, val_loader, device, epochs=200, patience=15):
+def train_model(model, train_loader, val_loader, device, epochs=100, patience=10):
     """
-    Train the model with early stopping and cosine annealing scheduler.
+    Train the model with early stopping and cosine annealing.
     """
     criterion = nn.MSELoss()
     optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-5)
@@ -114,47 +289,55 @@ def train_model(model, train_loader, val_loader, device, epochs=200, patience=15
     
     best_val_loss = float('inf')
     epochs_no_improve = 0
-    best_model_path = 'best_lstm_model.pth'
+    best_model_path = 'best_tree_lstm_model.pth'
     
     train_losses = []
     val_losses = []
     
     for epoch in range(epochs):
-        # Training
         model.train()
         train_loss = 0.0
-        for X_batch, y_batch in train_loader:
-            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+        train_count = 0
+        for batch in train_loader:
+            node_features = batch['node_features'].to(device)
+            adj_list = batch['adj_list']
+            node_order = batch['node_order']
+            y_batch = batch['execution_time'].to(device)
+            
             optimizer.zero_grad()
-            outputs = model(X_batch)
-            loss = criterion(outputs, y_batch)
+            outputs = model(node_features[0], adj_list[0], node_order[0])
+            loss = criterion(outputs, y_batch[0])
             loss.backward()
             optimizer.step()
-            train_loss += loss.item() * X_batch.size(0)
-        train_loss /= len(train_loader.dataset)
+            train_loss += loss.item()
+            train_count += 1
+        train_loss /= train_count
         train_losses.append(train_loss)
         
-        # Validation
         model.eval()
         val_loss = 0.0
         val_mae = 0.0
+        val_count = 0
         with torch.no_grad():
-            for X_batch, y_batch in val_loader:
-                X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-                outputs = model(X_batch)
-                loss = criterion(outputs, y_batch)
-                val_loss += loss.item() * X_batch.size(0)
-                val_mae += torch.abs(outputs - y_batch).sum().item()
-        val_loss /= len(val_loader.dataset)
-        val_mae /= len(val_loader.dataset)
+            for batch in val_loader:
+                node_features = batch['node_features'].to(device)
+                adj_list = batch['adj_list']
+                node_order = batch['node_order']
+                y_batch = batch['execution_time'].to(device)
+                
+                outputs = model(node_features[0], adj_list[0], node_order[0])
+                loss = criterion(outputs, y_batch[0])
+                val_loss += loss.item()
+                val_mae += torch.abs(outputs - y_batch[0]).item()
+                val_count += 1
+        val_loss /= val_count
+        val_mae /= val_count
         val_losses.append(val_loss)
         
         print(f"Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, Val MAE: {val_mae:.4f}")
         
-        # Scheduler step
         scheduler.step()
         
-        # Early stopping
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             epochs_no_improve = 0
@@ -165,35 +348,38 @@ def train_model(model, train_loader, val_loader, device, epochs=200, patience=15
                 print(f"Early stopping triggered after {epoch+1} epochs")
                 break
     
-    # Load best model
     model.load_state_dict(torch.load(best_model_path))
     os.remove(best_model_path)
     return train_losses, val_losses
 
 def evaluate_model(model, test_loader, device, scaler):
     """
-    Evaluate the model on the test set and compute error percentages.
+    Evaluate model and compute error percentages for test set.
     """
     model.eval()
     predictions = []
     targets = []
     
     with torch.no_grad():
-        for X_batch, y_batch in test_loader:
-            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-            outputs = model(X_batch)
+        for batch in test_loader:
+            node_features = batch['node_features'].to(device)
+            adj_list = batch['adj_list']
+            node_order = batch['node_order']
+            y_batch = batch['execution_time'].to(device)
+            
+            outputs = model(node_features[0], adj_list[0], node_order[0])
             predictions.append(outputs.cpu().numpy())
             targets.append(y_batch.cpu().numpy())
     
-    predictions = np.concatenate(predictions)
-    targets = np.concatenate(targets)
+    predictions = np.array(predictions)
+    targets = np.array(targets)
     
     # Inverse transform to original scale
     predictions_orig = scaler.inverse_transform(predictions.reshape(-1, 1)).flatten()
     targets_orig = scaler.inverse_transform(targets.reshape(-1, 1)).flatten()
     
     # Calculate error percentages
-    error_percentages = np.abs(predictions_orig - targets_orig) / np.abs(targets_orig) * 100
+    error_percentages = np.abs(predictions_orig - targets_orig) / np.abs(targets_orig + 1e-10) * 100
     mean_error_percentage = np.mean(error_percentages)
     
     # Print predictions and errors
@@ -205,14 +391,14 @@ def evaluate_model(model, test_loader, device, scaler):
     
     return predictions_orig, targets_orig, error_percentages, mean_error_percentage
 
-def plot_loss(train_losses, val_losses, output_file='loss_plot_pytorch.png'):
+def plot_loss(train_losses, val_losses, output_file='loss_plot_tree_lstm.png'):
     """
     Plot training and validation loss and save to file.
     """
     plt.figure(figsize=(10, 6))
     plt.plot(train_losses, label='Training Loss')
     plt.plot(val_losses, label='Validation Loss')
-    plt.title('Training and Validation Loss')
+    plt.title('Training and Validation Loss (Tree-LSTM)')
     plt.xlabel('Epoch')
     plt.ylabel('Loss (MSE)')
     plt.legend()
@@ -221,7 +407,7 @@ def plot_loss(train_losses, val_losses, output_file='loss_plot_pytorch.png'):
     plt.close()
 
 def main():
-    # Set random seed for reproducibility
+    # Set random seed
     torch.manual_seed(42)
     np.random.seed(42)
     
@@ -229,29 +415,27 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
-    # Load dataset
-    sequences, execution_times = load_dataset()
-    print(f"Loaded dataset with {sequences.shape[0]} samples")
-    print(f"Sequence shape: {sequences.shape}")
-    print(f"Execution times shape: {execution_times.shape}")
+    # Prepare dataset
+    synthetic_data_dir = "synthetic_data"
+    graphs, execution_times = prepare_graph_dataset(synthetic_data_dir)
+    print(f"Loaded dataset with {len(graphs)} samples")
     
     # Standardize execution times
     time_scaler = StandardScaler()
     execution_times = time_scaler.fit_transform(execution_times.reshape(-1, 1)).flatten()
     
     # Split data
-    X_train, X_val, X_test, y_train, y_val, y_test = split_data(sequences, execution_times)
-    print(f"Train samples: {X_train.shape[0]}, Val samples: {X_val.shape[0]}, Test samples: {X_test.shape[0]}")
+    X_train, X_val, X_test, y_train, y_val, y_test = split_data(graphs, execution_times)
+    print(f"Train samples: {len(X_train)}, Val samples: {len(X_val)}, Test samples: {len(X_test)}")
     
     # Create dataloaders
-    batch_size = 32
     train_loader, val_loader, test_loader = create_dataloaders(
-        X_train, y_train, X_val, y_val, X_test, y_test, batch_size
+        X_train, y_train, X_val, y_val, X_test, y_test
     )
     
     # Initialize model
-    input_dim = X_train.shape[2]
-    model = EnhancedExecutionTimeLSTM(input_dim=input_dim).to(device)
+    input_dim = X_train[0][0].shape[1] if X_train else 1  # Feature dim from first graph
+    model = ChildSumTreeLSTM(input_dim=input_dim).to(device)
     
     # Train model
     train_losses, val_losses = train_model(model, train_loader, val_loader, device)
@@ -264,7 +448,7 @@ def main():
     
     # Plot loss
     plot_loss(train_losses, val_losses)
-    print("Loss plot saved as 'loss_plot_pytorch.png'")
+    print("Loss plot saved as 'loss_plot_tree_lstm.png'")
 
 if __name__ == "__main__":
     main()
