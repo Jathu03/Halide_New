@@ -14,6 +14,11 @@ def parse_json_data(json_data):
     execution_time = None
     programming_details = json_data.get('programming_details', [])
     
+    # Check if programming_details contains only strings
+    if all(isinstance(item, str) for item in programming_details):
+        print(f"Debug: programming_details contains only strings: {[type(item) for item in programming_details]}")
+        return None, None, None, None
+    
     # Possible keys for execution time
     possible_time_keys = ['total_execution_time_ms', 'execution_time_ms', 'total_time_ms', 'runtime_ms']
     
@@ -30,7 +35,6 @@ def parse_json_data(json_data):
         # Log keys of programming_details items for debugging
         keys = [list(item.keys()) if isinstance(item, dict) else type(item) for item in programming_details]
         print(f"Debug: No execution time found. Keys in programming_details: {keys}")
-        # Proceed with default execution time to collect graph data
         execution_time = 0.0
     
     # Initialize graph
@@ -52,7 +56,7 @@ def parse_json_data(json_data):
             mem_patterns = details['Memory access patterns']
             for pattern in mem_patterns:
                 if isinstance(pattern, str):
-                    values = [float(v) for v in pattern.split() if v.replace('.', '').isdigit()]
+                    values = [float(v) for v in pattern.split() if v.replace('.', '').replace('-', '').isdigit()]
                     feature_vector.extend(values)
         
         # Operation histogram
@@ -145,7 +149,18 @@ def parse_json_data(json_data):
         if 'Load Jacobians' in details:
             jacobians = details['Load Jacobians']
             for row in jacobians:
-                values = [float(v) if v.replace('/', '').replace('.', '').replace('-', '').isdigit() or '/' in v else 0.0 for v in row.split()]
+                values = []
+                for v in row.split():
+                    try:
+                        if '/' in v:
+                            num, denom = v.split('/')
+                            values.append(float(num) / float(denom))
+                        elif v.replace('.', '').replace('-', '').isdigit():
+                            values.append(float(v))
+                        else:
+                            values.append(0.0)
+                    except (ValueError, ZeroDivisionError):
+                        values.append(0.0)
                 edge_vector.extend(values)
         
         edge_features[(from_node, to_node)] = edge_vector
