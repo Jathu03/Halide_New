@@ -23,7 +23,7 @@ def set_seed(seed=42):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
         torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = True  # Enable for faster training
+        torch.backends.cudnn.benchmark = False
 
 set_seed(42)
 
@@ -114,6 +114,7 @@ class GraphLSTMCell(nn.Module):
         # Verify input dimensions
         expected_input = input_dim + hidden_dim
         self.expected_input = expected_input
+        print(f"GraphLSTMCell: input_dim={input_dim}, hidden_dim={hidden_dim}, expected_input={expected_input}")
         
         # Input, forget, cell, output gates
         self.W_i = nn.Linear(expected_input, hidden_dim)
@@ -159,6 +160,8 @@ class GraphLSTM(nn.Module):
         self.seq_len = seq_len
         self.input_dim = input_dim
         
+        print(f"GraphLSTM: initializing with input_dim={input_dim}, hidden_dim={hidden_dim}")
+        
         self.cells = nn.ModuleList([
             GraphLSTMCell(input_dim if i == 0 else hidden_dim, hidden_dim)
             for i in range(num_layers)
@@ -177,9 +180,11 @@ class GraphLSTM(nn.Module):
         x = data.x
         edge_index = data.edge_index
         batch = data.batch
-        batch_size = data.num_graphs
+        graph_idx = data.graph_idx
         
         # Initialize hidden and cell states
+        batch_size = data.num_graphs
+        # Shape: [num_layers, batch_size, seq_len, hidden_dim]
         h = [torch.zeros(batch_size, self.seq_len, self.hidden_dim, device=x.device) for _ in range(self.num_layers)]
         c = [torch.zeros(batch_size, self.seq_len, self.hidden_dim, device=x.device) for _ in range(self.num_layers)]
         
@@ -192,6 +197,7 @@ class GraphLSTM(nn.Module):
         
         # Process each timestep
         outputs = []
+        # Store updates for h and c to avoid in-place operations
         h_updates = [[] for _ in range(self.num_layers)]
         c_updates = [[] for _ in range(self.num_layers)]
         
@@ -204,13 +210,14 @@ class GraphLSTM(nn.Module):
             for layer in range(self.num_layers):
                 h_prev = h[layer][:, t, :]  # Shape: [batch_size, hidden_dim]
                 c_prev = c[layer][:, t, :]  # Shape: [batch_size, hidden_dim]
-                
-                # Vectorized processing for the batch
                 new_h = []
                 new_c = []
+                
                 for b in range(batch_size):
+                    # Get global index for node at timestep t in graph b
                     global_idx = b * self.seq_len + t
-                    neighbors = adj_list[b].get(t, [])
+                    neighbors = adj_list[b].get(t, [])  # Neighbors for node t in graph b
+                    # Convert neighbor indices to local indices
                     neighbors_h = [
                         h[layer][b, n % self.seq_len]
                         for n in neighbors
@@ -226,13 +233,12 @@ class GraphLSTM(nn.Module):
                     new_h.append(h_t)
                     new_c.append(c_t)
                 
-                new_h = torch.stack(new_h)  # Shape: [batch_size, hidden_dim]
-                new_c = torch.stack(new_c)  # Shape: [batch_size, hidden_dim]
-                h_updates[layer].append(new_h)
-                c_updates[layer].append(new_c)
-                layer_input = new_h  # Update input for next layer
+                # Collect updates instead of assigning in-place
+                h_updates[layer].append(torch.stack(new_h))  # Shape: [batch_size, hidden_dim]
+                c_updates[layer].append(torch.stack(new_c))  # Shape: [batch_size, hidden_dim]
+                layer_input = h_updates[layer][-1]  # Update input for next layer
             
-            outputs.append(h_updates[-1][-1])
+            outputs.append(h_updates[-1][-1])  # Collect output from last layer
         
         # Construct final h and c tensors
         for layer in range(self.num_layers):
@@ -307,11 +313,11 @@ def prepare_train_val_test_split(sequences, execution_times, test_size=20, val_s
     return train_dataset, val_dataset, test_dataset, y_scaler, seq_len
 
 def train_model_with_fold(model, train_loader, val_loader, fold=0, 
-                          epochs=2, learning_rate=0.001, min_lr=1e-6,
+                          epochs=200, learning_rate=0.001, min_lr=1e-6,
                           weight_decay=1e-5, patience=25,
                           gradient_accumulation_steps=1,
                           use_warmup=True, warmup_epochs=10,
-                          use_amp=True):
+                          use_amp=False):
     """
     Train a single model with improved training strategy.
     """
@@ -319,13 +325,16 @@ def train_model_with_fold(model, train_loader, val_loader, fold=0,
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     
     # Learning rate scheduler
+    steps_per_epoch = max(1, len(train_loader) // gradient_accumulation_steps)
+    print(f"Scheduler: steps_per_epoch={steps_per_epoch}, total_steps={steps_per_epoch * epochs}")
+    
     if use_warmup:
         scheduler = OneCycleLR(
             optimizer, 
             max_lr=learning_rate,
-            steps_per_epoch=len(train_loader) // gradient_accumulation_steps,
+            steps_per_epoch=steps_per_epoch,
             epochs=epochs,
-            pct_start=warmup_epochs/epochs,
+            pct_start=max(0.05, warmup_epochs / epochs),  # Ensure non-zero warmup
             anneal_strategy='cos',
             div_factor=25,
             final_div_factor=1000,
@@ -466,35 +475,15 @@ def main():
         sequences, execution_times
     )
     
-    # Create dataloaders with optimized settings
+    # Create dataloaders
     collator = GraphAttentionCollator()
-    train_loader = DataLoader(
-        train_dataset, 
-        batch_size=64, 
-        shuffle=True, 
-        collate_fn=collator,
-        pin_memory=True,
-        num_workers=4
-    )
-    val_loader = DataLoader(
-        val_dataset, 
-        batch_size=64, 
-        shuffle=False, 
-        collate_fn=collator,
-        pin_memory=True,
-        num_workers=4
-    )
-    test_loader = DataLoader(
-        test_dataset, 
-        batch_size=64, 
-        shuffle=False, 
-        collate_fn=collator,
-        pin_memory=True,
-        num_workers=4
-    )
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, collate_fn=collator)
+    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, collate_fn=collator)
+    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, collate_fn=collator)
     
     # Initialize model
     input_dim = sequences.shape[2]
+    print(f"Main: input_dim={input_dim}, seq_len={seq_len}")
     model = GraphLSTM(input_dim=input_dim, seq_len=seq_len, hidden_dim=256).to(device)
     
     # Train model
