@@ -8,33 +8,56 @@ from torch.utils.data import TensorDataset, DataLoader
 import matplotlib.pyplot as plt
 import os
 
-class ExecutionTimeLSTM(nn.Module):
+class Attention(nn.Module):
     """
-    LSTM model for predicting execution times from graph sequences.
+    Attention mechanism to weigh LSTM outputs.
     """
-    def __init__(self, input_dim, hidden_dim=256, num_layers=3, dropout=0.3):
-        super(ExecutionTimeLSTM, self).__init__()
+    def __init__(self, hidden_dim):
+        super(Attention, self).__init__()
+        self.attention = nn.Linear(hidden_dim, 1)
+
+    def forward(self, lstm_out):
+        # lstm_out: (batch_size, seq_len, hidden_dim)
+        attn_weights = torch.softmax(self.attention(lstm_out).squeeze(-1), dim=1)  # (batch_size, seq_len)
+        context = torch.bmm(attn_weights.unsqueeze(1), lstm_out).squeeze(1)  # (batch_size, hidden_dim)
+        return context, attn_weights
+
+class EnhancedExecutionTimeLSTM(nn.Module):
+    """
+    Enhanced LSTM model with bidirectional LSTM, attention, and normalization.
+    """
+    def __init__(self, input_dim, hidden_dim=512, num_layers=4, dropout=0.4):
+        super(EnhancedExecutionTimeLSTM, self).__init__()
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        
         self.lstm = nn.LSTM(
             input_size=input_dim,
             hidden_size=hidden_dim,
             num_layers=num_layers,
             batch_first=True,
+            bidirectional=True,
             dropout=dropout if num_layers > 1 else 0
         )
+        self.ln = nn.LayerNorm(hidden_dim * 2)  # For bidirectional output
+        self.attention = Attention(hidden_dim * 2)
         self.fc = nn.Sequential(
-            nn.Linear(hidden_dim, 128),
+            nn.Linear(hidden_dim * 2, 256),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(128, 64),
+            nn.LayerNorm(256),
+            nn.Linear(256, 128),
             nn.ReLU(),
-            nn.Linear(64, 1)
+            nn.Dropout(dropout),
+            nn.Linear(128, 1)
         )
 
     def forward(self, x):
         # x: (batch_size, seq_len, input_dim)
-        lstm_out, _ = self.lstm(x)  # lstm_out: (batch_size, seq_len, hidden_dim)
-        last_out = lstm_out[:, -1, :]  # Take the last time step: (batch_size, hidden_dim)
-        output = self.fc(last_out)  # (batch_size, 1)
+        lstm_out, _ = self.lstm(x)  # (batch_size, seq_len, hidden_dim * 2)
+        lstm_out = self.ln(lstm_out)
+        context, _ = self.attention(lstm_out)  # (batch_size, hidden_dim * 2)
+        output = self.fc(context)  # (batch_size, 1)
         return output.squeeze(-1)  # (batch_size,)
 
 def load_dataset(file_path='halide_data.npz'):
@@ -81,13 +104,13 @@ def create_dataloaders(X_train, y_train, X_val, y_val, X_test, y_test, batch_siz
     
     return train_loader, val_loader, test_loader
 
-def train_model(model, train_loader, val_loader, device, epochs=100, patience=10):
+def train_model(model, train_loader, val_loader, device, epochs=200, patience=15):
     """
-    Train the model with early stopping and learning rate scheduling.
+    Train the model with early stopping and cosine annealing scheduler.
     """
     criterion = nn.MSELoss()
-    optimizer = optim.AdamW(model.parameters(), lr=0.001)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
+    optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-5)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     
     best_val_loss = float('inf')
     epochs_no_improve = 0
@@ -129,7 +152,7 @@ def train_model(model, train_loader, val_loader, device, epochs=100, patience=10
         print(f"Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, Val MAE: {val_mae:.4f}")
         
         # Scheduler step
-        scheduler.step(val_loss)
+        scheduler.step()
         
         # Early stopping
         if val_loss < best_val_loss:
@@ -144,17 +167,14 @@ def train_model(model, train_loader, val_loader, device, epochs=100, patience=10
     
     # Load best model
     model.load_state_dict(torch.load(best_model_path))
-    os.remove(best_model_path)  # Clean up
+    os.remove(best_model_path)
     return train_losses, val_losses
 
 def evaluate_model(model, test_loader, device, scaler):
     """
-    Evaluate the model on the test set.
+    Evaluate the model on the test set and compute error percentages.
     """
-    criterion = nn.MSELoss()
     model.eval()
-    test_loss = 0.0
-    test_mae = 0.0
     predictions = []
     targets = []
     
@@ -162,23 +182,28 @@ def evaluate_model(model, test_loader, device, scaler):
         for X_batch, y_batch in test_loader:
             X_batch, y_batch = X_batch.to(device), y_batch.to(device)
             outputs = model(X_batch)
-            loss = criterion(outputs, y_batch)
-            test_loss += loss.item() * X_batch.size(0)
-            test_mae += torch.abs(outputs - y_batch).sum().item()
             predictions.append(outputs.cpu().numpy())
             targets.append(y_batch.cpu().numpy())
     
-    test_loss /= len(test_loader.dataset)
-    test_mae /= len(test_loader.dataset)
     predictions = np.concatenate(predictions)
     targets = np.concatenate(targets)
     
-    # Inverse transform for original scale
+    # Inverse transform to original scale
     predictions_orig = scaler.inverse_transform(predictions.reshape(-1, 1)).flatten()
     targets_orig = scaler.inverse_transform(targets.reshape(-1, 1)).flatten()
-    mae_orig = np.mean(np.abs(predictions_orig - targets_orig))
     
-    return test_loss, test_mae, mae_orig
+    # Calculate error percentages
+    error_percentages = np.abs(predictions_orig - targets_orig) / np.abs(targets_orig) * 100
+    mean_error_percentage = np.mean(error_percentages)
+    
+    # Print predictions and errors
+    print("\nTest Set Predictions:")
+    print("Sample | Actual Time (ms) | Predicted Time (ms) | Error Percentage (%)")
+    print("-" * 60)
+    for i, (actual, pred, err) in enumerate(zip(targets_orig, predictions_orig, error_percentages)):
+        print(f"{i+1:6d} | {actual:15.4f} | {pred:18.4f} | {err:20.4f}")
+    
+    return predictions_orig, targets_orig, error_percentages, mean_error_percentage
 
 def plot_loss(train_losses, val_losses, output_file='loss_plot_pytorch.png'):
     """
@@ -225,17 +250,17 @@ def main():
     )
     
     # Initialize model
-    input_dim = X_train.shape[2]  # Feature dimension
-    model = ExecutionTimeLSTM(input_dim=input_dim).to(device)
+    input_dim = X_train.shape[2]
+    model = EnhancedExecutionTimeLSTM(input_dim=input_dim).to(device)
     
     # Train model
     train_losses, val_losses = train_model(model, train_loader, val_loader, device)
     
     # Evaluate model
-    test_loss, test_mae, mae_orig = evaluate_model(model, test_loader, device, time_scaler)
-    print(f"Test Loss (MSE, standardized): {test_loss:.4f}")
-    print(f"Test MAE (standardized): {test_mae:.4f}")
-    print(f"Test MAE (original scale, ms): {mae_orig:.4f}")
+    predictions, targets, error_percentages, mean_error_percentage = evaluate_model(
+        model, test_loader, device, time_scaler
+    )
+    print(f"\nMean Error Percentage: {mean_error_percentage:.4f}%")
     
     # Plot loss
     plot_loss(train_losses, val_losses)
