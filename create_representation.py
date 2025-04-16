@@ -31,22 +31,17 @@ def parse_json_data(json_data):
     
     # Extract execution time
     execution_time = None
-    possible_time_keys = ['total_execution_time_ms', 'execution_time_ms', 'total_time_ms', 'runtime_ms']
-    
-    for item in prog_data.get('Nodes', []) + [prog_data]:
-        if isinstance(item, dict):
-            for time_key in possible_time_keys:
-                if item.get('name') == time_key:
-                    try:
-                        execution_time = float(item.get('value'))
-                        break
-                    except (ValueError, TypeError):
-                        continue
-            if execution_time is not None:
+    for item in prog_data:
+        if isinstance(item, dict) and item.get('name') == 'total_execution_time_ms':
+            try:
+                execution_time = float(item.get('value'))
+                print(f"Debug: Execution time found: {execution_time} ms")
                 break
+            except (ValueError, TypeError):
+                continue
     
     if execution_time is None:
-        print(f"Debug: No execution time found in programming_details")
+        print("Debug: No execution time found in programming_details")
         execution_time = 0.0
     
     # Initialize graph
