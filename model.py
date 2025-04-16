@@ -1,14 +1,18 @@
 import numpy as np
 import torch
 from torch import nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, random_split, Subset
 import matplotlib.pyplot as plt
 import os
 import random
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import MinMaxScaler
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
 import time
+from torch_geometric.nn import GCNConv, GATv2Conv, global_mean_pool, global_add_pool
+from torch_geometric.data import Data, Batch
+import math
 
 # Set random seeds for reproducibility
 random.seed(42)
@@ -21,19 +25,79 @@ if torch.cuda.is_available():
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
-class HalideDataset(Dataset):
+class HalideGraphDataset(Dataset):
     """
-    PyTorch Dataset for Halide execution time prediction
+    PyTorch Dataset for Halide execution time prediction using graph structure
     """
-    def __init__(self, sequences, execution_times):
-        self.sequences = torch.FloatTensor(sequences)
+    def __init__(self, sequences, execution_times, seq_len=10, num_features=None):
+        """
+        Transforms sequence data into graph-structured data
+        
+        Args:
+            sequences: numpy array of sequences
+            execution_times: numpy array of execution times
+            seq_len: length of each sequence
+            num_features: number of features per node
+        """
+        self.sequences = sequences
         self.execution_times = torch.FloatTensor(execution_times).reshape(-1, 1)
+        self.seq_len = seq_len
+        self.num_features = num_features or sequences.shape[2]
+        
+        # Pre-process the data into graph format
+        self.graph_data = [self._create_graph(seq) for seq in sequences]
+        
+    def _create_graph(self, sequence):
+        """
+        Creates a graph representation from a sequence
+        
+        For each element in the sequence:
+        - Create a node with the element's features
+        - Connect to the previous element (sequential edge)
+        - Add skip connections to capture long-range dependencies
+        """
+        # Node features are directly from the sequence
+        x = torch.FloatTensor(sequence)
+        
+        # Edge indices (source, target)
+        edges = []
+        
+        # Sequential edges (connecting adjacent nodes)
+        for i in range(self.seq_len - 1):
+            edges.append((i, i + 1))
+            edges.append((i + 1, i))  # Bidirectional
+        
+        # Skip connections (connect every node to nodes 2 and 3 steps away)
+        for i in range(self.seq_len - 2):
+            edges.append((i, i + 2))
+            edges.append((i + 2, i))  # Bidirectional
+            
+        for i in range(self.seq_len - 3):
+            edges.append((i, i + 3))
+            edges.append((i + 3, i))  # Bidirectional
+        
+        # Full connectivity for the first and last nodes (to act as start/end points)
+        for i in range(1, self.seq_len):
+            edges.append((0, i))
+            edges.append((i, 0))
+            
+        for i in range(self.seq_len - 1):
+            edges.append((i, self.seq_len - 1))
+            edges.append((self.seq_len - 1, i))
+        
+        # Convert to PyTorch tensor
+        edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
+        
+        # Create PyTorch Geometric Data object
+        data = Data(x=x, edge_index=edge_index)
+        
+        return data
         
     def __len__(self):
         return len(self.sequences)
     
     def __getitem__(self, idx):
-        return self.sequences[idx], self.execution_times[idx]
+        return self.graph_data[idx], self.execution_times[idx]
 
 
 def load_dataset(file_path='halide_data.npz'):
@@ -75,19 +139,34 @@ def prepare_train_val_test_split(sequences, execution_times, test_size=20):
     # Split the remaining data into training and validation (80/20 split)
     train_indices, val_indices = train_test_split(remaining_indices, test_size=0.2, random_state=42)
     
-    # Apply MinMaxScaler to the execution times to improve training stability
+    # Feature scaling - standardize the sequence data
+    x_scaler = StandardScaler()
+    sequences_flat = sequences.reshape(-1, sequences.shape[2])
+    sequences_scaled_flat = x_scaler.fit_transform(sequences_flat)
+    sequences_scaled = sequences_scaled_flat.reshape(sequences.shape)
+    
+    # Apply RobustScaler or Log transformation to the execution times for better handling of outliers
+    # Using log transformation for execution times as they can vary greatly in magnitude
+    execution_times_log = np.log1p(execution_times)  # log1p to handle zeros
+    
+    # Then scale the log-transformed values
     y_scaler = MinMaxScaler()
-    execution_times_scaled = y_scaler.fit_transform(execution_times.reshape(-1, 1)).flatten()
+    execution_times_scaled = y_scaler.fit_transform(execution_times_log.reshape(-1, 1)).flatten()
     
     # Print some statistics about the target variable
     print(f"Execution times statistics before scaling:")
     print(f"  Min: {np.min(execution_times)}, Max: {np.max(execution_times)}")
     print(f"  Mean: {np.mean(execution_times)}, Std: {np.std(execution_times)}")
-    print(f"Execution times statistics after scaling:")
+    print(f"Execution times statistics after log transform and scaling:")
     print(f"  Min: {np.min(execution_times_scaled)}, Max: {np.max(execution_times_scaled)}")
     
-    # Create the entire dataset with scaled execution times
-    full_dataset = HalideDataset(sequences, execution_times_scaled)
+    # Create graph dataset with scaled data
+    # Extract sequence length from data shape
+    seq_len = sequences.shape[1]
+    num_features = sequences.shape[2]
+    
+    print(f"Creating graph dataset with sequence length {seq_len} and {num_features} features")
+    full_dataset = HalideGraphDataset(sequences_scaled, execution_times_scaled, seq_len=seq_len, num_features=num_features)
     
     # Create dataset splits using indices
     train_dataset = Subset(full_dataset, train_indices)
@@ -99,89 +178,154 @@ def prepare_train_val_test_split(sequences, execution_times, test_size=20):
     print(f"  Validation: {len(val_dataset)} samples")
     print(f"  Test: {len(test_dataset)} samples")
     
-    return train_dataset, val_dataset, test_dataset, y_scaler
+    # Create custom inverse transform function for y
+    def inverse_transform_y(y_scaled):
+        y_log = y_scaler.inverse_transform(y_scaled.reshape(-1, 1)).flatten()
+        y_original = np.expm1(y_log)  # Inverse of log1p
+        return y_original
+    
+    return train_dataset, val_dataset, test_dataset, inverse_transform_y
 
 
-class ImprovedLSTMModel(nn.Module):
+class GraphAttentionCollator:
     """
-    Improved LSTM model for execution time prediction with residual connections and layer normalization
+    Custom collator for batching graph data
     """
-    def __init__(self, input_size, hidden_size1=128, hidden_size2=64, dropout=0.3):
-        super(ImprovedLSTMModel, self).__init__()
+    def __call__(self, batch):
+        graphs = [item[0] for item in batch]
+        targets = torch.stack([item[1] for item in batch])
         
-        # First layer: bidirectional LSTM
-        self.lstm1 = nn.LSTM(
-            input_size=input_size,
-            hidden_size=hidden_size1,
-            batch_first=True,
-            bidirectional=True  # Use bidirectional LSTM for better feature extraction
-        )
+        # Batch the graphs
+        batched_graph = Batch.from_data_list(graphs)
         
-        self.layer_norm1 = nn.LayerNorm(hidden_size1 * 2)  # *2 because bidirectional
-        self.dropout1 = nn.Dropout(dropout)
-        
-        # Second layer: standard LSTM
-        self.lstm2 = nn.LSTM(
-            input_size=hidden_size1 * 2,
-            hidden_size=hidden_size2,
-            batch_first=True
-        )
-        
-        self.layer_norm2 = nn.LayerNorm(hidden_size2)
-        self.dropout2 = nn.Dropout(dropout)
-        
-        # Attention mechanism
-        self.attention = nn.Sequential(
-            nn.Linear(hidden_size2, 1),
-            nn.Softmax(dim=1)
-        )
-        
-        # Dense layers
-        self.fc1 = nn.Linear(hidden_size2, 32)
-        self.layer_norm3 = nn.LayerNorm(32)
-        self.relu = nn.ReLU()
-        self.dropout3 = nn.Dropout(0.2)
-        self.fc2 = nn.Linear(32, 16)
-        self.layer_norm4 = nn.LayerNorm(16)
-        self.dropout4 = nn.Dropout(0.1)
-        self.fc3 = nn.Linear(16, 1)
+        return batched_graph, targets
+
+
+class SelfAttention(nn.Module):
+    """
+    Self-attention layer for processing node features
+    """
+    def __init__(self, in_features, out_features):
+        super(SelfAttention, self).__init__()
+        self.query = nn.Linear(in_features, out_features)
+        self.key = nn.Linear(in_features, out_features)
+        self.value = nn.Linear(in_features, out_features)
+        self.scale = math.sqrt(out_features)
         
     def forward(self, x):
-        # First LSTM layer (bidirectional)
-        out, _ = self.lstm1(x)
-        out = self.layer_norm1(out)
-        out = self.dropout1(out)
+        # x shape: [batch_size, seq_len, in_features]
+        q = self.query(x)  # [batch_size, seq_len, out_features]
+        k = self.key(x)    # [batch_size, seq_len, out_features]
+        v = self.value(x)  # [batch_size, seq_len, out_features]
         
-        # Second LSTM layer
-        out, _ = self.lstm2(out)
-        out = self.layer_norm2(out)
-        out = self.dropout2(out)
+        # Compute attention scores
+        scores = torch.matmul(q, k.transpose(-2, -1)) / self.scale  # [batch_size, seq_len, seq_len]
         
-        # Attention mechanism
-        attention_weights = self.attention(out)
-        out = torch.sum(attention_weights * out, dim=1)
+        # Apply softmax to get attention weights
+        attention_weights = F.softmax(scores, dim=-1)  # [batch_size, seq_len, seq_len]
         
-        # Fully connected layers with residual connections
-        residual = out
-        out = self.fc1(out)
-        out = self.layer_norm3(out)
-        out = self.relu(out)
-        out = self.dropout3(out)
+        # Apply attention weights to values
+        output = torch.matmul(attention_weights, v)  # [batch_size, seq_len, out_features]
         
-        out = self.fc2(out)
-        out = self.layer_norm4(out)
-        out = self.relu(out)
-        out = self.dropout4(out)
-        
-        out = self.fc3(out)
-        
-        return out
+        return output
 
 
-def train_model(model, train_loader, val_loader, epochs=150, learning_rate=0.0005, patience=15, 
-                weight_decay=1e-5, scheduler_factor=0.5, scheduler_patience=5):
+class GraphAttentionModel(nn.Module):
     """
-    Train the PyTorch LSTM model with improved training procedure
+    Graph Neural Network model with attention mechanism for execution time prediction
+    """
+    def __init__(self, num_node_features, hidden_dim=64, num_layers=3, dropout=0.2):
+        super(GraphAttentionModel, self).__init__()
+        
+        # Multiple GNN layers with different attention heads
+        self.conv1 = GATv2Conv(num_node_features, hidden_dim, heads=4, dropout=dropout, concat=True)
+        expanded_dim = hidden_dim * 4  # Due to concat=True with 4 heads
+        
+        # Middle layers
+        self.convs = nn.ModuleList()
+        for _ in range(num_layers - 2):
+            self.convs.append(
+                GATv2Conv(expanded_dim, hidden_dim, heads=4, dropout=dropout, concat=True)
+            )
+        
+        # Final GNN layer
+        self.conv_final = GATv2Conv(expanded_dim, hidden_dim, heads=1, dropout=dropout, concat=False)
+        
+        # Batch normalization layers for stability
+        self.batch_norms = nn.ModuleList()
+        for _ in range(num_layers - 1):
+            self.batch_norms.append(nn.BatchNorm1d(expanded_dim))
+        self.batch_norm_final = nn.BatchNorm1d(hidden_dim)
+        
+        # Self-attention layer for capturing sequence patterns
+        self.self_attention = SelfAttention(hidden_dim, hidden_dim)
+        
+        # Output layers with residual connections
+        self.fc1 = nn.Linear(hidden_dim, hidden_dim // 2)
+        self.dropout1 = nn.Dropout(dropout)
+        self.fc2 = nn.Linear(hidden_dim // 2, hidden_dim // 4)
+        self.dropout2 = nn.Dropout(dropout)
+        self.fc3 = nn.Linear(hidden_dim // 4, 1)
+        
+        # Activation functions
+        self.leaky_relu = nn.LeakyReLU(0.1)
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, data):
+        # Extract node features and edge indices
+        x, edge_index = data.x, data.edge_index
+        
+        # First GNN layer
+        x = self.conv1(x, edge_index)
+        x = self.leaky_relu(x)
+        x = self.batch_norms[0](x)
+        x = self.dropout(x)
+        
+        # Middle GNN layers
+        for i, conv in enumerate(self.convs):
+            x_res = x  # Save for residual connection
+            x = conv(x, edge_index)
+            x = self.leaky_relu(x)
+            x = self.batch_norms[i+1](x)
+            x = self.dropout(x)
+            # Add residual connection if dimensions match
+            if x_res.shape[-1] == x.shape[-1]:
+                x = x + x_res
+        
+        # Final GNN layer
+        x = self.conv_final(x, edge_index)
+        x = self.leaky_relu(x)
+        x = self.batch_norm_final(x)
+        
+        # Reshape for self-attention
+        batch_size = data.num_graphs
+        nodes_per_graph = x.size(0) // batch_size
+        x = x.view(batch_size, nodes_per_graph, -1)
+        
+        # Apply self-attention
+        x = self.self_attention(x)
+        
+        # Global pooling: combine all node features for each graph
+        x = x.mean(dim=1)  # Simple mean pooling across nodes
+        
+        # MLP for final prediction
+        x = self.fc1(x)
+        x = self.leaky_relu(x)
+        x = self.dropout1(x)
+        
+        x = self.fc2(x)
+        x = self.leaky_relu(x)
+        x = self.dropout2(x)
+        
+        x = self.fc3(x)
+        
+        return x
+
+
+def train_model(model, train_loader, val_loader, epochs=150, learning_rate=0.0005, patience=20, 
+                weight_decay=1e-5, scheduler_factor=0.7, scheduler_patience=8):
+    """
+    Train the PyTorch Graph Neural Network model with improved training procedure
     """
     criterion = nn.MSELoss()
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
@@ -211,11 +355,12 @@ def train_model(model, train_loader, val_loader, epochs=150, learning_rate=0.000
         train_loss = 0.0
         train_mae = 0.0
         
-        for sequences, targets in train_loader:
-            sequences, targets = sequences.to(device), targets.to(device)
+        for batch_data, targets in train_loader:
+            batch_data = batch_data.to(device)
+            targets = targets.to(device)
             
             # Forward pass
-            outputs = model(sequences)
+            outputs = model(batch_data)
             loss = criterion(outputs, targets)
             
             # Backward and optimize
@@ -227,12 +372,12 @@ def train_model(model, train_loader, val_loader, epochs=150, learning_rate=0.000
             
             optimizer.step()
             
-            train_loss += loss.item()
-            train_mae += torch.mean(torch.abs(outputs - targets)).item()
+            train_loss += loss.item() * batch_data.num_graphs
+            train_mae += torch.sum(torch.abs(outputs - targets)).item()
         
-        train_loss /= len(train_loader)
+        train_loss /= len(train_loader.dataset)
         train_losses.append(train_loss)
-        train_mae /= len(train_loader)
+        train_mae /= len(train_loader.dataset)
         train_maes.append(train_mae)
         
         # Validation
@@ -241,17 +386,18 @@ def train_model(model, train_loader, val_loader, epochs=150, learning_rate=0.000
         val_mae = 0.0
         
         with torch.no_grad():
-            for sequences, targets in val_loader:
-                sequences, targets = sequences.to(device), targets.to(device)
-                outputs = model(sequences)
+            for batch_data, targets in val_loader:
+                batch_data = batch_data.to(device)
+                targets = targets.to(device)
+                outputs = model(batch_data)
                 loss = criterion(outputs, targets)
                 
-                val_loss += loss.item()
-                val_mae += torch.mean(torch.abs(outputs - targets)).item()
+                val_loss += loss.item() * batch_data.num_graphs
+                val_mae += torch.sum(torch.abs(outputs - targets)).item()
         
-        val_loss /= len(val_loader)
+        val_loss /= len(val_loader.dataset)
         val_losses.append(val_loss)
-        val_mae /= len(val_loader)
+        val_mae /= len(val_loader.dataset)
         val_maes.append(val_mae)
         
         # Update learning rate scheduler
@@ -268,7 +414,7 @@ def train_model(model, train_loader, val_loader, epochs=150, learning_rate=0.000
             best_model = model.state_dict().copy()
             counter = 0
             # Save best model
-            torch.save(best_model, 'best_lstm_model.pth')
+            torch.save(best_model, 'best_gnn_model.pth')
             print(f"Saved new best model with validation loss: {val_loss:.4f}")
         else:
             counter += 1
@@ -283,10 +429,10 @@ def train_model(model, train_loader, val_loader, epochs=150, learning_rate=0.000
     print(f"Training completed in {total_time:.2f} seconds ({total_time/60:.2f} minutes)")
     
     return model, {'train_loss': train_losses, 'val_loss': val_losses, 
-                  'train_mae': train_maes, 'val_mae': val_maes}
+                   'train_mae': train_maes, 'val_mae': val_maes}
 
 
-def evaluate_model(model, test_loader, y_scaler):
+def evaluate_model(model, test_loader, inverse_transform_y):
     """
     Evaluate the model on the test set and calculate error percentages
     with inverse transform to get original scale predictions
@@ -297,19 +443,21 @@ def evaluate_model(model, test_loader, y_scaler):
     y_pred_scaled = []
     
     with torch.no_grad():
-        for sequences, targets in test_loader:
-            sequences, targets = sequences.to(device), targets.to(device)
-            outputs = model(sequences)
+        for batch_data, targets in test_loader:
+            batch_data = batch_data.to(device)
+            targets = targets.to(device)
+            outputs = model(batch_data)
             
             y_true_scaled.extend(targets.cpu().numpy().flatten())
             y_pred_scaled.extend(outputs.cpu().numpy().flatten())
     
-    # Inverse transform the scaled predictions and targets
+    # Convert to numpy arrays
     y_true_scaled = np.array(y_true_scaled).reshape(-1, 1)
     y_pred_scaled = np.array(y_pred_scaled).reshape(-1, 1)
     
-    y_true = y_scaler.inverse_transform(y_true_scaled).flatten()
-    y_pred = y_scaler.inverse_transform(y_pred_scaled).flatten()
+    # Apply inverse transform to get original scale
+    y_true = inverse_transform_y(y_true_scaled)
+    y_pred = inverse_transform_y(y_pred_scaled)
     
     # Calculate absolute errors
     absolute_errors = np.abs(y_pred - y_true)
@@ -320,10 +468,12 @@ def evaluate_model(model, test_loader, y_scaler):
     # Calculate mean and standard deviation of errors
     mean_absolute_error = np.mean(absolute_errors)
     mean_percentage_error = np.mean(percentage_errors)
+    median_percentage_error = np.median(percentage_errors)
     
     print("\nTest Set Evaluation:")
     print(f"Mean Absolute Error: {mean_absolute_error:.4f}")
     print(f"Mean Percentage Error: {mean_percentage_error:.2f}%")
+    print(f"Median Percentage Error: {median_percentage_error:.2f}%")
     
     # Print individual predictions and errors
     print("\nIndividual Test Sample Results:")
@@ -376,19 +526,41 @@ def plot_results(history, y_true, y_pred):
     ax3.set_aspect('equal', adjustable='box')
     
     plt.tight_layout()
-    plt.savefig('lstm_results_pytorch_improved.png', dpi=300)
+    plt.savefig('gnn_results.png', dpi=300)
     
     # Create additional plot for error analysis
     plt.figure(figsize=(12, 6))
     error_percentages = (np.abs(y_pred - y_true) / np.clip(np.abs(y_true), 1e-10, None)) * 100
-    plt.bar(range(len(y_true)), error_percentages)
-    plt.axhline(np.mean(error_percentages), color='r', linestyle='--', label=f'Mean Error: {np.mean(error_percentages):.2f}%')
-    plt.title('Percentage Error by Test Sample')
-    plt.xlabel('Test Sample')
+    
+    # Sort errors for better visualization
+    sorted_indices = np.argsort(error_percentages)
+    sorted_errors = error_percentages[sorted_indices]
+    
+    plt.bar(range(len(y_true)), sorted_errors)
+    plt.axhline(np.mean(error_percentages), color='r', linestyle='--', 
+                label=f'Mean Error: {np.mean(error_percentages):.2f}%')
+    plt.axhline(np.median(error_percentages), color='g', linestyle='--', 
+                label=f'Median Error: {np.median(error_percentages):.2f}%')
+    plt.title('Percentage Error by Test Sample (Sorted)')
+    plt.xlabel('Test Sample (Sorted by Error)')
     plt.ylabel('Error (%)')
     plt.legend()
     plt.grid(True, axis='y')
-    plt.savefig('error_analysis.png', dpi=300)
+    plt.savefig('error_analysis_gnn.png', dpi=300)
+    
+    # Add histogram of errors
+    plt.figure(figsize=(10, 6))
+    plt.hist(error_percentages, bins=20, alpha=0.7, color='blue')
+    plt.axvline(np.mean(error_percentages), color='r', linestyle='--', 
+                label=f'Mean Error: {np.mean(error_percentages):.2f}%')
+    plt.axvline(np.median(error_percentages), color='g', linestyle='--', 
+                label=f'Median Error: {np.median(error_percentages):.2f}%')
+    plt.title('Distribution of Percentage Errors')
+    plt.xlabel('Error (%)')
+    plt.ylabel('Frequency')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig('error_histogram_gnn.png', dpi=300)
     
     plt.show()
 
@@ -397,45 +569,55 @@ def main():
     # Load the dataset
     sequences, execution_times = load_dataset()
     
-    # Split data into training, validation, and test sets
-    train_dataset, val_dataset, test_dataset, y_scaler = prepare_train_val_test_split(
+    # Split data into training, validation, and test sets with improved preprocessing
+    train_dataset, val_dataset, test_dataset, inverse_transform_y = prepare_train_val_test_split(
         sequences, execution_times, test_size=20
     )
     
-    # Create data loaders with smaller batch size for more gradient updates
-    batch_size = 16  # Reduced from 32
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size)
-    test_loader = DataLoader(test_dataset, batch_size=1)  # Use batch size 1 for detailed evaluation
+    # Use custom collator for graph data
+    collator = GraphAttentionCollator()
     
-    # Get sample input shape
-    sample_input = next(iter(train_loader))[0]
-    input_size = sample_input.shape[2]  # Feature dimension
-    print(f"Input feature size: {input_size}")
+    # Create data loaders
+    batch_size = 16
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collator)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, collate_fn=collator)
+    test_loader = DataLoader(test_dataset, batch_size=1, collate_fn=collator)  # Use batch size 1 for detailed evaluation
     
-    # Initialize the improved model
-    model = ImprovedLSTMModel(input_size=input_size).to(device)
+    # Get sample input to determine feature size
+    sample_batch = next(iter(train_loader))
+    sample_data, _ = sample_batch
+    num_node_features = sample_data.num_node_features
+    print(f"Number of node features: {num_node_features}")
+    
+    # Initialize the GNN model
+    model = GraphAttentionModel(
+        num_node_features=num_node_features,
+        hidden_dim=64,
+        num_layers=3,
+        dropout=0.2
+    ).to(device)
+    
     print(model)
     
     # Count the number of parameters
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Total parameters: {total_params}")
     
-    # Train the model with improved hyperparameters
+    # Train the model with optimized hyperparameters
     model, history = train_model(
         model, 
         train_loader, 
         val_loader, 
-        epochs=200,  # More epochs with early stopping
-        learning_rate=0.0005,  # Lower learning rate
-        patience=20,  # More patience for early stopping
+        epochs=300,  # Increased epochs for better convergence
+        learning_rate=0.0003,  # Lower learning rate for stability
+        patience=25,  # More patience for early stopping
         weight_decay=1e-5,  # L2 regularization
-        scheduler_factor=0.7,  # More gradual learning rate reduction
-        scheduler_patience=8  # Wait more epochs before reducing LR
+        scheduler_factor=0.7,
+        scheduler_patience=10
     )
     
     # Evaluate the model on the test set
-    y_pred, absolute_errors, percentage_errors, y_true = evaluate_model(model, test_loader, y_scaler)
+    y_pred, absolute_errors, percentage_errors, y_true = evaluate_model(model, test_loader, inverse_transform_y)
     
     # Plot results
     plot_results(history, y_true, y_pred)
@@ -443,11 +625,11 @@ def main():
     # Save final model
     torch.save({
         'model_state_dict': model.state_dict(),
-        'y_scaler': y_scaler
-    }, 'final_lstm_model.pth')
+        'inverse_transform_y': inverse_transform_y
+    }, 'final_gnn_model.pth')
     
     print("\nModel training and evaluation complete!")
-    print("Full model saved to 'final_lstm_model.pth'")
+    print("Full model saved to 'final_gnn_model.pth'")
 
 
 if __name__ == "__main__":
