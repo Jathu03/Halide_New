@@ -39,24 +39,54 @@ def parse_json_data(json_data):
     # Check scheduling_data at root level
     if 'scheduling_data' in json_data:
         sched_data = json_data['scheduling_data']
-        print(f"Debug: Found scheduling_data at root. Keys: {list(sched_data.keys()) if isinstance(sched_data, dict) else 'Not a dict'}")
-        if isinstance(sched_data, dict) and sched_data.get('name') == 'total_execution_time_ms':
+        print(f"Debug: Found scheduling_data at root. Type: {type(sched_data).__name__}")
+        
+        # Handle scheduling_data as a list
+        if isinstance(sched_data, list):
+            print(f"Debug: scheduling_data is a list with {len(sched_data)} items")
+            for item in sched_data:
+                if isinstance(item, dict) and item.get('name') == 'total_execution_time_ms':
+                    try:
+                        execution_time = float(item.get('value'))
+                        print(f"Debug: Execution time found in scheduling_data (root list): {execution_time} ms")
+                        break
+                    except (ValueError, TypeError):
+                        print("Debug: Invalid execution time value in scheduling_data item")
+        # Handle scheduling_data as a dict (for robustness)
+        elif isinstance(sched_data, dict) and sched_data.get('name') == 'total_execution_time_ms':
             try:
                 execution_time = float(sched_data.get('value'))
-                print(f"Debug: Execution time found in scheduling_data (root): {execution_time} ms")
+                print(f"Debug: Execution time found in scheduling_data (root dict): {execution_time} ms")
             except (ValueError, TypeError):
-                print("Debug: Invalid execution time value in scheduling_data (root)")
+                print("Debug: Invalid execution time value in scheduling_data (root dict)")
+        else:
+            print(f"Debug: scheduling_data is neither a list nor a valid dict. Content: {sched_data}")
     
-    # Check scheduling_data within programming_details
+    # Check scheduling_data within programming_details (fallback)
     if execution_time is None and 'scheduling_data' in prog_data:
         sched_data = prog_data['scheduling_data']
-        print(f"Debug: Found scheduling_data in programming_details. Keys: {list(sched_data.keys()) if isinstance(sched_data, dict) else 'Not a dict'}")
-        if isinstance(sched_data, dict) and sched_data.get('name') == 'total_execution_time_ms':
+        print(f"Debug: Found scheduling_data in programming_details. Type: {type(sched_data).__name__}")
+        
+        # Handle scheduling_data as a list
+        if isinstance(sched_data, list):
+            print(f"Debug: scheduling_data is a list with {len(sched_data)} items")
+            for item in sched_data:
+                if isinstance(item, dict) and item.get('name') == 'total_execution_time_ms':
+                    try:
+                        execution_time = float(item.get('value'))
+                        print(f"Debug: Execution time found in scheduling_data (programming_details list): {execution_time} ms")
+                        break
+                    except (ValueError, TypeError):
+                        print("Debug: Invalid execution time value in scheduling_data item")
+        # Handle scheduling_data as a dict
+        elif isinstance(sched_data, dict) and sched_data.get('name') == 'total_execution_time_ms':
             try:
                 execution_time = float(sched_data.get('value'))
-                print(f"Debug: Execution time found in scheduling_data (programming_details): {execution_time} ms")
+                print(f"Debug: Execution time found in scheduling_data (programming_details dict): {execution_time} ms")
             except (ValueError, TypeError):
-                print("Debug: Invalid execution time value in scheduling_data (programming_details)")
+                print("Debug: Invalid execution time value in scheduling_data (programming_details dict)")
+        else:
+            print(f"Debug: scheduling_data is neither a list nor a valid dict. Content: {sched_data}")
     
     if execution_time is None:
         print("Debug: No execution time found in scheduling_data")
