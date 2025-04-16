@@ -10,22 +10,33 @@ def parse_json_data(json_data):
     """
     Parse the JSON data to extract program and schedule features.
     """
-    # Extract execution time
-    execution_time = None
-    programming_details = json_data.get('programming_details', [])
+    # Possible keys for program data
+    possible_data_keys = ['programming_details', 'program_data', 'details', 'schedule', 'pipeline']
+    
+    programming_details = None
+    for key in possible_data_keys:
+        if key in json_data and isinstance(json_data[key], list):
+            programming_details = json_data[key]
+            break
+    
+    if programming_details is None:
+        print(f"Debug: No valid program data key found. Top-level keys: {list(json_data.keys())}")
+        return None, None, None, None
     
     # Check if programming_details contains only strings
     if all(isinstance(item, str) for item in programming_details):
-        print(f"Debug: programming_details contains only strings: {[type(item) for item in programming_details]}")
+        print(f"Debug: {key} contains only strings: {[type(item) for item in programming_details]}")
+        print(f"Debug: Top-level keys: {list(json_data.keys())}")
         return None, None, None, None
     
-    # Possible keys for execution time
+    # Extract execution time
+    execution_time = None
     possible_time_keys = ['total_execution_time_ms', 'execution_time_ms', 'total_time_ms', 'runtime_ms']
     
     for item in programming_details:
         if isinstance(item, dict):
-            for key in possible_time_keys:
-                if item.get('name') == key:
+            for time_key in possible_time_keys:
+                if item.get('name') == time_key:
                     execution_time = item.get('value')
                     break
             if execution_time is not None:
@@ -34,7 +45,7 @@ def parse_json_data(json_data):
     if execution_time is None:
         # Log keys of programming_details items for debugging
         keys = [list(item.keys()) if isinstance(item, dict) else type(item) for item in programming_details]
-        print(f"Debug: No execution time found. Keys in programming_details: {keys}")
+        print(f"Debug: No execution time found in {key}. Keys in {key}: {keys}")
         execution_time = 0.0
     
     # Initialize graph
@@ -113,7 +124,7 @@ def parse_json_data(json_data):
         G.add_node(name)
     
     # Process edges
-    edges = json_data['programming_details'].get('Edges', [])
+    edges = json_data.get('Edges', []) or [item for item in programming_details if isinstance(item, dict) and 'From' in item]
     for edge in edges:
         from_node = edge['From']
         to_node = edge['To']
