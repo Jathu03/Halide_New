@@ -142,10 +142,11 @@ class GraphLSTM(nn.Module):
     """
     Graph-LSTM model for execution time prediction.
     """
-    def __init__(self, input_dim, hidden_dim=256, num_layers=2, dropout=0.3):
+    def __init__(self, input_dim, seq_len, hidden_dim=256, num_layers=2, dropout=0.3):
         super(GraphLSTM, self).__init__()
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
+        self.seq_len = seq_len
         
         self.cells = nn.ModuleList([
             GraphLSTMCell(input_dim if i == 0 else hidden_dim, hidden_dim)
@@ -169,8 +170,8 @@ class GraphLSTM(nn.Module):
         
         # Initialize hidden and cell states
         batch_size = data.num_graphs
-        h = [torch.zeros(batch_size, x.size(0), self.hidden_dim, device=x.device) for _ in range(self.num_layers)]
-        c = [torch.zeros(batch_size, x.size(0), self.hidden_dim, device=x.device) for _ in range(self.num_layers)]
+        h = [torch.zeros(batch_size, self.seq_len, self.hidden_dim, device=x.device) for _ in range(self.num_layers)]
+        c = [torch.zeros(batch_size, self.seq_len, self.hidden_dim, device=x.device) for _ in range(self.num_layers)]
         
         # Build adjacency list
         adj_list = defaultdict(list)
@@ -180,17 +181,24 @@ class GraphLSTM(nn.Module):
         # Process each node sequentially
         outputs = []
         for t in range(self.seq_len):
+            # Select features for current timestep across graphs
             node_features = x[t::self.seq_len]
             for layer in range(self.num_layers):
-                h_prev = h[layer][:, t::self.seq_len]
-                c_prev = c[layer][:, t::self.seq_len]
+                h_prev = h[layer][:, t, :]
+                c_prev = c[layer][:, t, :]
                 new_h = []
                 new_c = []
                 
                 for node_idx in range(node_features.size(0)):
+                    # Compute global index for the node in the batch
                     global_idx = node_idx * self.seq_len + t
                     neighbors = adj_list.get(global_idx, [])
-                    neighbors_h = [h[layer][0, n % self.seq_len] for n in neighbors if n // self.seq_len == global_idx // self.seq_len]
+                    # Filter neighbors within the same graph
+                    neighbors_h = [
+                        h[layer][node_idx, n % self.seq_len]
+                        for n in neighbors
+                        if n // self.seq_len == global_idx // self.seq_len
+                    ]
                     
                     h_t, c_t = self.cells[layer](
                         node_features[node_idx], 
@@ -198,13 +206,13 @@ class GraphLSTM(nn.Module):
                         c_prev[node_idx], 
                         neighbors_h
                     )
-                    new_h.append(hExpr_t)
+                    new_h.append(h_t)
                     new_c.append(c_t)
                 
-                h[layer][:, t::self.seq_len] = torch.stack(new_h)
-                c[layer][:, t::self.seq_len] = torch.stack(new_c)
+                h[layer][:, t, :] = torch.stack(new_h)
+                c[layer][:, t, :] = torch.stack(new_c)
             
-            outputs.append(h[-1][:, t::self.seq_len])
+            outputs.append(h[-1][:, t, :])
         
         # Aggregate final hidden states
         final_h = torch.mean(torch.stack(outputs), dim=0)
@@ -272,7 +280,7 @@ def prepare_train_val_test_split(sequences, execution_times, test_size=20, val_s
     with open('x_scaler.pkl', 'wb') as f:
         pickle.dump(x_scaler, f)
     
-    return train_dataset, val_dataset, test_dataset, y_scaler
+    return train_dataset, val_dataset, test_dataset, y_scaler, seq_len
 
 def train_model_with_fold(model, train_loader, val_loader, fold=0, 
                           epochs=200, learning_rate=0.001, min_lr=1e-6,
@@ -430,11 +438,9 @@ def main():
     sequences, execution_times = load_dataset()
     
     # Prepare splits
-    train_dataset, val_dataset, test_dataset, y_scaler = prepare_train_val_test_split(
+    train_dataset, val_dataset, test_dataset, y_scaler, seq_len = prepare_train_val_test_split(
         sequences, execution_times
     )
-    global seq_len
-    seq_len = sequences.shape[1]
     
     # Create dataloaders
     collator = GraphAttentionCollator()
@@ -444,7 +450,7 @@ def main():
     
     # Initialize model
     input_dim = sequences.shape[2]
-    model = GraphLSTM(input_dim=input_dim).to(device)
+    model = GraphLSTM(input_dim=input_dim, seq_len=seq_len).to(device)
     
     # Train model
     train_losses, val_losses = train_model_with_fold(
