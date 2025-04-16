@@ -316,7 +316,7 @@ def train_model_with_fold(model, train_loader, val_loader, fold=0,
                           epochs=1, learning_rate=0.001, min_lr=1e-6,
                           weight_decay=1e-5, patience=25,
                           gradient_accumulation_steps=1,
-                          use_warmup=True, warmup_epochs=1,
+                          use_warmup=True, warmup_epochs=0,
                           use_amp=False):
     """
     Train a single model with improved training strategy.
