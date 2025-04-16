@@ -10,70 +10,43 @@ def parse_json_data(json_data):
     """
     Parse the JSON data to extract program and schedule features.
     """
-    # Possible keys for program data, prioritizing scheduling_data
-    possible_data_keys = ['scheduling_data', 'programming_details', 'program_data', 'details', 'pipeline']
-    
-    programming_details = None
-    selected_key = None
-    for key in possible_data_keys:
-        if key in json_data and isinstance(json_data[key], list):
-            programming_details = json_data[key]
-            selected_key = key
-            # Verify the list contains dictionaries with expected keys
-            if any(isinstance(item, dict) and any(k in item for k in ['Name', 'From', 'name']) for item in programming_details):
-                break
-            else:
-                programming_details = None  # Reset if no valid dictionaries found
-                selected_key = None
-    
-    if programming_details is None:
-        # Log sample content for debugging
-        debug_info = {}
-        for key in ['scheduling_data', 'programming_details']:
-            if key in json_data:
-                sample = json_data[key][:2] if isinstance(json_data[key], list) else json_data[key]
-                debug_info[key] = sample
-        print(f"Debug: No valid program data key found. Top-level keys: {list(json_data.keys())}")
-        print(f"Debug: Sample content: {debug_info}")
+    # Check for programming_details
+    if 'programming_details' not in json_data:
+        print(f"Debug: No 'programming_details' key found. Top-level keys: {list(json_data.keys())}")
         return None, None, None, None
     
-    # Check if programming_details contains only strings
-    if all(isinstance(item, str) for item in programming_details):
-        print(f"Debug: {selected_key} contains only strings: {[type(item) for item in programming_details]}")
-        print(f"Debug: Sample content: {programming_details[:2]}")
+    prog_data = json_data['programming_details']
+    
+    # Extract nodes
+    nodes = prog_data.get('Nodes', [])
+    if not nodes or not isinstance(nodes, list):
+        print(f"Debug: No valid nodes found in programming_details. Nodes: {nodes}")
+        return None, None, None, None
+    
+    # Extract edges
+    edges = prog_data.get('Edges', [])
+    if not edges or not isinstance(edges, list):
+        print(f"Debug: No valid edges found in programming_details. Edges: {edges}")
         return None, None, None, None
     
     # Extract execution time
     execution_time = None
     possible_time_keys = ['total_execution_time_ms', 'execution_time_ms', 'total_time_ms', 'runtime_ms']
     
-    for item in programming_details:
+    for item in prog_data.get('Nodes', []) + [prog_data]:
         if isinstance(item, dict):
             for time_key in possible_time_keys:
                 if item.get('name') == time_key:
-                    execution_time = item.get('value')
-                    break
+                    try:
+                        execution_time = float(item.get('value'))
+                        break
+                    except (ValueError, TypeError):
+                        continue
             if execution_time is not None:
                 break
     
     if execution_time is None:
-        # Try alternative execution time fields
-        for item in programming_details:
-            if isinstance(item, dict):
-                for time_key in possible_time_keys:
-                    if time_key in item:
-                        try:
-                            execution_time = float(item[time_key])
-                            break
-                        except (ValueError, TypeError):
-                            continue
-            if execution_time is not None:
-                break
-    
-    if execution_time is None:
-        # Log keys of programming_details items for debugging
-        keys = [list(item.keys()) if isinstance(item, dict) else type(item) for item in programming_details]
-        print(f"Debug: No execution time found in {selected_key}. Keys in {selected_key}: {keys}")
+        print(f"Debug: No execution time found in programming_details")
         execution_time = 0.0
     
     # Initialize graph
@@ -82,8 +55,9 @@ def parse_json_data(json_data):
     edge_features = {}
     
     # Process nodes
-    nodes = [item for item in programming_details if isinstance(item, dict) and 'Name' in item]
     for node in nodes:
+        if not isinstance(node, dict) or 'Name' not in node:
+            continue
         name = node['Name']
         details = node.get('Details', {})
         
@@ -155,8 +129,9 @@ def parse_json_data(json_data):
         G.add_node(name)
     
     # Process edges
-    edges = json_data.get('Edges', []) or [item for item in programming_details if isinstance(item, dict) and 'From' in item]
     for edge in edges:
+        if not isinstance(edge, dict) or 'From' not in edge or 'To' not in edge:
+            continue
         from_node = edge['From']
         to_node = edge['To']
         details = edge.get('Details', {})
@@ -168,11 +143,8 @@ def parse_json_data(json_data):
         if 'Footprint' in details:
             footprint = details['Footprint']
             for fp in footprint:
-                # Extract numerical values from footprint expressions
                 try:
-                    # Simple parsing for min/max values
                     value = fp.split(':')[-1].strip()
-                    # Handle basic arithmetic expressions
                     if '/' in value:
                         num, denom = value.split('/')
                         edge_vector.append(float(num) / float(denom))
@@ -208,9 +180,9 @@ def parse_json_data(json_data):
         edge_features[(from_node, to_node)] = edge_vector
         G.add_edge(from_node, to_node)
     
-    # Return None if no valid graph data
-    if not node_features and not edge_features:
-        print(f"Debug: No valid nodes or edges found in {selected_key}")
+    # Validate graph
+    if not node_features or not edge_features:
+        print(f"Debug: No valid nodes or edges found after parsing. Nodes: {len(node_features)}, Edges: {len(edge_features)}")
         return None, None, None, None
     
     return G, node_features, edge_features, execution_time
@@ -219,35 +191,28 @@ def create_sequence_representation(G, node_features, edge_features, max_nodes):
     """
     Create a sequential representation of the DAG for LSTM input, padded to max_nodes.
     """
-    # Perform topological sort to ensure consistent ordering
     topo_order = list(nx.topological_sort(G))
     
-    # Initialize sequence
     sequence = []
     max_node_len = max(len(f) for f in node_features.values()) if node_features else 1
     max_edge_len = max(len(f) for f in edge_features.values()) if edge_features else 1
     
-    for node in topo_order[:max_nodes]:  # Limit to max_nodes
-        # Get node features
+    for node in topo_order[:max_nodes]:
         node_vec = node_features.get(node, [0.0] * max_node_len)
         if len(node_vec) < max_node_len:
             node_vec.extend([0.0] * (max_node_len - len(node_vec)))
         
-        # Get incoming edge features
         edge_vec = [0.0] * max_edge_len
         predecessors = list(G.predecessors(node))
         if predecessors:
-            # Average features of incoming edges
             incoming_edges = [(pred, node) for pred in predecessors if (pred, node) in edge_features]
             if incoming_edges:
                 edge_vecs = [edge_features[edge] for edge in incoming_edges]
                 edge_vec = np.mean([ev + [0.0] * (max_edge_len - len(ev)) for ev in edge_vecs], axis=0).tolist()
         
-        # Combine node and edge features
         combined = node_vec + edge_vec
         sequence.append(combined)
     
-    # Pad sequence if fewer than max_nodes
     while len(sequence) < max_nodes:
         sequence.append([0.0] * (max_node_len + max_edge_len))
     
@@ -258,7 +223,7 @@ def normalize_features(sequences):
     Normalize feature sequences.
     """
     if len(sequences) == 0:
-        return np.array([]), None  # Return empty array and None scaler if no sequences
+        return np.array([]), None
     scaler = StandardScaler()
     flattened = sequences.reshape(-1, sequences.shape[-1])
     normalized = scaler.fit_transform(flattened)
@@ -273,14 +238,12 @@ def prepare_dataset(synthetic_data_dir):
     all_sequences = []
     execution_times = []
     
-    # Collect all JSON files
     json_files = []
     for root, _, files in os.walk(synthetic_data_dir):
         for file in files:
             if file.endswith('.json'):
                 json_files.append(os.path.join(root, file))
     
-    # Determine max_nodes across all graphs
     for json_file in json_files:
         with open(json_file, 'r') as f:
             try:
@@ -295,7 +258,6 @@ def prepare_dataset(synthetic_data_dir):
             continue
         max_nodes = max(max_nodes, G.number_of_nodes())
     
-    # Process each JSON file
     for json_file in json_files:
         with open(json_file, 'r') as f:
             try:
@@ -303,30 +265,24 @@ def prepare_dataset(synthetic_data_dir):
             except json.JSONDecodeError:
                 continue
                 
-        # Parse JSON to extract features
         G, node_features, edge_features, execution_time = parse_json_data(json_data)
         if G is None:
             continue
         
-        # Create sequence representation
         sequence = create_sequence_representation(G, node_features, edge_features, max_nodes)
         all_sequences.append(sequence)
         execution_times.append(execution_time)
     
-    # Convert to numpy arrays
     all_sequences = np.array(all_sequences)
     
-    # Normalize features
     normalized_sequences, scaler = normalize_features(all_sequences)
     
-    # Create dataset
     dataset = {
         'sequences': normalized_sequences,
         'execution_times': np.array(execution_times),
         'scaler': scaler
     }
     
-    # Save dataset only if there is data
     if len(all_sequences) > 0:
         np.savez('halide_data.npz', 
                  sequences=dataset['sequences'], 
@@ -336,7 +292,6 @@ def prepare_dataset(synthetic_data_dir):
     
     return dataset
 
-# Example usage
 if __name__ == "__main__":
     synthetic_data_dir = "synthetic_data"
     dataset = prepare_dataset(synthetic_data_dir)
