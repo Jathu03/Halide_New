@@ -13,6 +13,7 @@ import time
 from torch_geometric.nn import GCNConv, GATv2Conv, global_mean_pool, global_add_pool
 from torch_geometric.data import Data, Batch
 import math
+import pickle
 
 # Set random seeds for reproducibility
 random.seed(42)
@@ -118,6 +119,30 @@ def load_dataset(file_path='halide_data.npz'):
     return sequences, execution_times
 
 
+# Define ScalerWrapper class to make the inverse transform function picklable
+class ScalerWrapper:
+    """
+    Wrapper class for scaling and inverse scaling operations
+    This makes the scaling operations picklable
+    """
+    def __init__(self, y_scaler):
+        self.y_scaler = y_scaler
+        
+    def inverse_transform_y(self, y_scaled):
+        """
+        Apply inverse transform to convert scaled values back to original scale
+        """
+        y_log = self.y_scaler.inverse_transform(y_scaled.reshape(-1, 1)).flatten()
+        y_original = np.expm1(y_log)  # Inverse of log1p
+        return y_original
+    
+    def __call__(self, y_scaled):
+        """
+        Make the object callable for convenience
+        """
+        return self.inverse_transform_y(y_scaled)
+
+
 def prepare_train_val_test_split(sequences, execution_times, test_size=20):
     """
     Split the dataset into training, validation and test sets with improved preprocessing.
@@ -178,13 +203,14 @@ def prepare_train_val_test_split(sequences, execution_times, test_size=20):
     print(f"  Validation: {len(val_dataset)} samples")
     print(f"  Test: {len(test_dataset)} samples")
     
-    # Create custom inverse transform function for y
-    def inverse_transform_y(y_scaled):
-        y_log = y_scaler.inverse_transform(y_scaled.reshape(-1, 1)).flatten()
-        y_original = np.expm1(y_log)  # Inverse of log1p
-        return y_original
+    # Create a picklable wrapper for the inverse transform function
+    scaler_wrapper = ScalerWrapper(y_scaler)
     
-    return train_dataset, val_dataset, test_dataset, inverse_transform_y
+    # Save the scaler for later use
+    with open('y_scaler.pkl', 'wb') as f:
+        pickle.dump(scaler_wrapper, f)
+    
+    return train_dataset, val_dataset, test_dataset, scaler_wrapper
 
 
 class GraphAttentionCollator:
@@ -570,7 +596,7 @@ def main():
     sequences, execution_times = load_dataset()
     
     # Split data into training, validation, and test sets with improved preprocessing
-    train_dataset, val_dataset, test_dataset, inverse_transform_y = prepare_train_val_test_split(
+    train_dataset, val_dataset, test_dataset, scaler_wrapper = prepare_train_val_test_split(
         sequences, execution_times, test_size=20
     )
     
@@ -617,19 +643,51 @@ def main():
     )
     
     # Evaluate the model on the test set
-    y_pred, absolute_errors, percentage_errors, y_true = evaluate_model(model, test_loader, inverse_transform_y)
+    y_pred, absolute_errors, percentage_errors, y_true = evaluate_model(model, test_loader, scaler_wrapper)
     
     # Plot results
     plot_results(history, y_true, y_pred)
     
-    # Save final model
+    # Save final model - now saving only what's needed
     torch.save({
         'model_state_dict': model.state_dict(),
-        'inverse_transform_y': inverse_transform_y
+        # Not saving the scaler_wrapper here as it's already saved to disk
+        'model_class_name': 'GraphAttentionModel',
+        'num_node_features': num_node_features,
+        'hidden_dim': 64,
+        'num_layers': 3,
+        'dropout': 0.2
     }, 'final_gnn_model.pth')
     
     print("\nModel training and evaluation complete!")
     print("Full model saved to 'final_gnn_model.pth'")
+    print("Scaler saved to 'y_scaler.pkl'")
+
+
+# Function to load model and make predictions (for future use)
+def load_model_and_predict(model_path='final_gnn_model.pth', scaler_path='y_scaler.pkl'):
+    """
+    Load a saved model and its scaler to make predictions
+    """
+    # Load model parameters
+    checkpoint = torch.load(model_path, map_location=device)
+    
+    # Create model instance
+    model = GraphAttentionModel(
+        num_node_features=checkpoint['num_node_features'],
+        hidden_dim=checkpoint['hidden_dim'],
+        num_layers=checkpoint['num_layers'],
+        dropout=checkpoint['dropout']
+    ).to(device)
+    
+    # Load state dict
+    model.load_state_dict(checkpoint['model_state_dict'])
+    
+    # Load scaler
+    with open(scaler_path, 'rb') as f:
+        scaler_wrapper = pickle.load(f)
+    
+    return model, scaler_wrapper
 
 
 if __name__ == "__main__":
