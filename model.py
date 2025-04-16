@@ -313,10 +313,10 @@ def prepare_train_val_test_split(sequences, execution_times, test_size=20, val_s
     return train_dataset, val_dataset, test_dataset, y_scaler, seq_len
 
 def train_model_with_fold(model, train_loader, val_loader, fold=0, 
-                          epochs=1, learning_rate=0.001, min_lr=1e-6,
+                          epochs=15, learning_rate=0.001, min_lr=1e-6,
                           weight_decay=1e-5, patience=25,
                           gradient_accumulation_steps=1,
-                          use_warmup=True, warmup_epochs=0,
+                          use_warmup=True, warmup_epochs=10,
                           use_amp=False):
     """
     Train a single model with improved training strategy.
