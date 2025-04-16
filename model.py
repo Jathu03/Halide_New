@@ -1,17 +1,38 @@
 import numpy as np
-import tensorflow as tf
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout
-from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
-from sklearn.model_selection import train_test_split
+import torch
+from torch import nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader, random_split, Subset
 import matplotlib.pyplot as plt
 import os
 import random
+from sklearn.model_selection import train_test_split
 
 # Set random seeds for reproducibility
-np.random.seed(42)
-tf.random.set_seed(42)
 random.seed(42)
+np.random.seed(42)
+torch.manual_seed(42)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(42)
+
+# Define device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+class HalideDataset(Dataset):
+    """
+    PyTorch Dataset for Halide execution time prediction
+    """
+    def __init__(self, sequences, execution_times):
+        self.sequences = torch.FloatTensor(sequences)
+        self.execution_times = torch.FloatTensor(execution_times).reshape(-1, 1)
+        
+    def __len__(self):
+        return len(self.sequences)
+    
+    def __getitem__(self, idx):
+        return self.sequences[idx], self.execution_times[idx]
+
 
 def load_dataset(file_path='halide_data.npz'):
     """
@@ -29,6 +50,7 @@ def load_dataset(file_path='halide_data.npz'):
     print(f"Execution times shape: {execution_times.shape}")
     
     return sequences, execution_times
+
 
 def prepare_train_val_test_split(sequences, execution_times, test_size=20):
     """
@@ -52,95 +74,181 @@ def prepare_train_val_test_split(sequences, execution_times, test_size=20):
     # Split the remaining data into training and validation (80/20 split)
     train_indices, val_indices = train_test_split(remaining_indices, test_size=0.2, random_state=42)
     
-    # Create the splits
-    X_train = sequences[train_indices]
-    y_train = execution_times[train_indices]
+    # Create the entire dataset
+    full_dataset = HalideDataset(sequences, execution_times)
     
-    X_val = sequences[val_indices]
-    y_val = execution_times[val_indices]
-    
-    X_test = sequences[test_indices]
-    y_test = execution_times[test_indices]
+    # Create dataset splits using indices
+    train_dataset = Subset(full_dataset, train_indices)
+    val_dataset = Subset(full_dataset, val_indices)
+    test_dataset = Subset(full_dataset, test_indices)
     
     print(f"Split dataset into:")
-    print(f"  Training: {len(X_train)} samples")
-    print(f"  Validation: {len(X_val)} samples")
-    print(f"  Test: {len(X_test)} samples")
+    print(f"  Training: {len(train_dataset)} samples")
+    print(f"  Validation: {len(val_dataset)} samples")
+    print(f"  Test: {len(test_dataset)} samples")
     
-    return X_train, y_train, X_val, y_val, X_test, y_test
+    return train_dataset, val_dataset, test_dataset
 
-def build_lstm_model(input_shape):
+
+class LSTMModel(nn.Module):
     """
-    Build an LSTM model for execution time prediction.
+    LSTM model for execution time prediction
     """
-    model = Sequential([
-        # First LSTM layer with return sequences to stack another LSTM
-        LSTM(128, input_shape=input_shape, return_sequences=True),
-        Dropout(0.2),
+    def __init__(self, input_size, hidden_size1=128, hidden_size2=64, dropout=0.2):
+        super(LSTMModel, self).__init__()
+        
+        self.lstm1 = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size1,
+            batch_first=True
+        )
+        
+        self.dropout1 = nn.Dropout(dropout)
+        
+        self.lstm2 = nn.LSTM(
+            input_size=hidden_size1,
+            hidden_size=hidden_size2,
+            batch_first=True
+        )
+        
+        self.dropout2 = nn.Dropout(dropout)
+        
+        self.fc1 = nn.Linear(hidden_size2, 32)
+        self.relu = nn.ReLU()
+        self.dropout3 = nn.Dropout(0.1)
+        self.fc2 = nn.Linear(32, 1)
+        
+    def forward(self, x):
+        # First LSTM layer
+        out, _ = self.lstm1(x)
+        out = self.dropout1(out)
         
         # Second LSTM layer
-        LSTM(64, return_sequences=False),
-        Dropout(0.2),
+        out, _ = self.lstm2(out)
+        # Take the output from the last time step
+        out = out[:, -1, :]
+        out = self.dropout2(out)
         
-        # Dense layers for regression
-        Dense(32, activation='relu'),
-        Dropout(0.1),
-        Dense(1)  # Output layer for execution time prediction
-    ])
-    
-    # Compile the model
-    model.compile(
-        optimizer='adam',
-        loss='mean_squared_error',
-        metrics=['mean_absolute_error']
-    )
-    
-    model.summary()
-    return model
+        # Fully connected layers
+        out = self.fc1(out)
+        out = self.relu(out)
+        out = self.dropout3(out)
+        out = self.fc2(out)
+        
+        return out
 
-def train_model(model, X_train, y_train, X_val, y_val, epochs=100, batch_size=32):
-    """
-    Train the LSTM model with early stopping and model checkpointing.
-    """
-    # Create callbacks
-    early_stopping = EarlyStopping(
-        monitor='val_loss',
-        patience=10,
-        restore_best_weights=True,
-        verbose=1
-    )
-    
-    model_checkpoint = ModelCheckpoint(
-        'best_lstm_model.h5',
-        monitor='val_loss',
-        save_best_only=True,
-        verbose=1
-    )
-    
-    # Train the model
-    history = model.fit(
-        X_train, y_train,
-        validation_data=(X_val, y_val),
-        epochs=epochs,
-        batch_size=batch_size,
-        callbacks=[early_stopping, model_checkpoint],
-        verbose=1
-    )
-    
-    return model, history
 
-def evaluate_model(model, X_test, y_test):
+def train_model(model, train_loader, val_loader, epochs=100, learning_rate=0.001, patience=10):
     """
-    Evaluate the model on the test set and calculate error percentages.
+    Train the PyTorch LSTM model with early stopping
     """
-    # Make predictions
-    y_pred = model.predict(X_test)
+    criterion = nn.MSELoss()
+    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    
+    # For early stopping
+    best_val_loss = float('inf')
+    counter = 0
+    best_model = None
+    
+    # Training history
+    train_losses = []
+    val_losses = []
+    train_maes = []
+    val_maes = []
+    
+    for epoch in range(epochs):
+        # Training
+        model.train()
+        train_loss = 0.0
+        train_mae = 0.0
+        
+        for sequences, targets in train_loader:
+            sequences, targets = sequences.to(device), targets.to(device)
+            
+            # Forward pass
+            outputs = model(sequences)
+            loss = criterion(outputs, targets)
+            
+            # Backward and optimize
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            
+            train_loss += loss.item()
+            train_mae += torch.mean(torch.abs(outputs - targets)).item()
+        
+        train_loss /= len(train_loader)
+        train_losses.append(train_loss)
+        train_mae /= len(train_loader)
+        train_maes.append(train_mae)
+        
+        # Validation
+        model.eval()
+        val_loss = 0.0
+        val_mae = 0.0
+        
+        with torch.no_grad():
+            for sequences, targets in val_loader:
+                sequences, targets = sequences.to(device), targets.to(device)
+                outputs = model(sequences)
+                loss = criterion(outputs, targets)
+                
+                val_loss += loss.item()
+                val_mae += torch.mean(torch.abs(outputs - targets)).item()
+        
+        val_loss /= len(val_loader)
+        val_losses.append(val_loss)
+        val_mae /= len(val_loader)
+        val_maes.append(val_mae)
+        
+        print(f'Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.4f}, Train MAE: {train_mae:.4f}, '
+              f'Val Loss: {val_loss:.4f}, Val MAE: {val_mae:.4f}')
+        
+        # Early stopping check
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_model = model.state_dict().copy()
+            counter = 0
+            # Save best model
+            torch.save(best_model, 'best_lstm_model.pth')
+        else:
+            counter += 1
+            if counter >= patience:
+                print(f'Early stopping at epoch {epoch+1}')
+                break
+    
+    # Load the best model
+    model.load_state_dict(best_model)
+    
+    return model, {'train_loss': train_losses, 'val_loss': val_losses, 
+                  'train_mae': train_maes, 'val_mae': val_maes}
+
+
+def evaluate_model(model, test_loader):
+    """
+    Evaluate the model on the test set and calculate error percentages
+    """
+    model.eval()
+    
+    y_true = []
+    y_pred = []
+    
+    with torch.no_grad():
+        for sequences, targets in test_loader:
+            sequences, targets = sequences.to(device), targets.to(device)
+            outputs = model(sequences)
+            
+            y_true.extend(targets.cpu().numpy().flatten())
+            y_pred.extend(outputs.cpu().numpy().flatten())
+    
+    y_true = np.array(y_true)
+    y_pred = np.array(y_pred)
     
     # Calculate absolute errors
-    absolute_errors = np.abs(y_pred.flatten() - y_test)
+    absolute_errors = np.abs(y_pred - y_true)
     
     # Calculate percentage errors
-    percentage_errors = (absolute_errors / np.clip(np.abs(y_test), 1e-10, None)) * 100
+    percentage_errors = (absolute_errors / np.clip(np.abs(y_true), 1e-10, None)) * 100
     
     # Calculate mean and standard deviation of errors
     mean_absolute_error = np.mean(absolute_errors)
@@ -155,21 +263,22 @@ def evaluate_model(model, X_test, y_test):
     print("Sample | Actual Time | Predicted Time | Abs Error | Error %")
     print("-" * 70)
     
-    for i in range(len(y_test)):
-        print(f"{i:6d} | {y_test[i]:11.2f} | {y_pred[i][0]:14.2f} | {absolute_errors[i]:9.2f} | {percentage_errors[i]:7.2f}%")
+    for i in range(len(y_true)):
+        print(f"{i:6d} | {y_true[i]:11.2f} | {y_pred[i]:14.2f} | {absolute_errors[i]:9.2f} | {percentage_errors[i]:7.2f}%")
     
     return y_pred, absolute_errors, percentage_errors
 
-def plot_results(history, y_test, y_pred):
+
+def plot_results(history, y_true, y_pred):
     """
-    Plot training history and prediction results.
+    Plot training history and prediction results
     """
     # Create a figure with subplots
     fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 5))
     
     # Plot training & validation loss
-    ax1.plot(history.history['loss'])
-    ax1.plot(history.history['val_loss'])
+    ax1.plot(history['train_loss'])
+    ax1.plot(history['val_loss'])
     ax1.set_title('Model Loss')
     ax1.set_ylabel('Loss (MSE)')
     ax1.set_xlabel('Epoch')
@@ -177,8 +286,8 @@ def plot_results(history, y_test, y_pred):
     ax1.grid(True)
     
     # Plot training & validation MAE
-    ax2.plot(history.history['mean_absolute_error'])
-    ax2.plot(history.history['val_mean_absolute_error'])
+    ax2.plot(history['train_mae'])
+    ax2.plot(history['val_mae'])
     ax2.set_title('Mean Absolute Error')
     ax2.set_ylabel('MAE')
     ax2.set_xlabel('Epoch')
@@ -186,9 +295,9 @@ def plot_results(history, y_test, y_pred):
     ax2.grid(True)
     
     # Plot actual vs predicted values
-    ax3.scatter(y_test, y_pred)
-    min_val = min(np.min(y_test), np.min(y_pred))
-    max_val = max(np.max(y_test), np.max(y_pred))
+    ax3.scatter(y_true, y_pred)
+    min_val = min(np.min(y_true), np.min(y_pred))
+    max_val = max(np.max(y_true), np.max(y_pred))
     ax3.plot([min_val, max_val], [min_val, max_val], 'r--')
     ax3.set_title('Actual vs Predicted Execution Times')
     ax3.set_xlabel('Actual Time (ms)')
@@ -196,35 +305,72 @@ def plot_results(history, y_test, y_pred):
     ax3.grid(True)
     
     plt.tight_layout()
-    plt.savefig('lstm_results.png')
+    plt.savefig('lstm_results_pytorch.png')
     plt.show()
+
 
 def main():
     # Load the dataset
     sequences, execution_times = load_dataset()
     
     # Split data into training, validation, and test sets
-    X_train, y_train, X_val, y_val, X_test, y_test = prepare_train_val_test_split(
+    train_dataset, val_dataset, test_dataset = prepare_train_val_test_split(
         sequences, execution_times, test_size=20
     )
     
-    # Get the input shape for the model
-    input_shape = (X_train.shape[1], X_train.shape[2])
-    print(f"Input shape: {input_shape}")
+    # Create data loaders
+    batch_size = 32
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size)
     
-    # Build the LSTM model
-    model = build_lstm_model(input_shape)
+    # Get sample input shape (assuming we're dealing with a sequence dataset)
+    sample_input = next(iter(train_loader))[0]
+    input_size = sample_input.shape[2]  # Feature dimension
+    print(f"Input feature size: {input_size}")
+    
+    # Initialize the model
+    model = LSTMModel(input_size=input_size).to(device)
+    print(model)
+    
+    # Count the number of parameters
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Total parameters: {total_params}")
     
     # Train the model
-    model, history = train_model(model, X_train, y_train, X_val, y_val)
+    model, history = train_model(
+        model, 
+        train_loader, 
+        val_loader, 
+        epochs=100, 
+        learning_rate=0.001,
+        patience=10
+    )
     
     # Evaluate the model on the test set
-    y_pred, absolute_errors, percentage_errors = evaluate_model(model, X_test, y_test)
+    # Extract all test data for evaluation
+    all_test_sequences = []
+    all_test_targets = []
+    
+    for test_sequences, test_targets in test_loader:
+        all_test_sequences.extend(test_sequences.numpy())
+        all_test_targets.extend(test_targets.numpy().flatten())
+    
+    all_test_sequences = np.array(all_test_sequences)
+    all_test_targets = np.array(all_test_targets)
+    
+    # Create a new DataLoader with batch size 1 for individual predictions
+    individual_test_dataset = HalideDataset(all_test_sequences, all_test_targets)
+    individual_test_loader = DataLoader(individual_test_dataset, batch_size=1)
+    
+    # Evaluate
+    y_pred, absolute_errors, percentage_errors = evaluate_model(model, individual_test_loader)
     
     # Plot results
-    plot_results(history, y_test, y_pred.flatten())
+    plot_results(history, all_test_targets, y_pred)
     
     print("\nModel training and evaluation complete!")
+
 
 if __name__ == "__main__":
     main()
