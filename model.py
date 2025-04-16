@@ -197,6 +197,10 @@ class GraphLSTM(nn.Module):
         
         # Process each timestep
         outputs = []
+        # Store updates for h and c to avoid in-place operations
+        h_updates = [[] for _ in range(self.num_layers)]
+        c_updates = [[] for _ in range(self.num_layers)]
+        
         for t in range(self.seq_len):
             # Get node features for timestep t across all graphs
             node_indices = torch.arange(t, x.size(0), self.seq_len, device=x.device)
@@ -229,11 +233,17 @@ class GraphLSTM(nn.Module):
                     new_h.append(h_t)
                     new_c.append(c_t)
                 
-                h[layer][:, t, :] = torch.stack(new_h)
-                c[layer][:, t, :] = torch.stack(new_c)
-                layer_input = h[layer][:, t, :]  # Update input for next layer
+                # Collect updates instead of assigning in-place
+                h_updates[layer].append(torch.stack(new_h))  # Shape: [batch_size, hidden_dim]
+                c_updates[layer].append(torch.stack(new_c))  # Shape: [batch_size, hidden_dim]
+                layer_input = h_updates[layer][-1]  # Update input for next layer
             
-            outputs.append(h[-1][:, t, :])
+            outputs.append(h_updates[-1][-1])  # Collect output from last layer
+        
+        # Construct final h and c tensors
+        for layer in range(self.num_layers):
+            h[layer] = torch.stack(h_updates[layer], dim=1)  # Shape: [batch_size, seq_len, hidden_dim]
+            c[layer] = torch.stack(c_updates[layer], dim=1)  # Shape: [batch_size, seq_len, hidden_dim]
         
         # Aggregate final hidden states
         final_h = torch.mean(torch.stack(outputs), dim=0)  # Shape: [batch_size, hidden_dim]
