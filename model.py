@@ -114,6 +114,7 @@ class GraphLSTMCell(nn.Module):
         # Verify input dimensions
         expected_input = input_dim + hidden_dim
         self.expected_input = expected_input
+        print(f"GraphLSTMCell: input_dim={input_dim}, hidden_dim={hidden_dim}, expected_input={expected_input}")
         
         # Input, forget, cell, output gates
         self.W_i = nn.Linear(expected_input, hidden_dim)
@@ -159,6 +160,8 @@ class GraphLSTM(nn.Module):
         self.seq_len = seq_len
         self.input_dim = input_dim
         
+        print(f"GraphLSTM: initializing with input_dim={input_dim}, hidden_dim={hidden_dim}")
+        
         self.cells = nn.ModuleList([
             GraphLSTMCell(input_dim if i == 0 else hidden_dim, hidden_dim)
             for i in range(num_layers)
@@ -199,6 +202,7 @@ class GraphLSTM(nn.Module):
             node_indices = torch.arange(t, x.size(0), self.seq_len, device=x.device)
             node_features = x[node_indices]  # Shape: [batch_size, input_dim]
             
+            layer_input = node_features  # Start with input features
             for layer in range(self.num_layers):
                 h_prev = h[layer][:, t, :]  # Shape: [batch_size, hidden_dim]
                 c_prev = c[layer][:, t, :]  # Shape: [batch_size, hidden_dim]
@@ -217,7 +221,7 @@ class GraphLSTM(nn.Module):
                     ]
                     
                     h_t, c_t = self.cells[layer](
-                        node_features[b], 
+                        layer_input[b], 
                         h_prev[b], 
                         c_prev[b], 
                         neighbors_h
@@ -227,6 +231,7 @@ class GraphLSTM(nn.Module):
                 
                 h[layer][:, t, :] = torch.stack(new_h)
                 c[layer][:, t, :] = torch.stack(new_c)
+                layer_input = h[layer][:, t, :]  # Update input for next layer
             
             outputs.append(h[-1][:, t, :])
         
@@ -465,6 +470,7 @@ def main():
     
     # Initialize model
     input_dim = sequences.shape[2]
+    print(f"Main: input_dim={input_dim}, seq_len={seq_len}")
     model = GraphLSTM(input_dim=input_dim, seq_len=seq_len, hidden_dim=256).to(device)
     
     # Train model
