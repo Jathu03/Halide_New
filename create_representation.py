@@ -11,11 +11,17 @@ def parse_json_data(json_data):
     Parse the JSON data to extract program and schedule features.
     """
     # Extract execution time
-    execution_time = next(
-        (item['value'] for item in json_data['programming_details'] if isinstance(item, dict) and item.get('name') == 'total_execution_time_ms'),
-        None
-    )
+    execution_time = None
+    programming_details = json_data.get('programming_details', [])
+    
+    for item in programming_details:
+        if isinstance(item, dict) and item.get('name') == 'total_execution_time_ms':
+            execution_time = item.get('value')
+            break
+    
     if execution_time is None:
+        # Debug: Print structure of programming_details to understand why execution_time is missing
+        print(f"Debug: No 'total_execution_time_ms' found. programming_details content: {programming_details}")
         return None, None, None, None  # Skip files with missing execution time
     
     # Initialize graph
@@ -24,7 +30,7 @@ def parse_json_data(json_data):
     edge_features = {}
     
     # Process nodes
-    nodes = [item for item in json_data['programming_details'] if isinstance(item, dict) and 'Name' in item]
+    nodes = [item for item in programming_details if isinstance(item, dict) and 'Name' in item]
     for node in nodes:
         name = node['Name']
         details = node['Details']
@@ -254,6 +260,8 @@ def prepare_dataset(synthetic_data_dir):
         np.savez('halide_data.npz', 
                  sequences=dataset['sequences'], 
                  execution_times=dataset['execution_times'])
+    else:
+        print("Warning: No valid JSON files were processed. Dataset is empty.")
     
     return dataset
 
