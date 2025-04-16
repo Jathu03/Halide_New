@@ -64,7 +64,7 @@ class HalideGraphDataset(Dataset):
     """
     Dataset for Halide execution time prediction using graph structure.
     """
-    def __init__(self, sequences, execution_times, seq_len=10, num_features=None):
+    def __init__(self, sequences, execution_times, seq_len=44, num_features=None):
         self.sequences = sequences
         self.execution_times = torch.FloatTensor(execution_times).reshape(-1, 1)
         self.seq_len = seq_len
@@ -170,40 +170,45 @@ class GraphLSTM(nn.Module):
         
         # Initialize hidden and cell states
         batch_size = data.num_graphs
+        # Shape: [num_layers, batch_size, seq_len, hidden_dim]
         h = [torch.zeros(batch_size, self.seq_len, self.hidden_dim, device=x.device) for _ in range(self.num_layers)]
         c = [torch.zeros(batch_size, self.seq_len, self.hidden_dim, device=x.device) for _ in range(self.num_layers)]
         
-        # Build adjacency list
-        adj_list = defaultdict(list)
+        # Build adjacency list per graph
+        adj_list = [defaultdict(list) for _ in range(batch_size)]
+        batch_indices = batch[::self.seq_len]
         for src, dst in edge_index.t().tolist():
-            adj_list[dst].append(src)
+            src_graph = batch[src].item()
+            adj_list[src_graph][dst].append(src)
         
-        # Process each node sequentially
+        # Process each timestep
         outputs = []
         for t in range(self.seq_len):
-            # Select features for current timestep across graphs
-            node_features = x[t::self.seq_len]
+            # Get node features for timestep t across all graphs
+            node_indices = torch.arange(t, x.size(0), self.seq_len, device=x.device)
+            node_features = x[node_indices]  # Shape: [batch_size, input_dim]
+            
             for layer in range(self.num_layers):
-                h_prev = h[layer][:, t, :]
-                c_prev = c[layer][:, t, :]
+                h_prev = h[layer][:, t, :]  # Shape: [batch_size, hidden_dim]
+                c_prev = c[layer][:, t, :]  # Shape: [batch_size, hidden_dim]
                 new_h = []
                 new_c = []
                 
-                for node_idx in range(node_features.size(0)):
-                    # Compute global index for the node in the batch
-                    global_idx = node_idx * self.seq_len + t
-                    neighbors = adj_list.get(global_idx, [])
-                    # Filter neighbors within the same graph
+                for b in range(batch_size):
+                    # Get global index for node at timestep t in graph b
+                    global_idx = b * self.seq_len + t
+                    neighbors = adj_list[b].get(t, [])  # Neighbors for node t in graph b
+                    # Convert neighbor indices to global indices and get hidden states
                     neighbors_h = [
-                        h[layer][node_idx, n % self.seq_len]
+                        h[layer][b, n % self.seq_len]
                         for n in neighbors
-                        if n // self.seq_len == global_idx // self.seq_len
+                        if (n < self.seq_len) and (n >= 0)
                     ]
                     
                     h_t, c_t = self.cells[layer](
-                        node_features[node_idx], 
-                        h_prev[node_idx], 
-                        c_prev[node_idx], 
+                        node_features[b], 
+                        h_prev[b], 
+                        c_prev[b], 
                         neighbors_h
                     )
                     new_h.append(h_t)
@@ -215,8 +220,7 @@ class GraphLSTM(nn.Module):
             outputs.append(h[-1][:, t, :])
         
         # Aggregate final hidden states
-        final_h = torch.mean(torch.stack(outputs), dim=0)
-        final_h = global_mean_pool(final_h, batch[::self.seq_len])
+        final_h = torch.mean(torch.stack(outputs), dim=0)  # Shape: [batch_size, hidden_dim]
         final_h = self.dropout(final_h)
         out = self.fc(final_h)
         return out.squeeze(-1)
@@ -450,7 +454,7 @@ def main():
     
     # Initialize model
     input_dim = sequences.shape[2]
-    model = GraphLSTM(input_dim=input_dim, seq_len=seq_len).to(device)
+    model = GraphLSTM(input_dim=input_dim, seq_len=seq_len, hidden_dim=256).to(device)
     
     # Train model
     train_losses, val_losses = train_model_with_fold(
