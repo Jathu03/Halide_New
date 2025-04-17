@@ -1,256 +1,482 @@
-import json
 import numpy as np
-import pandas as pd
-from sklearn.preprocessing import StandardScaler, LabelEncoder
-from collections import defaultdict
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader, Subset
+from sklearn.model_selection import train_test_split
 import matplotlib.pyplot as plt
 import os
-from glob import glob
+import random
+from sklearn.preprocessing import RobustScaler
+import pickle
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.cuda.amp import autocast, GradScaler
+from torch_geometric.data import Data, Batch
+from collections import defaultdict
+from tqdm import tqdm
+import time
 
-# Load the JSON data from a file
-def load_json_data(file_path):
-    with open(file_path, 'r') as f:
-        data = json.load(f)
-    return data
+# Set random seeds
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = True  # Enable for faster training
 
-# 1. Enhanced Feature Extraction
-def extract_features(data):
-    # Handle different JSON structures
-    if isinstance(data, list) and len(data) > 0:
-        data_dict = data[0]
-    elif isinstance(data, dict):
-        data_dict = data
-    else:
-        print("Error: Unexpected JSON structure. Expected a list or dict. Using empty dict as fallback.")
-        data_dict = {}
+set_seed(42)
 
-    edges = data_dict.get('programming_details', {}).get('Edges', [])
-    nodes = data_dict.get('programming_details', {}).get('Nodes', [])
-    
-    # Feature dictionaries
-    edge_features = []
-    node_features = []
-    temporal_sequences = []
-    
-    # Extract Edge Features
-    for edge in edges:
-        footprint = edge['Details']['Footprint']
-        jacobians = edge['Details']['Load Jacobians']
+# Define device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+class AdvancedScalerWrapper:
+    """
+    Enhanced wrapper for scaling execution times.
+    """
+    def __init__(self, scaler_type='log_robust'):
+        self.scaler_type = scaler_type
+        self.scaler = None
+        self.offset = 0
+
+    def fit_transform(self, y):
+        min_y = np.min(y)
+        if min_y <= 0:
+            self.offset = abs(min_y) + 1.0
+        y_log = np.log1p(y + self.offset)
+        self.scaler = RobustScaler()
+        y_scaled = self.scaler.fit_transform(y_log.reshape(-1, 1)).flatten()
+        return y_scaled
+
+    def transform(self, y):
+        y_log = np.log1p(y + self.offset)
+        return self.scaler.transform(y_log.reshape(-1, 1)).flatten()
+
+    def inverse_transform_y(self, y_scaled):
+        y_log = self.scaler.inverse_transform(y_scaled.reshape(-1, 1)).flatten()
+        return np.expm1(y_log) - self.offset
+
+    def __call__(self, y_scaled):
+        return self.inverse_transform_y(y_scaled)
+
+class HalideGraphDataset(Dataset):
+    """
+    Dataset for Halide execution time prediction using graph structure.
+    """
+    def __init__(self, sequences, execution_times, seq_len=44, num_features=None):
+        self.sequences = sequences
+        self.execution_times = torch.FloatTensor(execution_times).reshape(-1, 1)
+        self.seq_len = seq_len
+        self.num_features = num_features or sequences.shape[2]
         
-        fp_min_0 = parse_footprint(footprint[0]) if len(footprint) > 0 else 0.0
-        fp_max_0 = parse_footprint(footprint[1]) if len(footprint) > 1 else 0.0
-        fp_min_1 = parse_footprint(footprint[2]) if len(footprint) > 2 else 0.0
-        fp_max_1 = parse_footprint(footprint[3]) if len(footprint) > 3 else 0.0
-        fp_min_2 = parse_footprint(footprint[4]) if len(footprint) > 4 else 0.0
-        fp_max_2 = parse_footprint(footprint[5]) if len(footprint) > 5 else 0.0
+        # Pre-process into graph format with adjacency lists
+        self.graph_data = []
+        self.adj_lists = []
+        for i, seq in enumerate(sequences):
+            graph, adj_list = self._create_graph(seq, i)
+            self.graph_data.append(graph)
+            self.adj_lists.append(adj_list)
         
-        def parse_jacobian(value):
-            try:
-                return float(eval(value.replace('_', '0')))
-            except:
-                return 0.0
+    def _create_graph(self, sequence, idx):
+        x = torch.FloatTensor(sequence)
         
-        jacobian_00 = parse_jacobian(jacobians[0].split()[0]) if len(jacobians) > 0 else 0.0
-        jacobian_11 = parse_jacobian(jacobians[1].split()[1]) if len(jacobians) > 1 else 0.0
-        jacobian_22 = parse_jacobian(jacobians[2].split()[2]) if len(jacobians) > 2 else 0.0
+        # Create edges and adjacency list
+        edges = []
+        adj_list = defaultdict(list)
+        for i in range(self.seq_len - 1):
+            edges.append((i, i + 1))
+            edges.append((i + 1, i))
+            adj_list[i].append(i + 1)
+            adj_list[i + 1].append(i)
         
-        edge_dict = {
-            'name': edge['Name'],
-            'from': edge['From'],
-            'to': edge['To'],
-            'footprint_min_0': fp_min_0,
-            'footprint_max_0': fp_max_0,
-            'footprint_min_1': fp_min_1,
-            'footprint_max_1': fp_max_1,
-            'footprint_min_2': fp_min_2,
-            'footprint_max_2': fp_max_2,
-            'jacobian_00': jacobian_00,
-            'jacobian_11': jacobian_11,
-            'jacobian_22': jacobian_22,
-        }
-        edge_features.append(edge_dict)
-        temporal_sequences.append(edge['Name'])
+        edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
+        data = Data(x=x, edge_index=edge_index, graph_idx=idx)
+        return data, adj_list
+        
+    def __len__(self):
+        return len(self.sequences)
     
-    # Extract Node Features
-    for node in nodes:
-        details = node['Details']
-        op_hist = details['Op histogram']
-        ops_add = 0
-        ops_mul = 0
-        ops_div = 0
-        for line in op_hist:
-            parts = line.split()
-            if len(parts) >= 2:
-                if parts[1] == '+:':
-                    ops_add = int(parts[2])
-                elif parts[1] == '*:':
-                    ops_mul = int(parts[2])
-                elif parts[1] == '/:':
-                    ops_div = int(parts[2])
-        
-        if 'scheduling_feature' in details:
-            sched = details['scheduling_feature']
-            node_dict = {
-                'name': node['Name'],
-                'pointwise': sum(map(int, details['Memory access patterns'][0].split()[1:])),
-                'transpose': sum(map(int, details['Memory access patterns'][1].split()[1:])),
-                'broadcast': sum(map(int, details['Memory access patterns'][2].split()[1:])),
-                'slice': sum(map(int, details['Memory access patterns'][3].split()[1:])),
-                'ops_add': ops_add,
-                'ops_mul': ops_mul,
-                'ops_div': ops_div,
-                'inner_parallelism': sched['inner_parallelism'],
-                'outer_parallelism': sched['outer_parallelism'],
-                'num_vectors': sched['num_vectors'],
-                'working_set': sched['working_set'],
-                'points_computed_total': sched['points_computed_total'],
-            }
-        else:
-            node_dict = {
-                'name': node['Name'],
-                'pointwise': sum(map(int, details['Memory access patterns'][0].split()[1:])),
-                'transpose': sum(map(int, details['Memory access patterns'][1].split()[1:])),
-                'broadcast': sum(map(int, details['Memory access patterns'][2].split()[1:])),
-                'slice': sum(map(int, details['Memory access patterns'][3].split()[1:])),
-                'ops_add': ops_add,
-                'ops_mul': ops_mul,
-                'ops_div': ops_div,
-            }
-        node_features.append(node_dict)
-    
-    # Total execution time from scheduling_data
-    scheduling_data = data_dict.get('scheduling_data', [])
-    execution_time = 0.0
-    for item in scheduling_data:
-        if isinstance(item, dict) and item.get('name') == 'total_execution_time_ms':
-            execution_time = item.get('value', 0.0)
-            break
-    if execution_time == 0.0:
-        print("Warning: 'total_execution_time_ms' not found in 'scheduling_data'. Using default value 0.0.")
-    
-    return edge_features, node_features, temporal_sequences, execution_time
+    def __getitem__(self, idx):
+        return self.graph_data[idx], self.execution_times[idx], self.adj_lists[idx]
 
-# 2. Data Preprocessing Pipeline
-def preprocess_data(edge_features_list, node_features_list, temporal_sequences_list):
-    # Combine all edge and node features into DataFrames
-    all_edge_df = pd.concat([pd.DataFrame(ef) for ef in edge_features_list], ignore_index=True) if edge_features_list else pd.DataFrame()
-    all_node_df = pd.concat([pd.DataFrame(nf) for nf in node_features_list], ignore_index=True) if node_features_list else pd.DataFrame()
-    
-    # Encode categorical variables
-    le = LabelEncoder()
-    if not all_edge_df.empty and 'from' in all_edge_df.columns:
-        all_edge_df['from'] = le.fit_transform(all_edge_df['from'])
-        all_edge_df['to'] = le.fit_transform(all_edge_df['to'])
-    if not all_node_df.empty and 'name' in all_node_df.columns:
-        all_node_df['name'] = le.fit_transform(all_node_df['name'])
-    
-    # Normalize numerical features
-    scaler = StandardScaler()
-    edge_numeric_cols = ['footprint_min_0', 'footprint_max_0', 'footprint_min_1', 
-                         'footprint_max_1', 'footprint_min_2', 'footprint_max_2',
-                         'jacobian_00', 'jacobian_11', 'jacobian_22']
-    node_numeric_cols = ['pointwise', 'transpose', 'broadcast', 'slice', 
-                         'ops_add', 'ops_mul', 'ops_div']
-    
-    if 'inner_parallelism' in all_node_df.columns:
-        node_numeric_cols.extend(['inner_parallelism', 'outer_parallelism', 
-                                  'num_vectors', 'working_set', 'points_computed_total'])
-    
-    if not all_edge_df.empty and all(col in all_edge_df.columns for col in edge_numeric_cols):
-        all_edge_df[edge_numeric_cols] = scaler.fit_transform(all_edge_df[edge_numeric_cols])
-    if not all_node_df.empty and all(col in all_node_df.columns for col in node_numeric_cols):
-        all_node_df[node_numeric_cols] = scaler.fit_transform(all_node_df[node_numeric_cols])
-    
-    # Create temporal sequence representations for each file
-    sequence_data_list = []
-    for temporal_sequences, edge_features in zip(temporal_sequences_list, edge_features_list):
-        edge_df = pd.DataFrame(edge_features)
-        if not edge_df.empty and 'from' in edge_df.columns:
-            edge_df['from'] = le.fit_transform(edge_df['from'])
-            edge_df['to'] = le.fit_transform(edge_df['to'])
-            edge_df[edge_numeric_cols] = scaler.fit_transform(edge_df[edge_numeric_cols])
-            sequence_data = []
-            for seq in temporal_sequences:
-                edge_idx = edge_df[edge_df['name'] == seq].index
-                if not edge_idx.empty:
-                    edge_row = edge_df.iloc[edge_idx[0]][edge_numeric_cols + ['from', 'to']].values
-                    sequence_data.append(edge_row)
-            sequence_data_list.append(np.array(sequence_data))
-        else:
-            sequence_data_list.append(np.array([]))
-    
-    return all_edge_df, all_node_df, sequence_data_list
+class GraphAttentionCollator:
+    """
+    Custom collator for batching graph data and adjacency lists.
+    """
+    def __call__(self, batch):
+        graphs = [item[0] for item in batch]
+        targets = torch.stack([item[1] for item in batch])
+        adj_lists = [item[2] for item in batch]
+        batched_graph = Batch.from_data_list(graphs)
+        return batched_graph, targets, adj_lists
 
-# Helper to parse footprint expressions
-def parse_footprint(footprint_str):
-    try:
-        value = footprint_str.split(':')[-1].strip()
-        return float(eval(value))
-    except:
-        return 0.0
+class GraphLSTMCell(nn.Module):
+    """
+    Graph-LSTM cell that incorporates neighbor information.
+    """
+    def __init__(self, input_dim, hidden_dim):
+        super(GraphLSTMCell, self).__init__()
+        self.hidden_dim = hidden_dim
+        self.input_dim = input_dim
+        
+        expected_input = input_dim + hidden_dim
+        self.expected_input = expected_input
+        print(f"GraphLSTMCell: input_dim={input_dim}, hidden_dim={hidden_dim}, expected_input={expected_input}")
+        
+        self.W_i = nn.Linear(expected_input, hidden_dim)
+        self.W_f = nn.Linear(expected_input, hidden_dim)
+        self.W_c = nn.Linear(expected_input, hidden_dim)
+        self.W_o = nn.Linear(expected_input, hidden_dim)
+        self.W_n = nn.Linear(hidden_dim, hidden_dim)
 
-# Main execution
-if __name__ == "__main__":
-    # Base directory
-    base_dir = "synthetic_data"
+    def forward(self, x, h_prev, c_prev, neighbors_h):
+        assert x.shape[-1] == self.input_dim, f"Expected x dim {self.input_dim}, got {x.shape[-1]}"
+        assert h_prev.shape[-1] == self.hidden_dim, f"Expected h_prev dim {self.hidden_dim}, got {h_prev.shape[-1]}"
+        
+        combined = torch.cat([x, h_prev], dim=-1)
+        assert combined.shape[-1] == self.expected_input, f"Expected combined dim {self.expected_input}, got {combined.shape[-1]}"
+        
+        i = torch.sigmoid(self.W_i(combined))
+        f = torch.sigmoid(self.W_f(combined))
+        c_tilde = torch.tanh(self.W_c(combined))
+        o = torch.sigmoid(self.W_o(combined))
+        
+        if neighbors_h is not None and len(neighbors_h) > 0:
+            neighbor_h = torch.mean(torch.stack(neighbors_h), dim=0)
+            neighbor_contrib = self.W_n(neighbor_h)
+            c_tilde = c_tilde + neighbor_contrib
+        
+        c = f * c_prev + i * c_tilde
+        h = o * torch.tanh(c)
+        
+        return h, c
+
+class GraphLSTM(nn.Module):
+    """
+    Graph-LSTM model for execution time prediction.
+    """
+    def __init__(self, input_dim, seq_len, hidden_dim=256, num_layers=2, dropout=0.3):
+        super(GraphLSTM, self).__init__()
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+        self.seq_len = seq_len
+        self.input_dim = input_dim
+        
+        print(f"GraphLSTM: initializing with input_dim={input_dim}, hidden_dim={hidden_dim}")
+        
+        self.cells = nn.ModuleList([
+            GraphLSTMCell(input_dim if i == 0 else hidden_dim, hidden_dim)
+            for i in range(num_layers)
+        ])
+        self.dropout = nn.Dropout(dropout)
+        self.fc = nn.Sequential(
+            nn.Linear(hidden_dim, 128),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1)
+        )
+
+    def forward(self, data, adj_lists):
+        x = data.x
+        edge_index = data.edge_index
+        batch = data.batch
+        
+        batch_size = data.num_graphs
+        h = [torch.zeros(batch_size, self.seq_len, self.hidden_dim, device=x.device) for _ in range(self.num_layers)]
+        c = [torch.zeros(batch_size, self.seq_len, self.hidden_dim, device=x.device) for _ in range(self.num_layers)]
+        
+        outputs = []
+        h_updates = [[] for _ in range(self.num_layers)]
+        c_updates = [[] for _ in range(self.num_layers)]
+        
+        for t in range(self.seq_len):
+            start_time = time.time()
+            node_indices = torch.arange(t, x.size(0), self.seq_len, device=x.device)
+            node_features = x[node_indices]  # Shape: [batch_size, input_dim]
+            
+            layer_input = node_features
+            for layer in range(self.num_layers):
+                h_prev = h[layer][:, t, :]  # Shape: [batch_size, hidden_dim]
+                c_prev = c[layer][:, t, :]  # Shape: [batch_size, hidden_dim]
+                
+                # Vectorized neighbor aggregation
+                neighbors_h_batch = []
+                for b in range(batch_size):
+                    neighbors = adj_lists[b].get(t, [])
+                    neighbors_h = [
+                        h[layer][b, n % self.seq_len]
+                        for n in neighbors
+                        if (n < self.seq_len) and (n >= 0)
+                    ]
+                    neighbors_h_batch.append(neighbors_h)
+                
+                # Process batch in one go
+                h_t, c_t = self.cells[layer](
+                    layer_input, 
+                    h_prev, 
+                    c_prev, 
+                    neighbors_h_batch if any(len(nh) > 0 for nh in neighbors_h_batch) else None
+                )
+                
+                h_updates[layer].append(h_t)
+                c_updates[layer].append(c_t)
+                layer_input = h_t
+            
+            outputs.append(h_updates[-1][-1])
+            # print(f"Timestep {t+1} forward time: {time.time() - start_time:.4f}s")
+        
+        for layer in range(self.num_layers):
+            h[layer] = torch.stack(h_updates[layer], dim=1)
+            c[layer] = torch.stack(c_updates[layer], dim=1)
+        
+        final_h = torch.mean(torch.stack(outputs), dim=0)
+        final_h = self.dropout(final_h)
+        out = self.fc(final_h)
+        return out.squeeze(-1)
+
+def load_dataset(file_path='halide_data.npz'):
+    """
+    Load the dataset.
+    """
+    data = np.load(file_path)
+    sequences = data['sequences'].astype(np.float32)
+    execution_times = data['execution_times'].astype(np.float32)
+    print(f"Loaded dataset with {len(sequences)} samples")
+    print(f"Sequence shape: {sequences.shape}")
+    print(f"Execution times shape: {execution_times.shape}")
+    return sequences, execution_times
+
+def prepare_train_val_test_split(sequences, execution_times, test_size=20, val_size=0.2, 
+                                 scaler_type='log_robust', feature_scaling='robust'):
+    """
+    Split the dataset with preprocessing.
+    """
+    n_samples = len(sequences)
+    indices = np.arange(n_samples)
+    np.random.shuffle(indices)
     
-    # Collect all JSON files
-    json_files = glob(os.path.join(base_dir, "*", "*.json"))
-    print(f"Found {len(json_files)} JSON files.")
+    test_indices = indices[:test_size]
+    remaining_indices = indices[test_size:]
+    train_indices, val_indices = train_test_split(
+        remaining_indices, test_size=val_size, random_state=42
+    )
     
-    # Lists to store data from all files
-    all_edge_features = []
-    all_node_features = []
-    all_temporal_sequences = []
-    all_execution_times = []
+    x_scaler = RobustScaler()
+    sequences_flat = sequences[train_indices].reshape(-1, sequences.shape[2])
+    x_scaler.fit(sequences_flat)
+    sequences_scaled = x_scaler.transform(sequences.reshape(-1, sequences.shape[2])).reshape(sequences.shape)
     
-    # Process each file
-    for file_path in json_files:
-        print(f"Processing: {file_path}")
-        try:
-            data = load_json_data(file_path)
-            edge_features, node_features, temporal_sequences, execution_time = extract_features(data)
-            all_edge_features.append(edge_features)
-            all_node_features.append(node_features)
-            all_temporal_sequences.append(temporal_sequences)
-            all_execution_times.append(execution_time)
-        except Exception as e:
-            print(f"Error processing {file_path}: {e}")
+    y_scaler = AdvancedScalerWrapper(scaler_type=scaler_type)
+    y_scaler.fit_transform(execution_times[train_indices])
+    execution_times_scaled = y_scaler.transform(execution_times)
     
-    # Preprocess all data
-    edge_df, node_df, sequence_data_list = preprocess_data(all_edge_features, all_node_features, all_temporal_sequences)
-    execution_times = np.array(all_execution_times)
+    seq_len = sequences.shape[1]
+    num_features = sequences.shape[2]
     
-    # Pad sequence_data_list to have uniform shape (files × max_timesteps × features)
-    max_timesteps = max(len(seq) for seq in sequence_data_list if seq.size > 0) if sequence_data_list else 0
-    if max_timesteps > 0:
-        padded_sequences = []
-        feature_dim = sequence_data_list[0].shape[1] if sequence_data_list and sequence_data_list[0].size > 0 else 0
-        for seq in sequence_data_list:
-            if seq.size > 0:
-                padded = np.pad(seq, ((0, max_timesteps - len(seq)), (0, 0)), mode='constant', constant_values=0)
-                padded_sequences.append(padded)
+    full_dataset = HalideGraphDataset(
+        sequences_scaled, execution_times_scaled, seq_len=seq_len, num_features=num_features
+    )
+    
+    train_dataset = Subset(full_dataset, train_indices)
+    val_dataset = Subset(full_dataset, val_indices)
+    test_dataset = Subset(full_dataset, test_indices)
+    
+    print(f"Split dataset into:")
+    print(f"  Training: {len(train_dataset)} samples")
+    print(f"  Validation: {len(val_dataset)} samples")
+    print(f"  Test: {len(test_dataset)} samples")
+    
+    with open('y_scaler_advanced.pkl', 'wb') as f:
+        pickle.dump(y_scaler, f)
+    with open('x_scaler.pkl', 'wb') as f:
+        pickle.dump(x_scaler, f)
+    
+    return train_dataset, val_dataset, test_dataset, y_scaler, seq_len
+
+def train_model_with_fold(model, train_loader, val_loader, fold=0, 
+                          epochs=30, learning_rate=0.001, min_lr=1e-6,
+                          weight_decay=1e-5, patience=10,
+                          gradient_accumulation_steps=1,
+                          use_amp=True):
+    """
+    Train a single model with improved training strategy.
+    """
+    criterion = nn.MSELoss()
+    optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    
+    scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=min_lr)
+    scaler = GradScaler() if use_amp else None
+    best_val_loss = float('inf')
+    epochs_no_improve = 0
+    best_model_path = f'best_graph_lstm_model_fold_{fold}.pth'
+    
+    train_losses = []
+    val_losses = []
+    
+    for epoch in range(epochs):
+        epoch_start_time = time.time()
+        model.train()
+        train_loss = 0.0
+        train_count = 0
+        optimizer.zero_grad()
+        
+        for i, (data, target, adj_lists) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}")):
+            data = data.to(device)
+            target = target.squeeze(-1).to(device)
+            
+            with autocast(enabled=use_amp):
+                output = model(data, adj_lists)
+                loss = criterion(output, target) / gradient_accumulation_steps
+            if use_amp:
+                scaler.scale(loss).backward()
+                if (i + 1) % gradient_accumulation_steps == 0:
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad()
+                    scheduler.step()
             else:
-                padded_sequences.append(np.zeros((max_timesteps, feature_dim)))
-        all_sequence_data = np.stack(padded_sequences)
-    else:
-        all_sequence_data = np.array([])  # Empty if no valid sequences
+                loss.backward()
+                if (i + 1) % gradient_accumulation_steps == 0:
+                    optimizer.step()
+                    optimizer.zero_grad()
+                    scheduler.step()
+            
+            train_loss += loss.item() * gradient_accumulation_steps * data.num_graphs
+            train_count += data.num_graphs
+        
+        train_loss /= train_count
+        train_losses.append(train_loss)
+        
+        model.eval()
+        val_loss = 0.0
+        val_mae = 0.0
+        val_count = 0
+        with torch.no_grad():
+            for data, target, adj_lists in val_loader:
+                data = data.to(device)
+                target = target.squeeze(-1).to(device)
+                with autocast(enabled=use_amp):
+                    output = model(data, adj_lists)
+                    loss = criterion(output, target)
+                val_loss += loss.item() * data.num_graphs
+                val_mae += torch.abs(output - target).sum().item()
+                val_count += data.num_graphs
+        
+        val_loss /= val_count
+        val_mae /= val_count
+        val_losses.append(val_loss)
+        
+        print(f"Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, Val MAE: {val_mae:.4f}, Time: {time.time() - epoch_start_time:.2f}s")
+        
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            epochs_no_improve = 0
+            torch.save(model.state_dict(), best_model_path)
+        else:
+            epochs_no_improve += 1
+            if epochs_no_improve >= patience:
+                print(f"Early stopping triggered after {epoch+1} epochs")
+                break
     
-    # Output shapes
-    print("All Edge DataFrame Shape:", edge_df.shape)
-    print("All Node DataFrame Shape:", node_df.shape)
-    print("All Sequence Data Shape (files × timesteps × features):", all_sequence_data.shape)
-    print("Execution Times Shape:", execution_times.shape)
-    if all_sequence_data.size > 0:
-        print("Sample Sequence Data (first file, first timestep):\n", all_sequence_data[0, 0])
-    print("Sample Execution Time (first file):", execution_times[0])
+    model.load_state_dict(torch.load(best_model_path))
+    os.remove(best_model_path)
+    return train_losses, val_losses
+
+def evaluate_model(model, test_loader, device, y_scaler):
+    """
+    Evaluate model and compute error percentages.
+    """
+    model.eval()
+    predictions = []
+    targets = []
     
-    # Save the dataset
-    output_dir = "preprocessed_dataset"
-    os.makedirs(output_dir, exist_ok=True)
+    with torch.no_grad():
+        for data, target, adj_lists in test_loader:
+            data = data.to(device)
+            output = model(data, adj_lists)
+            predictions.append(output.cpu().numpy())
+            targets.append(target.squeeze(-1).cpu().numpy())
     
-    np.save(os.path.join(output_dir, "sequence_data.npy"), all_sequence_data)
-    edge_df.to_csv(os.path.join(output_dir, "edge_features.csv"), index=False)
-    node_df.to_csv(os.path.join(output_dir, "node_features.csv"), index=False)
-    np.save(os.path.join(output_dir, "execution_times.npy"), execution_times)
-    print(f"Dataset saved to {output_dir}")
+    predictions = np.concatenate(predictions)
+    targets = np.concatenate(targets)
+    
+    predictions_orig = y_scaler(predictions)
+    targets_orig = y_scaler(targets)
+    
+    error_percentages = np.abs(predictions_orig - targets_orig) / (np.abs(targets_orig) + 1e-10) * 100
+    mean_error_percentage = np.mean(error_percentages)
+    
+    print("\nTest Set Predictions:")
+    print("Sample | Actual Time (ms) | Predicted Time (ms) | Error Percentage (%)")
+    print("-" * 60)
+    for i, (actual, pred, err) in enumerate(zip(targets_orig, predictions_orig, error_percentages)):
+        print(f"{i+1:6d} | {actual:15.4f} | {pred:18.4f} | {err:20.4f}")
+    
+    return predictions_orig, targets_orig, error_percentages, mean_error_percentage
+
+def plot_loss(train_losses, val_losses, output_file='loss_plot_graph_lstm.png'):
+    """
+    Plot training and validation loss.
+    """
+    plt.figure(figsize=(10, 6))
+    plt.plot(train_losses, label='Training Loss')
+    plt.plot(val_losses, label='Validation Loss')
+    plt.title('Training and Validation Loss (Graph-LSTM)')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss (MSE)')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(output_file)
+    plt.close()
+
+def main():
+    # Load dataset
+    sequences, execution_times = load_dataset()
+    
+    # Prepare splits
+    train_dataset, val_dataset, test_dataset, y_scaler, seq_len = prepare_train_val_test_split(
+        sequences, execution_times
+    )
+    
+    # Create dataloaders with optimizations
+    collator = GraphAttentionCollator()
+    train_loader = DataLoader(
+        train_dataset, batch_size=64, shuffle=True, 
+        collate_fn=collator, num_workers=4, pin_memory=True
+    )
+    val_loader = DataLoader(
+        val_dataset, batch_size=64, shuffle=False, 
+        collate_fn=collator, num_workers=4, pin_memory=True
+    )
+    test_loader = DataLoader(
+        test_dataset, batch_size=64, shuffle=False, 
+        collate_fn=collator, num_workers=4, pin_memory=True
+    )
+    
+    # Initialize model
+    input_dim = sequences.shape[2]
+    print(f"Main: input_dim={input_dim}, seq_len={seq_len}")
+    model = GraphLSTM(input_dim=input_dim, seq_len=seq_len, hidden_dim=256).to(device)
+    
+    # Train model
+    train_losses, val_losses = train_model_with_fold(
+        model, train_loader, val_loader,
+        use_amp=torch.cuda.is_available()
+    )
+    
+    # Evaluate model
+    predictions, targets, error_percentages, mean_error_percentage = evaluate_model(
+        model, test_loader, device, y_scaler
+    )
+    print(f"\nMean Error Percentage: {mean_error_percentage:.4f}%")
+    
+    # Plot loss
+    plot_loss(train_losses, val_losses)
+    print("Loss plot saved as 'loss_plot_graph_lstm.png'")
+
+if __name__ == "__main__":
+    main()
