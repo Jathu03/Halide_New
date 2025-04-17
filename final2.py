@@ -24,7 +24,7 @@ def set_seed(seed=42):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
         torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = True  # Enable for faster training
+        torch.backends.cudnn.benchmark = True
 
 set_seed(42)
 
@@ -71,7 +71,6 @@ class HalideGraphDataset(Dataset):
         self.seq_len = seq_len
         self.num_features = num_features or sequences.shape[2]
         
-        # Pre-process into graph format with adjacency lists
         self.graph_data = []
         self.adj_lists = []
         for i, seq in enumerate(sequences):
@@ -82,7 +81,6 @@ class HalideGraphDataset(Dataset):
     def _create_graph(self, sequence, idx):
         x = torch.FloatTensor(sequence)
         
-        # Create edges and adjacency list
         edges = []
         adj_list = defaultdict(list)
         for i in range(self.seq_len - 1):
@@ -131,7 +129,7 @@ class GraphLSTMCell(nn.Module):
         self.W_o = nn.Linear(expected_input, hidden_dim)
         self.W_n = nn.Linear(hidden_dim, hidden_dim)
 
-    def forward(self, x, h_prev, c_prev, neighbors_h):
+    def forward(self, x, h_prev, c_prev, neighbors_h_batch):
         assert x.shape[-1] == self.input_dim, f"Expected x dim {self.input_dim}, got {x.shape[-1]}"
         assert h_prev.shape[-1] == self.hidden_dim, f"Expected h_prev dim {self.hidden_dim}, got {h_prev.shape[-1]}"
         
@@ -143,10 +141,19 @@ class GraphLSTMCell(nn.Module):
         c_tilde = torch.tanh(self.W_c(combined))
         o = torch.sigmoid(self.W_o(combined))
         
-        if neighbors_h is not None and len(neighbors_h) > 0:
-            neighbor_h = torch.mean(torch.stack(neighbors_h), dim=0)
-            neighbor_contrib = self.W_n(neighbor_h)
+        # Aggregate neighbor hidden states for the batch
+        if neighbors_h_batch is not None and any(len(nh) > 0 for nh in neighbors_h_batch):
+            # Initialize neighbor contributions
+            neighbor_contrib = torch.zeros_like(h_prev)
+            for b in range(len(neighbors_h_batch)):
+                neighbors_h = neighbors_h_batch[b]
+                if len(neighbors_h) > 0:
+                    neighbor_h = torch.mean(torch.stack(neighbors_h), dim=0)
+                    neighbor_contrib[b] = self.W_n(neighbor_h)
             c_tilde = c_tilde + neighbor_contrib
+        else:
+            # No neighbors, no contribution
+            pass
         
         c = f * c_prev + i * c_tilde
         h = o * torch.tanh(c)
@@ -194,7 +201,6 @@ class GraphLSTM(nn.Module):
         c_updates = [[] for _ in range(self.num_layers)]
         
         for t in range(self.seq_len):
-            start_time = time.time()
             node_indices = torch.arange(t, x.size(0), self.seq_len, device=x.device)
             node_features = x[node_indices]  # Shape: [batch_size, input_dim]
             
@@ -203,7 +209,7 @@ class GraphLSTM(nn.Module):
                 h_prev = h[layer][:, t, :]  # Shape: [batch_size, hidden_dim]
                 c_prev = c[layer][:, t, :]  # Shape: [batch_size, hidden_dim]
                 
-                # Vectorized neighbor aggregation
+                # Collect neighbor hidden states for the batch
                 neighbors_h_batch = []
                 for b in range(batch_size):
                     neighbors = adj_lists[b].get(t, [])
@@ -214,12 +220,12 @@ class GraphLSTM(nn.Module):
                     ]
                     neighbors_h_batch.append(neighbors_h)
                 
-                # Process batch in one go
+                # Process batch
                 h_t, c_t = self.cells[layer](
                     layer_input, 
                     h_prev, 
                     c_prev, 
-                    neighbors_h_batch if any(len(nh) > 0 for nh in neighbors_h_batch) else None
+                    neighbors_h_batch
                 )
                 
                 h_updates[layer].append(h_t)
@@ -227,7 +233,6 @@ class GraphLSTM(nn.Module):
                 layer_input = h_t
             
             outputs.append(h_updates[-1][-1])
-            # print(f"Timestep {t+1} forward time: {time.time() - start_time:.4f}s")
         
         for layer in range(self.num_layers):
             h[layer] = torch.stack(h_updates[layer], dim=1)
