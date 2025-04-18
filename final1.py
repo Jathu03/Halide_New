@@ -20,6 +20,7 @@ import logging
 import shutil
 from tqdm import tqdm
 from collections import Counter
+import torch.nn.functional as F
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -94,11 +95,11 @@ def extract_features_from_file(file_path, cache_dir='feature_cache', cache_versi
                 cached_data = pickle.load(f)
             if isinstance(cached_data, tuple) and len(cached_data) == 2:
                 features, graph_data = cached_data
-                if graph_data.x.size(0) > 0 and graph_data.y is not None:
+                if graph_data.x.size(0) > 0 and graph_data.y is not None and graph_data.x.shape[1] == 36:
                     logging.info(f"Loaded cached data for {file_path}: {len(features)} features, {graph_data.num_nodes} nodes, {graph_data.num_edges} edges")
                     return features, graph_data
                 else:
-                    logging.warning(f"Invalid graph data in cache for {file_path}, reprocessing")
+                    logging.warning(f"Invalid graph data in cache for {file_path} (dim={graph_data.x.shape[1]}), reprocessing")
             else:
                 logging.warning(f"Invalid cache format for {cache_path}, reprocessing")
         except Exception as e:
@@ -212,8 +213,16 @@ def extract_features_from_file(file_path, cache_dir='feature_cache', cache_versi
     logging.info(f"Total unique operations for {file_path}: {len(op_counter)}")
     if len(op_counter) > 100:
         logging.warning(f"Excessive operations ({len(op_counter)}) in {file_path}, limiting to {max_ops}")
-    top_ops = [op for op, _ in op_counter.most_common(max_ops)]
-    op_keys = sorted(top_ops)
+        # Use a fixed set of common operations if too many
+        common_ops = ['add', 'and', 'cast', 'constant', 'div', 'eq', 'externcall', 'funccall', 
+                      'imagecall', 'le', 'let', 'lt', 'max', 'min', 'mod', 'mul', 'ne', 'not', 
+                      'or', 'param', 'select', 'selfcall', 'sub', 'variable']
+        top_ops = [op for op in common_ops if op in op_counter][:max_ops]
+        if len(top_ops) < max_ops:
+            top_ops.extend([op for op, _ in op_counter.most_common(max_ops - len(top_ops))])
+    else:
+        top_ops = [op for op, _ in op_counter.most_common(max_ops)]
+    op_keys = sorted(top_ops)[:max_ops]  # Strictly limit to max_ops
     logging.info(f"Selected top {len(op_keys)} operations for node features: {op_keys}")
     
     # Normalize scheduling metrics
@@ -231,20 +240,30 @@ def extract_features_from_file(file_path, cache_dir='feature_cache', cache_versi
     else:
         metric_values = [0] * len(important_metrics)
     
+    # Ensure node feature dimension = max_ops + len(important_metrics)
+    target_feature_dim = max_ops + len(important_metrics)  # 24 + 12 = 36
     for node in nodes_features:
         node_vec = [node.get(f'op_{op}', 0) for op in op_keys]
         node_vec.extend(metric_values)
+        # Truncate or pad to target dimension
+        if len(node_vec) > target_feature_dim:
+            node_vec = node_vec[:target_feature_dim]
+        elif len(node_vec) < target_feature_dim:
+            node_vec.extend([0] * (target_feature_dim - len(node_vec)))
         node_features_list.append(node_vec)
     
     if not node_features_list:
         logging.warning(f"No node features for {file_path}, creating dummy graph")
-        node_features_list = [[0] * (len(op_keys) + len(important_metrics))]
+        node_features_list = [[0] * target_feature_dim]
     
     x = torch.tensor(node_features_list, dtype=torch.float)
     edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous() if edges else torch.zeros((2, 0), dtype=torch.long)
     y = torch.tensor([np.log1p(execution_time)], dtype=torch.float)
     
     graph_data = Data(x=x, edge_index=edge_index, y=y)
+    if graph_data.x.shape[1] != target_feature_dim:
+        logging.error(f"Invalid node feature dimension {graph_data.x.shape[1]} for {file_path}, expected {target_feature_dim}")
+        return None
     logging.info(f"Node feature dimension: {x.shape[1]}")
     
     # Cache features and graph data
@@ -370,21 +389,12 @@ def clean_and_transform_features(train_features, val_features, test_features, tr
     val_df = all_features_df.iloc[train_size:train_size + val_size]
     test_df = all_features_df.iloc[train_size + val_size:]
     
-    # Update graph node features to match selected features
-    target_feature_dim = min(36, len(selected_features))  # Cap at 36 (24 ops + 12 metrics)
+    # Validate graph node feature dimensions
+    target_feature_dim = 36  # 24 ops + 12 metrics
     for graph in train_graphs + val_graphs + test_graphs:
-        if graph.x.size(0) > 0:
-            node_features = graph.x.numpy()
-            current_dim = node_features.shape[1]
-            if current_dim > target_feature_dim:
-                # Truncate to target dimension
-                node_features = node_features[:, :target_feature_dim]
-            elif current_dim < target_feature_dim:
-                # Pad with zeros
-                padding = np.zeros((node_features.shape[0], target_feature_dim - current_dim))
-                node_features = np.hstack([node_features, padding])
-            graph.x = torch.tensor(node_features, dtype=torch.float)
-            logging.info(f"Adjusted node feature dimension to {graph.x.shape[1]} for graph with {graph.num_nodes} nodes")
+        if graph.x.size(0) > 0 and graph.x.shape[1] != target_feature_dim:
+            logging.error(f"Graph has incorrect node feature dimension {graph.x.shape[1]} (expected {target_feature_dim})")
+            raise ValueError(f"Invalid node feature dimension {graph.x.shape[1]}")
     
     return train_df, val_df, test_df, train_graphs, val_graphs, test_graphs
 
