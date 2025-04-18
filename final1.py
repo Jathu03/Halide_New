@@ -84,7 +84,7 @@ def get_execution_time(file_path, max_retries=2, timeout=5):
             logging.error(f"Unexpected error in {file_path}: {str(e)}")
             return None
 
-def extract_features_from_file(file_path, cache_dir='feature_cache', cache_version='v1', max_ops=50):
+def extract_features_from_file(file_path, cache_dir='feature_cache', cache_version='v1', max_ops=24):
     cache_path = os.path.join(cache_dir, file_path.replace('/', '_').replace('.json', f'_v{cache_version}.pkl'))
     
     # Check cache
@@ -209,6 +209,9 @@ def extract_features_from_file(file_path, cache_dir='feature_cache', cache_versi
         for key, value in node.items():
             if key.startswith('op_'):
                 op_counter[key[3:]] += value
+    logging.info(f"Total unique operations for {file_path}: {len(op_counter)}")
+    if len(op_counter) > 100:
+        logging.warning(f"Excessive operations ({len(op_counter)}) in {file_path}, limiting to {max_ops}")
     top_ops = [op for op, _ in op_counter.most_common(max_ops)]
     op_keys = sorted(top_ops)
     logging.info(f"Selected top {len(op_keys)} operations for node features: {op_keys}")
@@ -367,13 +370,21 @@ def clean_and_transform_features(train_features, val_features, test_features, tr
     val_df = all_features_df.iloc[train_size:train_size + val_size]
     test_df = all_features_df.iloc[train_size + val_size:]
     
-    # Update graph node features with selected features
+    # Update graph node features to match selected features
+    target_feature_dim = min(36, len(selected_features))  # Cap at 36 (24 ops + 12 metrics)
     for graph in train_graphs + val_graphs + test_graphs:
         if graph.x.size(0) > 0:
             node_features = graph.x.numpy()
-            node_df = pd.DataFrame(node_features, columns=[f'feature_{i}' for i in range(node_features.shape[1])])
-            selected_node_features = node_df.iloc[:, :min(len(selected_features), node_df.shape[1])].values
-            graph.x = torch.tensor(selected_node_features, dtype=torch.float)
+            current_dim = node_features.shape[1]
+            if current_dim > target_feature_dim:
+                # Truncate to target dimension
+                node_features = node_features[:, :target_feature_dim]
+            elif current_dim < target_feature_dim:
+                # Pad with zeros
+                padding = np.zeros((node_features.shape[0], target_feature_dim - current_dim))
+                node_features = np.hstack([node_features, padding])
+            graph.x = torch.tensor(node_features, dtype=torch.float)
+            logging.info(f"Adjusted node feature dimension to {graph.x.shape[1]} for graph with {graph.num_nodes} nodes")
     
     return train_df, val_df, test_df, train_graphs, val_graphs, test_graphs
 
