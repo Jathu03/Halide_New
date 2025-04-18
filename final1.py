@@ -17,6 +17,8 @@ import pickle
 import time
 import psutil
 import logging
+import shutil
+from tqdm import tqdm
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -32,13 +34,18 @@ def set_seed(seed=42):
 
 set_seed(42)
 
-def get_execution_time(file_path, max_retries=2):
+def get_execution_time(file_path, max_retries=2, timeout=5):
     for attempt in range(max_retries):
         try:
+            start_time = time.time()
             with open(file_path, 'rb') as f:
                 raw_content = f.read()
                 content = raw_content.decode('utf-8', errors='replace').replace('\0', '')
                 data = json.loads(content)
+            
+            if time.time() - start_time > timeout:
+                logging.warning(f"Timeout reading {file_path}")
+                return None
             
             if 'programming_details' not in data:
                 logging.error(f"'programming_details' key not found in {file_path}")
@@ -76,8 +83,8 @@ def get_execution_time(file_path, max_retries=2):
             logging.error(f"Unexpected error in {file_path}: {str(e)}")
             return None
 
-def extract_features_from_file(file_path, cache_dir='feature_cache'):
-    cache_path = os.path.join(cache_dir, file_path.replace('/', '_').replace('.json', '.pkl'))
+def extract_features_from_file(file_path, cache_dir='feature_cache', cache_version='v1'):
+    cache_path = os.path.join(cache_dir, file_path.replace('/', '_').replace('.json', f'_v{cache_version}.pkl'))
     
     # Check cache
     if os.path.exists(cache_path) and os.path.getmtime(file_path) <= os.path.getmtime(cache_path):
@@ -86,14 +93,18 @@ def extract_features_from_file(file_path, cache_dir='feature_cache'):
                 cached_data = pickle.load(f)
             if isinstance(cached_data, tuple) and len(cached_data) == 2:
                 features, graph_data = cached_data
-                logging.info(f"Loaded cached data for {file_path}: {len(features)} features, {graph_data.num_nodes} nodes")
-                return features, graph_data
+                if graph_data.x.size(0) > 0 and graph_data.y is not None:
+                    logging.info(f"Loaded cached data for {file_path}: {len(features)} features, {graph_data.num_nodes} nodes, {graph_data.num_edges} edges")
+                    return features, graph_data
+                else:
+                    logging.warning(f"Invalid graph data in cache for {file_path}, reprocessing")
             else:
                 logging.warning(f"Invalid cache format for {cache_path}, reprocessing")
         except Exception as e:
             logging.error(f"Error loading cache for {file_path}: {str(e)}, reprocessing")
     
     # Process JSON file
+    start_time = time.time()
     try:
         with open(file_path, 'r') as f:
             data = json.load(f)
@@ -187,10 +198,11 @@ def extract_features_from_file(file_path, cache_dir='feature_cache'):
         features['avg_ops_per_node'] = sum(op_counts.values()) / len(nodes_features)
         features['op_diversity'] = op_types / len(nodes_features)
     
-    # Create graph data
+    # Optimize node feature extraction
+    op_keys = sorted(set(k[3:] for k in op_counts.keys() if k.startswith('op_')))
     node_features_list = []
     for node in nodes_features:
-        node_vec = [node.get(f'op_{op}', 0) for op in sorted(set(k[3:] for k in op_counts.keys() if k.startswith('op_')))]
+        node_vec = [node.get(f'op_{op}', 0) for op in op_keys]
         if scheduling_features and scheduling_features[0]:
             for metric in important_metrics:
                 if metric in scheduling_features[0]:
@@ -208,7 +220,7 @@ def extract_features_from_file(file_path, cache_dir='feature_cache'):
     with open(cache_path, 'wb') as f:
         pickle.dump((features, graph_data), f)
     
-    logging.info(f"Processed {file_path}: {len(features)} features, {graph_data.num_nodes} nodes, {graph_data.num_edges} edges")
+    logging.info(f"Processed {file_path}: {len(features)} features, {graph_data.num_nodes} nodes, {graph_data.num_edges} edges, Time: {time.time() - start_time:.3f}s")
     return features, graph_data
 
 def process_directory(directory_path, cache_dir='feature_cache'):
@@ -218,20 +230,29 @@ def process_directory(directory_path, cache_dir='feature_cache'):
     
     json_files = sorted([f for f in os.listdir(directory_path) if f.endswith('.json')])
     
-    for filename in json_files:
-        file_path = os.path.join(directory_path, filename)
-        result = extract_features_from_file(file_path, cache_dir)
-        if result is not None:
-            features, graph_data = result
-            all_features.append(features)
-            all_graphs.append(graph_data)
-            file_names.append(filename)
-        else:
-            logging.warning(f"Skipping {file_path} due to processing error")
-    
+    try:
+        for filename in tqdm(json_files, desc=f"Processing {directory_path}", leave=False):
+            file_path = os.path.join(directory_path, filename)
+            result = extract_features_from_file(file_path, cache_dir)
+            if result is not None:
+                features, graph_data = result
+                all_features.append(features)
+                all_graphs.append(graph_data)
+                file_names.append(filename)
+            else:
+                logging.warning(f"Skipping {file_path} due to processing error")
+    except KeyboardInterrupt:
+        logging.warning(f"Interrupted while processing {directory_path}. Saving partial progress...")
+        return all_features, all_graphs, file_names
     return all_features, all_graphs, file_names
 
 def process_main_directory(main_dir, cache_dir='feature_cache', val_size=0.2):
+    # Clear cache directory
+    if os.path.exists(cache_dir):
+        shutil.rmtree(cache_dir)
+        logging.info(f"Cleared cache directory: {cache_dir}")
+    os.makedirs(cache_dir, exist_ok=True)
+    
     all_features = []
     all_graphs = []
     all_file_names = []
@@ -240,16 +261,19 @@ def process_main_directory(main_dir, cache_dir='feature_cache', val_size=0.2):
     if len(subdirs) < 1:
         raise ValueError(f"Expected at least 1 subdirectory in {main_dir}, found {len(subdirs)}")
     
-    for subdir in subdirs:
-        subdir_path = os.path.join(main_dir, subdir)
-        features, graphs, file_names = process_directory(subdir_path, cache_dir)
-        if not features:
-            logging.warning(f"Skipping {subdir} due to no valid data")
-            continue
-        all_features.extend(features)
-        all_graphs.extend(graphs)
-        all_file_names.extend([os.path.join(subdir, fname) for fname in file_names])
-        logging.info(f"Processed subdir {subdir}: {len(features)} files, {len(graphs)} graphs")
+    try:
+        for subdir in tqdm(subdirs, desc="Processing subdirectories"):
+            subdir_path = os.path.join(main_dir, subdir)
+            features, graphs, file_names = process_directory(subdir_path, cache_dir)
+            if not features:
+                logging.warning(f"Skipping {subdir} due to no valid data")
+                continue
+            all_features.extend(features)
+            all_graphs.extend(graphs)
+            all_file_names.extend([os.path.join(subdir, fname) for fname in file_names])
+            logging.info(f"Processed subdir {subdir}: {len(features)} files, {len(graphs)} graphs")
+    except KeyboardInterrupt:
+        logging.warning("Interrupted during subdirectory processing. Saving partial progress...")
     
     total_files = len(all_features)
     if total_files < 50:
@@ -454,30 +478,30 @@ def create_data_loaders(train_graphs, val_graphs, test_graphs, batch_size=8):
     try:
         train_loader = GeometricDataLoader(
             train_graphs, batch_size=batch_size, shuffle=True, 
-            num_workers=4, pin_memory=True
+            num_workers=2, pin_memory=True
         )
         val_loader = GeometricDataLoader(
             val_graphs, batch_size=batch_size, shuffle=False, 
-            num_workers=4, pin_memory=True
+            num_workers=2, pin_memory=True
         )
         test_loader = GeometricDataLoader(
             test_graphs, batch_size=batch_size, shuffle=False, 
-            num_workers=4, pin_memory=True
+            num_workers=2, pin_memory=True
         )
     except RuntimeError as e:
         logging.warning(f"DataLoader failed with batch_size={batch_size}, trying batch_size=4: {str(e)}")
         batch_size = 4
         train_loader = GeometricDataLoader(
             train_graphs, batch_size=batch_size, shuffle=True, 
-            num_workers=4, pin_memory=True
+            num_workers=2, pin_memory=True
         )
         val_loader = GeometricDataLoader(
             val_graphs, batch_size=batch_size, shuffle=False, 
-            num_workers=4, pin_memory=True
+            num_workers=2, pin_memory=True
         )
         test_loader = GeometricDataLoader(
             test_graphs, batch_size=batch_size, shuffle=False, 
-            num_workers=4, pin_memory=True
+            num_workers=2, pin_memory=True
         )
     
     return train_loader, val_loader, test_loader
@@ -509,7 +533,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
     val_mapes = []
     train_mapes = []
     
-    for epoch in range(num_epochs):
+    for epoch in tqdm(range(num_epochs), desc="Training epochs"):
         epoch_start_time = time.time()
         model.train()
         running_loss = 0.0
@@ -710,72 +734,77 @@ def plot_metrics(train_losses, val_losses, val_maes, val_mapes, train_mapes):
 
 def main(main_dir, cache_dir='feature_cache'):
     logging.info(f"Processing main directory: {main_dir}")
-    (train_features, val_features, test_features, 
-     train_graphs, val_graphs, test_graphs, 
-     train_file_names, val_file_names, test_file_names) = process_main_directory(main_dir, cache_dir)
-    
-    logging.info(f"Total training samples: {len(train_features)}, graphs: {len(train_graphs)}")
-    logging.info(f"Total validation samples: {len(val_features)}, graphs: {len(val_graphs)}")
-    logging.info(f"Total test samples: {len(test_features)}, graphs: {len(test_graphs)}")
-    
-    if len(train_features) == 0 or len(test_features) == 0:
-        logging.error("No valid training or test data found")
-        return None
-    
-    original_execution_times = {fname: f['execution_time'] for f, fname in zip(test_features, test_file_names)}
-    
-    train_graphs, val_graphs, test_graphs, scaler_y = prepare_data_for_model(
-        train_features, val_features, test_features, train_graphs, val_graphs, test_graphs
-    )
-    
-    train_loader, val_loader, test_loader = create_data_loaders(
-        train_graphs, val_graphs, test_graphs, batch_size=8
-    )
-    
-    input_size = train_graphs[0].x.shape[1] if train_graphs[0].x.size(0) > 0 else 1
-    model = GraphLSTMModel(
-        input_size=input_size,
-        hidden_sizes=[256, 128, 64],
-        output_size=1,
-        dropout_rate=0.5,
-        num_heads=4
-    )
-    
-    criterion = nn.MSELoss()
-    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=5e-4)
-    
-    logging.info("Building and training Graph LSTM model...")
-    train_losses, val_losses, val_maes, val_mapes, train_mapes = train_model(
-        model, train_loader, val_loader, criterion, optimizer, num_epochs=400, patience=50
-    )
-    
-    plot_metrics(train_losses, val_losses, val_maes, val_mapes, train_mapes)
-    
-    logging.info("\nEvaluating model:")
-    y_test_actual, y_pred_actual = evaluate_model(
-        model, test_loader, scaler_y, test_file_names, is_log_transformed=True, original_execution_times=original_execution_times
-    )
-    
-    logging.info("\nSaving the trained model as 'graph_lstm_model.pt'...")
-    model.eval()
-    device = next(model.parameters()).device
-    logging.info(f"Model is on device: {device}")
-    
     try:
-        sample_data = train_graphs[0].to(device)
-        traced_model = torch.jit.trace(model, sample_data)
-        traced_model.save("graph_lstm_model.pt")
-        logging.info("Model successfully saved as 'graph_lstm_model.pt'")
-    except Exception as e:
-        logging.error(f"Error saving the model: {str(e)}")
-        torch.save(model.state_dict(), "graph_lstm_model_state.pt")
-        logging.info("Saved model state dict as 'graph_lstm_model_state.pt'")
+        (train_features, val_features, test_features, 
+         train_graphs, val_graphs, test_graphs, 
+         train_file_names, val_file_names, test_file_names) = process_main_directory(main_dir, cache_dir)
+        
+        logging.info(f"Total training samples: {len(train_features)}, graphs: {len(train_graphs)}")
+        logging.info(f"Total validation samples: {len(val_features)}, graphs: {len(val_graphs)}")
+        logging.info(f"Total test samples: {len(test_features)}, graphs: {len(test_graphs)}")
+        
+        if len(train_features) == 0 or len(test_features) == 0:
+            logging.error("No valid training or test data found")
+            return None
+        
+        original_execution_times = {fname: f['execution_time'] for f, fname in zip(test_features, test_file_names)}
+        
+        train_graphs, val_graphs, test_graphs, scaler_y = prepare_data_for_model(
+            train_features, val_features, test_features, train_graphs, val_graphs, test_graphs
+        )
+        
+        train_loader, val_loader, test_loader = create_data_loaders(
+            train_graphs, val_graphs, test_graphs, batch_size=8
+        )
+        
+        input_size = train_graphs[0].x.shape[1] if train_graphs[0].x.size(0) > 0 else 1
+        model = GraphLSTMModel(
+            input_size=input_size,
+            hidden_sizes=[256, 128, 64],
+            output_size=1,
+            dropout_rate=0.5,
+            num_heads=4
+        )
+        
+        criterion = nn.MSELoss()
+        optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=5e-4)
+        
+        logging.info("Building and training Graph LSTM model...")
+        train_losses, val_losses, val_maes, val_mapes, train_mapes = train_model(
+            model, train_loader, val_loader, criterion, optimizer, num_epochs=400, patience=50
+        )
+        
+        plot_metrics(train_losses, val_losses, val_maes, val_mapes, train_mapes)
+        
+        logging.info("\nEvaluating model:")
+        y_test_actual, y_pred_actual = evaluate_model(
+            model, test_loader, scaler_y, test_file_names, is_log_transformed=True, original_execution_times=original_execution_times
+        )
+        
+        logging.info("\nSaving the trained model as 'graph_lstm_model.pt'...")
+        model.eval()
+        device = next(model.parameters()).device
+        logging.info(f"Model is on device: {device}")
+        
+        try:
+            sample_data = train_graphs[0].to(device)
+            traced_model = torch.jit.trace(model, sample_data)
+            traced_model.save("graph_lstm_model.pt")
+            logging.info("Model successfully saved as 'graph_lstm_model.pt'")
+        except Exception as e:
+            logging.error(f"Error saving the model: {str(e)}")
+            torch.save(model.state_dict(), "graph_lstm_model_state.pt")
+            logging.info("Saved model state dict as 'graph_lstm_model_state.pt'")
+        
+        # Save scaler
+        with open('scaler_y_graph.pkl', 'wb') as f:
+            pickle.dump(scaler_y, f)
+        
+        return model, scaler_y, y_test_actual, y_pred_actual
     
-    # Save scaler
-    with open('scaler_y_graph.pkl', 'wb') as f:
-        pickle.dump(scaler_y, f)
-    
-    return model, scaler_y, y_test_actual, y_pred_actual
+    except KeyboardInterrupt:
+        logging.warning("Main function interrupted. Saving partial progress...")
+        return None
 
 if __name__ == "__main__":
     main_dir = "synthetic_data"
