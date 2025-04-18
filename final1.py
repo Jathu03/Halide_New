@@ -85,7 +85,7 @@ def get_execution_time(file_path, max_retries=2, timeout=5):
             logging.error(f"Unexpected error in {file_path}: {str(e)}")
             return None
 
-def extract_features_from_file(file_path, cache_dir='feature_cache', cache_version='v1', max_ops=24):
+def extract_features_from_file(file_path, cache_dir='feature_cache', cache_version='v2', max_ops=24):
     cache_path = os.path.join(cache_dir, file_path.replace('/', '_').replace('.json', f'_v{cache_version}.pkl'))
     
     # Check cache
@@ -96,7 +96,7 @@ def extract_features_from_file(file_path, cache_dir='feature_cache', cache_versi
             if isinstance(cached_data, tuple) and len(cached_data) == 2:
                 features, graph_data = cached_data
                 if graph_data.x.size(0) > 0 and graph_data.y is not None and graph_data.x.shape[1] == 36:
-                    logging.info(f"Loaded cached data for {file_path}: {len(features)} features, {graph_data.num_nodes} nodes, {graph_data.num_edges} edges")
+                    logging.info(f"Loaded cached data for {file_path}: {len(features)} features, {graph_data.num_nodes} nodes, {graph_data.num_edges} edges, feature_dim={graph_data.x.shape[1]}")
                     return features, graph_data
                 else:
                     logging.warning(f"Invalid graph data in cache for {file_path} (dim={graph_data.x.shape[1]}), reprocessing")
@@ -212,14 +212,8 @@ def extract_features_from_file(file_path, cache_dir='feature_cache', cache_versi
                 op_counter[key[3:]] += value
     logging.info(f"Total unique operations for {file_path}: {len(op_counter)}")
     if len(op_counter) > 100:
-        logging.warning(f"Excessive operations ({len(op_counter)}) in {file_path}, limiting to {max_ops}")
-        # Use a fixed set of common operations if too many
-        common_ops = ['add', 'and', 'cast', 'constant', 'div', 'eq', 'externcall', 'funccall', 
-                      'imagecall', 'le', 'let', 'lt', 'max', 'min', 'mod', 'mul', 'ne', 'not', 
-                      'or', 'param', 'select', 'selfcall', 'sub', 'variable']
-        top_ops = [op for op in common_ops if op in op_counter][:max_ops]
-        if len(top_ops) < max_ops:
-            top_ops.extend([op for op, _ in op_counter.most_common(max_ops - len(top_ops))])
+        logging.warning(f"Excessive operations ({len(op_counter)}) in {file_path}, skipping file")
+        return None
     else:
         top_ops = [op for op, _ in op_counter.most_common(max_ops)]
     op_keys = sorted(top_ops)[:max_ops]  # Strictly limit to max_ops
@@ -391,9 +385,9 @@ def clean_and_transform_features(train_features, val_features, test_features, tr
     
     # Validate graph node feature dimensions
     target_feature_dim = 36  # 24 ops + 12 metrics
-    for graph in train_graphs + val_graphs + test_graphs:
+    for i, graph in enumerate(train_graphs + val_graphs + test_graphs):
         if graph.x.size(0) > 0 and graph.x.shape[1] != target_feature_dim:
-            logging.error(f"Graph has incorrect node feature dimension {graph.x.shape[1]} (expected {target_feature_dim})")
+            logging.error(f"Graph {i} has incorrect node feature dimension {graph.x.shape[1]} (expected {target_feature_dim})")
             raise ValueError(f"Invalid node feature dimension {graph.x.shape[1]}")
     
     return train_df, val_df, test_df, train_graphs, val_graphs, test_graphs
@@ -430,6 +424,14 @@ def prepare_data_for_model(train_features, val_features, test_features, train_gr
     
     logging.info(f"Graph node feature dimension: {train_graphs[0].x.shape[1] if train_graphs[0].x.size(0) > 0 else 0}")
     logging.info(f"Sample graph: nodes={train_graphs[0].num_nodes}, edges={train_graphs[0].num_edges}")
+    
+    # Validate all graphs before DataLoader
+    target_feature_dim = 36
+    for i, (graph, fname) in enumerate(zip(train_graphs, train_file_names)):
+        if graph.x.size(0) > 0 and graph.x.shape[1] != target_feature_dim:
+            logging.error(f"Train graph {i} from {fname} has incorrect node feature dimension {graph.x.shape[1]} (expected {target_feature_dim})")
+            raise ValueError(f"Invalid node feature dimension {graph.x.shape[1]}")
+        logging.info(f"Train graph {i} from {fname}: feature_dim={graph.x.shape[1]}, nodes={graph.num_nodes}")
     
     return train_graphs, val_graphs, test_graphs, scaler_y
 
@@ -589,7 +591,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
         running_loss = 0.0
         train_mape = 0.0
         train_count = 0
-        for data in train_loader:
+        for batch_idx, data in enumerate(train_loader):
             data = data.to(device)
             optimizer.zero_grad()
             with torch.cuda.amp.autocast(enabled=scaler is not None):
@@ -609,6 +611,8 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
             running_loss += loss.item() * data.num_graphs
             train_mape += torch.abs((outputs - data.y.view(-1, 1)) / (data.y.view(-1, 1).abs() + 1e-8)).sum().item()
             train_count += data.num_graphs
+            if batch_idx == 0:
+                logging.info(f"First batch: num_nodes={data.x.shape[0]}, feature_dim={data.x.shape[1]}")
         
         train_loss = running_loss / len(train_loader.dataset)
         train_mape = (train_mape / len(train_loader.dataset)) * 100
