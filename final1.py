@@ -85,7 +85,7 @@ def get_execution_time(file_path, max_retries=2, timeout=5):
             logging.error(f"Unexpected error in {file_path}: {str(e)}")
             return None
 
-def extract_features_from_file(file_path, cache_dir='feature_cache', cache_version='v4', max_ops=24, force_reprocess=False):
+def extract_features_from_file(file_path, cache_dir='feature_cache', cache_version='v5', max_ops=24, force_reprocess=False):
     cache_path = os.path.join(cache_dir, file_path.replace('/', '_').replace('.json', f'_v{cache_version}.pkl'))
     
     # Check cache
@@ -137,12 +137,26 @@ def extract_features_from_file(file_path, cache_dir='feature_cache', cache_versi
             node_feature = {}
             if 'Details' in node and 'Op histogram' in node['Details']:
                 op_hist = node['Details']['Op histogram']
+                logging.info(f"Raw Op histogram for {file_path}, node {idx}: {op_hist}")
                 for op_line in op_hist:
+                    if not isinstance(op_line, str):
+                        logging.error(f"Invalid Op histogram entry in {file_path}, node {idx}: {op_line}")
+                        return None
                     parts = op_line.strip().split(':')
-                    if len(parts) == 2:
-                        op_name = parts[0].strip()
-                        op_count = int(parts[1].strip())
-                        node_feature[f'op_{op_name.lower()}'] = op_count
+                    if len(parts) != 2:
+                        logging.error(f"Malformed Op histogram entry in {file_path}, node {idx}: {op_line}")
+                        return None
+                    op_name, op_count = parts
+                    op_name = op_name.strip()
+                    try:
+                        op_count = int(op_count.strip())
+                    except ValueError:
+                        logging.error(f"Invalid operation count in {file_path}, node {idx}: {op_line}")
+                        return None
+                    if not op_name:
+                        logging.error(f"Empty operation name in {file_path}, node {idx}: {op_line}")
+                        return None
+                    node_feature[f'op_{op_name.lower()}'] = op_count
             nodes_features.append(node_feature)
             node_id_map[node.get('Name', f'node_{idx}')] = idx
     
@@ -204,7 +218,6 @@ def extract_features_from_file(file_path, cache_dir='feature_cache', cache_versi
         features['op_diversity'] = op_types / len(nodes_features)
     
     # Optimize node feature extraction
-    # Select top-K operations by total count
     op_counter = Counter()
     for node in nodes_features:
         for key, value in node.items():
@@ -215,10 +228,10 @@ def extract_features_from_file(file_path, cache_dir='feature_cache', cache_versi
         logging.warning(f"Excessive operations ({len(op_counter)}) in {file_path}, expected <= {max_ops}, skipping file")
         return None
     top_ops = [op for op, _ in op_counter.most_common(max_ops)]
-    op_keys = sorted(top_ops)[:max_ops]  # Strictly limit to max_ops
+    op_keys = sorted(top_ops)[:max_ops]
     if len(op_keys) != max_ops:
         logging.warning(f"Insufficient operations ({len(op_keys)}) in {file_path}, expected {max_ops}, padding with zeros")
-        op_keys.extend(['pad_{}'.format(i) for i in range(max_ops - len(op_keys))])
+        op_keys.extend([f'pad_{i}' for i in range(max_ops - len(op_keys))])
     logging.info(f"Selected {len(op_keys)} operations for node features: {op_keys}")
     
     # Normalize scheduling metrics
@@ -229,7 +242,7 @@ def extract_features_from_file(file_path, cache_dir='feature_cache', cache_versi
             if metric in scheduling_features[0]:
                 metric_values.append(scheduling_features[0][metric])
             else:
-                metric_values.append(0)  # Fill missing metrics with 0
+                metric_values.append(0)
         if len(metric_values) != len(important_metrics):
             logging.error(f"Metric values length {len(metric_values)} does not match expected {len(important_metrics)} for {file_path}")
             return None
@@ -248,7 +261,12 @@ def extract_features_from_file(file_path, cache_dir='feature_cache', cache_versi
         node_vec = [node.get(f'op_{op}', 0) for op in op_keys]
         node_vec.extend(metric_values)
         logging.info(f"Node {node_idx} feature vector length before truncation for {file_path}: {len(node_vec)}")
-        # Truncate or pad to target dimension
+        logging.info(f"Node {node_idx} feature vector content for {file_path}: {node_vec[:10]}... (first 10)")
+        # Validate numerical content
+        if not all(isinstance(v, (int, float)) for v in node_vec):
+            logging.error(f"Non-numerical values in node {node_idx} feature vector for {file_path}: {node_vec}")
+            return None
+        # Truncate or pad
         if len(node_vec) > target_feature_dim:
             logging.warning(f"Truncating node {node_idx} feature vector from {len(node_vec)} to {target_feature_dim} for {file_path}")
             node_vec = node_vec[:target_feature_dim]
@@ -278,6 +296,7 @@ def extract_features_from_file(file_path, cache_dir='feature_cache', cache_versi
     os.makedirs(cache_dir, exist_ok=True)
     with open(cache_path, 'wb') as f:
         pickle.dump((features, graph_data), f)
+    logging.info(f"Cached data for {file_path} at {cache_path}")
     
     logging.info(f"Processed {file_path}: {len(features)} features, {graph_data.num_nodes} nodes, {graph_data.num_edges} edges, Time: {time.time() - start_time:.3f}s")
     return features, graph_data
@@ -464,6 +483,8 @@ def validate_data_loader(loader, file_names, set_name="Train", target_feature_di
         if data.x.size(0) > 0 and data.x.shape[1] != target_feature_dim:
             batch_files = file_names[batch_idx * loader.batch_size : (batch_idx + 1) * loader.batch_size]
             logging.error(f"{set_name} batch {batch_idx} has incorrect feature dimension {data.x.shape[1]} (expected {target_feature_dim}), files: {batch_files}")
+            torch.save(data, f'problematic_batch_{set_name.lower()}_{batch_idx}.pt')
+            logging.info(f"Saved problematic batch to problematic_batch_{set_name.lower()}_{batch_idx}.pt")
             raise ValueError(f"Invalid batch feature dimension {data.x.shape[1]}")
         batch_files = file_names[batch_idx * loader.batch_size : (batch_idx + 1) * loader.batch_size]
         logging.info(f"{set_name} batch {batch_idx}: num_nodes={data.x.shape[0]}, feature_dim={data.x.shape[1]}, files={batch_files}")
@@ -559,10 +580,10 @@ class MultiHeadAttention(nn.Module):
         out = self.fc_out(out)
         return out
 
-def create_data_loaders(train_graphs, val_graphs, test_graphs, batch_size=1):  # Set batch_size=1 for debugging
+def create_data_loaders(train_graphs, val_graphs, test_graphs, batch_size=1):
     try:
         train_loader = GeometricDataLoader(
-            train_graphs, batch_size=batch_size, shuffle=True, 
+            train_graphs, batch_size=batch_size, shuffle=False,  # Disable shuffling
             num_workers=2, pin_memory=True
         )
         val_loader = GeometricDataLoader(
@@ -577,7 +598,7 @@ def create_data_loaders(train_graphs, val_graphs, test_graphs, batch_size=1):  #
         logging.warning(f"DataLoader failed with batch_size={batch_size}, trying batch_size=1: {str(e)}")
         batch_size = 1
         train_loader = GeometricDataLoader(
-            train_graphs, batch_size=batch_size, shuffle=True, 
+            train_graphs, batch_size=batch_size, shuffle=False, 
             num_workers=2, pin_memory=True
         )
         val_loader = GeometricDataLoader(
@@ -596,7 +617,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, train_fil
     logging.info(f"Using device: {device}")
     model.to(device)
     
-    # Validate DataLoader before training
+    # Validate DataLoader
     logging.info("Validating train DataLoader...")
     validate_data_loader(train_loader, train_file_names, set_name="Train")
     
@@ -630,6 +651,12 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, train_fil
         train_count = 0
         for batch_idx, data in enumerate(train_loader):
             data = data.to(device)
+            # Debug first batch
+            if batch_idx == 0:
+                batch_files = train_file_names[batch_idx * train_loader.batch_size : (batch_idx + 1) * train_loader.batch_size]
+                logging.info(f"First training batch: num_nodes={data.x.shape[0]}, feature_dim={data.x.shape[1]}, files={batch_files}")
+                torch.save(data, 'first_training_batch.pt')
+                logging.info("Saved first training batch to first_training_batch.pt")
             optimizer.zero_grad()
             with torch.cuda.amp.autocast(enabled=scaler is not None):
                 outputs = model(data)
@@ -648,9 +675,6 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, train_fil
             running_loss += loss.item() * data.num_graphs
             train_mape += torch.abs((outputs - data.y.view(-1, 1)) / (data.y.view(-1, 1).abs() + 1e-8)).sum().item()
             train_count += data.num_graphs
-            if batch_idx == 0:
-                batch_files = train_file_names[batch_idx * train_loader.batch_size : (batch_idx + 1) * train_loader.batch_size]
-                logging.info(f"First batch: num_nodes={data.x.shape[0]}, feature_dim={data.x.shape[1]}, files={batch_files}")
         
         train_loss = running_loss / len(train_loader.dataset)
         train_mape = (train_mape / len(train_loader.dataset)) * 100
@@ -848,7 +872,7 @@ def main(main_dir, cache_dir='feature_cache'):
         )
         
         train_loader, val_loader, test_loader = create_data_loaders(
-            train_graphs, val_graphs, test_graphs, batch_size=1  # Debug with batch_size=1
+            train_graphs, val_graphs, test_graphs, batch_size=1
         )
         
         input_size = train_graphs[0].x.shape[1] if train_graphs[0].x.size(0) > 0 else 1
