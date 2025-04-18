@@ -50,7 +50,7 @@ def get_execution_time(file_path, max_retries=2):
                         logging.info(f"Extracted execution time for {file_path}: {execution_time} ms")
                         return float(execution_time)
             
-            if schedules and isinstance(schedules[-1], dict) and "value" in скрывать[-1]:
+            if schedules and isinstance(schedules[-1], dict) and "value" in schedules[-1]:
                 execution_time = schedules[-1]["value"]
                 logging.warning(f"'total_execution_time_ms' not found in {file_path}, using last schedule value: {execution_time} ms")
                 return float(execution_time)
@@ -250,8 +250,16 @@ def clean_and_transform_features(train_features, val_features, test_features):
     if 'total_vectors' in all_features_df.columns and all_features_df['total_vectors'].max() > 0:
         all_features_df['bytes_per_vector'] = all_features_df['total_bytes_at_production'] / (all_features_df['total_vectors'] + 1e-8)
     
+    # Feature selection based on correlation with target
     numeric_cols = all_features_df.select_dtypes(include=['number']).columns
-    all_features_df = all_features_df[numeric_cols]
+    correlations = all_features_df[numeric_cols].corr()['execution_time_log'].abs()
+    selected_features = correlations[correlations > 0.1].index.tolist()
+    if 'execution_time' in selected_features:
+        selected_features.remove('execution_time')
+    if 'execution_time_log' in selected_features:
+        selected_features.remove('execution_time_log')
+    all_features_df = all_features_df[selected_features + ['execution_time', 'execution_time_log']]
+    logging.info(f"Selected {len(selected_features)} features based on correlation > 0.1: {selected_features}")
     
     train_size = len(train_features)
     val_size = len(val_features)
@@ -331,7 +339,7 @@ class MultiHeadAttention(nn.Module):
         return out
 
 class AdvancedLSTMModel(nn.Module):
-    def __init__(self, input_size, hidden_sizes=[512, 256, 128, 64], output_size=1, dropout_rate=0.4, num_heads=8):
+    def __init__(self, input_size, hidden_sizes=[512, 256, 128], output_size=1, dropout_rate=0.5, num_heads=4):
         super(AdvancedLSTMModel, self).__init__()
         
         self.hidden_sizes = hidden_sizes
@@ -371,7 +379,6 @@ class AdvancedLSTMModel(nn.Module):
             if i < len(self.lstm_layers) - 1:
                 lstm_out = dropout(lstm_out)
         
-        # Take the last time step
         attn_out = lstm_out[:, -1, :]
         
         fc_out = attn_out
@@ -388,22 +395,38 @@ def create_data_loaders(X_train, y_train, X_val, y_val, X_test, y_test, batch_si
     val_dataset = TensorDataset(X_val, y_val)
     test_dataset = TensorDataset(X_test, y_test)
     
-    train_loader = DataLoader(
-        train_dataset, batch_size=batch_size, shuffle=True, 
-        num_workers=4, pin_memory=True
-    )
-    val_loader = DataLoader(
-        val_dataset, batch_size=batch_size, shuffle=False, 
-        num_workers=4, pin_memory=True
-    )
-    test_loader = DataLoader(
-        test_dataset, batch_size=batch_size, shuffle=False, 
-        num_workers=4, pin_memory=True
-    )
+    try:
+        train_loader = DataLoader(
+            train_dataset, batch_size=batch_size, shuffle=True, 
+            num_workers=4, pin_memory=True
+        )
+        val_loader = DataLoader(
+            val_dataset, batch_size=batch_size, shuffle=False, 
+            num_workers=4, pin_memory=True
+        )
+        test_loader = DataLoader(
+            test_dataset, batch_size=batch_size, shuffle=False, 
+            num_workers=4, pin_memory=True
+        )
+    except RuntimeError as e:
+        logging.warning(f"DataLoader failed with batch_size={batch_size}, trying batch_size=8: {str(e)}")
+        batch_size = 8
+        train_loader = DataLoader(
+            train_dataset, batch_size=batch_size, shuffle=True, 
+            num_workers=4, pin_memory=True
+        )
+        val_loader = DataLoader(
+            val_dataset, batch_size=batch_size, shuffle=False, 
+            num_workers=4, pin_memory=True
+        )
+        test_loader = DataLoader(
+            test_dataset, batch_size=batch_size, shuffle=False, 
+            num_workers=4, pin_memory=True
+        )
     
     return train_loader, val_loader, test_loader
 
-def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs=300, patience=50):
+def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs=350, patience=40):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logging.info(f"Using device: {device}")
     model.to(device)
@@ -411,10 +434,10 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
     steps_per_epoch = len(train_loader)
     scheduler = OneCycleLR(
         optimizer,
-        max_lr=2e-4,
+        max_lr=1e-4,
         steps_per_epoch=steps_per_epoch,
         epochs=num_epochs,
-        pct_start=0.25,
+        pct_start=0.3,
         anneal_strategy='cos',
         div_factor=25,
         final_div_factor=1000
@@ -428,11 +451,14 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
     val_losses = []
     val_maes = []
     val_mapes = []
+    train_mapes = []
     
     for epoch in range(num_epochs):
         epoch_start_time = time.time()
         model.train()
         running_loss = 0.0
+        train_mape = 0.0
+        train_count = 0
         for inputs, targets in train_loader:
             inputs, targets = inputs.to(device), targets.to(device)
             optimizer.zero_grad()
@@ -451,9 +477,13 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
                 optimizer.step()
             scheduler.step()
             running_loss += loss.item() * inputs.size(0)
+            train_mape += torch.abs((outputs - targets) / (targets.abs() + 1e-8)).sum().item()
+            train_count += inputs.size(0)
         
         train_loss = running_loss / len(train_loader.dataset)
+        train_mape = (train_mape / len(train_loader.dataset)) * 100
         train_losses.append(train_loss)
+        train_mapes.append(train_mape)
         
         model.eval()
         val_loss = 0.0
@@ -480,7 +510,13 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
         
         grad_norm = sum(p.grad.norm().item() for p in model.parameters() if p.grad is not None)
         mem_usage = psutil.Process().memory_info().rss / (1024 ** 2)  # MB
-        logging.info(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, Val MAE: {val_mae:.4f}, Val MAPE: {val_mape:.2f}%, Grad Norm: {grad_norm:.4f}, Memory: {mem_usage:.2f} MB, Time: {time.time() - epoch_start_time:.2f}s')
+        logging.info(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, Train MAPE: {train_mape:.2f}%, Val MAE: {val_mae:.4f}, Val MAPE: {val_mape:.2f}%, Grad Norm: {grad_norm:.4f}, Memory: {mem_usage:.2f} MB, Time: {time.time() - epoch_start_time:.2f}s')
+        
+        # Save checkpoint
+        if epoch % 50 == 0:
+            checkpoint_path = f'checkpoint_epoch_{epoch}.pt'
+            torch.save(model.state_dict(), checkpoint_path)
+            logging.info(f"Saved checkpoint: {checkpoint_path}")
         
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -497,9 +533,9 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
     if best_model_state is not None:
         model.load_state_dict(best_model_state)
     
-    return train_losses, val_losses, val_maes, val_mapes
+    return train_losses, val_losses, val_maes, val_mapes, train_mapes
 
-def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_transformed=True, original_execution_times=None):
+def evaluate_model(model, X_test, y_test, scaler_y, file_names_test, is_log_transformed=True, original_execution_times=None):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.to(device)
     model.eval()
@@ -511,8 +547,8 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_tran
     y_pred_scaled = y_pred_scaled.cpu().numpy()
     y_test = y_test.cpu().numpy()
     
-    y_test_transformed = y_scaler.inverse_transform(y_test)
-    y_pred_transformed = y_scaler.inverse_transform(y_pred_scaled)
+    y_test_transformed = scaler_y.inverse_transform(y_test)
+    y_pred_transformed = scaler_y.inverse_transform(y_pred_scaled)
     
     logging.info("\nDebugging transformed values before inverse log:")
     for i in range(min(5, len(y_test_transformed))):
@@ -571,13 +607,13 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_tran
     plt.xlabel('Absolute Error (ms)')
     plt.ylabel('Density')
     plt.grid(True)
-    plt.savefig('error_histogram_advanced_lstm.png')
+    plt.savefig('error_histogram_advanced_lstm_fixed.png')
     plt.close()
-    logging.info("Error histogram saved as 'error_histogram_advanced_lstm.png'")
+    logging.info("Error histogram saved as 'error_histogram_advanced_lstm_fixed.png'")
     
     return y_test_actual, y_pred_actual
 
-def plot_metrics(train_losses, val_losses, val_maes, val_mapes):
+def plot_metrics(train_losses, val_losses, val_maes, val_mapes, train_mapes):
     plt.figure(figsize=(15, 10))
     
     plt.subplot(3, 1, 1)
@@ -598,17 +634,18 @@ def plot_metrics(train_losses, val_losses, val_maes, val_mapes):
     plt.grid(True)
     
     plt.subplot(3, 1, 3)
+    plt.plot(range(1, len(train_mapes) + 1), train_mapes, label='Training MAPE')
     plt.plot(range(1, len(val_mapes) + 1), val_mapes, label='Validation MAPE')
     plt.xlabel('Epoch')
     plt.ylabel('MAPE (%)')
-    plt.title('Validation MAPE')
+    plt.title('Training and Validation MAPE')
     plt.legend()
     plt.grid(True)
     
     plt.tight_layout()
-    plt.savefig('metrics_advanced_lstm.png')
+    plt.savefig('metrics_advanced_lstm_fixed.png')
     plt.close()
-    logging.info("Metrics plot saved as 'metrics_advanced_lstm.png'")
+    logging.info("Metrics plot saved as 'metrics_advanced_lstm_fixed.png'")
 
 def main(main_dir, cache_dir='feature_cache'):
     logging.info(f"Processing main directory: {main_dir}")
@@ -634,28 +671,28 @@ def main(main_dir, cache_dir='feature_cache'):
     
     model = AdvancedLSTMModel(
         input_size=input_size,
-        hidden_sizes=[512, 256, 128, 64],
+        hidden_sizes=[512, 256, 128],
         output_size=1,
-        dropout_rate=0.4,
-        num_heads=8
+        dropout_rate=0.5,
+        num_heads=4
     )
     
-    criterion = nn.HuberLoss(delta=1.0)
-    optimizer = optim.AdamW(model.parameters(), lr=2e-4, weight_decay=2e-4)
+    criterion = nn.MSELoss()
+    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=5e-4)
     
     logging.info("Building and training Advanced LSTM model...")
-    train_losses, val_losses, val_maes, val_mapes = train_model(
-        model, train_loader, val_loader, criterion, optimizer, num_epochs=300, patience=50
+    train_losses, val_losses, val_maes, val_mapes, train_mapes = train_model(
+        model, train_loader, val_loader, criterion, optimizer, num_epochs=350, patience=40
     )
     
-    plot_metrics(train_losses, val_losses, val_maes, val_mapes)
+    plot_metrics(train_losses, val_losses, val_maes, val_mapes, train_mapes)
     
     logging.info("\nEvaluating model:")
     y_test_actual, y_pred_actual = evaluate_model(
-        model, X_test, y_test, y_scaler, test_file_names, is_log_transformed, original_execution_times
+        model, X_test, y_test, scaler_y, test_file_names, is_log_transformed, original_execution_times
     )
     
-    logging.info("\nSaving the trained model as 'advanced_lstm_model.pt'...")
+    logging.info("\nSaving the trained model as 'advanced_lstm_model_fixed.pt'...")
     model.eval()
     device = next(model.parameters()).device
     logging.info(f"Model is on device: {device}")
@@ -663,15 +700,15 @@ def main(main_dir, cache_dir='feature_cache'):
     try:
         sample_input = torch.randn(1, 1, input_size).to(device)
         traced_model = torch.jit.trace(model, sample_input)
-        traced_model.save("advanced_lstm_model.pt")
-        logging.info("Model successfully saved as 'advanced_lstm_model.pt'")
+        traced_model.save("advanced_lstm_model_fixed.pt")
+        logging.info("Model successfully saved as 'advanced_lstm_model_fixed.pt'")
     except Exception as e:
         logging.error(f"Error saving the model: {str(e)}")
     
     # Save scalers
-    with open('scaler_X.pkl', 'wb') as f:
+    with open('scaler_X_fixed.pkl', 'wb') as f:
         pickle.dump(scaler_X, f)
-    with open('scaler_y.pkl', 'wb') as f:
+    with open('scaler_y_fixed.pkl', 'wb') as f:
         pickle.dump(scaler_y, f)
     
     return model, scaler_y, y_test_actual, y_pred_actual
