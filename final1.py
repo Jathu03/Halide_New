@@ -104,6 +104,13 @@ def extract_features_from_file(file_path, cache_dir='feature_cache', cache_versi
         except Exception as e:
             logging.error(f"Error loading cache for {file_path}: {str(e)}, reprocessing")
     
+    # Define important metrics
+    important_metrics = [
+        'bytes_at_production', 'bytes_at_realization', 'bytes_at_root', 'bytes_at_task',
+        'inner_parallelism', 'outer_parallelism', 'num_productions', 'num_realizations',
+        'num_scalars', 'num_vectors', 'points_computed_total', 'working_set'
+    ]
+    
     # Process JSON file
     start_time = time.time()
     try:
@@ -114,7 +121,8 @@ def extract_features_from_file(file_path, cache_dir='feature_cache', cache_versi
         return None
     
     execution_time = get_execution_time(file_path)
-    if execution_time is None:
+    if execution_time is None or execution_time == 0.0:
+        logging.warning(f"Skipping {file_path} due to invalid execution time: {execution_time}")
         return None
     
     nodes_features = []
@@ -173,11 +181,6 @@ def extract_features_from_file(file_path, cache_dir='feature_cache', cache_versi
     features.update(op_counts)
     
     if scheduling_features and scheduling_features[0]:
-        important_metrics = [
-            'bytes_at_production', 'bytes_at_realization', 'bytes_at_root', 'bytes_at_task',
-            'inner_parallelism', 'outer_parallelism', 'num_productions', 'num_realizations',
-            'num_scalars', 'num_vectors', 'points_computed_total', 'working_set'
-        ]
         for metric in important_metrics:
             if metric in scheduling_features[0]:
                 features[f'sched_{metric}'] = scheduling_features[0][metric]
@@ -230,7 +233,11 @@ def extract_features_from_file(file_path, cache_dir='feature_cache', cache_versi
         node_vec.extend(metric_values)
         node_features_list.append(node_vec)
     
-    x = torch.tensor(node_features_list, dtype=torch.float) if node_features_list else torch.zeros((1, 1))
+    if not node_features_list:
+        logging.warning(f"No node features for {file_path}, creating dummy graph")
+        node_features_list = [[0] * (len(op_keys) + len(important_metrics))]
+    
+    x = torch.tensor(node_features_list, dtype=torch.float)
     edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous() if edges else torch.zeros((2, 0), dtype=torch.long)
     y = torch.tensor([np.log1p(execution_time)], dtype=torch.float)
     
