@@ -392,7 +392,7 @@ def clean_and_transform_features(train_features, val_features, test_features, tr
     
     return train_df, val_df, test_df, train_graphs, val_graphs, test_graphs
 
-def prepare_data_for_model(train_features, val_features, test_features, train_graphs, val_graphs, test_graphs):
+def prepare_data_for_model(train_features, val_features, test_features, train_graphs, val_graphs, test_graphs, train_file_names, val_file_names, test_file_names):
     train_df, val_df, test_df, train_graphs, val_graphs, test_graphs = clean_and_transform_features(
         train_features, val_features, test_features, train_graphs, val_graphs, test_graphs
     )
@@ -432,6 +432,16 @@ def prepare_data_for_model(train_features, val_features, test_features, train_gr
             logging.error(f"Train graph {i} from {fname} has incorrect node feature dimension {graph.x.shape[1]} (expected {target_feature_dim})")
             raise ValueError(f"Invalid node feature dimension {graph.x.shape[1]}")
         logging.info(f"Train graph {i} from {fname}: feature_dim={graph.x.shape[1]}, nodes={graph.num_nodes}")
+    for i, (graph, fname) in enumerate(zip(val_graphs, val_file_names)):
+        if graph.x.size(0) > 0 and graph.x.shape[1] != target_feature_dim:
+            logging.error(f"Val graph {i} from {fname} has incorrect node feature dimension {graph.x.shape[1]} (expected {target_feature_dim})")
+            raise ValueError(f"Invalid node feature dimension {graph.x.shape[1]}")
+        logging.info(f"Val graph {i} from {fname}: feature_dim={graph.x.shape[1]}, nodes={graph.num_nodes}")
+    for i, (graph, fname) in enumerate(zip(test_graphs, test_file_names)):
+        if graph.x.size(0) > 0 and graph.x.shape[1] != target_feature_dim:
+            logging.error(f"Test graph {i} from {fname} has incorrect node feature dimension {graph.x.shape[1]} (expected {target_feature_dim})")
+            raise ValueError(f"Invalid node feature dimension {graph.x.shape[1]}")
+        logging.info(f"Test graph {i} from {fname}: feature_dim={graph.x.shape[1]}, nodes={graph.num_nodes}")
     
     return train_graphs, val_graphs, test_graphs, scaler_y
 
@@ -804,7 +814,9 @@ def main(main_dir, cache_dir='feature_cache'):
         original_execution_times = {fname: f['execution_time'] for f, fname in zip(test_features, test_file_names)}
         
         train_graphs, val_graphs, test_graphs, scaler_y = prepare_data_for_model(
-            train_features, val_features, test_features, train_graphs, val_graphs, test_graphs
+            train_features, val_features, test_features, 
+            train_graphs, val_graphs, test_graphs,
+            train_file_names, val_file_names, test_file_names
         )
         
         train_loader, val_loader, test_loader = create_data_loaders(
