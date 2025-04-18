@@ -85,11 +85,11 @@ def get_execution_time(file_path, max_retries=2, timeout=5):
             logging.error(f"Unexpected error in {file_path}: {str(e)}")
             return None
 
-def extract_features_from_file(file_path, cache_dir='feature_cache', cache_version='v2', max_ops=24):
+def extract_features_from_file(file_path, cache_dir='feature_cache', cache_version='v3', max_ops=24, force_reprocess=False):
     cache_path = os.path.join(cache_dir, file_path.replace('/', '_').replace('.json', f'_v{cache_version}.pkl'))
     
     # Check cache
-    if os.path.exists(cache_path) and os.path.getmtime(file_path) <= os.path.getmtime(cache_path):
+    if not force_reprocess and os.path.exists(cache_path) and os.path.getmtime(file_path) <= os.path.getmtime(cache_path):
         try:
             with open(cache_path, 'rb') as f:
                 cached_data = pickle.load(f)
@@ -211,7 +211,7 @@ def extract_features_from_file(file_path, cache_dir='feature_cache', cache_versi
             if key.startswith('op_'):
                 op_counter[key[3:]] += value
     logging.info(f"Total unique operations for {file_path}: {len(op_counter)}")
-    if len(op_counter) > 100:
+    if len(op_counter) > 50:
         logging.warning(f"Excessive operations ({len(op_counter)}) in {file_path}, skipping file")
         return None
     else:
@@ -239,11 +239,13 @@ def extract_features_from_file(file_path, cache_dir='feature_cache', cache_versi
     for node in nodes_features:
         node_vec = [node.get(f'op_{op}', 0) for op in op_keys]
         node_vec.extend(metric_values)
+        logging.info(f"Node feature vector length before truncation for {file_path}: {len(node_vec)}")
         # Truncate or pad to target dimension
         if len(node_vec) > target_feature_dim:
             node_vec = node_vec[:target_feature_dim]
         elif len(node_vec) < target_feature_dim:
             node_vec.extend([0] * (target_feature_dim - len(node_vec)))
+        logging.info(f"Node feature vector length after truncation for {file_path}: {len(node_vec)}")
         node_features_list.append(node_vec)
     
     if not node_features_list:
@@ -268,7 +270,7 @@ def extract_features_from_file(file_path, cache_dir='feature_cache', cache_versi
     logging.info(f"Processed {file_path}: {len(features)} features, {graph_data.num_nodes} nodes, {graph_data.num_edges} edges, Time: {time.time() - start_time:.3f}s")
     return features, graph_data
 
-def process_directory(directory_path, cache_dir='feature_cache'):
+def process_directory(directory_path, cache_dir='feature_cache', force_reprocess=False):
     all_features = []
     all_graphs = []
     file_names = []
@@ -278,7 +280,7 @@ def process_directory(directory_path, cache_dir='feature_cache'):
     try:
         for filename in tqdm(json_files, desc=f"Processing {directory_path}", leave=False):
             file_path = os.path.join(directory_path, filename)
-            result = extract_features_from_file(file_path, cache_dir)
+            result = extract_features_from_file(file_path, cache_dir, force_reprocess=force_reprocess)
             if result is not None:
                 features, graph_data = result
                 all_features.append(features)
@@ -291,7 +293,7 @@ def process_directory(directory_path, cache_dir='feature_cache'):
         return all_features, all_graphs, file_names
     return all_features, all_graphs, file_names
 
-def process_main_directory(main_dir, cache_dir='feature_cache', val_size=0.2):
+def process_main_directory(main_dir, cache_dir='feature_cache', val_size=0.2, force_reprocess=False):
     # Clear cache directory
     if os.path.exists(cache_dir):
         shutil.rmtree(cache_dir)
@@ -309,7 +311,7 @@ def process_main_directory(main_dir, cache_dir='feature_cache', val_size=0.2):
     try:
         for subdir in tqdm(subdirs, desc="Processing subdirectories"):
             subdir_path = os.path.join(main_dir, subdir)
-            features, graphs, file_names = process_directory(subdir_path, cache_dir)
+            features, graphs, file_names = process_directory(subdir_path, cache_dir, force_reprocess)
             if not features:
                 logging.warning(f"Skipping {subdir} due to no valid data")
                 continue
@@ -568,7 +570,7 @@ def create_data_loaders(train_graphs, val_graphs, test_graphs, batch_size=8):
     
     return train_loader, val_loader, test_loader
 
-def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs=400, patience=50):
+def train_model(model, train_loader, val_loader, criterion, optimizer, train_file_names, num_epochs=400, patience=50):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logging.info(f"Using device: {device}")
     model.to(device)
@@ -594,6 +596,14 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
     val_maes = []
     val_mapes = []
     train_mapes = []
+    
+    # Validate batches
+    target_feature_dim = 36
+    for batch_idx, data in enumerate(train_loader):
+        if data.x.size(0) > 0 and data.x.shape[1] != target_feature_dim:
+            batch_files = train_file_names[batch_idx * train_loader.batch_size : (batch_idx + 1) * train_loader.batch_size]
+            logging.error(f"Batch {batch_idx} has incorrect feature dimension {data.x.shape[1]} (expected {target_feature_dim}), files: {batch_files}")
+            raise ValueError(f"Invalid batch feature dimension {data.x.shape[1]}")
     
     for epoch in tqdm(range(num_epochs), desc="Training epochs"):
         epoch_start_time = time.time()
@@ -622,7 +632,8 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
             train_mape += torch.abs((outputs - data.y.view(-1, 1)) / (data.y.view(-1, 1).abs() + 1e-8)).sum().item()
             train_count += data.num_graphs
             if batch_idx == 0:
-                logging.info(f"First batch: num_nodes={data.x.shape[0]}, feature_dim={data.x.shape[1]}")
+                batch_files = train_file_names[batch_idx * train_loader.batch_size : (batch_idx + 1) * train_loader.batch_size]
+                logging.info(f"First batch: num_nodes={data.x.shape[0]}, feature_dim={data.x.shape[1]}, files={batch_files}")
         
         train_loss = running_loss / len(train_loader.dataset)
         train_mape = (train_mape / len(train_loader.dataset)) * 100
@@ -801,7 +812,7 @@ def main(main_dir, cache_dir='feature_cache'):
     try:
         (train_features, val_features, test_features, 
          train_graphs, val_graphs, test_graphs, 
-         train_file_names, val_file_names, test_file_names) = process_main_directory(main_dir, cache_dir)
+         train_file_names, val_file_names, test_file_names) = process_main_directory(main_dir, cache_dir, force_reprocess=True)
         
         logging.info(f"Total training samples: {len(train_features)}, graphs: {len(train_graphs)}")
         logging.info(f"Total validation samples: {len(val_features)}, graphs: {len(val_graphs)}")
@@ -838,7 +849,7 @@ def main(main_dir, cache_dir='feature_cache'):
         
         logging.info("Building and training Graph LSTM model...")
         train_losses, val_losses, val_maes, val_mapes, train_mapes = train_model(
-            model, train_loader, val_loader, criterion, optimizer, num_epochs=400, patience=50
+            model, train_loader, val_loader, criterion, optimizer, train_file_names, num_epochs=400, patience=50
         )
         
         plot_metrics(train_losses, val_losses, val_maes, val_mapes, train_mapes)
