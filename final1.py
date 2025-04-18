@@ -78,10 +78,22 @@ def get_execution_time(file_path, max_retries=2):
 
 def extract_features_from_file(file_path, cache_dir='feature_cache'):
     cache_path = os.path.join(cache_dir, file_path.replace('/', '_').replace('.json', '.pkl'))
-    if os.path.exists(cache_path) and os.path.getmtime(file_path) <= os.path.getmtime(cache_path):
-        with open(cache_path, 'rb') as f:
-            return pickle.load(f)
     
+    # Check cache
+    if os.path.exists(cache_path) and os.path.getmtime(file_path) <= os.path.getmtime(cache_path):
+        try:
+            with open(cache_path, 'rb') as f:
+                cached_data = pickle.load(f)
+            if isinstance(cached_data, tuple) and len(cached_data) == 2:
+                features, graph_data = cached_data
+                logging.info(f"Loaded cached data for {file_path}: {len(features)} features, {graph_data.num_nodes} nodes")
+                return features, graph_data
+            else:
+                logging.warning(f"Invalid cache format for {cache_path}, reprocessing")
+        except Exception as e:
+            logging.error(f"Error loading cache for {file_path}: {str(e)}, reprocessing")
+    
+    # Process JSON file
     try:
         with open(file_path, 'r') as f:
             data = json.load(f)
@@ -191,10 +203,12 @@ def extract_features_from_file(file_path, cache_dir='feature_cache'):
     
     graph_data = Data(x=x, edge_index=edge_index, y=y)
     
+    # Cache features and graph data
     os.makedirs(cache_dir, exist_ok=True)
     with open(cache_path, 'wb') as f:
         pickle.dump((features, graph_data), f)
     
+    logging.info(f"Processed {file_path}: {len(features)} features, {graph_data.num_nodes} nodes, {graph_data.num_edges} edges")
     return features, graph_data
 
 def process_directory(directory_path, cache_dir='feature_cache'):
@@ -212,6 +226,8 @@ def process_directory(directory_path, cache_dir='feature_cache'):
             all_features.append(features)
             all_graphs.append(graph_data)
             file_names.append(filename)
+        else:
+            logging.warning(f"Skipping {file_path} due to processing error")
     
     return all_features, all_graphs, file_names
 
