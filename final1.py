@@ -7,7 +7,9 @@ from sklearn.model_selection import train_test_split
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import TensorDataset, DataLoader
+from torch.utils.data import Dataset
+from torch_geometric.data import Data, DataLoader as GeometricDataLoader
+from torch_geometric.nn import GCNConv
 from torch.optim.lr_scheduler import OneCycleLR
 import random
 import matplotlib.pyplot as plt
@@ -92,12 +94,14 @@ def extract_features_from_file(file_path, cache_dir='feature_cache'):
         return None
     
     nodes_features = []
-    edges_features = []
+    edges = []
+    node_id_map = {}
     programming_details = data.get("programming_details", {})
     
+    # Process nodes
     if 'Nodes' in programming_details:
-        for node in programming_details['Nodes']:
-            node_feature = {'Name': node.get('Name', '')}
+        for idx, node in enumerate(programming_details['Nodes']):
+            node_feature = {}
             if 'Details' in node and 'Op histogram' in node['Details']:
                 op_hist = node['Details']['Op histogram']
                 for op_line in op_hist:
@@ -107,33 +111,34 @@ def extract_features_from_file(file_path, cache_dir='feature_cache'):
                         op_count = int(parts[1].strip())
                         node_feature[f'op_{op_name.lower()}'] = op_count
             nodes_features.append(node_feature)
+            node_id_map[node.get('Name', f'node_{idx}')] = idx
     
+    # Process edges
     if 'Edges' in programming_details:
         for edge in programming_details['Edges']:
-            edge_feature = {
-                'From': edge.get('From', ''),
-                'To': edge.get('To', ''),
-                'Name': edge.get('Name', '')
-            }
-            edges_features.append(edge_feature)
+            from_node = edge.get('From', '')
+            to_node = edge.get('To', '')
+            if from_node in node_id_map and to_node in node_id_map:
+                edges.append([node_id_map[from_node], node_id_map[to_node]])
     
+    # Process scheduling features
     scheduling_features = []
     scheduling_data = data.get("scheduling_data", programming_details.get('Schedules', []))
-    
     for sched in scheduling_data:
-        sched_feature = {'Name': sched.get('Name', '')}
+        sched_feature = {}
         if 'Details' in sched and 'scheduling_feature' in sched['Details']:
             sf = sched['Details']['scheduling_feature']
             for key, value in sf.items():
                 sched_feature[key] = value
         scheduling_features.append(sched_feature)
     
+    # Aggregate features
     features = {
         'execution_time': execution_time,
         'nodes_count': len(nodes_features),
-        'edges_count': len(edges_features),
+        'edges_count': len(edges),
         'scheduling_count': len(scheduling_features),
-        'node_edge_ratio': len(nodes_features) / len(edges_features) if len(edges_features) > 0 else 0
+        'node_edge_ratio': len(nodes_features) / len(edges) if len(edges) > 0 else 0
     }
     
     op_counts = {}
@@ -143,16 +148,15 @@ def extract_features_from_file(file_path, cache_dir='feature_cache'):
                 op_counts[key] = op_counts.get(key, 0) + value
     features.update(op_counts)
     
-    if scheduling_features:
+    if scheduling_features and scheduling_features[0]:
         important_metrics = [
             'bytes_at_production', 'bytes_at_realization', 'bytes_at_root', 'bytes_at_task',
             'inner_parallelism', 'outer_parallelism', 'num_productions', 'num_realizations',
             'num_scalars', 'num_vectors', 'points_computed_total', 'working_set'
         ]
-        if scheduling_features[0]:
-            for metric in important_metrics:
-                if metric in scheduling_features[0]:
-                    features[f'sched_{metric}'] = scheduling_features[0][metric]
+        for metric in important_metrics:
+            if metric in scheduling_features[0]:
+                features[f'sched_{metric}'] = scheduling_features[0][metric]
         
         total_bytes_at_production = sum(sf.get('bytes_at_production', 0) for sf in scheduling_features if isinstance(sf, dict))
         total_vectors = sum(sf.get('num_vectors', 0) for sf in scheduling_features if isinstance(sf, dict))
@@ -171,29 +175,49 @@ def extract_features_from_file(file_path, cache_dir='feature_cache'):
         features['avg_ops_per_node'] = sum(op_counts.values()) / len(nodes_features)
         features['op_diversity'] = op_types / len(nodes_features)
     
+    # Create graph data
+    node_features_list = []
+    for node in nodes_features:
+        node_vec = [node.get(f'op_{op}', 0) for op in sorted(set(k[3:] for k in op_counts.keys() if k.startswith('op_')))]
+        if scheduling_features and scheduling_features[0]:
+            for metric in important_metrics:
+                if metric in scheduling_features[0]:
+                    node_vec.append(scheduling_features[0][metric])
+        node_features_list.append(node_vec)
+    
+    x = torch.tensor(node_features_list, dtype=torch.float) if node_features_list else torch.zeros((1, 1))
+    edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous() if edges else torch.zeros((2, 0), dtype=torch.long)
+    y = torch.tensor([np.log1p(execution_time)], dtype=torch.float)
+    
+    graph_data = Data(x=x, edge_index=edge_index, y=y)
+    
     os.makedirs(cache_dir, exist_ok=True)
     with open(cache_path, 'wb') as f:
-        pickle.dump(features, f)
+        pickle.dump((features, graph_data), f)
     
-    return features
+    return features, graph_data
 
 def process_directory(directory_path, cache_dir='feature_cache'):
     all_features = []
+    all_graphs = []
     file_names = []
     
     json_files = sorted([f for f in os.listdir(directory_path) if f.endswith('.json')])
     
     for filename in json_files:
         file_path = os.path.join(directory_path, filename)
-        features = extract_features_from_file(file_path, cache_dir)
-        if features is not None:
+        result = extract_features_from_file(file_path, cache_dir)
+        if result is not None:
+            features, graph_data = result
             all_features.append(features)
+            all_graphs.append(graph_data)
             file_names.append(filename)
     
-    return all_features, file_names
+    return all_features, all_graphs, file_names
 
 def process_main_directory(main_dir, cache_dir='feature_cache', val_size=0.2):
     all_features = []
+    all_graphs = []
     all_file_names = []
     
     subdirs = sorted([d for d in os.listdir(main_dir) if os.path.isdir(os.path.join(main_dir, d))])
@@ -202,42 +226,49 @@ def process_main_directory(main_dir, cache_dir='feature_cache', val_size=0.2):
     
     for subdir in subdirs:
         subdir_path = os.path.join(main_dir, subdir)
-        features, file_names = process_directory(subdir_path, cache_dir)
+        features, graphs, file_names = process_directory(subdir_path, cache_dir)
         if not features:
             logging.warning(f"Skipping {subdir} due to no valid data")
             continue
         all_features.extend(features)
+        all_graphs.extend(graphs)
         all_file_names.extend([os.path.join(subdir, fname) for fname in file_names])
-        logging.info(f"Processed subdir {subdir}: {len(features)} files")
+        logging.info(f"Processed subdir {subdir}: {len(features)} files, {len(graphs)} graphs")
     
     total_files = len(all_features)
     if total_files < 50:
         raise ValueError(f"Expected at least 50 files total, found {total_files}")
     
-    combined = list(zip(all_features, all_file_names))
+    combined = list(zip(all_features, all_graphs, all_file_names))
     random.shuffle(combined)
-    all_features, all_file_names = zip(*combined)
+    all_features, all_graphs, all_file_names = zip(*combined)
     
     test_size = 50
     train_val_features = all_features[:-test_size]
     test_features = all_features[-test_size:]
+    train_val_graphs = all_graphs[:-test_size]
+    test_graphs = all_graphs[-test_size:]
     train_val_file_names = all_file_names[:-test_size]
     test_file_names = all_file_names[-test_size:]
     
     train_size = int((1 - val_size) * len(train_val_features))
     train_features = train_val_features[:train_size]
     val_features = train_val_features[train_size:]
+    train_graphs = train_val_graphs[:train_size]
+    val_graphs = train_val_graphs[train_size:]
     train_file_names = train_val_file_names[:train_size]
     val_file_names = train_val_file_names[train_size:]
     
     logging.info(f"Total files: {total_files}")
-    logging.info(f"Training files: {len(train_features)}")
-    logging.info(f"Validation files: {len(val_features)}")
-    logging.info(f"Testing files: {len(test_features)}")
+    logging.info(f"Training files: {len(train_features)}, graphs: {len(train_graphs)}")
+    logging.info(f"Validation files: {len(val_features)}, graphs: {len(val_graphs)}")
+    logging.info(f"Testing files: {len(test_features)}, graphs: {len(test_graphs)}")
     
-    return train_features, val_features, test_features, list(train_file_names), list(val_file_names), list(test_file_names)
+    return (train_features, val_features, test_features, 
+            train_graphs, val_graphs, test_graphs, 
+            list(train_file_names), list(val_file_names), list(test_file_names))
 
-def clean_and_transform_features(train_features, val_features, test_features):
+def clean_and_transform_features(train_features, val_features, test_features, train_graphs, val_graphs, test_graphs):
     all_features_df = pd.DataFrame(train_features + val_features + test_features)
     all_features_df = all_features_df.fillna(0)
     
@@ -250,7 +281,7 @@ def clean_and_transform_features(train_features, val_features, test_features):
     if 'total_vectors' in all_features_df.columns and all_features_df['total_vectors'].max() > 0:
         all_features_df['bytes_per_vector'] = all_features_df['total_bytes_at_production'] / (all_features_df['total_vectors'] + 1e-8)
     
-    # Feature selection based on correlation with target
+    # Feature selection based on correlation
     numeric_cols = all_features_df.select_dtypes(include=['number']).columns
     correlations = all_features_df[numeric_cols].corr()['execution_time_log'].abs()
     selected_features = correlations[correlations > 0.1].index.tolist()
@@ -267,48 +298,113 @@ def clean_and_transform_features(train_features, val_features, test_features):
     val_df = all_features_df.iloc[train_size:train_size + val_size]
     test_df = all_features_df.iloc[train_size + val_size:]
     
-    return train_df, val_df, test_df
+    # Update graph node features with selected features
+    for graph in train_graphs + val_graphs + test_graphs:
+        if graph.x.size(0) > 0:
+            node_features = graph.x.numpy()
+            node_df = pd.DataFrame(node_features, columns=[f'feature_{i}' for i in range(node_features.shape[1])])
+            selected_node_features = node_df.iloc[:, :len(selected_features)].values
+            graph.x = torch.tensor(selected_node_features, dtype=torch.float)
+    
+    return train_df, val_df, test_df, train_graphs, val_graphs, test_graphs
 
-def prepare_data_for_model(train_features, val_features, test_features):
-    train_df, val_df, test_df = clean_and_transform_features(train_features, val_features, test_features)
+def prepare_data_for_model(train_features, val_features, test_features, train_graphs, val_graphs, test_graphs):
+    train_df, val_df, test_df, train_graphs, val_graphs, test_graphs = clean_and_transform_features(
+        train_features, val_features, test_features, train_graphs, val_graphs, test_graphs
+    )
     
     y_train = train_df['execution_time_log'].values.reshape(-1, 1)
     y_val = val_df['execution_time_log'].values.reshape(-1, 1)
     y_test = test_df['execution_time_log'].values.reshape(-1, 1)
-    train_df = train_df.drop(['execution_time', 'execution_time_log'], axis=1)
-    val_df = val_df.drop(['execution_time', 'execution_time_log'], axis=1)
-    test_df = test_df.drop(['execution_time', 'execution_time_log'], axis=1)
     
     logging.info("\nDebugging target values in prepare_data_for_model:")
     logging.info(f"First 5 y_train raw: {y_train[:5].flatten()}")
     logging.info(f"First 5 y_val raw: {y_val[:5].flatten()}")
     logging.info(f"First 5 y_test raw: {y_test[:5].flatten()}")
     
-    scaler_X = StandardScaler()
     scaler_y = StandardScaler()
-    
-    X_train_scaled = scaler_X.fit_transform(train_df)
     y_train_scaled = scaler_y.fit_transform(y_train)
-    X_val_scaled = scaler_X.transform(val_df)
     y_val_scaled = scaler_y.transform(y_val)
-    X_test_scaled = scaler_X.transform(test_df)
     y_test_scaled = scaler_y.transform(y_test)
     
     logging.info(f"First 5 y_train scaled: {y_train_scaled[:5].flatten()}")
     logging.info(f"First 5 y_val scaled: {y_val_scaled[:5].flatten()}")
     logging.info(f"First 5 y_test scaled: {y_test_scaled[:5].flatten()}")
     
-    X_train_tensor = torch.FloatTensor(X_train_scaled).unsqueeze(1)
-    y_train_tensor = torch.FloatTensor(y_train_scaled)
-    X_val_tensor = torch.FloatTensor(X_val_scaled).unsqueeze(1)
-    y_val_tensor = torch.FloatTensor(y_val_scaled)
-    X_test_tensor = torch.FloatTensor(X_test_scaled).unsqueeze(1)
-    y_test_tensor = torch.FloatTensor(y_test_scaled)
+    for i, graph in enumerate(train_graphs):
+        graph.y = torch.tensor(y_train_scaled[i], dtype=torch.float)
+    for i, graph in enumerate(val_graphs):
+        graph.y = torch.tensor(y_val_scaled[i], dtype=torch.float)
+    for i, graph in enumerate(test_graphs):
+        graph.y = torch.tensor(y_test_scaled[i], dtype=torch.float)
     
-    logging.info(f"Input feature dimension: {X_train_scaled.shape[1]}")
+    logging.info(f"Graph node feature dimension: {train_graphs[0].x.shape[1] if train_graphs[0].x.size(0) > 0 else 0}")
+    logging.info(f"Sample graph: nodes={train_graphs[0].num_nodes}, edges={train_graphs[0].num_edges}")
     
-    return (X_train_tensor, y_train_tensor, X_val_tensor, y_val_tensor, X_test_tensor, y_test_tensor, 
-            scaler_X, scaler_y, X_train_scaled.shape[1], True)
+    return train_graphs, val_graphs, test_graphs, scaler_y
+
+class GraphLSTMModel(nn.Module):
+    def __init__(self, input_size, hidden_sizes=[256, 128, 64], output_size=1, dropout_rate=0.5, num_heads=4):
+        super(GraphLSTMModel, self).__init__()
+        
+        self.hidden_sizes = hidden_sizes
+        self.gcn_layers = nn.ModuleList()
+        self.lstm_layers = nn.ModuleList()
+        self.ln_layers = nn.ModuleList()
+        self.dropout_layers = nn.ModuleList()
+        
+        in_size = input_size
+        for hidden_size in hidden_sizes:
+            self.gcn_layers.append(GCNConv(in_size, hidden_size))
+            self.lstm_layers.append(nn.LSTM(hidden_size, hidden_size, batch_first=True, bidirectional=True))
+            self.ln_layers.append(nn.LayerNorm(hidden_size * 2))
+            self.dropout_layers.append(nn.Dropout(dropout_rate))
+            in_size = hidden_size
+        
+        self.attention = MultiHeadAttention(hidden_sizes[-1] * 2, num_heads)
+        
+        self.fc_layers = nn.ModuleList()
+        self.bn_layers = nn.ModuleList()
+        fc_sizes = [hidden_sizes[-1] * 2, 128, 64, 32]
+        for i in range(len(fc_sizes) - 1):
+            self.fc_layers.append(nn.Linear(fc_sizes[i], fc_sizes[i+1]))
+            self.bn_layers.append(nn.BatchNorm1d(fc_sizes[i+1]))
+        
+        self.output_layer = nn.Linear(fc_sizes[-1], output_size)
+        
+        self.relu = nn.ReLU()
+        self.leaky_relu = nn.LeakyReLU(0.1)
+    
+    def forward(self, data):
+        x, edge_index, batch = data.x, data.edge_index, data.batch
+        device = x.device
+        
+        for gcn, lstm, ln, dropout in zip(self.gcn_layers, self.lstm_layers, self.ln_layers, self.dropout_layers):
+            x = gcn(x, edge_index)
+            x = self.relu(x)
+            x = x.unsqueeze(1)  # Add time dimension for LSTM
+            x, _ = lstm(x)
+            x = ln(x)
+            x = x.squeeze(1)
+            x = dropout(x)
+        
+        # Global pooling
+        from torch_geometric.nn import global_mean_pool
+        x = global_mean_pool(x, batch)
+        
+        # Attention
+        x = x.unsqueeze(1)
+        x = self.attention(x, device)
+        x = x.squeeze(1)
+        
+        # Fully connected layers
+        for fc, bn in zip(self.fc_layers, self.bn_layers):
+            x = fc(x)
+            x = bn(x)
+            x = self.leaky_relu(x)
+        
+        x = self.output_layer(x)
+        return x
 
 class MultiHeadAttention(nn.Module):
     def __init__(self, hidden_size, num_heads):
@@ -338,95 +434,39 @@ class MultiHeadAttention(nn.Module):
         out = self.fc_out(out)
         return out
 
-class AdvancedLSTMModel(nn.Module):
-    def __init__(self, input_size, hidden_sizes=[512, 256, 128], output_size=1, dropout_rate=0.5, num_heads=4):
-        super(AdvancedLSTMModel, self).__init__()
-        
-        self.hidden_sizes = hidden_sizes
-        self.lstm_layers = nn.ModuleList()
-        self.ln_layers = nn.ModuleList()
-        self.dropout_layers = nn.ModuleList()
-        self.attention_layers = nn.ModuleList()
-        
-        for i, hidden_size in enumerate(hidden_sizes):
-            in_size = input_size if i == 0 else hidden_sizes[i-1] * 2  # *2 for bidirectional
-            self.lstm_layers.append(nn.LSTM(in_size, hidden_size, batch_first=True, bidirectional=True))
-            self.ln_layers.append(nn.LayerNorm(hidden_size * 2))
-            self.dropout_layers.append(nn.Dropout(dropout_rate))
-            self.attention_layers.append(MultiHeadAttention(hidden_size * 2, num_heads))
-        
-        self.fc_layers = nn.ModuleList()
-        self.bn_layers = nn.ModuleList()
-        
-        fc_sizes = [hidden_sizes[-1] * 2, 128, 64, 32, 16]
-        for i in range(len(fc_sizes) - 1):
-            self.fc_layers.append(nn.Linear(fc_sizes[i], fc_sizes[i+1]))
-            self.bn_layers.append(nn.BatchNorm1d(fc_sizes[i+1]))
-        
-        self.output_layer = nn.Linear(fc_sizes[-1], output_size)
-        
-        self.relu = nn.ReLU()
-        self.leaky_relu = nn.LeakyReLU(0.1)
-        
-    def forward(self, x):
-        device = x.device
-        lstm_out = x
-        
-        for i, (lstm, ln, dropout, attention) in enumerate(zip(self.lstm_layers, self.ln_layers, self.dropout_layers, self.attention_layers)):
-            lstm_out, _ = lstm(lstm_out)
-            lstm_out = ln(lstm_out)
-            lstm_out = attention(lstm_out, device)
-            if i < len(self.lstm_layers) - 1:
-                lstm_out = dropout(lstm_out)
-        
-        attn_out = lstm_out[:, -1, :]
-        
-        fc_out = attn_out
-        for fc, bn in zip(self.fc_layers, self.bn_layers):
-            fc_out = fc(fc_out)
-            fc_out = bn(fc_out)
-            fc_out = self.leaky_relu(fc_out)
-        
-        output = self.output_layer(fc_out)
-        return output
-
-def create_data_loaders(X_train, y_train, X_val, y_val, X_test, y_test, batch_size=12):
-    train_dataset = TensorDataset(X_train, y_train)
-    val_dataset = TensorDataset(X_val, y_val)
-    test_dataset = TensorDataset(X_test, y_test)
-    
+def create_data_loaders(train_graphs, val_graphs, test_graphs, batch_size=8):
     try:
-        train_loader = DataLoader(
-            train_dataset, batch_size=batch_size, shuffle=True, 
+        train_loader = GeometricDataLoader(
+            train_graphs, batch_size=batch_size, shuffle=True, 
             num_workers=4, pin_memory=True
         )
-        val_loader = DataLoader(
-            val_dataset, batch_size=batch_size, shuffle=False, 
+        val_loader = GeometricDataLoader(
+            val_graphs, batch_size=batch_size, shuffle=False, 
             num_workers=4, pin_memory=True
         )
-        test_loader = DataLoader(
-            test_dataset, batch_size=batch_size, shuffle=False, 
+        test_loader = GeometricDataLoader(
+            test_graphs, batch_size=batch_size, shuffle=False, 
             num_workers=4, pin_memory=True
         )
     except RuntimeError as e:
-        logging.warning(f"DataLoader failed with batch_size={batch_size}, trying batch_size=8: {str(e)}")
-        batch_size = 8
-        train_loader = DataLoader(
-            train_dataset, batch_size=batch_size, shuffle=True, 
+        logging.warning(f"DataLoader failed with batch_size={batch_size}, trying batch_size=4: {str(e)}")
+        batch_size = 4
+        train_loader = GeometricDataLoader(
+            train_graphs, batch_size=batch_size, shuffle=True, 
             num_workers=4, pin_memory=True
         )
-        val_loader = DataLoader(
-            val_dataset, batch_size=batch_size, shuffle=False, 
+        val_loader = GeometricDataLoader(
+            val_graphs, batch_size=batch_size, shuffle=False, 
             num_workers=4, pin_memory=True
         )
-        test_loader = DataLoader(
-            test_dataset, batch_size=batch_size, shuffle=False, 
+        test_loader = GeometricDataLoader(
+            test_graphs, batch_size=batch_size, shuffle=False, 
             num_workers=4, pin_memory=True
         )
     
     return train_loader, val_loader, test_loader
 
-def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs=350, patience=40):
+def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs=400, patience=50):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logging.info(f"Using device: {device}")
     model.to(device)
@@ -459,12 +499,12 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
         running_loss = 0.0
         train_mape = 0.0
         train_count = 0
-        for inputs, targets in train_loader:
-            inputs, targets = inputs.to(device), targets.to(device)
+        for data in train_loader:
+            data = data.to(device)
             optimizer.zero_grad()
             with torch.cuda.amp.autocast(enabled=scaler is not None):
-                outputs = model(inputs)
-                loss = criterion(outputs, targets)
+                outputs = model(data)
+                loss = criterion(outputs, data.y.view(-1, 1))
             if scaler:
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
@@ -476,9 +516,9 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
                 optimizer.step()
             scheduler.step()
-            running_loss += loss.item() * inputs.size(0)
-            train_mape += torch.abs((outputs - targets) / (targets.abs() + 1e-8)).sum().item()
-            train_count += inputs.size(0)
+            running_loss += loss.item() * data.num_graphs
+            train_mape += torch.abs((outputs - data.y.view(-1, 1)) / (data.y.view(-1, 1).abs() + 1e-8)).sum().item()
+            train_count += data.num_graphs
         
         train_loss = running_loss / len(train_loader.dataset)
         train_mape = (train_mape / len(train_loader.dataset)) * 100
@@ -491,15 +531,15 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
         val_mape = 0.0
         val_count = 0
         with torch.no_grad():
-            for inputs, targets in val_loader:
-                inputs, targets = inputs.to(device), targets.to(device)
+            for data in val_loader:
+                data = data.to(device)
                 with torch.cuda.amp.autocast(enabled=scaler is not None):
-                    outputs = model(inputs)
-                    loss = criterion(outputs, targets)
-                val_loss += loss.item() * inputs.size(0)
-                val_mae += torch.abs(outputs - targets).sum().item()
-                val_mape += torch.abs((outputs - targets) / (targets.abs() + 1e-8)).sum().item()
-                val_count += inputs.size(0)
+                    outputs = model(data)
+                    loss = criterion(outputs, data.y.view(-1, 1))
+                val_loss += loss.item() * data.num_graphs
+                val_mae += torch.abs(outputs - data.y.view(-1, 1)).sum().item()
+                val_mape += torch.abs((outputs - data.y.view(-1, 1)) / (data.y.view(-1, 1).abs() + 1e-8)).sum().item()
+                val_count += data.num_graphs
         
         val_loss /= len(val_loader.dataset)
         val_mae /= len(val_loader.dataset)
@@ -512,9 +552,8 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
         mem_usage = psutil.Process().memory_info().rss / (1024 ** 2)  # MB
         logging.info(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, Train MAPE: {train_mape:.2f}%, Val MAE: {val_mae:.4f}, Val MAPE: {val_mape:.2f}%, Grad Norm: {grad_norm:.4f}, Memory: {mem_usage:.2f} MB, Time: {time.time() - epoch_start_time:.2f}s')
         
-        # Save checkpoint
         if epoch % 50 == 0:
-            checkpoint_path = f'checkpoint_epoch_{epoch}.pt'
+            checkpoint_path = f'graph_checkpoint_epoch_{epoch}.pt'
             torch.save(model.state_dict(), checkpoint_path)
             logging.info(f"Saved checkpoint: {checkpoint_path}")
         
@@ -535,19 +574,25 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, num_epoch
     
     return train_losses, val_losses, val_maes, val_mapes, train_mapes
 
-def evaluate_model(model, X_test, y_test, scaler_y, file_names_test, is_log_transformed=True, original_execution_times=None):
+def evaluate_model(model, test_loader, scaler_y, file_names_test, is_log_transformed=True, original_execution_times=None):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.to(device)
     model.eval()
     
-    X_test = X_test.to(device)
+    y_pred_scaled = []
+    y_test_scaled = []
     with torch.no_grad():
-        y_pred_scaled = model(X_test)
+        for data in test_loader:
+            data = data.to(device)
+            with torch.cuda.amp.autocast():
+                outputs = model(data)
+            y_pred_scaled.append(outputs.cpu().numpy())
+            y_test_scaled.append(data.y.view(-1, 1).cpu().numpy())
     
-    y_pred_scaled = y_pred_scaled.cpu().numpy()
-    y_test = y_test.cpu().numpy()
+    y_pred_scaled = np.concatenate(y_pred_scaled)
+    y_test_scaled = np.concatenate(y_test_scaled)
     
-    y_test_transformed = scaler_y.inverse_transform(y_test)
+    y_test_transformed = scaler_y.inverse_transform(y_test_scaled)
     y_pred_transformed = scaler_y.inverse_transform(y_pred_scaled)
     
     logging.info("\nDebugging transformed values before inverse log:")
@@ -607,9 +652,9 @@ def evaluate_model(model, X_test, y_test, scaler_y, file_names_test, is_log_tran
     plt.xlabel('Absolute Error (ms)')
     plt.ylabel('Density')
     plt.grid(True)
-    plt.savefig('error_histogram_advanced_lstm_fixed.png')
+    plt.savefig('error_histogram_graph_lstm.png')
     plt.close()
-    logging.info("Error histogram saved as 'error_histogram_advanced_lstm_fixed.png'")
+    logging.info("Error histogram saved as 'error_histogram_graph_lstm.png'")
     
     return y_test_actual, y_pred_actual
 
@@ -643,17 +688,19 @@ def plot_metrics(train_losses, val_losses, val_maes, val_mapes, train_mapes):
     plt.grid(True)
     
     plt.tight_layout()
-    plt.savefig('metrics_advanced_lstm_fixed.png')
+    plt.savefig('metrics_graph_lstm.png')
     plt.close()
-    logging.info("Metrics plot saved as 'metrics_advanced_lstm_fixed.png'")
+    logging.info("Metrics plot saved as 'metrics_graph_lstm.png'")
 
 def main(main_dir, cache_dir='feature_cache'):
     logging.info(f"Processing main directory: {main_dir}")
-    train_features, val_features, test_features, train_file_names, val_file_names, test_file_names = process_main_directory(main_dir, cache_dir)
+    (train_features, val_features, test_features, 
+     train_graphs, val_graphs, test_graphs, 
+     train_file_names, val_file_names, test_file_names) = process_main_directory(main_dir, cache_dir)
     
-    logging.info(f"Total training samples: {len(train_features)}")
-    logging.info(f"Total validation samples: {len(val_features)}")
-    logging.info(f"Total test samples: {len(test_features)}")
+    logging.info(f"Total training samples: {len(train_features)}, graphs: {len(train_graphs)}")
+    logging.info(f"Total validation samples: {len(val_features)}, graphs: {len(val_graphs)}")
+    logging.info(f"Total test samples: {len(test_features)}, graphs: {len(test_graphs)}")
     
     if len(train_features) == 0 or len(test_features) == 0:
         logging.error("No valid training or test data found")
@@ -661,17 +708,18 @@ def main(main_dir, cache_dir='feature_cache'):
     
     original_execution_times = {fname: f['execution_time'] for f, fname in zip(test_features, test_file_names)}
     
-    (X_train, y_train, X_val, y_val, X_test, y_test, scaler_X, scaler_y, input_size, is_log_transformed) = prepare_data_for_model(
-        train_features, val_features, test_features
+    train_graphs, val_graphs, test_graphs, scaler_y = prepare_data_for_model(
+        train_features, val_features, test_features, train_graphs, val_graphs, test_graphs
     )
     
     train_loader, val_loader, test_loader = create_data_loaders(
-        X_train, y_train, X_val, y_val, X_test, y_test, batch_size=12
+        train_graphs, val_graphs, test_graphs, batch_size=8
     )
     
-    model = AdvancedLSTMModel(
+    input_size = train_graphs[0].x.shape[1] if train_graphs[0].x.size(0) > 0 else 1
+    model = GraphLSTMModel(
         input_size=input_size,
-        hidden_sizes=[512, 256, 128],
+        hidden_sizes=[256, 128, 64],
         output_size=1,
         dropout_rate=0.5,
         num_heads=4
@@ -680,35 +728,35 @@ def main(main_dir, cache_dir='feature_cache'):
     criterion = nn.MSELoss()
     optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=5e-4)
     
-    logging.info("Building and training Advanced LSTM model...")
+    logging.info("Building and training Graph LSTM model...")
     train_losses, val_losses, val_maes, val_mapes, train_mapes = train_model(
-        model, train_loader, val_loader, criterion, optimizer, num_epochs=350, patience=40
+        model, train_loader, val_loader, criterion, optimizer, num_epochs=400, patience=50
     )
     
     plot_metrics(train_losses, val_losses, val_maes, val_mapes, train_mapes)
     
     logging.info("\nEvaluating model:")
     y_test_actual, y_pred_actual = evaluate_model(
-        model, X_test, y_test, scaler_y, test_file_names, is_log_transformed, original_execution_times
+        model, test_loader, scaler_y, test_file_names, is_log_transformed=True, original_execution_times=original_execution_times
     )
     
-    logging.info("\nSaving the trained model as 'advanced_lstm_model_fixed.pt'...")
+    logging.info("\nSaving the trained model as 'graph_lstm_model.pt'...")
     model.eval()
     device = next(model.parameters()).device
     logging.info(f"Model is on device: {device}")
     
     try:
-        sample_input = torch.randn(1, 1, input_size).to(device)
-        traced_model = torch.jit.trace(model, sample_input)
-        traced_model.save("advanced_lstm_model_fixed.pt")
-        logging.info("Model successfully saved as 'advanced_lstm_model_fixed.pt'")
+        sample_data = train_graphs[0].to(device)
+        traced_model = torch.jit.trace(model, sample_data)
+        traced_model.save("graph_lstm_model.pt")
+        logging.info("Model successfully saved as 'graph_lstm_model.pt'")
     except Exception as e:
         logging.error(f"Error saving the model: {str(e)}")
+        torch.save(model.state_dict(), "graph_lstm_model_state.pt")
+        logging.info("Saved model state dict as 'graph_lstm_model_state.pt'")
     
-    # Save scalers
-    with open('scaler_X_fixed.pkl', 'wb') as f:
-        pickle.dump(scaler_X, f)
-    with open('scaler_y_fixed.pkl', 'wb') as f:
+    # Save scaler
+    with open('scaler_y_graph.pkl', 'wb') as f:
         pickle.dump(scaler_y, f)
     
     return model, scaler_y, y_test_actual, y_pred_actual
