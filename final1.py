@@ -19,6 +19,7 @@ import psutil
 import logging
 import shutil
 from tqdm import tqdm
+from collections import Counter
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -83,7 +84,7 @@ def get_execution_time(file_path, max_retries=2, timeout=5):
             logging.error(f"Unexpected error in {file_path}: {str(e)}")
             return None
 
-def extract_features_from_file(file_path, cache_dir='feature_cache', cache_version='v1'):
+def extract_features_from_file(file_path, cache_dir='feature_cache', cache_version='v1', max_ops=50):
     cache_path = os.path.join(cache_dir, file_path.replace('/', '_').replace('.json', f'_v{cache_version}.pkl'))
     
     # Check cache
@@ -199,14 +200,34 @@ def extract_features_from_file(file_path, cache_dir='feature_cache', cache_versi
         features['op_diversity'] = op_types / len(nodes_features)
     
     # Optimize node feature extraction
-    op_keys = sorted(set(k[3:] for k in op_counts.keys() if k.startswith('op_')))
+    # Select top-K operations by total count
+    op_counter = Counter()
+    for node in nodes_features:
+        for key, value in node.items():
+            if key.startswith('op_'):
+                op_counter[key[3:]] += value
+    top_ops = [op for op, _ in op_counter.most_common(max_ops)]
+    op_keys = sorted(top_ops)
+    logging.info(f"Selected top {len(op_keys)} operations for node features: {op_keys}")
+    
+    # Normalize scheduling metrics
     node_features_list = []
+    metric_values = []
+    if scheduling_features and scheduling_features[0]:
+        for metric in important_metrics:
+            if metric in scheduling_features[0]:
+                metric_values.append(scheduling_features[0][metric])
+        if metric_values:
+            metric_scaler = StandardScaler()
+            metric_values = metric_scaler.fit_transform(np.array(metric_values).reshape(-1, 1)).flatten()
+        else:
+            metric_values = [0] * len(important_metrics)
+    else:
+        metric_values = [0] * len(important_metrics)
+    
     for node in nodes_features:
         node_vec = [node.get(f'op_{op}', 0) for op in op_keys]
-        if scheduling_features and scheduling_features[0]:
-            for metric in important_metrics:
-                if metric in scheduling_features[0]:
-                    node_vec.append(scheduling_features[0][metric])
+        node_vec.extend(metric_values)
         node_features_list.append(node_vec)
     
     x = torch.tensor(node_features_list, dtype=torch.float) if node_features_list else torch.zeros((1, 1))
@@ -214,6 +235,7 @@ def extract_features_from_file(file_path, cache_dir='feature_cache', cache_versi
     y = torch.tensor([np.log1p(execution_time)], dtype=torch.float)
     
     graph_data = Data(x=x, edge_index=edge_index, y=y)
+    logging.info(f"Node feature dimension: {x.shape[1]}")
     
     # Cache features and graph data
     os.makedirs(cache_dir, exist_ok=True)
@@ -343,7 +365,7 @@ def clean_and_transform_features(train_features, val_features, test_features, tr
         if graph.x.size(0) > 0:
             node_features = graph.x.numpy()
             node_df = pd.DataFrame(node_features, columns=[f'feature_{i}' for i in range(node_features.shape[1])])
-            selected_node_features = node_df.iloc[:, :len(selected_features)].values
+            selected_node_features = node_df.iloc[:, :min(len(selected_features), node_df.shape[1])].values
             graph.x = torch.tensor(selected_node_features, dtype=torch.float)
     
     return train_df, val_df, test_df, train_graphs, val_graphs, test_graphs
@@ -758,6 +780,7 @@ def main(main_dir, cache_dir='feature_cache'):
         )
         
         input_size = train_graphs[0].x.shape[1] if train_graphs[0].x.size(0) > 0 else 1
+        logging.info(f"Model input size: {input_size}")
         model = GraphLSTMModel(
             input_size=input_size,
             hidden_sizes=[256, 128, 64],
