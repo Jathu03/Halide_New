@@ -296,7 +296,7 @@ def prepare_train_val_test_split(sequences, execution_times, test_size=20, val_s
     return train_dataset, val_dataset, test_dataset, y_scaler, seq_len
 
 def train_model_with_fold(model, train_loader, val_loader, fold=0, 
-                          epochs=50, learning_rate=5e-4, min_lr=1e-6,
+                          epochs=75, learning_rate=5e-4, min_lr=1e-6,
                           weight_decay=1e-5, patience=15,
                           gradient_accumulation_steps=1,
                           use_amp=True):
