@@ -85,7 +85,7 @@ def get_execution_time(file_path, max_retries=2, timeout=5):
             logging.error(f"Unexpected error in {file_path}: {str(e)}")
             return None
 
-def extract_features_from_file(file_path, cache_dir='feature_cache', cache_version='v3', max_ops=24, force_reprocess=False):
+def extract_features_from_file(file_path, cache_dir='feature_cache', cache_version='v4', max_ops=24, force_reprocess=False):
     cache_path = os.path.join(cache_dir, file_path.replace('/', '_').replace('.json', f'_v{cache_version}.pkl'))
     
     # Check cache
@@ -211,13 +211,15 @@ def extract_features_from_file(file_path, cache_dir='feature_cache', cache_versi
             if key.startswith('op_'):
                 op_counter[key[3:]] += value
     logging.info(f"Total unique operations for {file_path}: {len(op_counter)}")
-    if len(op_counter) > 50:
-        logging.warning(f"Excessive operations ({len(op_counter)}) in {file_path}, skipping file")
+    if len(op_counter) > max_ops:
+        logging.warning(f"Excessive operations ({len(op_counter)}) in {file_path}, expected <= {max_ops}, skipping file")
         return None
-    else:
-        top_ops = [op for op, _ in op_counter.most_common(max_ops)]
+    top_ops = [op for op, _ in op_counter.most_common(max_ops)]
     op_keys = sorted(top_ops)[:max_ops]  # Strictly limit to max_ops
-    logging.info(f"Selected top {len(op_keys)} operations for node features: {op_keys}")
+    if len(op_keys) != max_ops:
+        logging.warning(f"Insufficient operations ({len(op_keys)}) in {file_path}, expected {max_ops}, padding with zeros")
+        op_keys.extend(['pad_{}'.format(i) for i in range(max_ops - len(op_keys))])
+    logging.info(f"Selected {len(op_keys)} operations for node features: {op_keys}")
     
     # Normalize scheduling metrics
     node_features_list = []
@@ -226,6 +228,11 @@ def extract_features_from_file(file_path, cache_dir='feature_cache', cache_versi
         for metric in important_metrics:
             if metric in scheduling_features[0]:
                 metric_values.append(scheduling_features[0][metric])
+            else:
+                metric_values.append(0)  # Fill missing metrics with 0
+        if len(metric_values) != len(important_metrics):
+            logging.error(f"Metric values length {len(metric_values)} does not match expected {len(important_metrics)} for {file_path}")
+            return None
         if metric_values:
             metric_scaler = StandardScaler()
             metric_values = metric_scaler.fit_transform(np.array(metric_values).reshape(-1, 1)).flatten()
@@ -233,19 +240,24 @@ def extract_features_from_file(file_path, cache_dir='feature_cache', cache_versi
             metric_values = [0] * len(important_metrics)
     else:
         metric_values = [0] * len(important_metrics)
+    logging.info(f"Metric values length for {file_path}: {len(metric_values)}")
     
     # Ensure node feature dimension = max_ops + len(important_metrics)
     target_feature_dim = max_ops + len(important_metrics)  # 24 + 12 = 36
-    for node in nodes_features:
+    for node_idx, node in enumerate(nodes_features):
         node_vec = [node.get(f'op_{op}', 0) for op in op_keys]
         node_vec.extend(metric_values)
-        logging.info(f"Node feature vector length before truncation for {file_path}: {len(node_vec)}")
+        logging.info(f"Node {node_idx} feature vector length before truncation for {file_path}: {len(node_vec)}")
         # Truncate or pad to target dimension
         if len(node_vec) > target_feature_dim:
+            logging.warning(f"Truncating node {node_idx} feature vector from {len(node_vec)} to {target_feature_dim} for {file_path}")
             node_vec = node_vec[:target_feature_dim]
         elif len(node_vec) < target_feature_dim:
+            logging.warning(f"Padding node {node_idx} feature vector from {len(node_vec)} to {target_feature_dim} for {file_path}")
             node_vec.extend([0] * (target_feature_dim - len(node_vec)))
-        logging.info(f"Node feature vector length after truncation for {file_path}: {len(node_vec)}")
+        if len(node_vec) != target_feature_dim:
+            logging.error(f"Node {node_idx} feature vector length {len(node_vec)} does not match {target_feature_dim} for {file_path}")
+            return None
         node_features_list.append(node_vec)
     
     if not node_features_list:
@@ -260,7 +272,7 @@ def extract_features_from_file(file_path, cache_dir='feature_cache', cache_versi
     if graph_data.x.shape[1] != target_feature_dim:
         logging.error(f"Invalid node feature dimension {graph_data.x.shape[1]} for {file_path}, expected {target_feature_dim}")
         return None
-    logging.info(f"Node feature dimension: {x.shape[1]}")
+    logging.info(f"Node feature dimension for {file_path}: {x.shape[1]}")
     
     # Cache features and graph data
     os.makedirs(cache_dir, exist_ok=True)
@@ -447,6 +459,15 @@ def prepare_data_for_model(train_features, val_features, test_features, train_gr
     
     return train_graphs, val_graphs, test_graphs, scaler_y
 
+def validate_data_loader(loader, file_names, set_name="Train", target_feature_dim=36):
+    for batch_idx, data in enumerate(loader):
+        if data.x.size(0) > 0 and data.x.shape[1] != target_feature_dim:
+            batch_files = file_names[batch_idx * loader.batch_size : (batch_idx + 1) * loader.batch_size]
+            logging.error(f"{set_name} batch {batch_idx} has incorrect feature dimension {data.x.shape[1]} (expected {target_feature_dim}), files: {batch_files}")
+            raise ValueError(f"Invalid batch feature dimension {data.x.shape[1]}")
+        batch_files = file_names[batch_idx * loader.batch_size : (batch_idx + 1) * loader.batch_size]
+        logging.info(f"{set_name} batch {batch_idx}: num_nodes={data.x.shape[0]}, feature_dim={data.x.shape[1]}, files={batch_files}")
+
 class GraphLSTMModel(nn.Module):
     def __init__(self, input_size, hidden_sizes=[256, 128, 64], output_size=1, dropout_rate=0.5, num_heads=4):
         super(GraphLSTMModel, self).__init__()
@@ -538,7 +559,7 @@ class MultiHeadAttention(nn.Module):
         out = self.fc_out(out)
         return out
 
-def create_data_loaders(train_graphs, val_graphs, test_graphs, batch_size=8):
+def create_data_loaders(train_graphs, val_graphs, test_graphs, batch_size=1):  # Set batch_size=1 for debugging
     try:
         train_loader = GeometricDataLoader(
             train_graphs, batch_size=batch_size, shuffle=True, 
@@ -553,8 +574,8 @@ def create_data_loaders(train_graphs, val_graphs, test_graphs, batch_size=8):
             num_workers=2, pin_memory=True
         )
     except RuntimeError as e:
-        logging.warning(f"DataLoader failed with batch_size={batch_size}, trying batch_size=4: {str(e)}")
-        batch_size = 4
+        logging.warning(f"DataLoader failed with batch_size={batch_size}, trying batch_size=1: {str(e)}")
+        batch_size = 1
         train_loader = GeometricDataLoader(
             train_graphs, batch_size=batch_size, shuffle=True, 
             num_workers=2, pin_memory=True
@@ -574,6 +595,10 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, train_fil
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logging.info(f"Using device: {device}")
     model.to(device)
+    
+    # Validate DataLoader before training
+    logging.info("Validating train DataLoader...")
+    validate_data_loader(train_loader, train_file_names, set_name="Train")
     
     steps_per_epoch = len(train_loader)
     scheduler = OneCycleLR(
@@ -596,14 +621,6 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, train_fil
     val_maes = []
     val_mapes = []
     train_mapes = []
-    
-    # Validate batches
-    target_feature_dim = 36
-    for batch_idx, data in enumerate(train_loader):
-        if data.x.size(0) > 0 and data.x.shape[1] != target_feature_dim:
-            batch_files = train_file_names[batch_idx * train_loader.batch_size : (batch_idx + 1) * train_loader.batch_size]
-            logging.error(f"Batch {batch_idx} has incorrect feature dimension {data.x.shape[1]} (expected {target_feature_dim}), files: {batch_files}")
-            raise ValueError(f"Invalid batch feature dimension {data.x.shape[1]}")
     
     for epoch in tqdm(range(num_epochs), desc="Training epochs"):
         epoch_start_time = time.time()
@@ -831,7 +848,7 @@ def main(main_dir, cache_dir='feature_cache'):
         )
         
         train_loader, val_loader, test_loader = create_data_loaders(
-            train_graphs, val_graphs, test_graphs, batch_size=8
+            train_graphs, val_graphs, test_graphs, batch_size=1  # Debug with batch_size=1
         )
         
         input_size = train_graphs[0].x.shape[1] if train_graphs[0].x.size(0) > 0 else 1
