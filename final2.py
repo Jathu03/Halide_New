@@ -9,7 +9,7 @@ import os
 import random
 from sklearn.preprocessing import RobustScaler
 import pickle
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import OneCycleLR
 from torch.cuda.amp import autocast, GradScaler
 from torch_geometric.data import Data, Batch
 from collections import defaultdict
@@ -141,9 +141,7 @@ class GraphLSTMCell(nn.Module):
         c_tilde = torch.tanh(self.W_c(combined))
         o = torch.sigmoid(self.W_o(combined))
         
-        # Aggregate neighbor hidden states for the batch
         if neighbors_h_batch is not None and any(len(nh) > 0 for nh in neighbors_h_batch):
-            # Initialize neighbor contributions
             neighbor_contrib = torch.zeros_like(h_prev)
             for b in range(len(neighbors_h_batch)):
                 neighbors_h = neighbors_h_batch[b]
@@ -151,9 +149,6 @@ class GraphLSTMCell(nn.Module):
                     neighbor_h = torch.mean(torch.stack(neighbors_h), dim=0)
                     neighbor_contrib[b] = self.W_n(neighbor_h)
             c_tilde = c_tilde + neighbor_contrib
-        else:
-            # No neighbors, no contribution
-            pass
         
         c = f * c_prev + i * c_tilde
         h = o * torch.tanh(c)
@@ -164,14 +159,14 @@ class GraphLSTM(nn.Module):
     """
     Graph-LSTM model for execution time prediction.
     """
-    def __init__(self, input_dim, seq_len, hidden_dim=256, num_layers=2, dropout=0.3):
+    def __init__(self, input_dim, seq_len, hidden_dim=256, num_layers=4, dropout=0.4):
         super(GraphLSTM, self).__init__()
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         self.seq_len = seq_len
         self.input_dim = input_dim
         
-        print(f"GraphLSTM: initializing with input_dim={input_dim}, hidden_dim={hidden_dim}")
+        print(f"GraphLSTM: initializing with input_dim={input_dim}, hidden_dim={hidden_dim}, num_layers={num_layers}")
         
         self.cells = nn.ModuleList([
             GraphLSTMCell(input_dim if i == 0 else hidden_dim, hidden_dim)
@@ -209,7 +204,6 @@ class GraphLSTM(nn.Module):
                 h_prev = h[layer][:, t, :]  # Shape: [batch_size, hidden_dim]
                 c_prev = c[layer][:, t, :]  # Shape: [batch_size, hidden_dim]
                 
-                # Collect neighbor hidden states for the batch
                 neighbors_h_batch = []
                 for b in range(batch_size):
                     neighbors = adj_lists[b].get(t, [])
@@ -220,7 +214,6 @@ class GraphLSTM(nn.Module):
                     ]
                     neighbors_h_batch.append(neighbors_h)
                 
-                # Process batch
                 h_t, c_t = self.cells[layer](
                     layer_input, 
                     h_prev, 
@@ -303,8 +296,8 @@ def prepare_train_val_test_split(sequences, execution_times, test_size=20, val_s
     return train_dataset, val_dataset, test_dataset, y_scaler, seq_len
 
 def train_model_with_fold(model, train_loader, val_loader, fold=0, 
-                          epochs=64, learning_rate=0.001, min_lr=1e-6,
-                          weight_decay=1e-5, patience=10,
+                          epochs=50, learning_rate=5e-4, min_lr=1e-6,
+                          weight_decay=1e-5, patience=15,
                           gradient_accumulation_steps=1,
                           use_amp=True):
     """
@@ -313,7 +306,18 @@ def train_model_with_fold(model, train_loader, val_loader, fold=0,
     criterion = nn.MSELoss()
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     
-    scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=min_lr)
+    # OneCycleLR for dynamic learning rate
+    steps_per_epoch = max(1, len(train_loader) // gradient_accumulation_steps)
+    scheduler = OneCycleLR(
+        optimizer,
+        max_lr=learning_rate,
+        steps_per_epoch=steps_per_epoch,
+        epochs=epochs,
+        pct_start=0.2,  # 20% warmup
+        anneal_strategy='cos',
+        div_factor=25,
+        final_div_factor=1000
+    )
     scaler = GradScaler() if use_amp else None
     best_val_loss = float('inf')
     epochs_no_improve = 0
@@ -339,6 +343,9 @@ def train_model_with_fold(model, train_loader, val_loader, fold=0,
             if use_amp:
                 scaler.scale(loss).backward()
                 if (i + 1) % gradient_accumulation_steps == 0:
+                    # Gradient clipping
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                     scaler.step(optimizer)
                     scaler.update()
                     optimizer.zero_grad()
@@ -346,6 +353,7 @@ def train_model_with_fold(model, train_loader, val_loader, fold=0,
             else:
                 loss.backward()
                 if (i + 1) % gradient_accumulation_steps == 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                     optimizer.step()
                     optimizer.zero_grad()
                     scheduler.step()
@@ -375,7 +383,9 @@ def train_model_with_fold(model, train_loader, val_loader, fold=0,
         val_mae /= val_count
         val_losses.append(val_loss)
         
-        print(f"Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, Val MAE: {val_mae:.4f}, Time: {time.time() - epoch_start_time:.2f}s")
+        # Log gradient norm for debugging
+        grad_norm = sum(p.grad.norm().item() for p in model.parameters() if p.grad is not None)
+        print(f"Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, Val MAE: {val_mae:.4f}, Grad Norm: {grad_norm:.4f}, Time: {time.time() - epoch_start_time:.2f}s")
         
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -462,10 +472,10 @@ def main():
         collate_fn=collator, num_workers=4, pin_memory=True
     )
     
-    # Initialize model
+    # Initialize model with more layers
     input_dim = sequences.shape[2]
     print(f"Main: input_dim={input_dim}, seq_len={seq_len}")
-    model = GraphLSTM(input_dim=input_dim, seq_len=seq_len, hidden_dim=256).to(device)
+    model = GraphLSTM(input_dim=input_dim, seq_len=seq_len, hidden_dim=256, num_layers=4).to(device)
     
     # Train model
     train_losses, val_losses = train_model_with_fold(
