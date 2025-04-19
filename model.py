@@ -9,11 +9,13 @@ import os
 import random
 from sklearn.preprocessing import RobustScaler
 import pickle
+import json
 from torch.optim.lr_scheduler import OneCycleLR
 from torch.cuda.amp import autocast, GradScaler
 from torch_geometric.data import Data, Batch
 from collections import defaultdict
 from tqdm import tqdm
+import uuid
 
 # Set random seeds
 def set_seed(seed=42):
@@ -59,6 +61,15 @@ class AdvancedScalerWrapper:
 
     def __call__(self, y_scaled):
         return self.inverse_transform_y(y_scaled)
+
+    def save_to_json(self, filepath):
+        scaler_params = {
+            'offset': float(self.offset),
+            'center': float(self.scaler.center_[0]),
+            'scale': float(self.scaler.scale_[0])
+        }
+        with open(filepath, 'w') as f:
+            json.dump(scaler_params, f, indent=4)
 
 class HalideGraphDataset(Dataset):
     """
@@ -184,7 +195,6 @@ class GraphLSTM(nn.Module):
         
         # Initialize hidden and cell states
         batch_size = data.num_graphs
-        # Shape: [num_layers, batch_size, seq_len, hidden_dim]
         h = [torch.zeros(batch_size, self.seq_len, self.hidden_dim, device=x.device) for _ in range(self.num_layers)]
         c = [torch.zeros(batch_size, self.seq_len, self.hidden_dim, device=x.device) for _ in range(self.num_layers)]
         
@@ -197,27 +207,23 @@ class GraphLSTM(nn.Module):
         
         # Process each timestep
         outputs = []
-        # Store updates for h and c to avoid in-place operations
         h_updates = [[] for _ in range(self.num_layers)]
         c_updates = [[] for _ in range(self.num_layers)]
         
         for t in range(self.seq_len):
-            # Get node features for timestep t across all graphs
             node_indices = torch.arange(t, x.size(0), self.seq_len, device=x.device)
-            node_features = x[node_indices]  # Shape: [batch_size, input_dim]
+            node_features = x[node_indices]
             
-            layer_input = node_features  # Start with input features
+            layer_input = node_features
             for layer in range(self.num_layers):
-                h_prev = h[layer][:, t, :]  # Shape: [batch_size, hidden_dim]
-                c_prev = c[layer][:, t, :]  # Shape: [batch_size, hidden_dim]
+                h_prev = h[layer][:, t, :]
+                c_prev = c[layer][:, t, :]
                 new_h = []
                 new_c = []
                 
                 for b in range(batch_size):
-                    # Get global index for node at timestep t in graph b
                     global_idx = b * self.seq_len + t
-                    neighbors = adj_list[b].get(t, [])  # Neighbors for node t in graph b
-                    # Convert neighbor indices to local indices
+                    neighbors = adj_list[b].get(t, [])
                     neighbors_h = [
                         h[layer][b, n % self.seq_len]
                         for n in neighbors
@@ -233,20 +239,17 @@ class GraphLSTM(nn.Module):
                     new_h.append(h_t)
                     new_c.append(c_t)
                 
-                # Collect updates instead of assigning in-place
-                h_updates[layer].append(torch.stack(new_h))  # Shape: [batch_size, hidden_dim]
-                c_updates[layer].append(torch.stack(new_c))  # Shape: [batch_size, hidden_dim]
-                layer_input = h_updates[layer][-1]  # Update input for next layer
+                h_updates[layer].append(torch.stack(new_h))
+                c_updates[layer].append(torch.stack(new_c))
+                layer_input = h_updates[layer][-1]
             
-            outputs.append(h_updates[-1][-1])  # Collect output from last layer
+            outputs.append(h_updates[-1][-1])
         
-        # Construct final h and c tensors
         for layer in range(self.num_layers):
-            h[layer] = torch.stack(h_updates[layer], dim=1)  # Shape: [batch_size, seq_len, hidden_dim]
-            c[layer] = torch.stack(c_updates[layer], dim=1)  # Shape: [batch_size, seq_len, hidden_dim]
+            h[layer] = torch.stack(h_updates[layer], dim=1)
+            c[layer] = torch.stack(c_updates[layer], dim=1)
         
-        # Aggregate final hidden states
-        final_h = torch.mean(torch.stack(outputs), dim=0)  # Shape: [batch_size, hidden_dim]
+        final_h = torch.mean(torch.stack(outputs), dim=0)
         final_h = self.dropout(final_h)
         out = self.fc(final_h)
         return out.squeeze(-1)
@@ -262,6 +265,17 @@ def load_dataset(file_path='halide_data.npz'):
     print(f"Sequence shape: {sequences.shape}")
     print(f"Execution times shape: {execution_times.shape}")
     return sequences, execution_times
+
+def save_x_scaler_to_json(x_scaler, filepath):
+    """
+    Save RobustScaler parameters to JSON.
+    """
+    scaler_params = {
+        'center': x_scaler.center_.tolist(),
+        'scale': x_scaler.scale_.tolist()
+    }
+    with open(filepath, 'w') as f:
+        json.dump(scaler_params, f, indent=4)
 
 def prepare_train_val_test_split(sequences, execution_times, test_size=20, val_size=0.2, 
                                  scaler_type='log_robust', feature_scaling='robust'):
@@ -305,21 +319,61 @@ def prepare_train_val_test_split(sequences, execution_times, test_size=20, val_s
     print(f"  Validation: {len(val_dataset)} samples")
     print(f"  Test: {len(test_dataset)} samples")
     
+    # Save scalers
     with open('y_scaler_advanced.pkl', 'wb') as f:
         pickle.dump(y_scaler, f)
     with open('x_scaler.pkl', 'wb') as f:
         pickle.dump(x_scaler, f)
+    y_scaler.save_to_json('y_scaler.json')
+    save_x_scaler_to_json(x_scaler, 'x_scaler.json')
     
     return train_dataset, val_dataset, test_dataset, y_scaler, seq_len
+
+def save_checkpoint(model, optimizer, scheduler, epoch, train_losses, val_losses, fold, best_val_loss, checkpoint_path):
+    """
+    Save training checkpoint.
+    """
+    checkpoint = {
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(),
+        'epoch': epoch,
+        'train_losses': train_losses,
+        'val_losses': val_losses,
+        'fold': fold,
+        'best_val_loss': best_val_loss
+    }
+    torch.save(checkpoint, checkpoint_path)
+    print(f"Checkpoint saved at {checkpoint_path}")
+
+def load_checkpoint(model, optimizer, scheduler, checkpoint_path, device):
+    """
+    Load training checkpoint.
+    """
+    if os.path.exists(checkpoint_path):
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        start_epoch = checkpoint['epoch'] + 1
+        train_losses = checkpoint['train_losses']
+        val_losses = checkpoint['val_losses']
+        fold = checkpoint['fold']
+        best_val_loss = checkpoint['best_val_loss']
+        print(f"Loaded checkpoint from {checkpoint_path}, resuming from epoch {start_epoch}")
+        return start_epoch, train_losses, val_losses, fold, best_val_loss
+    else:
+        print(f"No checkpoint found at {checkpoint_path}, starting from scratch")
+        return 0, [], [], 0, float('inf')
 
 def train_model_with_fold(model, train_loader, val_loader, fold=0, 
                           epochs=75, learning_rate=0.001, min_lr=1e-6,
                           weight_decay=1e-5, patience=25,
                           gradient_accumulation_steps=1,
                           use_warmup=True, warmup_epochs=10,
-                          use_amp=False):
+                          use_amp=False, checkpoint_path='checkpoint_graph_lstm.pth'):
     """
-    Train a single model with improved training strategy.
+    Train a single model with checkpointing.
     """
     criterion = nn.MSELoss()
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
@@ -334,7 +388,7 @@ def train_model_with_fold(model, train_loader, val_loader, fold=0,
             max_lr=learning_rate,
             steps_per_epoch=steps_per_epoch,
             epochs=epochs,
-            pct_start=max(0.05, warmup_epochs / epochs),  # Ensure non-zero warmup
+            pct_start=max(0.05, warmup_epochs / epochs),
             anneal_strategy='cos',
             div_factor=25,
             final_div_factor=1000,
@@ -342,15 +396,15 @@ def train_model_with_fold(model, train_loader, val_loader, fold=0,
     else:
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=min_lr)
     
+    # Load checkpoint if exists
+    start_epoch, train_losses, val_losses, _, best_val_loss = load_checkpoint(
+        model, optimizer, scheduler, checkpoint_path, device
+    )
     scaler = GradScaler() if use_amp else None
-    best_val_loss = float('inf')
     epochs_no_improve = 0
     best_model_path = f'best_graph_lstm_model_fold_{fold}.pth'
     
-    train_losses = []
-    val_losses = []
-    
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, epochs):
         model.train()
         train_loss = 0.0
         train_count = 0
@@ -405,6 +459,9 @@ def train_model_with_fold(model, train_loader, val_loader, fold=0,
         
         print(f"Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, Val MAE: {val_mae:.4f}")
         
+        # Save checkpoint
+        save_checkpoint(model, optimizer, scheduler, epoch, train_losses, val_losses, fold, best_val_loss, checkpoint_path)
+        
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             epochs_no_improve = 0
@@ -416,6 +473,8 @@ def train_model_with_fold(model, train_loader, val_loader, fold=0,
                 break
     
     model.load_state_dict(torch.load(best_model_path))
+    # Save final model as .pt file
+    torch.save(model.state_dict(), 'graph_lstm_model.pt')
     os.remove(best_model_path)
     return train_losses, val_losses
 
@@ -489,7 +548,8 @@ def main():
     # Train model
     train_losses, val_losses = train_model_with_fold(
         model, train_loader, val_loader,
-        use_amp=torch.cuda.is_available()
+        use_amp=torch.cuda.is_available(),
+        checkpoint_path='checkpoint_graph_lstm.pth'
     )
     
     # Evaluate model
@@ -501,6 +561,8 @@ def main():
     # Plot loss
     plot_loss(train_losses, val_losses)
     print("Loss plot saved as 'loss_plot_graph_lstm.png'")
+    print("Model saved as 'graph_lstm_model.pt'")
+    print("Scalers saved as 'x_scaler.json' and 'y_scaler.json'")
 
 if __name__ == "__main__":
     main()
