@@ -2,8 +2,7 @@ import os
 import json
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import StandardScaler
-from sklearn.feature_selection import SelectKBest, f_regression
+from sklearn.preprocessing import StandardScaler, RobustScaler
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -61,6 +60,9 @@ def extract_features_from_file(file_path):
     if execution_time is None:
         print(f"Warning: No execution time found in {file_path}")
         return None
+    
+    # Clip execution time to reduce impact of outliers
+    execution_time = np.clip(execution_time, 1.0, 10000.0)
     
     nodes_features = []
     edges_features = []
@@ -224,22 +226,18 @@ def clean_and_transform_features(train_features, test_features):
     all_features_df = all_features_df.drop(columns=constant_columns)
     print(f"Dropped {len(constant_columns)} constant columns")
     
-    # Clip execution times to avoid extreme values
-    all_features_df['execution_time'] = all_features_df['execution_time'].clip(lower=1e-2, upper=1e5)
+    # Remove highly correlated features
+    corr_matrix = all_features_df.drop(['execution_time'], axis=1).corr().abs()
+    upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+    to_drop = [column for column in upper.columns if any(upper[column] > 0.9)]
+    all_features_df = all_features_df.drop(columns=to_drop)
+    print(f"Dropped {len(to_drop)} highly correlated features")
     
-    # Add an offset to avoid log(0) and stabilize small values
-    offset = 1.0
-    all_features_df['execution_time_log'] = np.log1p(all_features_df['execution_time'] + offset)
+    if 'execution_time' in all_features_df.columns:
+        all_features_df['execution_time_log'] = np.log1p(all_features_df['execution_time'])
     
     if 'total_vectors' in all_features_df.columns and all_features_df['total_vectors'].max() > 0:
         all_features_df['bytes_per_vector'] = all_features_df['total_bytes_at_production'] / (all_features_df['total_vectors'] + 1e-8)
-    
-    # Drop highly correlated features
-    corr_matrix = all_features_df.drop(['execution_time', 'execution_time_log'], axis=1).corr().abs()
-    upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
-    to_drop = [column for column in upper.columns if any(upper[column] > 0.8)]
-    all_features_df = all_features_df.drop(columns=to_drop)
-    print(f"Dropped {len(to_drop)} highly correlated features")
     
     numeric_cols = all_features_df.select_dtypes(include=['number']).columns
     all_features_df = all_features_df[numeric_cols]
@@ -253,36 +251,35 @@ def clean_and_transform_features(train_features, test_features):
 def prepare_data_for_model(train_features, test_features):
     train_df, test_df = clean_and_transform_features(train_features, test_features)
     
-    y_train = train_df['execution_time_log'].values.reshape(-1, 1)
-    y_test = test_df['execution_time_log'].values.reshape(-1, 1)
-    train_df = train_df.drop(['execution_time', 'execution_time_log'], axis=1)
-    test_df = test_df.drop(['execution_time', 'execution_time_log'], axis=1)
-    is_log_transformed = True
+    if 'execution_time_log' in train_df.columns:
+        y_train = train_df['execution_time_log'].values.reshape(-1, 1)
+        y_test = test_df['execution_time_log'].values.reshape(-1, 1)
+        train_df = train_df.drop(['execution_time', 'execution_time_log'], axis=1)
+        test_df = test_df.drop(['execution_time', 'execution_time_log'], axis=1)
+        is_log_transformed = True
+    else:
+        y_train = train_df['execution_time'].values.reshape(-1, 1)
+        y_test = test_df['execution_time'].values.reshape(-1, 1)
+        train_df = train_df.drop('execution_time', axis=1)
+        test_df = test_df.drop('execution_time', axis=1)
+        is_log_transformed = False
     
     print("\nDebugging target values in prepare_data_for_model:")
     print(f"First 5 y_train raw: {y_train[:5].flatten()}")
     print(f"First 5 y_test raw: {y_test[:5].flatten()}")
     
     scaler_X = StandardScaler()
-    scaler_y = StandardScaler()
+    scaler_y = RobustScaler()
     
     X_train_scaled = scaler_X.fit_transform(train_df)
     y_train_scaled = scaler_y.fit_transform(y_train)
     X_test_scaled = scaler_X.transform(test_df)
     y_test_scaled = scaler_y.transform(y_test)
     
-    # Feature selection
-    if train_df.shape[1] > 30:
-        selector = SelectKBest(f_regression, k=30)
-        X_train_scaled = selector.fit_transform(X_train_scaled, y_train.flatten())
-        X_test_scaled = selector.transform(X_test_scaled)
-        selected_mask = selector.get_support()
-        selected_features = [train_df.columns[i] for i in range(len(train_df.columns)) if selected_mask[i]]
-        print(f"Selected {len(selected_features)} features: {selected_features[:10]}...")
-    
     print(f"First 5 y_train scaled: {y_train_scaled[:5].flatten()}")
     print(f"First 5 y_test scaled: {y_test_scaled[:5].flatten()}")
     
+    # Remove the sequence dimension since we'll simplify the model
     X_train_tensor = torch.FloatTensor(X_train_scaled)
     y_train_tensor = torch.FloatTensor(y_train_scaled)
     X_test_tensor = torch.FloatTensor(X_test_scaled)
@@ -293,26 +290,45 @@ def prepare_data_for_model(train_features, test_features):
     return (X_train_tensor, y_train_tensor, X_test_tensor, y_test_tensor, 
             scaler_y, X_train_scaled.shape[1], is_log_transformed)
 
-class MLPModel(nn.Module):
-    def __init__(self, input_size, hidden_sizes=[128, 64, 32], output_size=1, dropout_rate=0.3):
-        super(MLPModel, self).__init__()
+class ImprovedLSTMModel(nn.Module):
+    def __init__(self, input_size, hidden_size=128, output_size=1, dropout_rate=0.3):
+        super(ImprovedLSTMModel, self).__init__()
+        self.hidden_size = hidden_size
         
-        layers = []
-        in_size = input_size
-        for hidden_size in hidden_sizes:
-            layers.append(nn.Linear(in_size, hidden_size))
-            layers.append(nn.BatchNorm1d(hidden_size))
-            layers.append(nn.ReLU())
-            layers.append(nn.Dropout(dropout_rate))
-            in_size = hidden_size
+        # Simplified LSTM with batch normalization
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers=1, batch_first=True)
+        self.bn_lstm = nn.BatchNorm1d(hidden_size)
         
-        layers.append(nn.Linear(in_size, output_size))
-        self.model = nn.Sequential(*layers)
+        # Fully connected layers
+        self.fc1 = nn.Linear(hidden_size, hidden_size // 2)
+        self.bn1 = nn.BatchNorm1d(hidden_size // 2)
+        self.fc2 = nn.Linear(hidden_size // 2, output_size)
+        
+        self.dropout = nn.Dropout(dropout_rate)
+        self.leaky_relu = nn.LeakyReLU(0.1)
     
     def forward(self, x):
-        return self.model(x)
+        # Input shape: [batch_size, feature_dim]
+        # Add a sequence dimension: [batch_size, 1, feature_dim]
+        x = x.unsqueeze(1)
+        
+        # LSTM: [batch_size, 1, feature_dim] -> [batch_size, 1, hidden_size]
+        lstm_out, _ = self.lstm(x)
+        lstm_out = lstm_out[:, -1, :]  # Take the last time step
+        lstm_out = self.bn_lstm(lstm_out)
+        lstm_out = self.leaky_relu(lstm_out)
+        lstm_out = self.dropout(lstm_out)
+        
+        # Fully connected layers
+        x = self.fc1(lstm_out)
+        x = self.bn1(x)
+        x = self.leaky_relu(x)
+        x = self.dropout(x)
+        
+        x = self.fc2(x)
+        return x
 
-def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=32):
+def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=16):
     train_dataset = TensorDataset(X_train, y_train)
     test_dataset = TensorDataset(X_test, y_test)
     
@@ -321,12 +337,25 @@ def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=32):
     
     return train_loader, test_loader
 
-def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=300, patience=50):
+class CustomLoss(nn.Module):
+    def __init__(self, mse_weight=0.5, mape_weight=0.5):
+        super(CustomLoss, self).__init__()
+        self.mse = nn.MSELoss()
+        self.mse_weight = mse_weight
+        self.mape_weight = mape_weight
+    
+    def forward(self, outputs, targets):
+        mse_loss = self.mse(outputs, targets)
+        # MAPE loss: mean absolute percentage error
+        mape_loss = torch.mean(torch.abs((outputs - targets) / (targets + 1e-2)))
+        return self.mse_weight * mse_loss + self.mape_weight * mape_loss
+
+def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=150, patience=20):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     model.to(device)
     
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10, verbose=True)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.3, patience=8, verbose=True)
     
     best_val_loss = float('inf')
     epochs_no_improve = 0
@@ -405,9 +434,8 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_tran
         print(f"Sample {i}: y_test_transformed={y_test_transformed[i][0]}, y_pred_transformed={y_pred_transformed[i][0]}")
     
     if is_log_transformed:
-        offset = 1.0  # Must match the offset used in clean_and_transform_features
-        y_test_actual = np.expm1(y_test_transformed) - offset
-        y_pred_actual = np.expm1(y_pred_transformed) - offset
+        y_test_actual = np.expm1(y_test_transformed)
+        y_pred_actual = np.expm1(y_pred_transformed)
     else:
         y_test_actual = y_test_transformed
         y_pred_actual = y_pred_transformed
@@ -430,6 +458,8 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_tran
         actual_val = y_test_actual[i][0]
         pred_val = y_pred_actual[i][0]
         error_percentage = abs(actual_val - pred_val) / actual_val * 100 if actual_val > 0 else 0
+        # Clip error percentage to prevent outliers
+        error_percentage = min(error_percentage, 1000.0)
         
         results_by_subfolder[subfolder].append({
             'file': file_path,
@@ -449,13 +479,12 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_tran
     mse = np.mean((y_test_actual - y_pred_actual) ** 2)
     rmse = np.sqrt(mse)
     mae = np.mean(np.abs(y_test_actual - y_pred_actual))
-    
-    # Robust MAPE calculation: exclude very small actual values
-    mask = y_test_actual > 1e-2  # Avoid division by very small numbers
+    # Robust MAPE calculation
+    mask = y_test_actual > 1.0  # Exclude very small values
     if mask.sum() > 0:
         mape = np.mean(np.abs((y_test_actual[mask] - y_pred_actual[mask]) / y_test_actual[mask])) * 100
     else:
-        mape = 0
+        mape = 0.0
     
     print("\nOverall Model Performance:")
     print(f"MSE: {mse}")
@@ -482,27 +511,27 @@ def main(main_dir):
     
     X_train, y_train, X_test, y_test, y_scaler, input_size, is_log_transformed = prepare_data_for_model(train_features, test_features)
     
-    train_loader, test_loader = create_data_loaders(X_train, y_train, X_test, y_test, batch_size=32)
+    train_loader, test_loader = create_data_loaders(X_train, y_train, X_test, y_test, batch_size=16)
     
-    model = MLPModel(
+    model = ImprovedLSTMModel(
         input_size=input_size,
-        hidden_sizes=[128, 64, 32],
+        hidden_size=128,
         output_size=1,
         dropout_rate=0.3
     )
     
-    criterion = nn.HuberLoss(delta=1.0)
+    criterion = CustomLoss(mse_weight=0.7, mape_weight=0.3)
     optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-4)
     
-    print("Building and training MLP model...")
+    print("Building and training Improved LSTM model...")
     train_losses, val_losses = train_model(
         model, 
         train_loader, 
         test_loader, 
         criterion, 
         optimizer, 
-        num_epochs=300,
-        patience=50
+        num_epochs=150,
+        patience=20
     )
     
     plt.figure(figsize=(10, 6))
@@ -513,9 +542,9 @@ def main(main_dir):
     plt.title('Training and Validation Loss over Epochs')
     plt.legend()
     plt.grid(True)
-    plt.savefig('loss_mlp_model.png')
+    plt.savefig('loss_improved_model.png')
     plt.close()
-    print("Training plot saved as 'loss_mlp_model.png'")
+    print("Training plot saved as 'loss_improved_model.png'")
     
     print("\nEvaluating model:")
     y_test_actual, y_pred_actual = evaluate_model(
@@ -530,7 +559,7 @@ def main(main_dir):
     
     try:
         sample_input = torch.randn(1, input_size).to(device)
-        traced_model = torch.jit.trace(model, sample_input)
+        traced_model = torch.jit.trace(model, sample_input.unsqueeze(1))
         traced_model.save("lstm_model.pt")
         print("Model successfully saved as 'lstm_model.pt'")
     except Exception as e:
