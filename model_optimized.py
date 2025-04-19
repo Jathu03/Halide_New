@@ -2,8 +2,8 @@ import os
 import json
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import StandardScaler
-from sklearn.ensemble import RandomForestRegressor
+from sklearn.preprocessing import RobustScaler
+from sklearn.feature_selection import SelectKBest, f_regression
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -11,6 +11,7 @@ from torch.utils.data import TensorDataset, DataLoader
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 import random
 import matplotlib.pyplot as plt
+import re
 
 def get_execution_time(file_path):
     try:
@@ -18,10 +19,6 @@ def get_execution_time(file_path):
             raw_content = f.read()
             content = raw_content.decode('utf-8', errors='replace').replace('\0', '')
             data = json.loads(content)
-        
-        if 'programming_details' not in data:
-            print(f"Error: 'programming_details' key not found in {file_path}")
-            return None
         
         schedules = data.get("scheduling_data", [])
         for item in schedules:
@@ -31,9 +28,19 @@ def get_execution_time(file_path):
                     print(f"Extracted execution time for {file_path}: {execution_time} ms")
                     return float(execution_time)
         
+        if 'programming_details' in data:
+            prog_details = data['programming_details']
+            if 'Schedules' in prog_details:
+                for item in prog_details['Schedules']:
+                    if isinstance(item, dict) and item.get('Name') == 'total_execution_time_ms':
+                        execution_time = item.get('Value')
+                        if execution_time is not None:
+                            print(f"Extracted execution time from programming_details for {file_path}: {execution_time} ms")
+                            return float(execution_time)
+        
         if schedules and isinstance(schedules[-1], dict) and "value" in schedules[-1]:
             execution_time = schedules[-1]["value"]
-            print(f"Warning: 'total_execution_time_ms' not found in 'Schedules' of {file_path}, using last schedule value: {execution_time} ms")
+            print(f"Warning: 'total_execution_time_ms' not found, using last schedule value: {execution_time} ms")
             return float(execution_time)
         
         print(f"Error: No valid execution time found in {file_path}")
@@ -52,131 +59,128 @@ def get_execution_time(file_path):
         print(f"Error: An unexpected error occurred while processing {file_path}: {str(e)}")
         return None
 
+def extract_op_histogram(op_hist_list):
+    op_counts = {}
+    for op_line in op_hist_list:
+        if isinstance(op_line, str):
+            parts = re.split(r'[:=]', op_line.strip(), 1)
+            if len(parts) == 2:
+                op_name = parts[0].strip().lower()
+                try:
+                    op_count = int(parts[1].strip())
+                    op_counts[f'op_{op_name}'] = op_count
+                except ValueError:
+                    match = re.search(r'\d+', parts[1])
+                    if match:
+                        op_counts[f'op_{op_name}'] = int(match.group())
+    return op_counts
+
 def extract_features_from_file(file_path):
-    with open(file_path, 'r') as f:
-        data = json.load(f)
-    
-    execution_time = get_execution_time(file_path)
-    
-    if execution_time is None:
-        print(f"Warning: No execution time found in {file_path}")
-        return None
-    
-    nodes_features = []
-    edges_features = []
-    programming_details = data.get("programming_details")
-    
-    if programming_details:
+    try:
+        with open(file_path, 'r') as f:
+            data = json.load(f)
+        
+        execution_time = get_execution_time(file_path)
+        if execution_time is None:
+            print(f"Warning: No execution time found in {file_path}")
+            return None
+        
+        features = {'execution_time': execution_time}
+        nodes_features = []
+        edges_features = []
+        programming_details = data.get("programming_details", {})
+        
         if 'Nodes' in programming_details:
             for node in programming_details['Nodes']:
                 node_feature = {}
-                node_feature['Name'] = node.get('Name', '')
                 if 'Details' in node and 'Op histogram' in node['Details']:
                     op_hist = node['Details']['Op histogram']
-                    for op_line in op_hist:
-                        parts = op_line.strip().split(':')
-                        if len(parts) == 2:
-                            op_name = parts[0].strip()
-                            op_count = int(parts[1].strip())
-                            node_feature[f'op_{op_name.lower()}'] = op_count
+                    if isinstance(op_hist, list):
+                        node_feature.update(extract_op_histogram(op_hist))
+                    elif isinstance(op_hist, str):
+                        node_feature.update(extract_op_histogram([op_hist]))
                 nodes_features.append(node_feature)
         
         if 'Edges' in programming_details:
             for edge in programming_details['Edges']:
-                edge_feature = {}
-                edge_feature['From'] = edge.get('From', '')
-                edge_feature['To'] = edge.get('To', '')
-                edge_feature['Name'] = edge.get('Name', '')
+                edge_feature = {
+                    'From': edge.get('From', ''),
+                    'To': edge.get('To', ''),
+                    'Name': edge.get('Name', '')
+                }
                 edges_features.append(edge_feature)
-    
-    scheduling_features = []
-    scheduling_data = data.get("scheduling_data")
-    
-    if not scheduling_data and programming_details and 'Schedules' in programming_details:
-        scheduling_data = programming_details['Schedules']
-    
-    if scheduling_data:
-        for sched in scheduling_data:
-            sched_feature = {}
-            sched_feature['Name'] = sched.get('Name', '')
-            if 'Details' in sched and 'scheduling_feature' in sched['Details']:
-                sf = sched['Details']['scheduling_feature']
-                for key, value in sf.items():
-                    sched_feature[key] = value
-            scheduling_features.append(sched_feature)
-    
-    features = {
-        'execution_time': execution_time,
-        'nodes_count': len(nodes_features),
-        'edges_count': len(edges_features),
-        'scheduling_count': len(scheduling_features)
-    }
-    
-    if len(nodes_features) > 0 and len(edges_features) > 0:
-        features['node_edge_ratio'] = len(nodes_features) / len(edges_features)
-    else:
-        features['node_edge_ratio'] = 0
-    
-    # Interaction terms
-    features['nodes_edges_interaction'] = features['nodes_count'] * features['edges_count']
-    
-    op_counts = {}
-    for node in nodes_features:
-        for key, value in node.items():
-            if key.startswith('op_'):
-                op_counts[key] = op_counts.get(key, 0) + value
-    features.update(op_counts)
-    
-    # Graph centrality features
-    if edges_features:
-        node_degrees = {}
-        for edge in edges_features:
-            from_node = edge['From']
-            to_node = edge['To']
-            node_degrees[from_node] = node_degrees.get(from_node, 0) + 1
-            node_degrees[to_node] = node_degrees.get(to_node, 0) + 1
-        degrees = list(node_degrees.values())
-        features['avg_node_degree'] = np.mean(degrees) if degrees else 0
-        features['max_node_degree'] = max(degrees) if degrees else 0
-    
-    if scheduling_features:
-        important_metrics = [
-            'bytes_at_production', 'bytes_at_realization', 'bytes_at_root', 'bytes_at_task',
-            'inner_parallelism', 'outer_parallelism', 'num_productions', 'num_realizations',
-            'num_scalars', 'num_vectors', 'points_computed_total', 'working_set'
-        ]
-        if scheduling_features and scheduling_features[0]:
-            for metric in important_metrics:
-                if metric in scheduling_features[0]:
-                    features[f'sched_{metric}'] = scheduling_features[0][metric]
         
-        total_bytes_at_production = sum(sf.get('bytes_at_production', 0) for sf in scheduling_features if isinstance(sf, dict))
-        total_vectors = sum(sf.get('num_vectors', 0) for sf in scheduling_features if isinstance(sf, dict))
-        total_parallelism = sum(sf.get('inner_parallelism', 0) * sf.get('outer_parallelism', 1) for sf in scheduling_features if isinstance(sf, dict))
+        scheduling_features = []
+        scheduling_data = data.get("scheduling_data", [])
+        if not scheduling_data and 'Schedules' in programming_details:
+            scheduling_data = programming_details['Schedules']
         
-        features['total_bytes_at_production'] = total_bytes_at_production
-        features['total_vectors'] = total_vectors
-        features['total_parallelism'] = total_parallelism
+        if scheduling_data:
+            for sched in scheduling_data:
+                if not isinstance(sched, dict):
+                    continue
+                sched_feature = {}
+                if 'Details' in sched and 'scheduling_feature' in sched['Details']:
+                    sf = sched['Details']['scheduling_feature']
+                    if isinstance(sf, dict):
+                        for key, value in sf.items():
+                            if isinstance(value, (int, float)):
+                                sched_feature[key] = value
+                scheduling_features.append(sched_feature)
         
-        if total_vectors > 0:
-            features['bytes_per_vector'] = total_bytes_at_production / total_vectors
-        else:
-            features['bytes_per_vector'] = 0
+        features['nodes_count'] = len(nodes_features)
+        features['edges_count'] = len(edges_features)
+        features['scheduling_count'] = len(scheduling_features)
+        features['node_edge_ratio'] = len(nodes_features) / len(edges_features) if len(edges_features) > 0 else 0
         
-        if 'working_set' in scheduling_features[0] and 'bytes_at_production' in scheduling_features[0]:
-            features['memory_pressure'] = scheduling_features[0]['working_set'] / scheduling_features[0]['bytes_at_production'] if scheduling_features[0]['bytes_at_production'] > 0 else 0
+        features['nodes_edges_interaction'] = features['nodes_count'] * features['edges_count']
+        
+        op_counts = {}
+        for node in nodes_features:
+            for key, value in node.items():
+                if key.startswith('op_'):
+                    op_counts[key] = op_counts.get(key, 0) + value
+        features.update(op_counts)
+        
+        if edges_features:
+            node_degrees = {}
+            for edge in edges_features:
+                from_node = edge['From']
+                to_node = edge['To']
+                node_degrees[from_node] = node_degrees.get(from_node, 0) + 1
+                node_degrees[to_node] = node_degrees.get(to_node, 0) + 1
+            degrees = list(node_degrees.values())
+            features['avg_node_degree'] = np.mean(degrees) if degrees else 0
+            features['max_node_degree'] = max(degrees) if degrees else 0
+        
+        if scheduling_features:
+            important_metrics = [
+                'bytes_at_production', 'num_vectors', 'inner_parallelism', 'outer_parallelism',
+                'points_computed_total', 'working_set'
+            ]
+            if scheduling_features[0]:
+                for metric in important_metrics:
+                    if metric in scheduling_features[0]:
+                        features[f'sched_{metric}'] = scheduling_features[0][metric]
+            
+            total_bytes_at_production = sum(sf.get('bytes_at_production', 0) for sf in scheduling_features)
+            total_vectors = sum(sf.get('num_vectors', 0) for sf in scheduling_features)
+            features['total_bytes_at_production'] = total_bytes_at_production
+            features['total_vectors'] = total_vectors
+            features['bytes_per_vector'] = total_bytes_at_production / total_vectors if total_vectors > 0 else 0
+        
+        if len(nodes_features) > 0:
+            features['avg_ops_per_node'] = sum(op_counts.values()) / len(nodes_features)
+        
+        return features
     
-    if len(nodes_features) > 0:
-        op_types = sum(1 for k in op_counts.keys())
-        features['avg_ops_per_node'] = sum(op_counts.values()) / len(nodes_features)
-        features['op_diversity'] = op_types / len(nodes_features) if len(nodes_features) > 0 else 0
-    
-    return features
+    except Exception as e:
+        print(f"Error extracting features from {file_path}: {str(e)}")
+        return None
 
 def process_directory(directory_path):
     all_features = []
     file_names = []
-    
     json_files = sorted([f for f in os.listdir(directory_path) if f.endswith('.json')])
     
     for filename in json_files:
@@ -191,7 +195,6 @@ def process_directory(directory_path):
 def process_main_directory(main_dir):
     all_features = []
     all_file_names = []
-    
     subdirs = sorted([d for d in os.listdir(main_dir) if os.path.isdir(os.path.join(main_dir, d))])
     
     if len(subdirs) < 1:
@@ -200,11 +203,9 @@ def process_main_directory(main_dir):
     for subdir in subdirs:
         subdir_path = os.path.join(main_dir, subdir)
         features, file_names = process_directory(subdir_path)
-        
         if not features:
             print(f"Skipping {subdir} due to no valid data")
             continue
-            
         all_features.extend(features)
         all_file_names.extend([os.path.join(subdir, fname) for fname in file_names])
         print(f"Processed subdir {subdir}: {len(features)} files")
@@ -231,7 +232,6 @@ def process_main_directory(main_dir):
 
 def clean_and_transform_features(train_features, test_features):
     all_features_df = pd.DataFrame(train_features + test_features)
-    
     all_features_df = all_features_df.fillna(0)
     
     constant_columns = [col for col in all_features_df.columns 
@@ -239,42 +239,16 @@ def clean_and_transform_features(train_features, test_features):
     all_features_df = all_features_df.drop(columns=constant_columns)
     print(f"Dropped {len(constant_columns)} constant columns")
     
-    if 'execution_time' in all_features_df.columns:
-        all_features_df['execution_time_log'] = np.log1p(all_features_df['execution_time'])
+    all_features_df['execution_time_log'] = np.log1p(all_features_df['execution_time'])
     
-    if 'total_vectors' in all_features_df.columns and all_features_df['total_vectors'].max() > 0:
-        all_features_df['bytes_per_vector'] = all_features_df['total_bytes_at_production'] / (all_features_df['total_vectors'] + 1e-8)
+    corr_matrix = all_features_df.drop(['execution_time', 'execution_time_log'], axis=1).corr().abs()
+    upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+    to_drop = [column for column in upper.columns if any(upper[column] > 0.75)]
+    all_features_df = all_features_df.drop(columns=to_drop)
+    print(f"Dropped {len(to_drop)} highly correlated features")
     
     numeric_cols = all_features_df.select_dtypes(include=['number']).columns
     all_features_df = all_features_df[numeric_cols]
-    
-    # Dynamic outlier clipping using IQR
-    for col in numeric_cols:
-        if col not in ['execution_time', 'execution_time_log']:
-            Q1 = all_features_df[col].quantile(0.25)
-            Q3 = all_features_df[col].quantile(0.75)
-            IQR = Q3 - Q1
-            lower_bound = Q1 - 1.5 * IQR
-            upper_bound = Q3 + 1.5 * IQR
-            all_features_df[col] = all_features_df[col].clip(lower=lower_bound, upper=upper_bound)
-    
-    # Correlation-based feature filtering
-    X = all_features_df.drop(['execution_time', 'execution_time_log'], axis=1, errors='ignore')
-    corr_matrix = X.corr().abs()
-    upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
-    to_drop = [column for column in upper.columns if any(upper[column] > 0.8)]
-    X = X.drop(columns=to_drop)
-    print(f"Dropped {len(to_drop)} highly correlated features")
-    
-    # Feature selection using RandomForest
-    y = all_features_df['execution_time_log'] if 'execution_time_log' in all_features_df else all_features_df['execution_time']
-    rf = RandomForestRegressor(n_estimators=100, random_state=42)
-    rf.fit(X, y)
-    importances = pd.Series(rf.feature_importances_, index=X.columns)
-    threshold = importances.quantile(0.2)  # Stricter threshold
-    selected_features = importances[importances > threshold].index.tolist()
-    print(f"Selected {len(selected_features)} features out of {len(X.columns)}")
-    all_features_df = all_features_df[selected_features + ['execution_time', 'execution_time_log'] if 'execution_time_log' in all_features_df else ['execution_time']]
     
     train_size = len(train_features)
     train_df = all_features_df.iloc[:train_size]
@@ -285,35 +259,33 @@ def clean_and_transform_features(train_features, test_features):
 def prepare_data_for_model(train_features, test_features):
     train_df, test_df = clean_and_transform_features(train_features, test_features)
     
-    if 'execution_time_log' in train_df.columns:
-        y_train = train_df['execution_time_log'].values.reshape(-1, 1)
-        y_test = test_df['execution_time_log'].values.reshape(-1, 1)
-        train_df = train_df.drop(['execution_time', 'execution_time_log'], axis=1)
-        test_df = test_df.drop(['execution_time', 'execution_time_log'], axis=1)
-        is_log_transformed = True
-    else:
-        y_train = train_df['execution_time'].values.reshape(-1, 1)
-        y_test = test_df['execution_time'].values.reshape(-1, 1)
-        train_df = train_df.drop('execution_time', axis=1)
-        test_df = test_df.drop('execution_time', axis=1)
-        is_log_transformed = False
+    y_train = train_df['execution_time_log'].values.reshape(-1, 1)
+    y_test = test_df['execution_time_log'].values.reshape(-1, 1)
+    train_df = train_df.drop(['execution_time', 'execution_time_log'], axis=1)
+    test_df = test_df.drop(['execution_time', 'execution_time_log'], axis=1)
     
-    print("\nDebugging target values in prepare_data_for_model:")
+    print("\nDebugging target values:")
     print(f"First 5 y_train raw: {y_train[:5].flatten()}")
     print(f"First 5 y_test raw: {y_test[:5].flatten()}")
     
-    scaler_X = StandardScaler()
-    scaler_y = StandardScaler()
+    scaler_X = RobustScaler()
+    scaler_y = RobustScaler()
     
     X_train_scaled = scaler_X.fit_transform(train_df)
     y_train_scaled = scaler_y.fit_transform(y_train)
     X_test_scaled = scaler_X.transform(test_df)
     y_test_scaled = scaler_y.transform(y_test)
     
-    X_train_scaled += np.random.normal(0, 0.01, X_train_scaled.shape)
-    
     print(f"First 5 y_train scaled: {y_train_scaled[:5].flatten()}")
     print(f"First 5 y_test scaled: {y_test_scaled[:5].flatten()}")
+    
+    if train_df.shape[1] > 30:
+        selector = SelectKBest(f_regression, k=30)
+        X_train_scaled = selector.fit_transform(X_train_scaled, y_train.flatten())
+        X_test_scaled = selector.transform(X_test_scaled)
+        selected_mask = selector.get_support()
+        selected_features = [train_df.columns[i] for i in range(len(train_df.columns)) if selected_mask[i]]
+        print(f"Selected {len(selected_features)} features: {selected_features[:10]}...")
     
     X_train_tensor = torch.FloatTensor(X_train_scaled).unsqueeze(1)
     y_train_tensor = torch.FloatTensor(y_train_scaled)
@@ -323,68 +295,55 @@ def prepare_data_for_model(train_features, test_features):
     print(f"Input feature dimension: {X_train_scaled.shape[1]}")
     
     return (X_train_tensor, y_train_tensor, X_test_tensor, y_test_tensor, 
-            scaler_X, scaler_y, train_df.columns.tolist(), is_log_transformed)
+            scaler_X, scaler_y, train_df.columns.tolist(), True)
 
-class EnhancedLSTMModel(nn.Module):
-    def __init__(self, input_size, hidden_sizes=[64, 32], output_size=1, dropout_rate=0.5):
-        super(EnhancedLSTMModel, self).__init__()
+class SimplifiedHybridModel(nn.Module):
+    def __init__(self, input_size, hidden_sizes=[64, 32], output_size=1, dropout_rate=0.4):
+        super(SimplifiedHybridModel, self).__init__()
+        
+        self.cnn = nn.Conv1d(1, 32, kernel_size=3, padding=1)
+        self.bn_cnn = nn.BatchNorm1d(32)
         
         self.lstm_layers = nn.ModuleList()
-        self.ln_layers = nn.ModuleList()
         self.dropout_layers = nn.ModuleList()
-        self.skip_connections = nn.ModuleList()
         
-        self.lstm_layers.append(nn.LSTM(input_size, hidden_sizes[0], batch_first=True, bidirectional=True))
-        self.ln_layers.append(nn.LayerNorm(hidden_sizes[0] * 2))
+        self.lstm_layers.append(nn.LSTM(32 * input_size, hidden_sizes[0], batch_first=True, bidirectional=True))
         self.dropout_layers.append(nn.Dropout(dropout_rate))
         
         for i in range(1, len(hidden_sizes)):
-            self.lstm_layers.append(nn.LSTM(hidden_sizes[i-1] * 2, hidden_sizes[i], batch_first=True, bidirectional=True))
-            self.ln_layers.append(nn.LayerNorm(hidden_sizes[i] * 2))
+            input_dim = hidden_sizes[i-1] * 2
+            self.lstm_layers.append(nn.LSTM(input_dim, hidden_sizes[i], batch_first=True, bidirectional=True))
             self.dropout_layers.append(nn.Dropout(dropout_rate))
-            self.skip_connections.append(nn.Linear(input_size if i == 1 else hidden_sizes[i-2] * 2, hidden_sizes[i] * 2))
         
-        self.fc_layers = nn.ModuleList()
-        self.bn_layers = nn.ModuleList()
-        self.fc_dropout = nn.Dropout(dropout_rate)
+        self.fc1 = nn.Linear(hidden_sizes[-1] * 2, hidden_sizes[-1])
+        self.bn_fc1 = nn.BatchNorm1d(hidden_sizes[-1])
+        self.fc2 = nn.Linear(hidden_sizes[-1], output_size)
         
-        self.fc_layers.append(nn.Linear(hidden_sizes[-1] * 2, hidden_sizes[-1]))
-        self.bn_layers.append(nn.BatchNorm1d(hidden_sizes[-1]))
-        self.fc_layers.append(nn.Linear(hidden_sizes[-1], hidden_sizes[-1] // 2))
-        self.bn_layers.append(nn.BatchNorm1d(hidden_sizes[-1] // 2))
-        
-        self.output_layer = nn.Linear(hidden_sizes[-1] // 2, output_size)
-        
-        self.relu = nn.ReLU()
         self.leaky_relu = nn.LeakyReLU(0.1)
-        
+    
     def forward(self, x):
-        lstm_out = x
-        skip_outs = [x]
+        batch_size, seq_len, feature_dim = x.size()
+        x = x.transpose(1, 2)  # [batch, features, seq_len]
         
-        for i, (lstm, ln, dropout) in enumerate(zip(self.lstm_layers, self.ln_layers, self.dropout_layers)):
-            lstm_out, _ = lstm(lstm_out)
-            lstm_out = ln(lstm_out)
-            if i < len(self.lstm_layers) - 1:
-                lstm_out = dropout(lstm_out)
-            if i > 0:
-                skip = self.skip_connections[i-1](skip_outs[i-1])
-                lstm_out = lstm_out + skip
-            skip_outs.append(lstm_out)
+        x = self.cnn(x)
+        x = self.bn_cnn(x)
+        x = self.leaky_relu(x)
         
-        fc_out = lstm_out[:, -1, :]  # Take the last time step
-        fc_out = self.fc_layers[0](fc_out)
-        fc_out = self.bn_layers[0](fc_out)
-        fc_out = self.leaky_relu(fc_out)
-        fc_out = self.fc_dropout(fc_out)
+        x = x.permute(0, 2, 1)  # [batch, seq_len, features]
+        if x.size(1) == 1:
+            x = x.repeat(1, 3, 1)  # Replicate to create sequence
         
-        fc_out = self.fc_layers[1](fc_out)
-        fc_out = self.bn_layers[1](fc_out)
-        fc_out = self.leaky_relu(fc_out)
-        fc_out = self.fc_dropout(fc_out)
+        for lstm, dropout in zip(self.lstm_layers, self.dropout_layers):
+            x, _ = lstm(x)
+            x = dropout(x)
         
-        output = self.output_layer(fc_out)
-        return output
+        x = x[:, -1, :]  # Last time step
+        x = self.fc1(x)
+        x = self.bn_fc1(x)
+        x = self.leaky_relu(x)
+        x = self.fc2(x)
+        
+        return x
 
 def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=16):
     train_dataset = TensorDataset(X_train, y_train)
@@ -396,24 +355,17 @@ def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=16):
     return train_loader, test_loader
 
 class CustomLoss(nn.Module):
-    def __init__(self, delta=1.0, mse_weight=0.3, l1_weight=1e-5):
+    def __init__(self, delta=1.2):
         super(CustomLoss, self).__init__()
         self.huber = nn.HuberLoss(delta=delta)
-        self.mse = nn.MSELoss()
-        self.mse_weight = mse_weight
-        self.l1_weight = l1_weight
     
     def forward(self, outputs, targets):
-        huber_loss = self.huber(outputs, targets)
-        mse_loss = self.mse(outputs, targets)
-        l1_loss = torch.mean(torch.abs(outputs))
-        return huber_loss + self.mse_weight * mse_loss + self.l1_weight * l1_loss
+        return self.huber(outputs, targets)
 
 class LinearWarmup:
-    def __init__(self, optimizer, warmup_epochs, total_epochs, start_lr, max_lr):
+    def __init__(self, optimizer, warmup_epochs, start_lr, max_lr):
         self.optimizer = optimizer
         self.warmup_epochs = warmup_epochs
-        self.total_epochs = total_epochs
         self.start_lr = start_lr
         self.max_lr = max_lr
         self.current_epoch = 0
@@ -426,13 +378,12 @@ class LinearWarmup:
                 param_group['lr'] = lr
             print(f"Warmup epoch {self.current_epoch}: Learning rate set to {lr:.6f}")
 
-def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=400, patience=80, warmup_epochs=15):
+def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=300, patience=50):
     device = torch.device('cpu')
-    print(f"Using device: {device}")
     model.to(device)
     
-    warmup = LinearWarmup(optimizer, warmup_epochs, num_epochs, start_lr=5e-6, max_lr=0.0003)
-    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=50, T_mult=2, eta_min=1e-6)
+    warmup = LinearWarmup(optimizer, warmup_epochs=10, start_lr=1e-5, max_lr=0.0002)
+    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=40, T_mult=2, eta_min=5e-6)
     
     best_val_loss = float('inf')
     epochs_no_improve = 0
@@ -450,9 +401,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
             outputs = model(inputs)
             loss = criterion(outputs, targets)
             loss.backward()
-            
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
-            
             optimizer.step()
             running_loss += loss.item() * inputs.size(0)
         
@@ -471,12 +420,11 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
         val_loss /= len(test_loader.dataset)
         val_losses.append(val_loss)
         
-        if epoch < warmup_epochs:
+        if epoch < 10:
             warmup.step()
         else:
             scheduler.step(epoch)
-            current_lr = optimizer.param_groups[0]['lr']
-            print(f"Epoch {epoch+1}: CosineAnnealingWarmRestarts learning rate: {current_lr:.6f}")
+            print(f"Epoch {epoch+1}: Learning rate: {optimizer.param_groups[0]['lr']:.6f}")
         
         print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
         
@@ -492,7 +440,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
                 checkpoint_path = f"lstm_model_{checkpoint_counter}.pt"
                 traced_model.save(checkpoint_path)
                 print(f"Saved checkpoint: {checkpoint_path}")
-                checkpoint_counter = checkpoint_counter % 3 + 1  # Save up to 3 checkpoints
+                checkpoint_counter = checkpoint_counter % 2 + 1  # Save 2 checkpoints
             except Exception as e:
                 print(f"Error saving checkpoint: {str(e)}")
             model.to(device)
@@ -504,12 +452,12 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
             model.load_state_dict(best_model_state)
             break
     
-    if best_model_state is not None and epochs_no_improve > 0:
+    if best_model_state is not None:
         model.load_state_dict(best_model_state)
     
     return train_losses, val_losses
 
-def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_transformed=False, original_execution_times=None, num_checkpoints=3):
+def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_transformed, original_execution_times, num_checkpoints=2):
     device = torch.device('cpu')
     model.to(device)
     model.eval()
@@ -540,26 +488,11 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_tran
         y_pred_scaled_ensemble /= max(1, sum(os.path.exists(f"lstm_model_{i}.pt") for i in range(1, num_checkpoints + 1)))
     
     y_test = y_test.cpu().numpy()
-    
     y_test_transformed = y_scaler.inverse_transform(y_test)
     y_pred_transformed = y_scaler.inverse_transform(y_pred_scaled_ensemble)
     
-    print("\nDebugging transformed values before inverse log:")
-    for i in range(min(5, len(y_test_transformed))):
-        print(f"Sample {i}: y_test_transformed={y_test_transformed[i][0]}, y_pred_transformed={y_pred_transformed[i][0]}")
-    
-    if is_log_transformed:
-        y_test_actual = np.expm1(y_test_transformed)
-        y_pred_actual = np.expm1(y_pred_transformed)
-    else:
-        y_test_actual = y_test_transformed
-        y_pred_actual = y_pred_transformed
-    
-    print("\nDebugging final values after all transformations:")
-    for i in range(min(5, len(y_test_actual))):
-        print(f"Sample {i}: y_test_actual={y_test_actual[i][0]}, y_pred_actual={y_pred_actual[i][0]}")
-        if original_execution_times:
-            print(f"  Original execution time from JSON: {original_execution_times[file_names_test[i]]}")
+    y_test_actual = np.expm1(y_test_transformed) if is_log_transformed else y_test_transformed
+    y_pred_actual = np.expm1(y_pred_transformed) if is_log_transformed else y_pred_transformed
     
     results_by_subfolder = {}
     for i, file_path in enumerate(file_names_test):
@@ -582,9 +515,9 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_tran
         print(f"\nResults for {subfolder}:")
         for result in results:
             print(f"File: {result['file']}")
-            print(f"  Actual execution time: {result['actual']} ms")
-            print(f"  Predicted execution time: {result['predicted']} ms")
-            print(f"  Error percentage: {result['error_percentage']:.2f}%")
+            print(f"  Actual: {result['actual']:.2f} ms")
+            print(f"  Predicted: {result['predicted']:.2f} ms")
+            print(f"  Error: {result['error_percentage']:.2f}%")
     
     mse = np.mean((y_test_actual - y_pred_actual) ** 2)
     rmse = np.sqrt(mse)
@@ -592,9 +525,9 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_tran
     mape = np.mean(np.abs((y_test_actual - y_pred_actual) / (y_test_actual + 1e-8))) * 100
     
     print("\nOverall Model Performance:")
-    print(f"MSE: {mse}")
-    print(f"RMSE: {rmse}")
-    print(f"MAE: {mae}")
+    print(f"MSE: {mse:.2f}")
+    print(f"RMSE: {rmse:.2f}")
+    print(f"MAE: {mae:.2f}")
     print(f"MAPE: {mape:.2f}%")
     
     return y_test_actual, y_pred_actual
@@ -602,7 +535,7 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_tran
 def save_scaler(scaler, feature_names, filename):
     scaler_data = {
         'feature_names': feature_names,
-        'means': scaler.mean_.tolist(),
+        'means': scaler.center_.tolist(),
         'scales': scaler.scale_.tolist()
     }
     with open(filename, 'w') as f:
@@ -611,7 +544,7 @@ def save_scaler(scaler, feature_names, filename):
 
 def save_y_scaler(scaler, is_log_transformed, filename):
     scaler_data = {
-        'mean': float(scaler.mean_[0]),
+        'mean': float(scaler.center_[0]),
         'scale': float(scaler.scale_[0]),
         'is_log_transformed': is_log_transformed
     }
@@ -623,41 +556,25 @@ def main(main_dir):
     print(f"Processing main directory: {main_dir}")
     train_features, test_features, test_file_names = process_main_directory(main_dir)
     
-    print(f"Total training samples: {len(train_features)} (randomly selected)")
-    print(f"Total test samples: {len(test_features)} (50 randomly selected)")
-    
-    if len(train_features) == 0 or len(test_features) == 0:
-        print("Error: No valid training or test data found")
-        return None
-    
-    original_execution_times = {}
-    for feature, fname in zip(test_features, test_file_names):
-        original_execution_times[fname] = feature['execution_time']
+    original_execution_times = {fname: f['execution_time'] for f, fname in zip(test_features, test_file_names)}
     
     (X_train, y_train, X_test, y_test, scaler_X, scaler_y, feature_names, is_log_transformed) = prepare_data_for_model(train_features, test_features)
     
     train_loader, test_loader = create_data_loaders(X_train, y_train, X_test, y_test, batch_size=16)
     
-    model = EnhancedLSTMModel(
+    model = SimplifiedHybridModel(
         input_size=len(feature_names),
         hidden_sizes=[64, 32],
         output_size=1,
-        dropout_rate=0.5
+        dropout_rate=0.4
     )
     
-    criterion = CustomLoss(delta=1.0, mse_weight=0.3, l1_weight=1e-5)
-    optimizer = optim.AdamW(model.parameters(), lr=0.0003, weight_decay=2e-4)
+    criterion = CustomLoss(delta=1.2)
+    optimizer = optim.AdamW(model.parameters(), lr=0.0002, weight_decay=3e-4)
     
-    print("Building and training Enhanced LSTM model...")
+    print("Training model...")
     train_losses, val_losses = train_model(
-        model, 
-        train_loader, 
-        test_loader, 
-        criterion, 
-        optimizer, 
-        num_epochs=400,
-        patience=80,
-        warmup_epochs=15
+        model, train_loader, test_loader, criterion, optimizer, num_epochs=300, patience=50
     )
     
     plt.figure(figsize=(10, 6))
@@ -665,30 +582,26 @@ def main(main_dir):
     plt.plot(range(1, len(val_losses) + 1), val_losses, label='Validation Loss')
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
-    plt.title('Training and Validation Loss over Epochs')
+    plt.title('Training and Validation Loss')
     plt.legend()
     plt.grid(True)
-    plt.savefig('loss_enhanced_model.png')
+    plt.savefig('loss_model.png')
     plt.close()
-    print("Training plot saved as 'loss_enhanced_model.png'")
+    print("Saved loss plot as 'loss_model.png'")
     
-    print("\nEvaluating model with ensemble prediction:")
+    print("\nEvaluating model:")
     y_test_actual, y_pred_actual = evaluate_model(
         model, X_test, y_test, scaler_y, test_file_names, 
-        is_log_transformed, original_execution_times, num_checkpoints=3
+        is_log_transformed, original_execution_times, num_checkpoints=2
     )
     
-    print("\nSaving the best model and scalers...")
     model.eval()
     model.to('cpu')
-    device = next(model.parameters()).device
-    print(f"Model is on device: {device}")
-    
     try:
-        sample_input = torch.randn(1, 1, len(feature_names)).to(device)
+        sample_input = torch.randn(1, 1, len(feature_names)).to('cpu')
         traced_model = torch.jit.trace(model, sample_input)
         traced_model.save("lstm_model.pt")
-        print("Best model saved as 'lstm_model.pt'")
+        print("Saved best model as 'lstm_model.pt'")
     except Exception as e:
         print(f"Error saving best model: {str(e)}")
     
