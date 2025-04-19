@@ -280,7 +280,7 @@ def prepare_data_for_model(train_features, test_features):
             scaler_X, scaler_y, train_df.columns.tolist(), is_log_transformed)
 
 class EnhancedLSTMModel(nn.Module):
-    def __init__(self, input_size, hidden_sizes=[256, 128, 64, 32], output_size=1, dropout_rate=0.2):
+    def __init__(self, input_size, hidden_sizes=[128, 64, 32], output_size=1, dropout_rate=0.3):
         super(EnhancedLSTMModel, self).__init__()
         
         self.lstm_layers = nn.ModuleList()
@@ -346,7 +346,7 @@ class EnhancedLSTMModel(nn.Module):
         
         return output
 
-def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=8):
+def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=16):
     train_dataset = TensorDataset(X_train, y_train)
     test_dataset = TensorDataset(X_test, y_test)
     
@@ -355,12 +355,12 @@ def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=8):
     
     return train_loader, test_loader
 
-def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=200, patience=30):
+def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=300, patience=50):
     device = torch.device('cpu')  # Force CPU
     print(f"Using device: {device}")
     model.to(device)
     
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10, verbose=True)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.7, patience=15, verbose=True)
     
     best_val_loss = float('inf')
     epochs_no_improve = 0
@@ -526,17 +526,17 @@ def main(main_dir):
     
     (X_train, y_train, X_test, y_test, scaler_X, scaler_y, feature_names, is_log_transformed) = prepare_data_for_model(train_features, test_features)
     
-    train_loader, test_loader = create_data_loaders(X_train, y_train, X_test, y_test, batch_size=8)
+    train_loader, test_loader = create_data_loaders(X_train, y_train, X_test, y_test, batch_size=16)
     
     model = EnhancedLSTMModel(
         input_size=len(feature_names),
-        hidden_sizes=[256, 128, 64, 32],
+        hidden_sizes=[128, 64, 32],
         output_size=1,
-        dropout_rate=0.2
+        dropout_rate=0.3
     )
     
-    criterion = nn.HuberLoss(delta=0.5)
-    optimizer = optim.AdamW(model.parameters(), lr=0.0005, weight_decay=1e-5)
+    criterion = nn.HuberLoss(delta=0.7)  # Adjusted delta for HuberLoss
+    optimizer = optim.AdamW(model.parameters(), lr=0.0005, weight_decay=1e-4)  # Increased weight decay
     
     print("Building and training Enhanced LSTM model...")
     train_losses, val_losses = train_model(
@@ -545,8 +545,8 @@ def main(main_dir):
         test_loader, 
         criterion, 
         optimizer, 
-        num_epochs=200,
-        patience=30
+        num_epochs=300,
+        patience=50
     )
     
     plt.figure(figsize=(10, 6))
