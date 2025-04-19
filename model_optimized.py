@@ -301,20 +301,23 @@ class SimplifiedHybridModel(nn.Module):
     def __init__(self, input_size, hidden_sizes=[64, 32], output_size=1, dropout_rate=0.4):
         super(SimplifiedHybridModel, self).__init__()
         
-        self.cnn = nn.Conv1d(1, 32, kernel_size=3, padding=1)
+        # CNN layer: input_size channels (features) to 32 output channels
+        self.cnn = nn.Conv1d(in_channels=input_size, out_channels=32, kernel_size=3, padding=1)
         self.bn_cnn = nn.BatchNorm1d(32)
         
         self.lstm_layers = nn.ModuleList()
         self.dropout_layers = nn.ModuleList()
         
-        self.lstm_layers.append(nn.LSTM(32 * input_size, hidden_sizes[0], batch_first=True, bidirectional=True))
+        # LSTM: input size is 32 (CNN output channels)
+        self.lstm_layers.append(nn.LSTM(input_size=32, hidden_size=hidden_sizes[0], batch_first=True, bidirectional=True))
         self.dropout_layers.append(nn.Dropout(dropout_rate))
         
         for i in range(1, len(hidden_sizes)):
-            input_dim = hidden_sizes[i-1] * 2
+            input_dim = hidden_sizes[i-1] * 2  # Bidirectional doubles the hidden size
             self.lstm_layers.append(nn.LSTM(input_dim, hidden_sizes[i], batch_first=True, bidirectional=True))
             self.dropout_layers.append(nn.Dropout(dropout_rate))
         
+        # Fully connected layers
         self.fc1 = nn.Linear(hidden_sizes[-1] * 2, hidden_sizes[-1])
         self.bn_fc1 = nn.BatchNorm1d(hidden_sizes[-1])
         self.fc2 = nn.Linear(hidden_sizes[-1], output_size)
@@ -322,22 +325,33 @@ class SimplifiedHybridModel(nn.Module):
         self.leaky_relu = nn.LeakyReLU(0.1)
     
     def forward(self, x):
+        # Input shape: [batch_size, seq_len=1, feature_dim=input_size] (e.g., [16, 1, 21])
         batch_size, seq_len, feature_dim = x.size()
-        x = x.transpose(1, 2)  # [batch, features, seq_len]
         
+        # Transpose to [batch_size, feature_dim, seq_len] for Conv1d (e.g., [16, 21, 1])
+        x = x.transpose(1, 2)
+        
+        # CNN: [batch_size, input_size, seq_len] -> [batch_size, 32, seq_len] (e.g., [16, 32, 1])
         x = self.cnn(x)
         x = self.bn_cnn(x)
         x = self.leaky_relu(x)
         
-        x = x.permute(0, 2, 1)  # [batch, seq_len, features]
-        if x.size(1) == 1:
-            x = x.repeat(1, 3, 1)  # Replicate to create sequence
+        # Permute to [batch_size, seq_len, 32] for LSTM (e.g., [16, 1, 32])
+        x = x.permute(0, 2, 1)
         
+        # Replicate sequence if seq_len=1: [batch_size, 1, 32] -> [batch_size, 3, 32]
+        if x.size(1) == 1:
+            x = x.repeat(1, 3, 1)
+        
+        # LSTM layers
         for lstm, dropout in zip(self.lstm_layers, self.dropout_layers):
             x, _ = lstm(x)
             x = dropout(x)
         
-        x = x[:, -1, :]  # Last time step
+        # Take last time step: [batch_size, 3, hidden_sizes[-1]*2] -> [batch_size, hidden_sizes[-1]*2]
+        x = x[:, -1, :]
+        
+        # Fully connected layers
         x = self.fc1(x)
         x = self.bn_fc1(x)
         x = self.leaky_relu(x)
