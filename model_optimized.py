@@ -287,9 +287,9 @@ def prepare_data_for_model(train_features, test_features):
         selected_features = [train_df.columns[i] for i in range(len(train_df.columns)) if selected_mask[i]]
         print(f"Selected {len(selected_features)} features: {selected_features[:10]}...")
     
-    X_train_tensor = torch.FloatTensor(X_train_scaled).unsqueeze(1)
+    X_train_tensor = torch.FloatTensor(X_train_scaled)
     y_train_tensor = torch.FloatTensor(y_train_scaled)
-    X_test_tensor = torch.FloatTensor(X_test_scaled).unsqueeze(1)
+    X_test_tensor = torch.FloatTensor(X_test_scaled)
     y_test_tensor = torch.FloatTensor(y_test_scaled)
     
     print(f"Input feature dimension: {X_train_scaled.shape[1]}")
@@ -298,65 +298,33 @@ def prepare_data_for_model(train_features, test_features):
             scaler_X, scaler_y, train_df.columns.tolist(), True)
 
 class SimplifiedHybridModel(nn.Module):
-    def __init__(self, input_size, hidden_sizes=[64, 32], output_size=1, dropout_rate=0.4):
+    def __init__(self, input_size, hidden_size=64, output_size=1, dropout_rate=0.3):
         super(SimplifiedHybridModel, self).__init__()
+        self.hidden_size = hidden_size
         
-        # CNN layer: input_size channels (features) to 32 output channels
-        self.cnn = nn.Conv1d(in_channels=input_size, out_channels=32, kernel_size=3, padding=1)
-        self.bn_cnn = nn.BatchNorm1d(32)
+        # Simple MLP with batch normalization
+        self.fc1 = nn.Linear(input_size, hidden_size)
+        self.bn1 = nn.BatchNorm1d(hidden_size)
+        self.fc2 = nn.Linear(hidden_size, hidden_size // 2)
+        self.bn2 = nn.BatchNorm1d(hidden_size // 2)
+        self.fc3 = nn.Linear(hidden_size // 2, output_size)
         
-        self.lstm_layers = nn.ModuleList()
-        self.dropout_layers = nn.ModuleList()
-        
-        # LSTM: input size is 32 (CNN output channels)
-        self.lstm_layers.append(nn.LSTM(input_size=32, hidden_size=hidden_sizes[0], batch_first=True, bidirectional=True))
-        self.dropout_layers.append(nn.Dropout(dropout_rate))
-        
-        for i in range(1, len(hidden_sizes)):
-            input_dim = hidden_sizes[i-1] * 2  # Bidirectional doubles the hidden size
-            self.lstm_layers.append(nn.LSTM(input_dim, hidden_sizes[i], batch_first=True, bidirectional=True))
-            self.dropout_layers.append(nn.Dropout(dropout_rate))
-        
-        # Fully connected layers
-        self.fc1 = nn.Linear(hidden_sizes[-1] * 2, hidden_sizes[-1])
-        self.bn_fc1 = nn.BatchNorm1d(hidden_sizes[-1])
-        self.fc2 = nn.Linear(hidden_sizes[-1], output_size)
-        
+        self.dropout = nn.Dropout(dropout_rate)
         self.leaky_relu = nn.LeakyReLU(0.1)
     
     def forward(self, x):
-        # Input shape: [batch_size, seq_len=1, feature_dim=input_size] (e.g., [16, 1, 21])
-        batch_size, seq_len, feature_dim = x.size()
-        
-        # Transpose to [batch_size, feature_dim, seq_len] for Conv1d (e.g., [16, 21, 1])
-        x = x.transpose(1, 2)
-        
-        # CNN: [batch_size, input_size, seq_len] -> [batch_size, 32, seq_len] (e.g., [16, 32, 1])
-        x = self.cnn(x)
-        x = self.bn_cnn(x)
-        x = self.leaky_relu(x)
-        
-        # Permute to [batch_size, seq_len, 32] for LSTM (e.g., [16, 1, 32])
-        x = x.permute(0, 2, 1)
-        
-        # Replicate sequence if seq_len=1: [batch_size, 1, 32] -> [batch_size, 3, 32]
-        if x.size(1) == 1:
-            x = x.repeat(1, 3, 1)
-        
-        # LSTM layers
-        for lstm, dropout in zip(self.lstm_layers, self.dropout_layers):
-            x, _ = lstm(x)
-            x = dropout(x)
-        
-        # Take last time step: [batch_size, 3, hidden_sizes[-1]*2] -> [batch_size, hidden_sizes[-1]*2]
-        x = x[:, -1, :]
-        
-        # Fully connected layers
+        # Input shape: [batch_size, feature_dim]
         x = self.fc1(x)
-        x = self.bn_fc1(x)
+        x = self.bn1(x)
         x = self.leaky_relu(x)
-        x = self.fc2(x)
+        x = self.dropout(x)
         
+        x = self.fc2(x)
+        x = self.bn2(x)
+        x = self.leaky_relu(x)
+        x = self.dropout(x)
+        
+        x = self.fc3(x)
         return x
 
 def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=16):
@@ -369,7 +337,7 @@ def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=16):
     return train_loader, test_loader
 
 class CustomLoss(nn.Module):
-    def __init__(self, delta=1.2):
+    def __init__(self, delta=1.0):
         super(CustomLoss, self).__init__()
         self.huber = nn.HuberLoss(delta=delta)
     
@@ -392,17 +360,16 @@ class LinearWarmup:
                 param_group['lr'] = lr
             print(f"Warmup epoch {self.current_epoch}: Learning rate set to {lr:.6f}")
 
-def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=300, patience=50):
+def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=200, patience=30):
     device = torch.device('cpu')
     model.to(device)
     
-    warmup = LinearWarmup(optimizer, warmup_epochs=10, start_lr=1e-5, max_lr=0.0002)
-    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=40, T_mult=2, eta_min=5e-6)
+    warmup = LinearWarmup(optimizer, warmup_epochs=10, start_lr=1e-5, max_lr=0.001)
+    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=40, T_mult=2, eta_min=1e-5)
     
     best_val_loss = float('inf')
     epochs_no_improve = 0
     best_model_state = None
-    checkpoint_counter = 1
     train_losses = []
     val_losses = []
     
@@ -415,7 +382,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
             outputs = model(inputs)
             loss = criterion(outputs, targets)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             running_loss += loss.item() * inputs.size(0)
         
@@ -433,8 +400,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
         
         val_loss /= len(test_loader.dataset)
         val_losses.append(val_loss)
-        
-        if epoch < 10:
+ワイ        if epoch < 10:
             warmup.step()
         else:
             scheduler.step(epoch)
@@ -446,24 +412,11 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
             best_val_loss = val_loss
             epochs_no_improve = 0
             best_model_state = model.state_dict().copy()
-            model.eval()
-            model.to('cpu')
-            try:
-                sample_input = torch.randn(1, 1, inputs.shape[2]).to('cpu')
-                traced_model = torch.jit.trace(model, sample_input)
-                checkpoint_path = f"lstm_model_{checkpoint_counter}.pt"
-                traced_model.save(checkpoint_path)
-                print(f"Saved checkpoint: {checkpoint_path}")
-                checkpoint_counter = checkpoint_counter % 2 + 1  # Save 2 checkpoints
-            except Exception as e:
-                print(f"Error saving checkpoint: {str(e)}")
-            model.to(device)
         else:
             epochs_no_improve += 1
         
         if epochs_no_improve >= patience:
             print(f'Early stopping after {epoch+1} epochs')
-            model.load_state_dict(best_model_state)
             break
     
     if best_model_state is not None:
@@ -471,42 +424,25 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
     
     return train_losses, val_losses
 
-def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_transformed, original_execution_times, num_checkpoints=2):
+def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_transformed, original_execution_times):
     device = torch.device('cpu')
     model.to(device)
     model.eval()
     
-    y_pred_scaled_ensemble = None
-    for i in range(1, num_checkpoints + 1):
-        checkpoint_path = f"lstm_model_{i}.pt"
-        if not os.path.exists(checkpoint_path):
-            print(f"Checkpoint {checkpoint_path} not found, skipping")
-            continue
-        try:
-            checkpoint_model = torch.jit.load(checkpoint_path, map_location=device)
-            checkpoint_model.eval()
-            with torch.no_grad():
-                y_pred_scaled = checkpoint_model(X_test.to(device)).cpu().numpy()
-            if y_pred_scaled_ensemble is None:
-                y_pred_scaled_ensemble = y_pred_scaled
-            else:
-                y_pred_scaled_ensemble += y_pred_scaled
-        except Exception as e:
-            print(f"Error loading checkpoint {checkpoint_path}: {str(e)}")
-    
-    if y_pred_scaled_ensemble is None:
-        print("No checkpoints loaded, falling back to single model")
-        with torch.no_grad():
-            y_pred_scaled_ensemble = model(X_test).cpu().numpy()
-    else:
-        y_pred_scaled_ensemble /= max(1, sum(os.path.exists(f"lstm_model_{i}.pt") for i in range(1, num_checkpoints + 1)))
+    with torch.no_grad():
+        y_pred_scaled = model(X_test.to(device)).cpu().numpy()
     
     y_test = y_test.cpu().numpy()
+    # Inverse transform the scaled values
     y_test_transformed = y_scaler.inverse_transform(y_test)
-    y_pred_transformed = y_scaler.inverse_transform(y_pred_scaled_ensemble)
+    y_pred_transformed = y_scaler.inverse_transform(y_pred_scaled)
     
+    # Inverse log transform
     y_test_actual = np.expm1(y_test_transformed) if is_log_transformed else y_test_transformed
     y_pred_actual = np.expm1(y_pred_transformed) if is_log_transformed else y_pred_transformed
+    
+    # Clip predictions to avoid negative values
+    y_pred_actual = np.maximum(y_pred_actual, 0)
     
     results_by_subfolder = {}
     for i, file_path in enumerate(file_names_test):
@@ -536,7 +472,9 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_tran
     mse = np.mean((y_test_actual - y_pred_actual) ** 2)
     rmse = np.sqrt(mse)
     mae = np.mean(np.abs(y_test_actual - y_pred_actual))
-    mape = np.mean(np.abs((y_test_actual - y_pred_actual) / (y_test_actual + 1e-8))) * 100
+    # Use a more robust MAPE calculation
+    mask = y_test_actual > 1e-2  # Avoid division by very small numbers
+    mape = np.mean(np.abs((y_test_actual[mask] - y_pred_actual[mask]) / y_test_actual[mask])) * 100 if mask.sum() > 0 else 0
     
     print("\nOverall Model Performance:")
     print(f"MSE: {mse:.2f}")
@@ -574,21 +512,21 @@ def main(main_dir):
     
     (X_train, y_train, X_test, y_test, scaler_X, scaler_y, feature_names, is_log_transformed) = prepare_data_for_model(train_features, test_features)
     
-    train_loader, test_loader = create_data_loaders(X_train, y_train, X_test, y_test, batch_size=16)
+    train_loader, test_loader = create_data_loaders(X_train, y_train, X_test, y_test, batch_size=32)
     
     model = SimplifiedHybridModel(
         input_size=len(feature_names),
-        hidden_sizes=[64, 32],
+        hidden_size=64,
         output_size=1,
-        dropout_rate=0.4
+        dropout_rate=0.3
     )
     
-    criterion = CustomLoss(delta=1.2)
-    optimizer = optim.AdamW(model.parameters(), lr=0.0002, weight_decay=3e-4)
+    criterion = CustomLoss(delta=1.0)
+    optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-4)
     
     print("Training model...")
     train_losses, val_losses = train_model(
-        model, train_loader, test_loader, criterion, optimizer, num_epochs=300, patience=50
+        model, train_loader, test_loader, criterion, optimizer, num_epochs=200, patience=30
     )
     
     plt.figure(figsize=(10, 6))
@@ -606,13 +544,13 @@ def main(main_dir):
     print("\nEvaluating model:")
     y_test_actual, y_pred_actual = evaluate_model(
         model, X_test, y_test, scaler_y, test_file_names, 
-        is_log_transformed, original_execution_times, num_checkpoints=2
+        is_log_transformed, original_execution_times
     )
     
     model.eval()
     model.to('cpu')
     try:
-        sample_input = torch.randn(1, 1, len(feature_names)).to('cpu')
+        sample_input = torch.randn(1, len(feature_names)).to('cpu')
         traced_model = torch.jit.trace(model, sample_input)
         traced_model.save("lstm_model.pt")
         print("Saved best model as 'lstm_model.pt'")
