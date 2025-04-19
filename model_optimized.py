@@ -279,10 +279,9 @@ def prepare_data_for_model(train_features, test_features):
     print(f"First 5 y_train scaled: {y_train_scaled[:5].flatten()}")
     print(f"First 5 y_test scaled: {y_test_scaled[:5].flatten()}")
     
-    # Remove the sequence dimension since we'll simplify the model
-    X_train_tensor = torch.FloatTensor(X_train_scaled)
+    X_train_tensor = torch.FloatTensor(X_train_scaled).unsqueeze(1)
     y_train_tensor = torch.FloatTensor(y_train_scaled)
-    X_test_tensor = torch.FloatTensor(X_test_scaled)
+    X_test_tensor = torch.FloatTensor(X_test_scaled).unsqueeze(1)
     y_test_tensor = torch.FloatTensor(y_test_scaled)
     
     print(f"Input feature dimension: {X_train_scaled.shape[1]}")
@@ -290,45 +289,43 @@ def prepare_data_for_model(train_features, test_features):
     return (X_train_tensor, y_train_tensor, X_test_tensor, y_test_tensor, 
             scaler_y, X_train_scaled.shape[1], is_log_transformed)
 
-class ImprovedLSTMModel(nn.Module):
+class PerfectLSTMModel(nn.Module):
     def __init__(self, input_size, hidden_size=128, output_size=1, dropout_rate=0.3):
-        super(ImprovedLSTMModel, self).__init__()
+        super(PerfectLSTMModel, self).__init__()
         self.hidden_size = hidden_size
         
-        # Simplified LSTM with batch normalization
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers=1, batch_first=True)
-        self.bn_lstm = nn.BatchNorm1d(hidden_size)
+        # LSTM layers with batch_first=True
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers=2, batch_first=True)
         
-        # Fully connected layers
-        self.fc1 = nn.Linear(hidden_size, hidden_size // 2)
-        self.bn1 = nn.BatchNorm1d(hidden_size // 2)
-        self.fc2 = nn.Linear(hidden_size // 2, output_size)
+        # Fully connected layers with batch normalization
+        self.fc1 = nn.Linear(hidden_size, 64)
+        self.bn1 = nn.BatchNorm1d(64)
+        self.fc2 = nn.Linear(64, 32)
+        self.bn2 = nn.BatchNorm1d(32)
+        self.fc3 = nn.Linear(32, output_size)
         
         self.dropout = nn.Dropout(dropout_rate)
         self.leaky_relu = nn.LeakyReLU(0.1)
     
     def forward(self, x):
-        # Input shape: [batch_size, feature_dim]
-        # Add a sequence dimension: [batch_size, 1, feature_dim]
-        x = x.unsqueeze(1)
-        
-        # LSTM: [batch_size, 1, feature_dim] -> [batch_size, 1, hidden_size]
+        # Input shape: [batch_size, seq_len=1, feature_dim]
         lstm_out, _ = self.lstm(x)
         lstm_out = lstm_out[:, -1, :]  # Take the last time step
-        lstm_out = self.bn_lstm(lstm_out)
-        lstm_out = self.leaky_relu(lstm_out)
-        lstm_out = self.dropout(lstm_out)
         
-        # Fully connected layers
         x = self.fc1(lstm_out)
         x = self.bn1(x)
         x = self.leaky_relu(x)
         x = self.dropout(x)
         
         x = self.fc2(x)
+        x = self.bn2(x)
+        x = self.leaky_relu(x)
+        x = self.dropout(x)
+        
+        x = self.fc3(x)
         return x
 
-def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=16):
+def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=32):
     train_dataset = TensorDataset(X_train, y_train)
     test_dataset = TensorDataset(X_test, y_test)
     
@@ -337,25 +334,21 @@ def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=16):
     
     return train_loader, test_loader
 
-class CustomLoss(nn.Module):
-    def __init__(self, mse_weight=0.5, mape_weight=0.5):
-        super(CustomLoss, self).__init__()
-        self.mse = nn.MSELoss()
-        self.mse_weight = mse_weight
-        self.mape_weight = mape_weight
+class CustomMAPELoss(nn.Module):
+    def __init__(self, epsilon=1e-2):
+        super(CustomMAPELoss, self).__init__()
+        self.epsilon = epsilon
     
     def forward(self, outputs, targets):
-        mse_loss = self.mse(outputs, targets)
-        # MAPE loss: mean absolute percentage error
-        mape_loss = torch.mean(torch.abs((outputs - targets) / (targets + 1e-2)))
-        return self.mse_weight * mse_loss + self.mape_weight * mape_loss
+        # Calculate MAPE with epsilon to avoid division by zero
+        return torch.mean(torch.abs((targets - outputs) / (targets + self.epsilon))) * 100
 
-def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=150, patience=20):
+def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=200, patience=30):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     model.to(device)
     
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.3, patience=8, verbose=True)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10, verbose=True)
     
     best_val_loss = float('inf')
     epochs_no_improve = 0
@@ -429,10 +422,6 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_tran
     y_test_transformed = y_scaler.inverse_transform(y_test)
     y_pred_transformed = y_scaler.inverse_transform(y_pred_scaled)
     
-    print("\nDebugging transformed values before inverse log:")
-    for i in range(min(5, len(y_test_transformed))):
-        print(f"Sample {i}: y_test_transformed={y_test_transformed[i][0]}, y_pred_transformed={y_pred_transformed[i][0]}")
-    
     if is_log_transformed:
         y_test_actual = np.expm1(y_test_transformed)
         y_pred_actual = np.expm1(y_pred_transformed)
@@ -442,12 +431,6 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_tran
     
     # Clip predictions to avoid negative values
     y_pred_actual = np.maximum(y_pred_actual, 1e-2)
-    
-    print("\nDebugging final values after all transformations:")
-    for i in range(min(5, len(y_test_actual))):
-        print(f"Sample {i}: y_test_actual={y_test_actual[i][0]}, y_pred_actual={y_pred_actual[i][0]}")
-        if original_execution_times:
-            print(f"  Original execution time from JSON: {original_execution_times[file_names_test[i]]}")
     
     results_by_subfolder = {}
     for i, file_path in enumerate(file_names_test):
@@ -511,27 +494,27 @@ def main(main_dir):
     
     X_train, y_train, X_test, y_test, y_scaler, input_size, is_log_transformed = prepare_data_for_model(train_features, test_features)
     
-    train_loader, test_loader = create_data_loaders(X_train, y_train, X_test, y_test, batch_size=16)
+    train_loader, test_loader = create_data_loaders(X_train, y_train, X_test, y_test, batch_size=32)
     
-    model = ImprovedLSTMModel(
+    model = PerfectLSTMModel(
         input_size=input_size,
         hidden_size=128,
         output_size=1,
         dropout_rate=0.3
     )
     
-    criterion = CustomLoss(mse_weight=0.7, mape_weight=0.3)
+    criterion = CustomMAPELoss(epsilon=1e-2)
     optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-4)
     
-    print("Building and training Improved LSTM model...")
+    print("Building and training Perfect LSTM model...")
     train_losses, val_losses = train_model(
         model, 
         train_loader, 
         test_loader, 
         criterion, 
         optimizer, 
-        num_epochs=150,
-        patience=20
+        num_epochs=200,
+        patience=30
     )
     
     plt.figure(figsize=(10, 6))
@@ -542,9 +525,9 @@ def main(main_dir):
     plt.title('Training and Validation Loss over Epochs')
     plt.legend()
     plt.grid(True)
-    plt.savefig('loss_improved_model.png')
+    plt.savefig('loss_perfect_model.png')
     plt.close()
-    print("Training plot saved as 'loss_improved_model.png'")
+    print("Training plot saved as 'loss_perfect_model.png'")
     
     print("\nEvaluating model:")
     y_test_actual, y_pred_actual = evaluate_model(
@@ -558,8 +541,8 @@ def main(main_dir):
     print(f"Model is on device: {device}")
     
     try:
-        sample_input = torch.randn(1, input_size).to(device)
-        traced_model = torch.jit.trace(model, sample_input.unsqueeze(1))
+        sample_input = torch.randn(1, 1, input_size).to(device)
+        traced_model = torch.jit.trace(model, sample_input)
         traced_model.save("lstm_model.pt")
         print("Model successfully saved as 'lstm_model.pt'")
     except Exception as e:
