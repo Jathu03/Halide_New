@@ -400,7 +400,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
         
         val_loss /= len(test_loader.dataset)
         val_losses.append(val_loss)
-ワイ        if epoch < 10:
+            if epoch < 10:
             warmup.step()
         else:
             scheduler.step(epoch)
