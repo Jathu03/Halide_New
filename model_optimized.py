@@ -2,7 +2,7 @@ import os
 import json
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import StandardScaler, RobustScaler
+from sklearn.preprocessing import StandardScaler
 from sklearn.ensemble import RandomForestRegressor
 import torch
 import torch.nn as nn
@@ -230,14 +230,18 @@ def clean_and_transform_features(train_features, test_features):
     if 'total_vectors' in all_features_df.columns and all_features_df['total_vectors'].max() > 0:
         all_features_df['bytes_per_vector'] = all_features_df['total_bytes_at_production'] / (all_features_df['total_vectors'] + 1e-8)
     
-    # Add interaction features
-    if 'nodes_count' in all_features_df and 'edges_count' in all_features_df:
-        all_features_df['nodes_edges_interaction'] = all_features_df['nodes_count'] * all_features_df['edges_count']
-    if 'total_bytes_at_production' in all_features_df and 'total_vectors' in all_features_df:
-        all_features_df['bytes_vectors_interaction'] = all_features_df['total_bytes_at_production'] * all_features_df['total_vectors']
-    
     numeric_cols = all_features_df.select_dtypes(include=['number']).columns
     all_features_df = all_features_df[numeric_cols]
+    
+    # Dynamic outlier clipping using IQR
+    for col in numeric_cols:
+        if col not in ['execution_time', 'execution_time_log']:
+            Q1 = all_features_df[col].quantile(0.25)
+            Q3 = all_features_df[col].quantile(0.75)
+            IQR = Q3 - Q1
+            lower_bound = Q1 - 1.5 * IQR
+            upper_bound = Q3 + 1.5 * IQR
+            all_features_df[col] = all_features_df[col].clip(lower=lower_bound, upper=upper_bound)
     
     # Feature selection using RandomForest
     X = all_features_df.drop(['execution_time', 'execution_time_log'], axis=1, errors='ignore')
@@ -245,7 +249,7 @@ def clean_and_transform_features(train_features, test_features):
     rf = RandomForestRegressor(n_estimators=100, random_state=42)
     rf.fit(X, y)
     importances = pd.Series(rf.feature_importances_, index=X.columns)
-    threshold = importances.quantile(0.1)
+    threshold = importances.quantile(0.15)  # Drop bottom 15% of features
     selected_features = importances[importances > threshold].index.tolist()
     print(f"Selected {len(selected_features)} features out of {len(X.columns)}")
     all_features_df = all_features_df[selected_features + ['execution_time', 'execution_time_log'] if 'execution_time_log' in all_features_df else ['execution_time']]
@@ -276,14 +280,15 @@ def prepare_data_for_model(train_features, test_features):
     print(f"First 5 y_train raw: {y_train[:5].flatten()}")
     print(f"First 5 y_test raw: {y_test[:5].flatten()}")
     
-    scaler_X = RobustScaler()
-    scaler_y = RobustScaler()
+    scaler_X = StandardScaler()
+    scaler_y = StandardScaler()
     
     X_train_scaled = scaler_X.fit_transform(train_df)
     y_train_scaled = scaler_y.fit_transform(y_train)
     X_test_scaled = scaler_X.transform(test_df)
     y_test_scaled = scaler_y.transform(y_test)
     
+    # Add noise to training data for augmentation
     X_train_scaled += np.random.normal(0, 0.01, X_train_scaled.shape)
     
     print(f"First 5 y_train scaled: {y_train_scaled[:5].flatten()}")
@@ -307,34 +312,35 @@ class EnhancedLSTMModel(nn.Module):
         self.ln_layers = nn.ModuleList()
         self.dropout_layers = nn.ModuleList()
         
-        self.lstm_layers.append(nn.LSTM(input_size, hidden_sizes[0], batch_first=True))
-        self.ln_layers.append(nn.LayerNorm(hidden_sizes[0]))
+        self.lstm_layers.append(nn.LSTM(input_size, hidden_sizes[0], batch_first=True, bidirectional=True))
+        self.ln_layers.append(nn.LayerNorm(hidden_sizes[0] * 2))  # Bidirectional doubles the hidden size
         self.dropout_layers.append(nn.Dropout(dropout_rate))
         
         for i in range(1, len(hidden_sizes)):
-            self.lstm_layers.append(nn.LSTM(hidden_sizes[i-1], hidden_sizes[i], batch_first=True))
-            self.ln_layers.append(nn.LayerNorm(hidden_sizes[i]))
+            self.lstm_layers.append(nn.LSTM(hidden_sizes[i-1] * 2, hidden_sizes[i], batch_first=True, bidirectional=True))
+            self.ln_layers.append(nn.LayerNorm(hidden_sizes[i] * 2))
             self.dropout_layers.append(nn.Dropout(dropout_rate))
         
-        self.attention = nn.Linear(hidden_sizes[-1], 1)
+        self.attention = nn.Linear(hidden_sizes[-1] * 2, 1)
         
         self.fc_layers = nn.ModuleList()
         self.bn_layers = nn.ModuleList()
+        self.fc_dropout = nn.Dropout(dropout_rate)
+        
+        self.fc_layers.append(nn.Linear(hidden_sizes[-1] * 2, hidden_sizes[-1]))
+        self.bn_layers.append(nn.BatchNorm1d(hidden_sizes[-1]))
         
         self.fc_layers.append(nn.Linear(hidden_sizes[-1], hidden_sizes[-1] // 2))
         self.bn_layers.append(nn.BatchNorm1d(hidden_sizes[-1] // 2))
         
-        self.fc_layers.append(nn.Linear(hidden_sizes[-1] // 2, hidden_sizes[-1] // 4))
-        self.bn_layers.append(nn.BatchNorm1d(hidden_sizes[-1] // 4))
-        
-        self.output_layer = nn.Linear(hidden_sizes[-1] // 4, output_size)
+        self.output_layer = nn.Linear(hidden_sizes[-1] // 2, output_size)
         
         self.relu = nn.ReLU()
         self.leaky_relu = nn.LeakyReLU(0.1)
         
-        self.has_residual = (hidden_sizes[-1] // 4 == hidden_sizes[-1] // 2)
+        self.has_residual = (hidden_sizes[-1] // 2 == hidden_sizes[-1])
         if not self.has_residual:
-            self.residual_adapter = nn.Linear(hidden_sizes[-1] // 2, hidden_sizes[-1] // 4)
+            self.residual_adapter = nn.Linear(hidden_sizes[-1], hidden_sizes[-1] // 2)
         
     def attention_net(self, lstm_output):
         attn_weights = self.attention(lstm_output).squeeze(2)
@@ -355,6 +361,7 @@ class EnhancedLSTMModel(nn.Module):
         fc_out = self.fc_layers[0](attn_output)
         fc_out = self.bn_layers[0](fc_out)
         fc_out = self.leaky_relu(fc_out)
+        fc_out = self.fc_dropout(fc_out)
         
         residual = fc_out
         if not self.has_residual:
@@ -363,6 +370,7 @@ class EnhancedLSTMModel(nn.Module):
         fc_out = self.fc_layers[1](fc_out)
         fc_out = self.bn_layers[1](fc_out)
         fc_out = self.leaky_relu(fc_out)
+        fc_out = self.fc_dropout(fc_out)
         
         fc_out = fc_out + residual
         
@@ -380,16 +388,18 @@ def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=16):
     return train_loader, test_loader
 
 class CustomLoss(nn.Module):
-    def __init__(self, delta=0.5, mse_weight=0.4):
+    def __init__(self, delta=0.7, mse_weight=0.3, l1_weight=1e-5):
         super(CustomLoss, self).__init__()
         self.huber = nn.HuberLoss(delta=delta)
         self.mse = nn.MSELoss()
         self.mse_weight = mse_weight
+        self.l1_weight = l1_weight
     
     def forward(self, outputs, targets):
         huber_loss = self.huber(outputs, targets)
         mse_loss = self.mse(outputs, targets)
-        return huber_loss + self.mse_weight * mse_loss
+        l1_loss = torch.mean(torch.abs(outputs))
+        return huber_loss + self.mse_weight * mse_loss + self.l1_weight * l1_loss
 
 class LinearWarmup:
     def __init__(self, optimizer, warmup_epochs, total_epochs, start_lr, max_lr):
@@ -408,8 +418,8 @@ class LinearWarmup:
                 param_group['lr'] = lr
             print(f"Warmup epoch {self.current_epoch}: Learning rate set to {lr:.6f}")
 
-def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=500, patience=100, warmup_epochs=10):
-    device = torch.device('cpu')
+def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=500, patience=100, warmup_epochs=20):
+    device = torch.device('cpu')  # Force CPU
     print(f"Using device: {device}")
     model.to(device)
     
@@ -419,12 +429,9 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
     best_val_loss = float('inf')
     epochs_no_improve = 0
     best_model_state = None
+    checkpoint_counter = 1
     train_losses = []
     val_losses = []
-    
-    # Scheduled sampling parameters
-    sampling_prob = 1.0  # Start with ground truth
-    sampling_decay = 0.995
     
     for epoch in range(num_epochs):
         model.train()
@@ -432,17 +439,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
         for inputs, targets in train_loader:
             inputs, targets = inputs.to(device), targets.to(device)
             optimizer.zero_grad()
-            
-            # Scheduled sampling
-            if random.random() < sampling_prob:
-                model_input = inputs
-            else:
-                with torch.no_grad():
-                    model_input = model(inputs)
-                    model_input = inputs.clone()
-                    model_input[:, :, 0] = model_input  # Replace first feature with prediction (simplified)
-            
-            outputs = model(model_input)
+            outputs = model(inputs)
             loss = criterion(outputs, targets)
             loss.backward()
             
@@ -469,12 +466,9 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
         if epoch < warmup_epochs:
             warmup.step()
         else:
-            scheduler.step()
+            scheduler.step(epoch)
             current_lr = optimizer.param_groups[0]['lr']
             print(f"Epoch {epoch+1}: CosineAnnealingWarmRestarts learning rate: {current_lr:.6f}")
-        
-        sampling_prob *= sampling_decay
-        print(f"Epoch {epoch+1}: Scheduled sampling probability: {sampling_prob:.4f}")
         
         print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
         
@@ -482,6 +476,19 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
             best_val_loss = val_loss
             epochs_no_improve = 0
             best_model_state = model.state_dict().copy()
+            # Save checkpoint for ensemble
+            model.eval()
+            model.to('cpu')
+            try:
+                sample_input = torch.randn(1, 1, inputs.shape[2]).to('cpu')
+                traced_model = torch.jit.trace(model, sample_input)
+                checkpoint_path = f"lstm_model_{checkpoint_counter}.pt"
+                traced_model.save(checkpoint_path)
+                print(f"Saved checkpoint: {checkpoint_path}")
+                checkpoint_counter = checkpoint_counter % 3 + 1  # Save up to 3 checkpoints
+            except Exception as e:
+                print(f"Error saving checkpoint: {str(e)}")
+            model.to(device)
         else:
             epochs_no_improve += 1
         
@@ -495,25 +502,41 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
     
     return train_losses, val_losses
 
-def evaluate_model(models, X_test, y_test, y_scaler, file_names_test, is_log_transformed=False, original_execution_times=None):
-    device = torch.device('cpu')
-    for model in models:
-        model.to(device)
-        model.eval()
+def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_transformed=False, original_execution_times=None, num_checkpoints=3):
+    device = torch.device('cpu')  # Force CPU
+    model.to(device)
+    model.eval()
     
-    X_test = X_test.to(device)
-    y_pred_scaled_ensemble = []
+    # Ensemble prediction using multiple checkpoints
+    y_pred_scaled_ensemble = None
+    for i in range(1, num_checkpoints + 1):
+        checkpoint_path = f"lstm_model_{i}.pt"
+        if not os.path.exists(checkpoint_path):
+            print(f"Checkpoint {checkpoint_path} not found, skipping")
+            continue
+        try:
+            checkpoint_model = torch.jit.load(checkpoint_path, map_location=device)
+            checkpoint_model.eval()
+            with torch.no_grad():
+                y_pred_scaled = checkpoint_model(X_test.to(device)).cpu().numpy()
+            if y_pred_scaled_ensemble is None:
+                y_pred_scaled_ensemble = y_pred_scaled
+            else:
+                y_pred_scaled_ensemble += y_pred_scaled
+        except Exception as e:
+            print(f"Error loading checkpoint {checkpoint_path}: {str(e)}")
     
-    with torch.no_grad():
-        for model in models:
-            y_pred_scaled = model(X_test)
-            y_pred_scaled_ensemble.append(y_pred_scaled.cpu().numpy())
+    if y_pred_scaled_ensemble is None:
+        print("No checkpoints loaded, falling back to single model")
+        with torch.no_grad():
+            y_pred_scaled_ensemble = model(X_test).cpu().numpy()
+    else:
+        y_pred_scaled_ensemble /= max(1, sum(os.path.exists(f"lstm_model_{i}.pt") for i in range(1, num_checkpoints + 1)))
     
-    y_pred_scaled = np.mean(y_pred_scaled_ensemble, axis=0)
     y_test = y_test.cpu().numpy()
     
     y_test_transformed = y_scaler.inverse_transform(y_test)
-    y_pred_transformed = y_scaler.inverse_transform(y_pred_scaled)
+    y_pred_transformed = y_scaler.inverse_transform(y_pred_scaled_ensemble)
     
     print("\nDebugging transformed values before inverse log:")
     for i in range(min(5, len(y_test_transformed))):
@@ -573,7 +596,7 @@ def evaluate_model(models, X_test, y_test, y_scaler, file_names_test, is_log_tra
 def save_scaler(scaler, feature_names, filename):
     scaler_data = {
         'feature_names': feature_names,
-        'means': scaler.center_.tolist(),
+        'means': scaler.mean_.tolist(),
         'scales': scaler.scale_.tolist()
     }
     with open(filename, 'w') as f:
@@ -582,7 +605,7 @@ def save_scaler(scaler, feature_names, filename):
 
 def save_y_scaler(scaler, is_log_transformed, filename):
     scaler_data = {
-        'mean': float(scaler.center_[0]),
+        'mean': float(scaler.mean_[0]),
         'scale': float(scaler.scale_[0]),
         'is_log_transformed': is_log_transformed
     }
@@ -609,74 +632,68 @@ def main(main_dir):
     
     train_loader, test_loader = create_data_loaders(X_train, y_train, X_test, y_test, batch_size=16)
     
-    num_models = 3
-    models = []
-    for i in range(num_models):
-        print(f"\nTraining model {i+1}/{num_models}")
-        model = EnhancedLSTMModel(
-            input_size=len(feature_names),
-            hidden_sizes=[128, 64, 32],
-            output_size=1,
-            dropout_rate=0.3
-        )
-        criterion = CustomLoss(delta=0.5, mse_weight=0.4)
-        optimizer = optim.AdamW(model.parameters(), lr=0.0005, weight_decay=1e-4)
-        
-        # Set different random seed for each model
-        torch.manual_seed(42 + i)
-        train_losses, val_losses = train_model(
-            model, 
-            train_loader, 
-            test_loader, 
-            criterion, 
-            optimizer, 
-            num_epochs=500,
-            patience=100,
-            warmup_epochs=10
-        )
-        
-        plt.figure(figsize=(10, 6))
-        plt.plot(range(1, len(train_losses) + 1), train_losses, label='Training Loss')
-        plt.plot(range(1, len(val_losses) + 1), val_losses, label='Validation Loss')
-        plt.xlabel('Epoch')
-        plt.ylabel('Loss')
-        plt.title(f'Training and Validation Loss for Model {i+1}')
-        plt.legend()
-        plt.grid(True)
-        plt.savefig(f'loss_model_{i+1}.png')
-        plt.close()
-        print(f"Training plot saved as 'loss_model_{i+1}.png'")
-        
-        models.append(model)
-        
-        # Save individual model
-        model.eval()
-        model.to('cpu')
-        device = next(model.parameters()).device
-        print(f"Model {i+1} is on device: {device}")
-        try:
-            sample_input = torch.randn(1, 1, len(feature_names)).to(device)
-            traced_model = torch.jit.trace(model, sample_input)
-            traced_model.save(f"lstm_model_{i+1}.pt")
-            print(f"Model {i+1} saved as 'lstm_model_{i+1}.pt'")
-        except Exception as e:
-            print(f"Error saving model {i+1}: {str(e)}")
-    
-    print("\nEvaluating ensemble model:")
-    y_test_actual, y_pred_actual = evaluate_model(
-        models, X_test, y_test, scaler_y, test_file_names, 
-        is_log_transformed, original_execution_times
+    model = EnhancedLSTMModel(
+        input_size=len(feature_names),
+        hidden_sizes=[128, 64, 32],
+        output_size=1,
+        dropout_rate=0.3
     )
     
-    print("\nSaving scalers...")
+    criterion = CustomLoss(delta=0.7, mse_weight=0.3, l1_weight=1e-5)
+    optimizer = optim.AdamW(model.parameters(), lr=0.0005, weight_decay=1e-4)
+    
+    print("Building and training Enhanced LSTM model...")
+    train_losses, val_losses = train_model(
+        model, 
+        train_loader, 
+        test_loader, 
+        criterion, 
+        optimizer, 
+        num_epochs=500,
+        patience=100,
+        warmup_epochs=20
+    )
+    
+    plt.figure(figsize=(10, 6))
+    plt.plot(range(1, len(train_losses) + 1), train_losses, label='Training Loss')
+    plt.plot(range(1, len(val_losses) + 1), val_losses, label='Validation Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('Training and Validation Loss over Epochs')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig('loss_enhanced_model.png')
+    plt.close()
+    print("Training plot saved as 'loss_enhanced_model.png'")
+    
+    print("\nEvaluating model with ensemble prediction:")
+    y_test_actual, y_pred_actual = evaluate_model(
+        model, X_test, y_test, scaler_y, test_file_names, 
+        is_log_transformed, original_execution_times, num_checkpoints=3
+    )
+    
+    print("\nSaving the best model and scalers...")
+    model.eval()
+    model.to('cpu')
+    device = next(model.parameters()).device
+    print(f"Model is on device: {device}")
+    
+    try:
+        sample_input = torch.randn(1, 1, len(feature_names)).to(device)
+        traced_model = torch.jit.trace(model, sample_input)
+        traced_model.save("lstm_model.pt")
+        print("Best model saved as 'lstm_model.pt'")
+    except Exception as e:
+        print(f"Error saving best model: {str(e)}")
+    
     save_scaler(scaler_X, feature_names, "scaler_X.json")
     save_y_scaler(scaler_y, is_log_transformed, "scaler_y.json")
     
-    return models, scaler_y, y_test_actual, y_pred_actual
+    return model, scaler_y, y_test_actual, y_pred_actual
 
 if __name__ == "__main__":
     main_dir = "synthetic_data"
     random.seed(42)
     result = main(main_dir)
     if result is not None:
-        models, y_scaler, y_test_actual, y_pred_actual = result
+        model, y_scaler, y_test_actual, y_pred_actual = result
