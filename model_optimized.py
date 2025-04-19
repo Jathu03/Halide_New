@@ -11,7 +11,6 @@ from torch.utils.data import TensorDataset, DataLoader
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 import random
 import matplotlib.pyplot as plt
-from scipy.stats import skew
 
 def get_execution_time(file_path):
     try:
@@ -120,23 +119,13 @@ def extract_features_from_file(file_path):
     
     # Interaction terms
     features['nodes_edges_interaction'] = features['nodes_count'] * features['edges_count']
-    if 'scheduling_count' in features:
-        features['nodes_scheduling_interaction'] = features['nodes_count'] * features['scheduling_count']
     
-    # Operation histogram statistics
     op_counts = {}
-    op_values = []
     for node in nodes_features:
         for key, value in node.items():
             if key.startswith('op_'):
                 op_counts[key] = op_counts.get(key, 0) + value
-                op_values.append(value)
     features.update(op_counts)
-    
-    if op_values:
-        features['op_count_variance'] = np.var(op_values) if len(op_values) > 1 else 0
-        features['op_count_skewness'] = skew(op_values) if len(op_values) > 2 else 0
-        features['op_count_mean'] = np.mean(op_values)
     
     # Graph centrality features
     if edges_features:
@@ -149,7 +138,6 @@ def extract_features_from_file(file_path):
         degrees = list(node_degrees.values())
         features['avg_node_degree'] = np.mean(degrees) if degrees else 0
         features['max_node_degree'] = max(degrees) if degrees else 0
-        features['degree_variance'] = np.var(degrees) if len(degrees) > 1 else 0
     
     if scheduling_features:
         important_metrics = [
@@ -177,12 +165,6 @@ def extract_features_from_file(file_path):
         
         if 'working_set' in scheduling_features[0] and 'bytes_at_production' in scheduling_features[0]:
             features['memory_pressure'] = scheduling_features[0]['working_set'] / scheduling_features[0]['bytes_at_production'] if scheduling_features[0]['bytes_at_production'] > 0 else 0
-        
-        # Scheduling statistics
-        bytes_values = [sf.get('bytes_at_production', 0) for sf in scheduling_features if isinstance(sf, dict)]
-        if bytes_values:
-            features['bytes_variance'] = np.var(bytes_values) if len(bytes_values) > 1 else 0
-            features['bytes_skewness'] = skew(bytes_values) if len(bytes_values) > 2 else 0
     
     if len(nodes_features) > 0:
         op_types = sum(1 for k in op_counts.keys())
@@ -276,13 +258,20 @@ def clean_and_transform_features(train_features, test_features):
             upper_bound = Q3 + 1.5 * IQR
             all_features_df[col] = all_features_df[col].clip(lower=lower_bound, upper=upper_bound)
     
-    # Feature selection using RandomForest
+    # Correlation-based feature filtering
     X = all_features_df.drop(['execution_time', 'execution_time_log'], axis=1, errors='ignore')
+    corr_matrix = X.corr().abs()
+    upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+    to_drop = [column for column in upper.columns if any(upper[column] > 0.8)]
+    X = X.drop(columns=to_drop)
+    print(f"Dropped {len(to_drop)} highly correlated features")
+    
+    # Feature selection using RandomForest
     y = all_features_df['execution_time_log'] if 'execution_time_log' in all_features_df else all_features_df['execution_time']
     rf = RandomForestRegressor(n_estimators=100, random_state=42)
     rf.fit(X, y)
     importances = pd.Series(rf.feature_importances_, index=X.columns)
-    threshold = importances.quantile(0.15)
+    threshold = importances.quantile(0.2)  # Stricter threshold
     selected_features = importances[importances > threshold].index.tolist()
     print(f"Selected {len(selected_features)} features out of {len(X.columns)}")
     all_features_df = all_features_df[selected_features + ['execution_time', 'execution_time_log'] if 'execution_time_log' in all_features_df else ['execution_time']]
@@ -336,35 +325,8 @@ def prepare_data_for_model(train_features, test_features):
     return (X_train_tensor, y_train_tensor, X_test_tensor, y_test_tensor, 
             scaler_X, scaler_y, train_df.columns.tolist(), is_log_transformed)
 
-class MultiHeadAttention(nn.Module):
-    def __init__(self, d_model, num_heads):
-        super(MultiHeadAttention, self).__init__()
-        assert d_model % num_heads == 0
-        self.d_model = d_model
-        self.num_heads = num_heads
-        self.d_k = d_model // num_heads
-        
-        self.W_q = nn.Linear(d_model, d_model)
-        self.W_k = nn.Linear(d_model, d_model)
-        self.W_v = nn.Linear(d_model, d_model)
-        self.W_o = nn.Linear(d_model, d_model)
-        
-    def forward(self, x):
-        batch_size = x.size(0)
-        Q = self.W_q(x).view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
-        K = self.W_k(x).view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
-        V = self.W_v(x).view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
-        
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / torch.sqrt(torch.tensor(self.d_k, dtype=torch.float32))
-        attn = torch.softmax(scores, dim=-1)
-        context = torch.matmul(attn, V)
-        
-        context = context.transpose(1, 2).contiguous().view(batch_size, -1, self.d_model)
-        output = self.W_o(context)
-        return output
-
 class EnhancedLSTMModel(nn.Module):
-    def __init__(self, input_size, hidden_sizes=[256, 128, 64, 32], output_size=1, dropout_rate=0.4):
+    def __init__(self, input_size, hidden_sizes=[64, 32], output_size=1, dropout_rate=0.5):
         super(EnhancedLSTMModel, self).__init__()
         
         self.lstm_layers = nn.ModuleList()
@@ -380,23 +342,18 @@ class EnhancedLSTMModel(nn.Module):
             self.lstm_layers.append(nn.LSTM(hidden_sizes[i-1] * 2, hidden_sizes[i], batch_first=True, bidirectional=True))
             self.ln_layers.append(nn.LayerNorm(hidden_sizes[i] * 2))
             self.dropout_layers.append(nn.Dropout(dropout_rate))
-            if i == 1:
-                self.skip_connections.append(nn.Linear(input_size, hidden_sizes[i] * 2))
-            else:
-                self.skip_connections.append(nn.Linear(hidden_sizes[i-2] * 2, hidden_sizes[i] * 2))
-        
-        self.multi_head_attn = MultiHeadAttention(hidden_sizes[-1] * 2, num_heads=4)
+            self.skip_connections.append(nn.Linear(input_size if i == 1 else hidden_sizes[i-2] * 2, hidden_sizes[i] * 2))
         
         self.fc_layers = nn.ModuleList()
         self.bn_layers = nn.ModuleList()
         self.fc_dropout = nn.Dropout(dropout_rate)
         
-        fc_sizes = [hidden_sizes[-1] * 2, hidden_sizes[-1], hidden_sizes[-1] // 2, hidden_sizes[-1] // 4]
-        for i in range(len(fc_sizes) - 1):
-            self.fc_layers.append(nn.Linear(fc_sizes[i], fc_sizes[i+1]))
-            self.bn_layers.append(nn.BatchNorm1d(fc_sizes[i+1]))
+        self.fc_layers.append(nn.Linear(hidden_sizes[-1] * 2, hidden_sizes[-1]))
+        self.bn_layers.append(nn.BatchNorm1d(hidden_sizes[-1]))
+        self.fc_layers.append(nn.Linear(hidden_sizes[-1], hidden_sizes[-1] // 2))
+        self.bn_layers.append(nn.BatchNorm1d(hidden_sizes[-1] // 2))
         
-        self.output_layer = nn.Linear(fc_sizes[-1], output_size)
+        self.output_layer = nn.Linear(hidden_sizes[-1] // 2, output_size)
         
         self.relu = nn.ReLU()
         self.leaky_relu = nn.LeakyReLU(0.1)
@@ -415,14 +372,16 @@ class EnhancedLSTMModel(nn.Module):
                 lstm_out = lstm_out + skip
             skip_outs.append(lstm_out)
         
-        attn_out = self.multi_head_attn(lstm_out)
+        fc_out = lstm_out[:, -1, :]  # Take the last time step
+        fc_out = self.fc_layers[0](fc_out)
+        fc_out = self.bn_layers[0](fc_out)
+        fc_out = self.leaky_relu(fc_out)
+        fc_out = self.fc_dropout(fc_out)
         
-        fc_out = attn_out[:, -1, :]  # Take the last time step
-        for i, (fc, bn) in enumerate(zip(self.fc_layers, self.bn_layers)):
-            fc_out = fc(fc_out)
-            fc_out = bn(fc_out)
-            fc_out = self.leaky_relu(fc_out)
-            fc_out = self.fc_dropout(fc_out)
+        fc_out = self.fc_layers[1](fc_out)
+        fc_out = self.bn_layers[1](fc_out)
+        fc_out = self.leaky_relu(fc_out)
+        fc_out = self.fc_dropout(fc_out)
         
         output = self.output_layer(fc_out)
         return output
@@ -437,7 +396,7 @@ def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=16):
     return train_loader, test_loader
 
 class CustomLoss(nn.Module):
-    def __init__(self, delta=0.7, mse_weight=0.3, l1_weight=1e-5):
+    def __init__(self, delta=1.0, mse_weight=0.3, l1_weight=1e-5):
         super(CustomLoss, self).__init__()
         self.huber = nn.HuberLoss(delta=delta)
         self.mse = nn.MSELoss()
@@ -467,12 +426,12 @@ class LinearWarmup:
                 param_group['lr'] = lr
             print(f"Warmup epoch {self.current_epoch}: Learning rate set to {lr:.6f}")
 
-def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=500, patience=100, warmup_epochs=20, accum_steps=2):
+def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=400, patience=80, warmup_epochs=15):
     device = torch.device('cpu')
     print(f"Using device: {device}")
     model.to(device)
     
-    warmup = LinearWarmup(optimizer, warmup_epochs, num_epochs, start_lr=1e-5, max_lr=0.0005)
+    warmup = LinearWarmup(optimizer, warmup_epochs, num_epochs, start_lr=5e-6, max_lr=0.0003)
     scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=50, T_mult=2, eta_min=1e-6)
     
     best_val_loss = float('inf')
@@ -485,23 +444,17 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
     for epoch in range(num_epochs):
         model.train()
         running_loss = 0.0
-        optimizer.zero_grad()
-        batch_count = 0
-        
         for inputs, targets in train_loader:
             inputs, targets = inputs.to(device), targets.to(device)
+            optimizer.zero_grad()
             outputs = model(inputs)
             loss = criterion(outputs, targets)
-            loss = loss / accum_steps
             loss.backward()
-            batch_count += 1
             
-            if batch_count % accum_steps == 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
-                optimizer.step()
-                optimizer.zero_grad()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
             
-            running_loss += loss.item() * inputs.size(0) * accum_steps
+            optimizer.step()
+            running_loss += loss.item() * inputs.size(0)
         
         train_loss = running_loss / len(train_loader.dataset)
         train_losses.append(train_loss)
@@ -518,10 +471,6 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
         val_loss /= len(test_loader.dataset)
         val_losses.append(val_loss)
         
-        # Dynamic L1 weight adjustment
-        l1_weight = 1e-5 * (1 - epoch / num_epochs)
-        criterion.l1_weight = l1_weight
-        
         if epoch < warmup_epochs:
             warmup.step()
         else:
@@ -529,7 +478,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
             current_lr = optimizer.param_groups[0]['lr']
             print(f"Epoch {epoch+1}: CosineAnnealingWarmRestarts learning rate: {current_lr:.6f}")
         
-        print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, L1 Weight: {l1_weight:.6f}')
+        print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
         
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -543,7 +492,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
                 checkpoint_path = f"lstm_model_{checkpoint_counter}.pt"
                 traced_model.save(checkpoint_path)
                 print(f"Saved checkpoint: {checkpoint_path}")
-                checkpoint_counter = checkpoint_counter % 5 + 1  # Save up to 5 checkpoints
+                checkpoint_counter = checkpoint_counter % 3 + 1  # Save up to 3 checkpoints
             except Exception as e:
                 print(f"Error saving checkpoint: {str(e)}")
             model.to(device)
@@ -560,7 +509,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
     
     return train_losses, val_losses
 
-def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_transformed=False, original_execution_times=None, num_checkpoints=5):
+def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_transformed=False, original_execution_times=None, num_checkpoints=3):
     device = torch.device('cpu')
     model.to(device)
     model.eval()
@@ -691,13 +640,13 @@ def main(main_dir):
     
     model = EnhancedLSTMModel(
         input_size=len(feature_names),
-        hidden_sizes=[256, 128, 64, 32],
+        hidden_sizes=[64, 32],
         output_size=1,
-        dropout_rate=0.4
+        dropout_rate=0.5
     )
     
-    criterion = CustomLoss(delta=0.7, mse_weight=0.3, l1_weight=1e-5)
-    optimizer = optim.AdamW(model.parameters(), lr=0.0005, weight_decay=1e-4)
+    criterion = CustomLoss(delta=1.0, mse_weight=0.3, l1_weight=1e-5)
+    optimizer = optim.AdamW(model.parameters(), lr=0.0003, weight_decay=2e-4)
     
     print("Building and training Enhanced LSTM model...")
     train_losses, val_losses = train_model(
@@ -706,10 +655,9 @@ def main(main_dir):
         test_loader, 
         criterion, 
         optimizer, 
-        num_epochs=500,
-        patience=100,
-        warmup_epochs=20,
-        accum_steps=2
+        num_epochs=400,
+        patience=80,
+        warmup_epochs=15
     )
     
     plt.figure(figsize=(10, 6))
@@ -727,7 +675,7 @@ def main(main_dir):
     print("\nEvaluating model with ensemble prediction:")
     y_test_actual, y_pred_actual = evaluate_model(
         model, X_test, y_test, scaler_y, test_file_names, 
-        is_log_transformed, original_execution_times, num_checkpoints=5
+        is_log_transformed, original_execution_times, num_checkpoints=3
     )
     
     print("\nSaving the best model and scalers...")
