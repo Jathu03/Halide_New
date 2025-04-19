@@ -2,13 +2,13 @@ import os
 import json
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, RobustScaler
 from sklearn.ensemble import RandomForestRegressor
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 import random
 import matplotlib.pyplot as plt
 
@@ -230,6 +230,12 @@ def clean_and_transform_features(train_features, test_features):
     if 'total_vectors' in all_features_df.columns and all_features_df['total_vectors'].max() > 0:
         all_features_df['bytes_per_vector'] = all_features_df['total_bytes_at_production'] / (all_features_df['total_vectors'] + 1e-8)
     
+    # Add interaction features
+    if 'nodes_count' in all_features_df and 'edges_count' in all_features_df:
+        all_features_df['nodes_edges_interaction'] = all_features_df['nodes_count'] * all_features_df['edges_count']
+    if 'total_bytes_at_production' in all_features_df and 'total_vectors' in all_features_df:
+        all_features_df['bytes_vectors_interaction'] = all_features_df['total_bytes_at_production'] * all_features_df['total_vectors']
+    
     numeric_cols = all_features_df.select_dtypes(include=['number']).columns
     all_features_df = all_features_df[numeric_cols]
     
@@ -239,7 +245,7 @@ def clean_and_transform_features(train_features, test_features):
     rf = RandomForestRegressor(n_estimators=100, random_state=42)
     rf.fit(X, y)
     importances = pd.Series(rf.feature_importances_, index=X.columns)
-    threshold = importances.quantile(0.1)  # Drop bottom 10% of features
+    threshold = importances.quantile(0.1)
     selected_features = importances[importances > threshold].index.tolist()
     print(f"Selected {len(selected_features)} features out of {len(X.columns)}")
     all_features_df = all_features_df[selected_features + ['execution_time', 'execution_time_log'] if 'execution_time_log' in all_features_df else ['execution_time']]
@@ -270,15 +276,14 @@ def prepare_data_for_model(train_features, test_features):
     print(f"First 5 y_train raw: {y_train[:5].flatten()}")
     print(f"First 5 y_test raw: {y_test[:5].flatten()}")
     
-    scaler_X = StandardScaler()
-    scaler_y = StandardScaler()
+    scaler_X = RobustScaler()
+    scaler_y = RobustScaler()
     
     X_train_scaled = scaler_X.fit_transform(train_df)
     y_train_scaled = scaler_y.fit_transform(y_train)
     X_test_scaled = scaler_X.transform(test_df)
     y_test_scaled = scaler_y.transform(y_test)
     
-    # Add noise to training data for augmentation
     X_train_scaled += np.random.normal(0, 0.01, X_train_scaled.shape)
     
     print(f"First 5 y_train scaled: {y_train_scaled[:5].flatten()}")
@@ -299,7 +304,7 @@ class EnhancedLSTMModel(nn.Module):
         super(EnhancedLSTMModel, self).__init__()
         
         self.lstm_layers = nn.ModuleList()
-        self.ln_layers = nn.ModuleList()  # Layer normalization
+        self.ln_layers = nn.ModuleList()
         self.dropout_layers = nn.ModuleList()
         
         self.lstm_layers.append(nn.LSTM(input_size, hidden_sizes[0], batch_first=True))
@@ -375,7 +380,7 @@ def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=16):
     return train_loader, test_loader
 
 class CustomLoss(nn.Module):
-    def __init__(self, delta=0.7, mse_weight=0.3):
+    def __init__(self, delta=0.5, mse_weight=0.4):
         super(CustomLoss, self).__init__()
         self.huber = nn.HuberLoss(delta=delta)
         self.mse = nn.MSELoss()
@@ -403,13 +408,13 @@ class LinearWarmup:
                 param_group['lr'] = lr
             print(f"Warmup epoch {self.current_epoch}: Learning rate set to {lr:.6f}")
 
-def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=400, patience=70, warmup_epochs=10):
-    device = torch.device('cpu')  # Force CPU
+def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=500, patience=100, warmup_epochs=10):
+    device = torch.device('cpu')
     print(f"Using device: {device}")
     model.to(device)
     
     warmup = LinearWarmup(optimizer, warmup_epochs, num_epochs, start_lr=1e-5, max_lr=0.0005)
-    scheduler = CosineAnnealingLR(optimizer, T_max=num_epochs - warmup_epochs, eta_min=1e-6)
+    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=50, T_mult=2, eta_min=1e-6)
     
     best_val_loss = float('inf')
     epochs_no_improve = 0
@@ -417,17 +422,31 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
     train_losses = []
     val_losses = []
     
+    # Scheduled sampling parameters
+    sampling_prob = 1.0  # Start with ground truth
+    sampling_decay = 0.995
+    
     for epoch in range(num_epochs):
         model.train()
         running_loss = 0.0
         for inputs, targets in train_loader:
             inputs, targets = inputs.to(device), targets.to(device)
             optimizer.zero_grad()
-            outputs = model(inputs)
+            
+            # Scheduled sampling
+            if random.random() < sampling_prob:
+                model_input = inputs
+            else:
+                with torch.no_grad():
+                    model_input = model(inputs)
+                    model_input = inputs.clone()
+                    model_input[:, :, 0] = model_input  # Replace first feature with prediction (simplified)
+            
+            outputs = model(model_input)
             loss = criterion(outputs, targets)
             loss.backward()
             
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)  # Reduced max_norm
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
             
             optimizer.step()
             running_loss += loss.item() * inputs.size(0)
@@ -452,7 +471,10 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
         else:
             scheduler.step()
             current_lr = optimizer.param_groups[0]['lr']
-            print(f"Epoch {epoch+1}: CosineAnnealingLR learning rate: {current_lr:.6f}")
+            print(f"Epoch {epoch+1}: CosineAnnealingWarmRestarts learning rate: {current_lr:.6f}")
+        
+        sampling_prob *= sampling_decay
+        print(f"Epoch {epoch+1}: Scheduled sampling probability: {sampling_prob:.4f}")
         
         print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
         
@@ -473,16 +495,21 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
     
     return train_losses, val_losses
 
-def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_transformed=False, original_execution_times=None):
-    device = torch.device('cpu')  # Force CPU
-    model.to(device)
-    model.eval()
+def evaluate_model(models, X_test, y_test, y_scaler, file_names_test, is_log_transformed=False, original_execution_times=None):
+    device = torch.device('cpu')
+    for model in models:
+        model.to(device)
+        model.eval()
     
     X_test = X_test.to(device)
-    with torch.no_grad():
-        y_pred_scaled = model(X_test)
+    y_pred_scaled_ensemble = []
     
-    y_pred_scaled = y_pred_scaled.cpu().numpy()
+    with torch.no_grad():
+        for model in models:
+            y_pred_scaled = model(X_test)
+            y_pred_scaled_ensemble.append(y_pred_scaled.cpu().numpy())
+    
+    y_pred_scaled = np.mean(y_pred_scaled_ensemble, axis=0)
     y_test = y_test.cpu().numpy()
     
     y_test_transformed = y_scaler.inverse_transform(y_test)
@@ -546,7 +573,7 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_tran
 def save_scaler(scaler, feature_names, filename):
     scaler_data = {
         'feature_names': feature_names,
-        'means': scaler.mean_.tolist(),
+        'means': scaler.center_.tolist(),
         'scales': scaler.scale_.tolist()
     }
     with open(filename, 'w') as f:
@@ -555,7 +582,7 @@ def save_scaler(scaler, feature_names, filename):
 
 def save_y_scaler(scaler, is_log_transformed, filename):
     scaler_data = {
-        'mean': float(scaler.mean_[0]),
+        'mean': float(scaler.center_[0]),
         'scale': float(scaler.scale_[0]),
         'is_log_transformed': is_log_transformed
     }
@@ -582,68 +609,74 @@ def main(main_dir):
     
     train_loader, test_loader = create_data_loaders(X_train, y_train, X_test, y_test, batch_size=16)
     
-    model = EnhancedLSTMModel(
-        input_size=len(feature_names),
-        hidden_sizes=[128, 64, 32],
-        output_size=1,
-        dropout_rate=0.3
-    )
+    num_models = 3
+    models = []
+    for i in range(num_models):
+        print(f"\nTraining model {i+1}/{num_models}")
+        model = EnhancedLSTMModel(
+            input_size=len(feature_names),
+            hidden_sizes=[128, 64, 32],
+            output_size=1,
+            dropout_rate=0.3
+        )
+        criterion = CustomLoss(delta=0.5, mse_weight=0.4)
+        optimizer = optim.AdamW(model.parameters(), lr=0.0005, weight_decay=1e-4)
+        
+        # Set different random seed for each model
+        torch.manual_seed(42 + i)
+        train_losses, val_losses = train_model(
+            model, 
+            train_loader, 
+            test_loader, 
+            criterion, 
+            optimizer, 
+            num_epochs=500,
+            patience=100,
+            warmup_epochs=10
+        )
+        
+        plt.figure(figsize=(10, 6))
+        plt.plot(range(1, len(train_losses) + 1), train_losses, label='Training Loss')
+        plt.plot(range(1, len(val_losses) + 1), val_losses, label='Validation Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.title(f'Training and Validation Loss for Model {i+1}')
+        plt.legend()
+        plt.grid(True)
+        plt.savefig(f'loss_model_{i+1}.png')
+        plt.close()
+        print(f"Training plot saved as 'loss_model_{i+1}.png'")
+        
+        models.append(model)
+        
+        # Save individual model
+        model.eval()
+        model.to('cpu')
+        device = next(model.parameters()).device
+        print(f"Model {i+1} is on device: {device}")
+        try:
+            sample_input = torch.randn(1, 1, len(feature_names)).to(device)
+            traced_model = torch.jit.trace(model, sample_input)
+            traced_model.save(f"lstm_model_{i+1}.pt")
+            print(f"Model {i+1} saved as 'lstm_model_{i+1}.pt'")
+        except Exception as e:
+            print(f"Error saving model {i+1}: {str(e)}")
     
-    criterion = CustomLoss(delta=0.7, mse_weight=0.3)
-    optimizer = optim.AdamW(model.parameters(), lr=0.0005, weight_decay=1e-4)
-    
-    print("Building and training Enhanced LSTM model...")
-    train_losses, val_losses = train_model(
-        model, 
-        train_loader, 
-        test_loader, 
-        criterion, 
-        optimizer, 
-        num_epochs=400,
-        patience=70,
-        warmup_epochs=10
-    )
-    
-    plt.figure(figsize=(10, 6))
-    plt.plot(range(1, len(train_losses) + 1), train_losses, label='Training Loss')
-    plt.plot(range(1, len(val_losses) + 1), val_losses, label='Validation Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.title('Training and Validation Loss over Epochs')
-    plt.legend()
-    plt.grid(True)
-    plt.savefig('loss_enhanced_model.png')
-    plt.close()
-    print("Training plot saved as 'loss_enhanced_model.png'")
-    
-    print("\nEvaluating model:")
+    print("\nEvaluating ensemble model:")
     y_test_actual, y_pred_actual = evaluate_model(
-        model, X_test, y_test, scaler_y, test_file_names, 
+        models, X_test, y_test, scaler_y, test_file_names, 
         is_log_transformed, original_execution_times
     )
     
-    print("\nSaving the trained model and scalers...")
-    model.eval()
-    model.to('cpu')  # Ensure model is on CPU
-    device = next(model.parameters()).device
-    print(f"Model is on device: {device}")
-    
-    try:
-        sample_input = torch.randn(1, 1, len(feature_names)).to(device)
-        traced_model = torch.jit.trace(model, sample_input)
-        traced_model.save("lstm_model.pt")
-        print("Model successfully saved as 'lstm_model.pt'")
-    except Exception as e:
-        print(f"Error saving the model: {str(e)}")
-    
+    print("\nSaving scalers...")
     save_scaler(scaler_X, feature_names, "scaler_X.json")
     save_y_scaler(scaler_y, is_log_transformed, "scaler_y.json")
     
-    return model, scaler_y, y_test_actual, y_pred_actual
+    return models, scaler_y, y_test_actual, y_pred_actual
 
 if __name__ == "__main__":
     main_dir = "synthetic_data"
     random.seed(42)
     result = main(main_dir)
     if result is not None:
-        model, y_scaler, y_test_actual, y_pred_actual = result
+        models, y_scaler, y_test_actual, y_pred_actual = result
