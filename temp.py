@@ -4,8 +4,6 @@ import numpy as np
 import pandas as pd
 import networkx as nx
 from sklearn.preprocessing import RobustScaler, QuantileTransformer
-from sklearn.decomposition import PCA
-
 from sklearn.decomposition import PCA as SKPCA
 import torch
 import torch.nn as nn
@@ -154,11 +152,19 @@ def extract_features_from_file(file_path):
         scheduling_sequence = [[0.0] * (len(important_metrics) + 9)]
     
     seq_array = np.array(scheduling_sequence)
-    scaler_seq = QuantileTransformer(output_distribution='normal')
+    # Adjust n_quantiles to be at most the number of samples
+    n_samples = seq_array.shape[0]
+    scaler_seq = QuantileTransformer(output_distribution='normal', n_quantiles=min(1000, n_samples))
     scheduling_sequence = scaler_seq.fit_transform(seq_array)
-    # Apply PCA to scheduling sequence
-    pca = SKPCA(n_components=min(10, scheduling_sequence.shape[1]))
-    scheduling_sequence = pca.fit_transform(scheduling_sequence)
+    # Dynamically adjust n_components for PCA
+    n_features = scheduling_sequence.shape[1]
+    desired_components = 10
+    n_components = min(desired_components, n_features, n_samples)
+    if n_components > 0:  # Only apply PCA if there are components to reduce to
+        pca = SKPCA(n_components=n_components)
+        scheduling_sequence = pca.fit_transform(scheduling_sequence)
+    else:
+        print(f"Warning: Skipping PCA for {file_path} as n_components would be 0 (n_features={n_features}, n_samples={n_samples})")
     scheduling_sequence = np.nan_to_num(scheduling_sequence, nan=0.0).tolist()
     
     op_counts = {}
