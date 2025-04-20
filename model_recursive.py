@@ -2,7 +2,8 @@ import os
 import json
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import RobustScaler, QuantileTransformer, VarianceThreshold
+from sklearn.preprocessing import RobustScaler, QuantileTransformer
+from sklearn.feature_selection import VarianceThreshold
 import torch
 import torch.nn as nn
 import torch.optim as optim
