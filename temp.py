@@ -127,7 +127,7 @@ def extract_features_from_file(file_path):
                 sched_feature.update(sf)
             scheduling_features.append(sched_feature)
     
-    # Enhanced scheduling sequence
+    # Enhanced scheduling sequence (without PCA for now)
     scheduling_sequence = []
     for sf in scheduling_features:
         seq_vector = [float(sf.get(metric, 0.0)) for metric in important_metrics]
@@ -156,15 +156,6 @@ def extract_features_from_file(file_path):
     n_samples = seq_array.shape[0]
     scaler_seq = QuantileTransformer(output_distribution='normal', n_quantiles=min(1000, n_samples))
     scheduling_sequence = scaler_seq.fit_transform(seq_array)
-    # Dynamically adjust n_components for PCA
-    n_features = scheduling_sequence.shape[1]
-    desired_components = 10
-    n_components = min(desired_components, n_features, n_samples)
-    if n_components > 0:  # Only apply PCA if there are components to reduce to
-        pca = SKPCA(n_components=n_components)
-        scheduling_sequence = pca.fit_transform(scheduling_sequence)
-    else:
-        print(f"Warning: Skipping PCA for {file_path} as n_components would be 0 (n_features={n_features}, n_samples={n_samples})")
     scheduling_sequence = np.nan_to_num(scheduling_sequence, nan=0.0).tolist()
     
     op_counts = {}
@@ -273,9 +264,59 @@ def mixup_data(seq_inputs, scalar_inputs, targets, alpha=0.2):
     return seq_inputs_mixed, scalar_inputs_mixed, targets_mixed
 
 def prepare_data_for_model(train_features, test_features):
-    train_sequences = [torch.FloatTensor(f['scheduling_sequence']) for f in train_features]
-    test_sequences = [torch.FloatTensor(f['scheduling_sequence']) for f in test_features]
+    # Collect all scheduling sequences
+    train_sequences_raw = [np.array(f['scheduling_sequence']) for f in train_features]
+    test_sequences_raw = [np.array(f['scheduling_sequence']) for f in test_features]
     
+    # Pad sequences to the same length for PCA
+    max_seq_length = max(max(len(seq) for seq in train_sequences_raw), max(len(seq) for seq in test_sequences_raw))
+    feature_dim = train_sequences_raw[0].shape[1]  # All sequences should have the same feature dimension at this point
+    
+    # Pad sequences with zeros to the maximum length
+    train_sequences_padded = []
+    test_sequences_padded = []
+    for seq in train_sequences_raw:
+        padded_seq = np.zeros((max_seq_length, feature_dim))
+        padded_seq[:len(seq), :] = seq
+        train_sequences_padded.append(padded_seq)
+    for seq in test_sequences_raw:
+        padded_seq = np.zeros((max_seq_length, feature_dim))
+        padded_seq[:len(seq), :] = seq
+        test_sequences_padded.append(padded_seq)
+    
+    # Convert to numpy arrays
+    train_sequences_padded = np.array(train_sequences_padded)  # Shape: (n_samples, max_seq_length, feature_dim)
+    test_sequences_padded = np.array(test_sequences_padded)
+    
+    # Reshape for PCA: (n_samples * max_seq_length, feature_dim)
+    train_reshaped = train_sequences_padded.reshape(-1, feature_dim)
+    test_reshaped = test_sequences_padded.reshape(-1, feature_dim)
+    
+    # Apply PCA to reduce dimensionality
+    desired_components = 10
+    n_samples = train_reshaped.shape[0]
+    n_features = train_reshaped.shape[1]
+    n_components = min(desired_components, n_features, n_samples)
+    if n_components > 0:
+        pca = SKPCA(n_components=n_components)
+        train_transformed = pca.fit_transform(train_reshaped)
+        test_transformed = pca.transform(test_reshaped)
+        print(f"Applied PCA with {n_components} components (original features: {n_features})")
+    else:
+        print("Warning: Skipping PCA as n_components would be 0")
+        train_transformed = train_reshaped
+        test_transformed = test_reshaped
+        n_components = n_features
+    
+    # Reshape back to (n_samples, max_seq_length, n_components)
+    train_transformed = train_transformed.reshape(len(train_features), max_seq_length, n_components)
+    test_transformed = test_transformed.reshape(len(test_features), max_seq_length, n_components)
+    
+    # Convert to tensors
+    train_sequences = [torch.FloatTensor(seq) for seq in train_transformed]
+    test_sequences = [torch.FloatTensor(seq) for seq in test_transformed]
+    
+    # Pad sequences (should now have consistent feature dimensions)
     train_sequences_padded = pad_sequence(train_sequences, batch_first=True)
     test_sequences_padded = pad_sequence(test_sequences, batch_first=True)
     
