@@ -3,7 +3,9 @@ import json
 import numpy as np
 import pandas as pd
 import networkx as nx
-from sklearn.preprocessing import RobustScaler, QuantileTransformer, PCA
+from sklearn.preprocessing import RobustScaler, QuantileTransformer
+from sklearn.decomposition import PCA
+
 from sklearn.decomposition import PCA as SKPCA
 import torch
 import torch.nn as nn
