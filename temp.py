@@ -587,22 +587,37 @@ def save_checkpoint(model, optimizer, scheduler, epoch, best_val_loss, epochs_no
         'train_losses': train_losses,
         'val_losses': val_losses
     }
-    torch.save(checkpoint, checkpoint_path)
-    print(f"Saved checkpoint to {checkpoint_path}")
+    # Verify that all required keys are present before saving
+    required_keys = ['model_state_dict', 'optimizer_state_dict', 'scheduler_state_dict', 'epoch', 'best_val_loss', 'epochs_no_improve', 'train_losses', 'val_losses']
+    if all(key in checkpoint for key in required_keys):
+        torch.save(checkpoint, checkpoint_path)
+        print(f"Saved checkpoint to {checkpoint_path}")
+    else:
+        print(f"Failed to save checkpoint to {checkpoint_path}: Missing required keys")
 
 def load_checkpoint(checkpoint_path, model, optimizer, scheduler):
     if os.path.exists(checkpoint_path):
-        checkpoint = torch.load(checkpoint_path)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        start_epoch = checkpoint['epoch'] + 1
-        best_val_loss = checkpoint['best_val_loss']
-        epochs_no_improve = checkpoint['epochs_no_improve']
-        train_losses = checkpoint['train_losses']
-        val_losses = checkpoint['val_losses']
-        print(f"Loaded checkpoint from {checkpoint_path}, resuming training from epoch {start_epoch}")
-        return start_epoch, best_val_loss, epochs_no_improve, train_losses, val_losses
+        try:
+            checkpoint = torch.load(checkpoint_path)
+            # Verify that all required keys are present
+            required_keys = ['model_state_dict', 'optimizer_state_dict', 'scheduler_state_dict', 'epoch', 'best_val_loss', 'epochs_no_improve', 'train_losses', 'val_losses']
+            if all(key in checkpoint for key in required_keys):
+                model.load_state_dict(checkpoint['model_state_dict'])
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                start_epoch = checkpoint['epoch'] + 1
+                best_val_loss = checkpoint['best_val_loss']
+                epochs_no_improve = checkpoint['epochs_no_improve']
+                train_losses = checkpoint['train_losses']
+                val_losses = checkpoint['val_losses']
+                print(f"Loaded checkpoint from {checkpoint_path}, resuming training from epoch {start_epoch}")
+                return start_epoch, best_val_loss, epochs_no_improve, train_losses, val_losses
+            else:
+                print(f"Checkpoint at {checkpoint_path} is missing required keys. Starting training from scratch.")
+                return 0, float('inf'), 0, [], []
+        except Exception as e:
+            print(f"Failed to load checkpoint from {checkpoint_path}: {str(e)}. Starting training from scratch.")
+            return 0, float('inf'), 0, [], []
     else:
         print("No checkpoint found, starting training from scratch")
         return 0, float('inf'), 0, [], []
@@ -620,7 +635,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, schedule
     warm_up_steps = warm_up_epochs * len(train_loader)
     current_step = start_epoch * len(train_loader)
     
-    best_model_state = model.state_dict().copy() if start_epoch == 0 else checkpoint['model_state_dict']
+    best_model_state = model.state_dict().copy() if start_epoch == 0 else model.state_dict()
     
     for epoch in range(start_epoch, num_epochs):
         model.train()
