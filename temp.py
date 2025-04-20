@@ -5,6 +5,7 @@ import pandas as pd
 import networkx as nx
 from sklearn.preprocessing import RobustScaler, QuantileTransformer
 from sklearn.decomposition import PCA as SKPCA
+from sklearn.feature_selection import VarianceThreshold  # Added this import
 import torch
 import torch.nn as nn
 import torch.optim as optim
