@@ -607,7 +607,7 @@ def load_checkpoint(checkpoint_path, model, optimizer, scheduler):
         print("No checkpoint found, starting training from scratch")
         return 0, float('inf'), 0, [], []
 
-def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=1000, patience=100, accumulation_steps=1, checkpoint_path='model.pth'):
+def train_model(model, train_loader, test_loader, criterion, optimizer, scheduler, num_epochs=1000, patience=100, accumulation_steps=1, checkpoint_path='model.pth'):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     model.to(device)
@@ -618,7 +618,6 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
     warm_up_epochs = 100
     total_steps = num_epochs * len(train_loader)
     warm_up_steps = warm_up_epochs * len(train_loader)
-    scheduler = CosineAnnealingLR(optimizer, T_max=total_steps - warm_up_steps, eta_min=5e-7)
     current_step = start_epoch * len(train_loader)
     
     best_model_state = model.state_dict().copy() if start_epoch == 0 else checkpoint['model_state_dict']
@@ -821,7 +820,7 @@ def main(main_dir):
     print("Training Highly Optimized LSTM model...")
     train_losses, val_losses = train_model(
         model, train_loader, test_loader,
-        custom_loss, optimizer,
+        custom_loss, optimizer, scheduler,
         num_epochs=1000, patience=100, accumulation_steps=1, checkpoint_path='model.pth'
     )
     
