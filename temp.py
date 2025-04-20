@@ -5,7 +5,7 @@ import pandas as pd
 import networkx as nx
 from sklearn.preprocessing import RobustScaler, QuantileTransformer
 from sklearn.decomposition import PCA as SKPCA
-from sklearn.feature_selection import VarianceThreshold  # Added this import
+from sklearn.feature_selection import VarianceThreshold
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -658,6 +658,9 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
             best_val_loss = val_loss
             epochs_no_improve = 0
             best_model_state = model.state_dict().copy()
+            # Save the checkpoint
+            torch.save(best_model_state, 'model.pth')
+            print(f"Saved checkpoint to 'model.pth' with validation loss: {best_val_loss:.4f}")
         else:
             epochs_no_improve += 1
         
