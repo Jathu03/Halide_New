@@ -576,24 +576,54 @@ def create_data_loaders(train_sequences, train_scalar, y_train, test_sequences, 
     
     return train_loader, test_loader
 
-def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=1000, patience=100, accumulation_steps=1):
+def save_checkpoint(model, optimizer, scheduler, epoch, best_val_loss, epochs_no_improve, train_losses, val_losses, checkpoint_path):
+    checkpoint = {
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(),
+        'epoch': epoch,
+        'best_val_loss': best_val_loss,
+        'epochs_no_improve': epochs_no_improve,
+        'train_losses': train_losses,
+        'val_losses': val_losses
+    }
+    torch.save(checkpoint, checkpoint_path)
+    print(f"Saved checkpoint to {checkpoint_path}")
+
+def load_checkpoint(checkpoint_path, model, optimizer, scheduler):
+    if os.path.exists(checkpoint_path):
+        checkpoint = torch.load(checkpoint_path)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        start_epoch = checkpoint['epoch'] + 1
+        best_val_loss = checkpoint['best_val_loss']
+        epochs_no_improve = checkpoint['epochs_no_improve']
+        train_losses = checkpoint['train_losses']
+        val_losses = checkpoint['val_losses']
+        print(f"Loaded checkpoint from {checkpoint_path}, resuming training from epoch {start_epoch}")
+        return start_epoch, best_val_loss, epochs_no_improve, train_losses, val_losses
+    else:
+        print("No checkpoint found, starting training from scratch")
+        return 0, float('inf'), 0, [], []
+
+def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=1000, patience=100, accumulation_steps=1, checkpoint_path='model.pth'):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     model.to(device)
+    
+    # Load checkpoint if it exists
+    start_epoch, best_val_loss, epochs_no_improve, train_losses, val_losses = load_checkpoint(checkpoint_path, model, optimizer, scheduler)
     
     warm_up_epochs = 100
     total_steps = num_epochs * len(train_loader)
     warm_up_steps = warm_up_epochs * len(train_loader)
     scheduler = CosineAnnealingLR(optimizer, T_max=total_steps - warm_up_steps, eta_min=5e-7)
-    current_step = 0
+    current_step = start_epoch * len(train_loader)
     
-    best_val_loss = float('inf')
-    epochs_no_improve = 0
-    best_model_state = None
-    train_losses = []
-    val_losses = []
+    best_model_state = model.state_dict().copy() if start_epoch == 0 else checkpoint['model_state_dict']
     
-    for epoch in range(num_epochs):
+    for epoch in range(start_epoch, num_epochs):
         model.train()
         running_loss = 0.0
         optimizer.zero_grad()
@@ -654,13 +684,15 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
         
         print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
         
+        # Save checkpoint after each epoch
+        save_checkpoint(model, optimizer, scheduler, epoch, best_val_loss, epochs_no_improve, train_losses, val_losses, checkpoint_path)
+        
         if val_loss < best_val_loss and not np.isnan(val_loss) and not np.isinf(val_loss):
             best_val_loss = val_loss
             epochs_no_improve = 0
             best_model_state = model.state_dict().copy()
-            # Save the checkpoint
-            torch.save(best_model_state, 'model.pth')
-            print(f"Saved checkpoint to 'model.pth' with validation loss: {best_val_loss:.4f}")
+            # Save best checkpoint
+            save_checkpoint(model, optimizer, scheduler, epoch, best_val_loss, epochs_no_improve, train_losses, val_losses, 'model_best.pth')
         else:
             epochs_no_improve += 1
         
@@ -781,12 +813,16 @@ def main(main_dir):
     )
     
     optimizer = optim.AdamW(model.parameters(), lr=5e-5, weight_decay=1e-5)
+    warm_up_epochs = 100
+    total_steps = 1000 * len(train_loader)  # num_epochs * len(train_loader)
+    warm_up_steps = warm_up_epochs * len(train_loader)
+    scheduler = CosineAnnealingLR(optimizer, T_max=total_steps - warm_up_steps, eta_min=5e-7)
     
     print("Training Highly Optimized LSTM model...")
     train_losses, val_losses = train_model(
         model, train_loader, test_loader,
         custom_loss, optimizer,
-        num_epochs=1000, patience=100, accumulation_steps=1
+        num_epochs=1000, patience=100, accumulation_steps=1, checkpoint_path='model.pth'
     )
     
     if train_losses is None or val_losses is None:
