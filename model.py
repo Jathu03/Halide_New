@@ -378,9 +378,13 @@ def train_model_with_fold(model, train_loader, val_loader, fold=0,
     criterion = nn.MSELoss()
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     
+    # Initialize a dummy scheduler to pass to load_checkpoint
+    # This will be replaced after loading the checkpoint with the correct total steps
+    dummy_scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=1.0)
+    
     # Load checkpoint if exists
     start_epoch, train_losses, val_losses, _, best_val_loss = load_checkpoint(
-        model, optimizer, scheduler, checkpoint_path, device
+        model, optimizer, dummy_scheduler, checkpoint_path, device
     )
     
     # Learning rate scheduler
@@ -402,6 +406,11 @@ def train_model_with_fold(model, train_loader, val_loader, fold=0,
         )
     else:
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=remaining_epochs, eta_min=min_lr)
+    
+    # Load the scheduler state from the checkpoint into the new scheduler
+    if os.path.exists(checkpoint_path):
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
     
     scaler = GradScaler() if use_amp else None
     epochs_no_improve = 0
