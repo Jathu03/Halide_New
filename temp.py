@@ -326,10 +326,11 @@ def prepare_data_for_model(train_features, test_features, test_size=50):
     X_test_tensor = torch.FloatTensor(X_test_scaled).unsqueeze(1)
     y_test_tensor = torch.FloatTensor(y_test_scaled)
     
-    print(f"Input feature dimension: {X_train_scaled.shape[1]}")
+    input_size = X_train_scaled.shape[1]
+    print(f"Input feature dimension: {input_size}")
     
     return (X_train_tensor, y_train_tensor, X_test_tensor, y_test_tensor, 
-            scaler_y, X_train_scaled.shape[1], is_log_transformed)
+            scaler_y, input_size, is_log_transformed)
 
 class Attention(nn.Module):
     def __init__(self, hidden_size):
@@ -532,17 +533,22 @@ def save_checkpoint(model, optimizer, scheduler, epoch, train_losses, val_losses
 
 def load_checkpoint(model, optimizer, scheduler, checkpoint_path='checkpoint_lstm.pth'):
     if os.path.exists(checkpoint_path):
-        checkpoint = torch.load(checkpoint_path, map_location=torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        start_epoch = checkpoint['epoch'] + 1
-        train_losses = checkpoint['train_losses']
-        val_losses = checkpoint['val_losses']
-        best_val_loss = checkpoint['best_val_loss']
-        epochs_no_improve = checkpoint['epochs_no_improve']
-        print(f"Loaded checkpoint from {checkpoint_path}, resuming from epoch {start_epoch}")
-        return start_epoch, train_losses, val_losses, best_val_loss, epochs_no_improve
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location=torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
+            model.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            start_epoch = checkpoint['epoch'] + 1
+            train_losses = checkpoint['train_losses']
+            val_losses = checkpoint['val_losses']
+            best_val_loss = checkpoint['best_val_loss']
+            epochs_no_improve = checkpoint['epochs_no_improve']
+            print(f"Loaded checkpoint from {checkpoint_path}, resuming from epoch {start_epoch}")
+            return start_epoch, train_losses, val_losses, best_val_loss, epochs_no_improve
+        except RuntimeError as e:
+            print(f"Warning: Failed to load checkpoint due to model architecture mismatch: {str(e)}")
+            print(f"Starting training from scratch instead.")
+            return 0, [], [], float('inf'), 0
     else:
         print(f"No checkpoint found at {checkpoint_path}, starting from scratch")
         return 0, [], [], float('inf'), 0
