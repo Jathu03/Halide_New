@@ -380,7 +380,7 @@ def load_checkpoint(model, optimizer, scheduler, checkpoint_path='checkpoint_lst
         print(f"No checkpoint found at {checkpoint_path}, starting from scratch")
         return 0, [], [], float('inf'), 0
 
-def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=200, patience=30, checkpoint_path='checkpoint_lstm.pth'):
+def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=500, patience=30, checkpoint_path='checkpoint_lstm.pth'):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     model.to(device)
@@ -556,7 +556,7 @@ def main(main_dir):
         test_loader, 
         criterion, 
         optimizer, 
-        num_epochs=200,
+        num_epochs=500,
         patience=30,
         checkpoint_path='checkpoint_lstm.pth'
     )
