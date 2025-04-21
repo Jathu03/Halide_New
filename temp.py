@@ -221,7 +221,7 @@ def process_main_directory(main_dir):
     
     return train_features, test_features, list(test_file_names)
 
-def clean_and_transform_features(train_features, test_features):
+def clean_and_transform_features(train_features, test_features, test_size=50):
     all_features_df = pd.DataFrame(train_features + test_features)
     
     # Remove outliers in execution time using IQR
@@ -232,6 +232,15 @@ def clean_and_transform_features(train_features, test_features):
     upper_bound = Q3 + 1.5 * IQR
     all_features_df = all_features_df[(all_features_df['execution_time'] >= lower_bound) & (all_features_df['execution_time'] <= upper_bound)]
     print(f"Removed {len(train_features + test_features) - len(all_features_df)} outliers based on execution time")
+    
+    # After outlier removal, ensure we have enough samples for the test set
+    if len(all_features_df) < test_size:
+        raise ValueError(f"After outlier removal, only {len(all_features_df)} samples remain, but {test_size} are required for the test set.")
+    
+    # Adjust the train-test split based on the remaining data
+    train_size = len(all_features_df) - test_size
+    if train_size <= 0:
+        raise ValueError("Not enough samples remaining for training after outlier removal and reserving test set.")
     
     # Log-transform skewed features
     skewed_features = ['total_bytes_at_production', 'total_vectors', 'total_parallelism']
@@ -267,14 +276,18 @@ def clean_and_transform_features(train_features, test_features):
     numeric_cols = all_features_df.select_dtypes(include=['number']).columns
     all_features_df = all_features_df[numeric_cols]
     
-    train_size = len(train_features)
+    # Split into train and test based on the adjusted sizes
     train_df = all_features_df.iloc[:train_size]
     test_df = all_features_df.iloc[train_size:]
     
+    # Verify that test_df has the expected number of samples
+    if len(test_df) != test_size:
+        raise ValueError(f"Test set has {len(test_df)} samples, but expected {test_size}.")
+    
     return train_df, test_df
 
-def prepare_data_for_model(train_features, test_features):
-    train_df, test_df = clean_and_transform_features(train_features, test_features)
+def prepare_data_for_model(train_features, test_features, test_size=50):
+    train_df, test_df = clean_and_transform_features(train_features, test_features, test_size=test_size)
     
     if 'execution_time_log' in train_df.columns:
         y_train = train_df['execution_time_log'].values.reshape(-1, 1)
@@ -620,7 +633,7 @@ def main(main_dir):
     for feature, fname in zip(test_features, test_file_names):
         original_execution_times[fname] = feature['execution_time']
     
-    X_train, y_train, X_test, y_test, y_scaler, input_size, is_log_transformed = prepare_data_for_model(train_features, test_features)
+    X_train, y_train, X_test, y_test, y_scaler, input_size, is_log_transformed = prepare_data_for_model(train_features, test_features, test_size=50)
     
     train_loader, test_loader = create_data_loaders(X_train, y_train, X_test, y_test, batch_size=16)
     
