@@ -162,7 +162,6 @@ def extract_features_from_file(file_path):
     if 'nodes_count' in features and 'scheduling_count' in features:
         features['nodes_per_schedule'] = features['nodes_count'] / (features['scheduling_count'] + 1e-8)
     
-    # Add interaction term between significant features
     features['inner_parallelism_total_parallelism'] = features.get('sched_inner_parallelism', 0) * features['total_parallelism']
     
     return features
@@ -226,7 +225,6 @@ def process_main_directory(main_dir):
 def clean_and_transform_features(train_features, test_features, test_size=50):
     all_features_df = pd.DataFrame(train_features + test_features)
     
-    # Remove outliers based on execution time
     Q1 = all_features_df['execution_time'].quantile(0.25)
     Q3 = all_features_df['execution_time'].quantile(0.75)
     IQR = Q3 - Q1
@@ -242,7 +240,6 @@ def clean_and_transform_features(train_features, test_features, test_size=50):
     if train_size <= 0:
         raise ValueError("Not enough samples remaining for training after outlier removal and reserving test set.")
     
-    # Drop features with low importance (Random Forest importance < 0.01 and low correlation)
     low_importance_features = [
         'sched_num_scalars', 'sched_points_computed_total', 'sched_bytes_at_realization',
         'sched_outer_parallelism', 'sched_num_realizations', 'sched_num_productions',
@@ -252,7 +249,6 @@ def clean_and_transform_features(train_features, test_features, test_size=50):
     all_features_df = all_features_df.drop(columns=[col for col in low_importance_features if col in all_features_df.columns])
     print(f"Dropped {len(low_importance_features)} low-importance features")
     
-    # Log transform skewed features
     skewed_features = ['total_bytes_at_production', 'total_vectors', 'total_parallelism']
     for feature in skewed_features:
         if feature in all_features_df.columns:
@@ -261,20 +257,17 @@ def clean_and_transform_features(train_features, test_features, test_size=50):
     
     all_features_df = all_features_df.fillna(0)
     
-    # Drop constant columns
     constant_columns = [col for col in all_features_df.columns 
                        if col != 'execution_time' and all_features_df[col].nunique() == 1]
     all_features_df = all_features_df.drop(columns=constant_columns)
     print(f"Dropped {len(constant_columns)} constant columns")
     
-    # Drop highly correlated features
     corr_matrix = all_features_df.drop(['execution_time'], axis=1).corr().abs()
     upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
     to_drop = [column for column in upper.columns if any(upper[column] > 0.9)]
     all_features_df = all_features_df.drop(columns=to_drop)
     print(f"Dropped {len(to_drop)} highly correlated features")
     
-    # Compute interaction term after dropping
     if 'log_total_bytes_at_production' in all_features_df.columns and 'log_total_vectors' in all_features_df.columns:
         all_features_df['log_bytes_per_vector'] = all_features_df['log_total_bytes_at_production'] / (all_features_df['log_total_vectors'] + 1e-8)
     else:
@@ -295,15 +288,16 @@ def clean_and_transform_features(train_features, test_features, test_size=50):
 def prepare_data_for_model(train_features, test_features, test_size=50):
     train_df, test_df = clean_and_transform_features(train_features, test_features, test_size=test_size)
     
-    y_train = train_df['execution_time'].values.reshape(-1, 1)
-    y_test = test_df['execution_time'].values.reshape(-1, 1)
+    # Log transform execution time to reduce skewness
+    y_train = np.log1p(train_df['execution_time'].values.reshape(-1, 1))
+    y_test = np.log1p(test_df['execution_time'].values.reshape(-1, 1))
     train_df = train_df.drop('execution_time', axis=1)
     test_df = test_df.drop('execution_time', axis=1)
-    is_log_transformed = False
+    is_log_transformed = True
     
     print("\nDebugging target values in prepare_data_for_model:")
-    print(f"First 5 y_train raw: {y_train[:5].flatten()}")
-    print(f"First 5 y_test raw: {y_test[:5].flatten()}")
+    print(f"First 5 y_train raw (log-transformed): {y_train[:5].flatten()}")
+    print(f"First 5 y_test raw (log-transformed): {y_test[:5].flatten()}")
     
     scaler_X = StandardScaler()
     scaler_y = RobustScaler()
@@ -316,17 +310,16 @@ def prepare_data_for_model(train_features, test_features, test_size=50):
     print(f"First 5 y_train scaled: {y_train_scaled[:5].flatten()}")
     print(f"First 5 y_test scaled: {y_test_scaled[:5].flatten()}")
     
-    # Data augmentation with emphasis on significant features
+    # Enhanced data augmentation
     X_train_scaled_aug = []
     y_train_scaled_aug = []
-    train_df_array = train_df.to_numpy()  # For feature-based checks
+    train_df_array = train_df.to_numpy()
     
     for i in range(len(y_train_scaled)):
-        actual_time = y_train[i][0]
+        actual_time = np.expm1(y_train[i][0])  # Convert back to original scale for condition
         X_train_scaled_aug.append(X_train_scaled[i])
         y_train_scaled_aug.append(y_train_scaled[i])
         
-        # Augment more if significant features are prominent
         inner_parallelism_idx = train_df.columns.get_loc('sched_inner_parallelism') if 'sched_inner_parallelism' in train_df.columns else -1
         total_parallelism_idx = train_df.columns.get_loc('total_parallelism') if 'total_parallelism' in train_df.columns else -1
         
@@ -336,13 +329,20 @@ def prepare_data_for_model(train_features, test_features, test_size=50):
         if total_parallelism_idx != -1 and train_df_array[i, total_parallelism_idx] > train_df['total_parallelism'].quantile(0.75):
             is_significant = True
         
-        # Augment small/large execution times or if significant features are high
-        if actual_time < 100 or actual_time > 500 or is_significant:
-            for _ in range(3 if is_significant else 2):  # More augmentation for significant samples
-                noise_X = np.random.normal(0, 0.05, X_train_scaled[i].shape)
-                noise_y = np.random.normal(0, 0.05, y_train_scaled[i].shape)
-                X_train_scaled_aug.append(X_train_scaled[i] + noise_X)
-                y_train_scaled_aug.append(y_train_scaled[i] + noise_y)
+        # Augment more for small execution times and significant features
+        augment_count = 0
+        if actual_time < 100:
+            augment_count = 5  # Increased for small execution times
+        elif actual_time > 500 or is_significant:
+            augment_count = 3
+        else:
+            augment_count = 2
+        
+        for _ in range(augment_count):
+            noise_X = np.random.normal(0, 0.05, X_train_scaled[i].shape)
+            noise_y = np.random.normal(0, 0.05, y_train_scaled[i].shape)
+            X_train_scaled_aug.append(X_train_scaled[i] + noise_X)
+            y_train_scaled_aug.append(y_train_scaled[i] + noise_y)
     
     X_train_scaled_aug = np.array(X_train_scaled_aug)
     y_train_scaled_aug = np.array(y_train_scaled_aug)
@@ -359,18 +359,21 @@ def prepare_data_for_model(train_features, test_features, test_size=50):
             scaler_y, input_size, is_log_transformed)
 
 class ImprovedLSTMModel(nn.Module):
-    def __init__(self, input_size, hidden_size=128, output_size=1, dropout_rate=0.2):
+    def __init__(self, input_size, hidden_size=192, output_size=1, dropout_rate=0.2):
         super(ImprovedLSTMModel, self).__init__()
         self.hidden_size = hidden_size
         self.num_layers = 2
         
         self.lstm = nn.LSTM(input_size, hidden_size, num_layers=self.num_layers, batch_first=True, dropout=dropout_rate)
         
-        self.fc1 = nn.Linear(hidden_size, 64)
-        self.bn1 = nn.BatchNorm1d(64)
-        self.fc2 = nn.Linear(64, 32)
-        self.bn2 = nn.BatchNorm1d(32)
-        self.fc3 = nn.Linear(32, output_size)
+        # Enhanced fully connected layers
+        self.fc1 = nn.Linear(hidden_size, 128)
+        self.bn1 = nn.BatchNorm1d(128)
+        self.fc2 = nn.Linear(128, 64)
+        self.bn2 = nn.BatchNorm1d(64)
+        self.fc3 = nn.Linear(64, 32)
+        self.bn3 = nn.BatchNorm1d(32)
+        self.fc4 = nn.Linear(32, output_size)
         
         self.dropout = nn.Dropout(dropout_rate)
         self.leaky_relu = nn.LeakyReLU(0.1)
@@ -395,6 +398,11 @@ class ImprovedLSTMModel(nn.Module):
         x = self.dropout(x)
         
         x = self.fc3(x)
+        x = self.bn3(x)
+        x = self.leaky_relu(x)
+        x = self.dropout(x)
+        
+        x = self.fc4(x)
         return x
 
 def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=16):
@@ -418,14 +426,18 @@ class WeightedCombinedLoss(nn.Module):
         mse = self.mse_loss(outputs, targets)
         mape = torch.abs((targets - outputs) / (targets + self.epsilon)) * 100
         
+        # Convert targets back to original scale to check execution time range
+        # Assuming targets are scaled and log-transformed
+        # This requires access to the scaler_y, which isn't passed here
+        # For simplicity, we'll use the scaled values and approximate
         weights = torch.ones_like(targets)
-        weights = torch.where(targets < 0.5, 0.5, weights)
-        weights = torch.where(targets > 2.0, 1.5, weights)
+        weights = torch.where(targets < -1.0, 2.0, weights)  # Approximate for small execution times (<100ms in log scale)
+        weights = torch.where(targets > 2.0, 1.5, weights)   # Large execution times
         
-        # Increase weight for samples with high values of significant features
+        # Weight based on significant features
         if feature_indices['sched_inner_parallelism'] != -1:
             inner_parallelism_vals = inputs[:, 0, feature_indices['sched_inner_parallelism']]
-            weights = torch.where(inner_parallelism_vals > 1.0, weights * 1.5, weights)  # 1.0 is approx 75th percentile in standard scaled space
+            weights = torch.where(inner_parallelism_vals > 1.0, weights * 1.5, weights)
         
         if feature_indices['total_parallelism'] != -1:
             total_parallelism_vals = inputs[:, 0, feature_indices['total_parallelism']]
@@ -436,15 +448,15 @@ class WeightedCombinedLoss(nn.Module):
         
         return self.mape_weight * weighted_mape + self.mse_weight * weighted_mse
 
-def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=1000, patience=50, checkpoint_path='checkpoint_lstm.pth', save_freq=10):
+def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=1000, patience=75, checkpoint_path='checkpoint_lstm.pth', save_freq=10):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     model.to(device)
     
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=20, verbose=True)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=30, verbose=True)
     
     warmup_epochs = 20
-    base_lr = 0.0005
+    base_lr = 0.0003  # Reduced learning rate
     for param_group in optimizer.param_groups:
         param_group['lr'] = base_lr / warmup_epochs
     
@@ -454,10 +466,6 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
     
     best_model_state = None
     
-    # Get feature indices for significant features
-    feature_names = train_loader.dataset.tensors[0].shape[2]  # Assuming train_loader is ready
-    dummy_df = pd.DataFrame(np.zeros((1, feature_names)), columns=[f'feat_{i}' for i in range(feature_names)])
-    # These indices need to be set after feature selection; for now, we'll approximate
     feature_indices = {
         'sched_inner_parallelism': -1,
         'total_parallelism': -1
@@ -683,13 +691,13 @@ def main(main_dir):
     
     model = ImprovedLSTMModel(
         input_size=input_size,
-        hidden_size=128,
+        hidden_size=192,
         output_size=1,
         dropout_rate=0.2
     )
     
     criterion = WeightedCombinedLoss(mape_weight=0.4, mse_weight=0.6, epsilon=1e-4)
-    optimizer = optim.AdamW(model.parameters(), lr=0.0005, weight_decay=1e-3)
+    optimizer = optim.AdamW(model.parameters(), lr=0.0003, weight_decay=1e-3)
     
     print("Building and training Improved LSTM model...")
     train_losses, val_losses = train_model(
@@ -699,7 +707,7 @@ def main(main_dir):
         criterion, 
         optimizer, 
         num_epochs=1000,
-        patience=50,
+        patience=75,
         checkpoint_path='checkpoint_lstm.pth',
         save_freq=10
     )
