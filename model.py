@@ -378,28 +378,31 @@ def train_model_with_fold(model, train_loader, val_loader, fold=0,
     criterion = nn.MSELoss()
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     
+    # Load checkpoint if exists
+    start_epoch, train_losses, val_losses, _, best_val_loss = load_checkpoint(
+        model, optimizer, scheduler, checkpoint_path, device
+    )
+    
     # Learning rate scheduler
     steps_per_epoch = max(1, len(train_loader) // gradient_accumulation_steps)
-    print(f"Scheduler: steps_per_epoch={steps_per_epoch}, total_steps={steps_per_epoch * epochs}")
+    remaining_epochs = epochs - start_epoch
+    total_steps = steps_per_epoch * remaining_epochs
+    print(f"Scheduler: steps_per_epoch={steps_per_epoch}, remaining_epochs={remaining_epochs}, total_steps={total_steps}")
     
     if use_warmup:
         scheduler = OneCycleLR(
             optimizer, 
             max_lr=learning_rate,
             steps_per_epoch=steps_per_epoch,
-            epochs=epochs,
-            pct_start=max(0.05, warmup_epochs / epochs),
+            epochs=remaining_epochs,
+            pct_start=max(0.05, warmup_epochs / remaining_epochs) if remaining_epochs > 0 else 0.05,
             anneal_strategy='cos',
             div_factor=25,
             final_div_factor=1000,
         )
     else:
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=min_lr)
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=remaining_epochs, eta_min=min_lr)
     
-    # Load checkpoint if exists
-    start_epoch, train_losses, val_losses, _, best_val_loss = load_checkpoint(
-        model, optimizer, scheduler, checkpoint_path, device
-    )
     scaler = GradScaler() if use_amp else None
     epochs_no_improve = 0
     best_model_path = f'best_graph_lstm_model_fold_{fold}.pth'
