@@ -1,441 +1,526 @@
 import os
-import pandas as pd
-import numpy as np
 import json
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.linear_model import LinearRegression
-from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_squared_error, r2_score
+import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
-from datetime import datetime
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, r2_score
+import scipy.stats as stats
+from pathlib import Path
+import warnings
+warnings.filterwarnings('ignore')
 
-def find_all_files(root_dir):
-    """Find all JSON files recursively in the given directory."""
-    all_files = []
-    for dirpath, dirnames, filenames in os.walk(root_dir):
-        for filename in filenames:
-            if filename.endswith('.json'):  # Filter for JSON files
-                all_files.append(os.path.join(dirpath, filename))
-    return all_files
+def get_execution_time(file_path):
+    try:
+        with open(file_path, 'rb') as f:
+            raw_content = f.read()
+            content = raw_content.decode('utf-8', errors='replace').replace('\0', '')
+            data = json.loads(content)
+        
+        schedules = data.get("scheduling_data", [])
+        for item in schedules:
+            if isinstance(item, dict) and item.get('name') == 'total_execution_time_ms':
+                execution_time = item.get('value')
+                if execution_time is not None:
+                    return float(execution_time)
+        
+        if schedules and isinstance(schedules[-1], dict) and "value" in schedules[-1]:
+            execution_time = schedules[-1]["value"]
+            return float(execution_time)
+        
+        return None
+    
+    except Exception as e:
+        print(f"Error processing {file_path}: {str(e)}")
+        return None
 
-def convert_to_numeric(value):
-    """Try to convert a value to numeric, handling various formats."""
-    if isinstance(value, (int, float)):
-        return float(value)
-    elif isinstance(value, str):
-        # Remove any non-numeric characters except decimal points and negative signs
-        try:
-            # Try direct conversion first
-            return float(value)
-        except ValueError:
-            # If that fails, try to extract numeric part
-            import re
-            numeric_str = re.sub(r'[^0-9.-]', '', value)
-            if numeric_str:
-                try:
-                    return float(numeric_str)
-                except ValueError:
-                    return None
-    return None
-
-def extract_data_from_file(file_path):
-    """Extract features and execution time from a JSON file."""
+def extract_features_from_file(file_path):
     try:
         with open(file_path, 'r') as f:
             data = json.load(f)
-        
-        # Create a dictionary to store the data
-        result = {'file_path': file_path}
-        
-        # Extract execution time from the specific structure
-        execution_time = None
-        
-        # Check if scheduling_data exists and contains a list of items
-        if 'scheduling_data' in data and isinstance(data['scheduling_data'], list):
-            # First, print all item names for the first file to help debug
-            if 'debug_first_file' not in globals():
-                global debug_first_file
-                debug_first_file = True
-                print("DEBUG: First file scheduling_data items:")
-                for item in data['scheduling_data']:
-                    if isinstance(item, dict) and 'name' in item:
-                        print(f"  Item name: {item['name']}, value type: {type(item.get('value', 'N/A'))}")
-            
-            # Extract all scheduling data items as features
-            for item in data['scheduling_data']:
-                if isinstance(item, dict) and 'name' in item and 'value' in item:
-                    # Get the name and value
-                    name = item['name']
-                    value = item['value']
-                    
-                    # If this is the execution time, store it separately
-                    if name == 'total_execution_time_ms':
-                        execution_time = convert_to_numeric(value)
-                    else:
-                        # Convert to numeric if possible
-                        numeric_value = convert_to_numeric(value)
-                        if numeric_value is not None:
-                            result[f"sched_{name}"] = numeric_value
-                        elif isinstance(value, (bool)):
-                            result[f"sched_{name}"] = 1 if value else 0
-                        elif isinstance(value, str) and value.lower() in ('true', 'false'):
-                            result[f"sched_{name}"] = 1 if value.lower() == 'true' else 0
-        
-        # If execution time wasn't found, try alternate locations
-        if execution_time is None and 'scheduling_data' in data:
-            # Look directly in the scheduling_data object
-            for key, value in data.get('scheduling_data', {}).items():
-                if key in ('total_execution_time_ms', 'execution_time', 'runtime', 'time_ms', 'elapsed_time'):
-                    execution_time = convert_to_numeric(value)
-                    break
-        
-        # If we still couldn't find execution time, print debug info and return None
+    
+        execution_time = get_execution_time(file_path)
         if execution_time is None:
-            print(f"Warning: Could not find execution time in {file_path}")
             return None
+    
+        nodes_features = []
+        edges_features = []
+        programming_details = data.get("programming_details", {})
         
-        result['execution_time'] = execution_time
+        if 'Nodes' in programming_details:
+            for node in programming_details['Nodes']:
+                node_feature = {}
+                node_feature['Name'] = node.get('Name', '')
+                if 'Details' in node and 'Op histogram' in node['Details']:
+                    op_hist = node['Details']['Op histogram']
+                    for op_line in op_hist:
+                        parts = op_line.strip().split(':')
+                        if len(parts) == 2:
+                            op_name = parts[0].strip()
+                            op_count = int(parts[1].strip())
+                            node_feature[f'op_{op_name.lower()}'] = op_count
+                nodes_features.append(node_feature)
         
-        # Extract features from programming_details if available
-        if 'programming_details' in data:
-            if isinstance(data['programming_details'], dict):
-                # If it's a dictionary, process all key-value pairs
-                for key, value in data['programming_details'].items():
-                    numeric_value = convert_to_numeric(value)
-                    if numeric_value is not None:
-                        result[f"prog_{key}"] = numeric_value
-                    elif isinstance(value, (bool)):
-                        result[f"prog_{key}"] = 1 if value else 0
-                    elif isinstance(value, str) and value.lower() in ('true', 'false'):
-                        result[f"prog_{key}"] = 1 if value.lower() == 'true' else 0
-            elif isinstance(data['programming_details'], list):
-                # If it's a list of items like scheduling_data
-                for item in data['programming_details']:
-                    if isinstance(item, dict) and 'name' in item and 'value' in item:
-                        numeric_value = convert_to_numeric(item['value'])
-                        if numeric_value is not None:
-                            result[f"prog_{item['name']}"] = numeric_value
-                        elif isinstance(item['value'], (bool)):
-                            result[f"prog_{item['name']}"] = 1 if item['value'] else 0
-                        elif isinstance(item['value'], str) and item['value'].lower() in ('true', 'false'):
-                            result[f"prog_{item['name']}"] = 1 if item['value'].lower() == 'true' else 0
+        if 'Edges' in programming_details:
+            for edge in programming_details['Edges']:
+                edge_feature = {}
+                edge_feature['From'] = edge.get('From', '')
+                edge_feature['To'] = edge.get('To', '')
+                edge_feature['Name'] = edge.get('Name', '')
+                edges_features.append(edge_feature)
+    
+        scheduling_features = []
+        scheduling_data = data.get("scheduling_data", [])
+        if not scheduling_data and 'Schedules' in programming_details:
+            scheduling_data = programming_details['Schedules']
+    
+        if scheduling_data:
+            for sched in scheduling_data:
+                sched_feature = {}
+                sched_feature['Name'] = sched.get('Name', '')
+                if 'Details' in sched and 'scheduling_feature' in sched['Details']:
+                    sf = sched['Details']['scheduling_feature']
+                    for key, value in sf.items():
+                        sched_feature[key] = value
+                scheduling_features.append(sched_feature)
+    
+        features = {
+            'execution_time': execution_time,
+            'nodes_count': len(nodes_features),
+            'edges_count': len(edges_features),
+            'scheduling_count': len(scheduling_features),
+            'total_bytes_at_production': 0.0,
+            'total_vectors': 0.0,
+            'total_parallelism': 0.0
+        }
         
-        # Extract any other top-level numeric features
-        for key, value in data.items():
-            if key not in ('scheduling_data', 'programming_details', 'file_path'):
-                numeric_value = convert_to_numeric(value)
-                if numeric_value is not None:
-                    result[f"other_{key}"] = numeric_value
-                elif isinstance(value, (bool)):
-                    result[f"other_{key}"] = 1 if value else 0
-                elif isinstance(value, str) and value.lower() in ('true', 'false'):
-                    result[f"other_{key}"] = 1 if value.lower() == 'true' else 0
+        if len(nodes_features) > 0 and len(edges_features) > 0:
+            features['node_edge_ratio'] = len(nodes_features) / len(edges_features)
+        else:
+            features['node_edge_ratio'] = 0
         
-        # Make sure we have at least one feature in addition to execution_time
-        if len(result) <= 2:  # file_path and execution_time only
-            print(f"Warning: No features found in {file_path}")
-            return None
+        op_counts = {}
+        for node in nodes_features:
+            for key, value in node.items():
+                if key.startswith('op_'):
+                    op_counts[key] = op_counts.get(key, 0) + value
+        features.update(op_counts)
         
-        return result
+        if scheduling_features and scheduling_features[0]:
+            important_metrics = [
+                'bytes_at_production', 'bytes_at_realization', 'bytes_at_root', 'bytes_at_task',
+                'inner_parallelism', 'outer_parallelism', 'num_productions', 'num_realizations',
+                'num_scalars', 'num_vectors', 'points_computed_total', 'working_set'
+            ]
+            for metric in important_metrics:
+                if metric in scheduling_features[0]:
+                    features[f'sched_{metric}'] = scheduling_features[0][metric]
+            
+            total_bytes_at_production = sum(sf.get('bytes_at_production', 0) for sf in scheduling_features if isinstance(sf, dict))
+            total_vectors = sum(sf.get('num_vectors', 0) for sf in scheduling_features if isinstance(sf, dict))
+            total_parallelism = sum(sf.get('inner_parallelism', 0) * sf.get('outer_parallelism', 1) for sf in scheduling_features if isinstance(sf, dict))
+            
+            features['total_bytes_at_production'] = total_bytes_at_production
+            features['total_vectors'] = total_vectors
+            features['total_parallelism'] = total_parallelism
+            
+            if total_vectors > 0:
+                features['bytes_per_vector'] = total_bytes_at_production / total_vectors
+            else:
+                features['bytes_per_vector'] = 0
+            
+            if 'working_set' in scheduling_features[0] and 'bytes_at_production' in scheduling_features[0]:
+                features['memory_pressure'] = scheduling_features[0]['working_set'] / scheduling_features[0]['bytes_at_production'] if scheduling_features[0]['bytes_at_production'] > 0 else 0
+        
+        if len(nodes_features) > 0:
+            op_types = sum(1 for k in op_counts.keys())
+            features['avg_ops_per_node'] = sum(op_counts.values()) / len(nodes_features)
+            features['op_diversity'] = op_types / len(nodes_features) if len(nodes_features) > 0 else 0
+        
+        features['bytes_per_parallelism'] = features['total_bytes_at_production'] / (features['total_parallelism'] + 1e-8)
+        features['nodes_per_schedule'] = features['nodes_count'] / (features['scheduling_count'] + 1e-8)
+        
+        return features
     
     except Exception as e:
-        print(f"Error processing file {file_path}: {str(e)}")
+        print(f"Error extracting features from {file_path}: {str(e)}")
         return None
 
-def analyze_data(df):
-    """Perform analysis on the collected data."""
-    # Drop rows with missing execution times
-    df = df.dropna(subset=['execution_time'])
+def process_all_files(main_dir):
+    all_features = []
+    file_paths = []
     
-    # Print basic info
-    print(f"Dataset shape: {df.shape}")
-    print(f"Execution time range: {df['execution_time'].min()} - {df['execution_time'].max()} ms")
+    main_dir_path = Path(main_dir)
+    if not main_dir_path.exists():
+        print(f"Directory '{main_dir}' does not exist.")
+        return all_features, file_paths
     
-    # Drop the file_path column for analysis
-    if 'file_path' in df.columns:
-        file_paths = df['file_path'].copy()
-        df = df.drop(columns=['file_path'])
+    for subdir_path in main_dir_path.iterdir():
+        if not subdir_path.is_dir():
+            continue
+        
+        for file_path in subdir_path.glob('*.json'):
+            print(f"Processing {file_path}...", end='\r')
+            features = extract_features_from_file(file_path)
+            if features is not None:
+                all_features.append(features)
+                file_paths.append(f"{subdir_path.name}/{file_path.name}")
     
-    # Make sure all columns are numeric
-    for col in df.columns:
-        if col != 'execution_time':
-            try:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
-            except:
-                print(f"Warning: Dropping non-numeric column {col}")
-                df = df.drop(columns=[col])
+    print(f"Processed {len(all_features)} files successfully.           ")
+    return all_features, file_paths
+
+def create_additional_features(df):
+    """Create additional derived features that might help the model"""
+    # Log transform of execution time (for models)
+    df['log_execution_time'] = np.log1p(df['execution_time'])
     
-    # Drop columns with all NA values
-    df = df.dropna(axis=1, how='all')
+    # Efficiency metrics
+    if 'sched_points_computed_total' in df.columns and 'execution_time' in df.columns:
+        df['computation_efficiency'] = df['sched_points_computed_total'] / (df['execution_time'] + 1e-8)
     
-    # Get numeric feature columns
-    feature_cols = [col for col in df.columns if col != 'execution_time']
+    if 'total_bytes_at_production' in df.columns and 'execution_time' in df.columns:
+        df['bytes_processing_rate'] = df['total_bytes_at_production'] / (df['execution_time'] + 1e-8)
     
-    if not feature_cols:
-        return "No numeric features found for analysis."
+    # Memory utilization metrics
+    if 'sched_working_set' in df.columns and 'sched_bytes_at_production' in df.columns:
+        df['memory_utilization_ratio'] = df['sched_working_set'] / (df['sched_bytes_at_production'] + 1e-8)
     
-    print(f"Numeric features for analysis: {len(feature_cols)}")
-    print(f"Sample features: {feature_cols[:10]}")
+    return df
+
+def analyze_feature_importance(features_list):
+    # Convert to DataFrame
+    df = pd.DataFrame(features_list)
     
-    # Handle any remaining missing values
-    df = df.fillna(df.mean())
+    # Create additional features
+    df = create_additional_features(df)
     
-    # Split data
-    X = df[feature_cols]
+    # Basic analysis of execution time
+    print(f"\nExecution time statistics:")
+    print(f"Min: {df['execution_time'].min():.2f} ms")
+    print(f"Max: {df['execution_time'].max():.2f} ms")
+    print(f"Mean: {df['execution_time'].mean():.2f} ms")
+    print(f"Median: {df['execution_time'].median():.2f} ms")
+    print(f"Std Dev: {df['execution_time'].std():.2f} ms")
+    
+    # Separate features and target
     y = df['execution_time']
+    X = df.drop(['execution_time', 'log_execution_time'] if 'log_execution_time' in df.columns else ['execution_time'], axis=1)
     
-    # Feature scaling
+    # Fill missing values
+    X = X.fillna(0)
+    
+    # Remove constant features
+    constant_features = [col for col in X.columns if X[col].nunique() <= 1]
+    if constant_features:
+        print(f"\nRemoving {len(constant_features)} constant features")
+        X = X.drop(constant_features, axis=1)
+    
+    # Scale features
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
     
-    # Split into training and testing sets
+    # Split data for evaluation
     X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2, random_state=42)
     
-    # Train a Random Forest model for feature importance
-    rf_model = RandomForestRegressor(n_estimators=100, random_state=42)
-    rf_model.fit(X_train, y_train)
+    # Train Random Forest
+    rf = RandomForestRegressor(n_estimators=100, random_state=42)
+    rf.fit(X_train, y_train)
+    
+    # Model evaluation
+    y_pred = rf.predict(X_test)
+    mse = mean_squared_error(y_test, y_pred)
+    r2 = r2_score(y_test, y_pred)
+    
+    print(f"\nModel Evaluation:")
+    print(f"Mean Squared Error: {mse:.2f}")
+    print(f"R² Score: {r2:.4f}")
+    
+    # Cross-validation
+    cv_scores = cross_val_score(rf, X_scaled, y, cv=5, scoring='r2')
+    print(f"Cross-validation R² scores: {cv_scores}")
+    print(f"Mean CV R²: {cv_scores.mean():.4f}")
     
     # Feature importance from Random Forest
-    rf_feature_importance = pd.DataFrame({
-        'Feature': feature_cols,
-        'RF_Importance': rf_model.feature_importances_
-    }).sort_values('RF_Importance', ascending=False)
+    feature_importances = pd.Series(rf.feature_importances_, index=X.columns)
+    feature_importances = feature_importances.sort_values(ascending=False)
     
-    # Linear regression for coefficients
-    lr_model = LinearRegression()
-    lr_model.fit(X_train, y_train)
+    # Compute Pearson and Spearman correlation coefficients
+    pearson_correlations = {}
+    spearman_correlations = {}
     
-    # Calculate standardized coefficients
-    lr_importance = np.abs(lr_model.coef_ * np.std(X, axis=0))
+    for column in X.columns:
+        p_corr, _ = stats.pearsonr(X[column], y)
+        s_corr, _ = stats.spearmanr(X[column], y)
+        pearson_correlations[column] = p_corr
+        spearman_correlations[column] = s_corr
     
-    # Linear regression coefficients
-    lr_feature_importance = pd.DataFrame({
-        'Feature': feature_cols,
-        'LR_Coefficient': lr_model.coef_,
-        'LR_Standardized_Coefficient': lr_importance
-    }).sort_values('LR_Standardized_Coefficient', ascending=False)
+    pearson_correlations = pd.Series(pearson_correlations).sort_values(ascending=False, key=abs)
+    spearman_correlations = pd.Series(spearman_correlations).sort_values(ascending=False, key=abs)
     
-    # Evaluate models
-    rf_predictions = rf_model.predict(X_test)
-    rf_mse = mean_squared_error(y_test, rf_predictions)
-    rf_r2 = r2_score(y_test, rf_predictions)
-    
-    lr_predictions = lr_model.predict(X_test)
-    lr_mse = mean_squared_error(y_test, lr_predictions)
-    lr_r2 = r2_score(y_test, lr_predictions)
-    
-    # Create correlation matrix
-    correlation_matrix = df.corr()
-    correlation_with_time = correlation_matrix['execution_time'].sort_values(ascending=False)
-    
-    # Basic statistics
-    basic_stats = df.describe()
-    
-    # Create plots directory if it doesn't exist
-    plots_dir = "feature_analysis_plots"
-    os.makedirs(plots_dir, exist_ok=True)
-    
-    # Plot feature importance
-    plt.figure(figsize=(12, 8))
-    top_n = min(20, len(rf_feature_importance))  # Limit to top 20 features
-    sns.barplot(x='RF_Importance', y='Feature', data=rf_feature_importance.head(top_n))
-    plt.title('Top Feature Importance (Random Forest)')
-    plt.tight_layout()
-    plt.savefig(os.path.join(plots_dir, 'rf_feature_importance.png'))
-    
-    # Plot correlation with execution time
-    plt.figure(figsize=(12, 8))
-    correlation_with_time_df = pd.DataFrame(correlation_with_time).drop('execution_time')
-    top_corr = correlation_with_time_df.head(top_n)
-    sns.barplot(x=top_corr['execution_time'], y=top_corr.index)
-    plt.title('Top Correlations with Execution Time')
-    plt.tight_layout()
-    plt.savefig(os.path.join(plots_dir, 'correlation_with_time.png'))
-    
-    # Plot execution time distribution
-    plt.figure(figsize=(12, 6))
-    sns.histplot(df['execution_time'], kde=True, bins=50)
-    plt.title('Execution Time Distribution')
-    plt.tight_layout()
-    plt.savefig(os.path.join(plots_dir, 'execution_time_distribution.png'))
-    
-    # Scatter plots for top features
-    for feature in rf_feature_importance['Feature'][:5]:  # Top 5 features
-        plt.figure(figsize=(10, 6))
-        sns.scatterplot(x=df[feature], y=df['execution_time'])
-        plt.title(f'Execution Time vs {feature}')
-        plt.tight_layout()
-        plt.savefig(os.path.join(plots_dir, f'scatter_{feature}.png'))
-        
-    # Add file_path back for reference
-    if 'file_path' in locals():
-        df['file_path'] = file_paths
-    
-    return {
-        'rf_feature_importance': rf_feature_importance,
-        'lr_feature_importance': lr_feature_importance,
-        'correlation_with_time': correlation_with_time,
-        'basic_stats': basic_stats,
-        'rf_mse': rf_mse,
-        'rf_r2': rf_r2,
-        'lr_mse': lr_mse,
-        'lr_r2': lr_r2,
-        'plots_dir': plots_dir,
-        'df': df
-    }
+    return feature_importances, pearson_correlations, spearman_correlations, y, df, X
 
-def generate_report(analysis_results, output_file="execution_time_analysis_report.txt"):
-    """Generate a comprehensive report from the analysis results."""
-    with open(output_file, 'w') as f:
-        f.write("============================================\n")
-        f.write("EXECUTION TIME FEATURE ANALYSIS REPORT\n")
-        f.write(f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write("============================================\n\n")
-        
-        f.write("SUMMARY\n")
-        f.write("=======\n")
-        f.write("This report analyzes the relationship between various scheduling features\n")
-        f.write("and execution times across multiple files in the dataset.\n\n")
-        
-        # Model performance
-        f.write("MODEL PERFORMANCE\n")
-        f.write("================\n")
-        f.write(f"Random Forest Mean Squared Error: {analysis_results['rf_mse']:.4f}\n")
-        f.write(f"Random Forest R² Score: {analysis_results['rf_r2']:.4f}\n")
-        f.write(f"Linear Regression Mean Squared Error: {analysis_results['lr_mse']:.4f}\n")
-        f.write(f"Linear Regression R² Score: {analysis_results['lr_r2']:.4f}\n\n")
-        
-        # Feature importance from Random Forest
-        f.write("FEATURE IMPORTANCE (RANDOM FOREST)\n")
-        f.write("================================\n")
-        for _, row in analysis_results['rf_feature_importance'].head(20).iterrows():
-            f.write(f"{row['Feature']}: {row['RF_Importance']:.4f}\n")
-        f.write("\n")
-        
-        # Linear regression coefficients
-        f.write("LINEAR REGRESSION COEFFICIENTS (TOP 20)\n")
-        f.write("====================================\n")
-        for _, row in analysis_results['lr_feature_importance'].head(20).iterrows():
-            f.write(f"{row['Feature']}: Raw Coefficient = {row['LR_Coefficient']:.4f}, ")
-            f.write(f"Standardized = {row['LR_Standardized_Coefficient']:.4f}\n")
-        f.write("\n")
-        
-        # Correlation with execution time
-        f.write("CORRELATION WITH EXECUTION TIME (TOP 20)\n")
-        f.write("====================================\n")
-        count = 0
-        for feature, corr in analysis_results['correlation_with_time'].items():
-            if feature != 'execution_time':
-                f.write(f"{feature}: {corr:.4f}\n")
-                count += 1
-                if count >= 20:
-                    break
-        f.write("\n")
-        
-        # Basic statistics
-        f.write("BASIC STATISTICS\n")
-        f.write("===============\n")
-        f.write(str(analysis_results['basic_stats']) + "\n\n")
-        
-        # Visualization information
-        f.write("VISUALIZATIONS\n")
-        f.write("=============\n")
-        f.write(f"Plots have been saved to the '{analysis_results['plots_dir']}' directory.\n")
-        f.write("Available visualizations:\n")
-        f.write("- Random Forest Feature Importance\n")
-        f.write("- Correlation with Execution Time\n")
-        f.write("- Execution Time Distribution\n")
-        f.write("- Scatter plots for top features\n\n")
-        
-        f.write("CONCLUSION\n")
-        f.write("==========\n")
-        
-        # Get top features for conclusion
-        top_features = analysis_results['rf_feature_importance']['Feature'].tolist()[:5]
-        f.write(f"The analysis indicates that the most significant features affecting execution time are:\n")
-        for i, feature in enumerate(top_features, 1):
-            importance = analysis_results['rf_feature_importance'].loc[
-                analysis_results['rf_feature_importance']['Feature'] == feature, 'RF_Importance'
-            ].values[0]
-            f.write(f"{i}. {feature} (Importance: {importance:.4f})\n")
-        
-        f.write("\nThese features should be prioritized when optimizing scheduling algorithms for performance.\n")
-        
-        # Add extremes analysis
-        f.write("\nEXTREME EXECUTION TIME ANALYSIS\n")
-        f.write("=============================\n")
-        
-        # Get fastest and slowest 5 files
-        df = analysis_results['df']
-        fastest = df.nsmallest(5, 'execution_time')
-        slowest = df.nlargest(5, 'execution_time')
-        
-        f.write("Fastest execution times:\n")
-        for _, row in fastest.iterrows():
-            f.write(f"  {row['file_path']}: {row['execution_time']:.2f} ms\n")
-        
-        f.write("\nSlowest execution times:\n")
-        for _, row in slowest.iterrows():
-            f.write(f"  {row['file_path']}: {row['execution_time']:.2f} ms\n")
-        
-    return output_file
+def plot_feature_importance(feature_importances, correlations, output_dir):
+    """Generate plots for feature importance and correlations"""
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Plot top 15 feature importances
+    plt.figure(figsize=(12, 8))
+    top_features = feature_importances.head(15)
+    sns.barplot(x=top_features.values, y=top_features.index)
+    plt.title('Top 15 Features by Importance (Random Forest)')
+    plt.tight_layout()
+    plt.savefig(f"{output_dir}/top_features_importance.png")
+    
+    # Plot top correlations
+    plt.figure(figsize=(12, 8))
+    top_correlations = correlations.head(15)
+    sns.barplot(x=top_correlations.values, y=top_correlations.index)
+    plt.title('Top 15 Features by Correlation with Execution Time')
+    plt.tight_layout()
+    plt.savefig(f"{output_dir}/top_features_correlation.png")
+    
+    plt.close('all')
 
-def main():
-    # Path to the main directory
-    root_dir = "synthetic_data"
+def plot_execution_time_distribution(execution_times, output_dir):
+    """Plot the distribution of execution times"""
+    os.makedirs(output_dir, exist_ok=True)
     
-    # Find all files
-    print(f"Scanning for files in {root_dir}...")
-    all_files = find_all_files(root_dir)
-    print(f"Found {len(all_files)} files")
+    plt.figure(figsize=(10, 6))
+    sns.histplot(execution_times, kde=True)
+    plt.title('Distribution of Execution Times')
+    plt.xlabel('Execution Time (ms)')
+    plt.ylabel('Frequency')
+    plt.tight_layout()
+    plt.savefig(f"{output_dir}/execution_time_distribution.png")
     
-    # Process each file and collect data
-    data_rows = []
-    for i, file_path in enumerate(all_files):
-        result = extract_data_from_file(file_path)
-        if result:
-            data_rows.append(result)
+    plt.figure(figsize=(10, 6))
+    sns.boxplot(x=execution_times)
+    plt.title('Execution Time Box Plot')
+    plt.xlabel('Execution Time (ms)')
+    plt.tight_layout()
+    plt.savefig(f"{output_dir}/execution_time_boxplot.png")
+    
+    plt.close('all')
+
+def plot_scatter_for_top_features(df, top_features, output_dir):
+    """Create scatter plots for top features vs execution time"""
+    os.makedirs(output_dir, exist_ok=True)
+    
+    for feature in top_features.index[:10]:  # Plot top 10 features
+        if feature in df.columns:
+            plt.figure(figsize=(8, 6))
+            sns.scatterplot(x=df[feature], y=df['execution_time'])
+            plt.title(f'{feature} vs Execution Time')
+            plt.xlabel(feature)
+            plt.ylabel('Execution Time (ms)')
+            plt.tight_layout()
+            plt.savefig(f"{output_dir}/scatter_{feature.replace('/', '_')}.png")
+            plt.close()
+
+def generate_report(feature_importances, pearson_correlations, spearman_correlations, 
+                    execution_times, file_paths, df, output_dir='analysis_results'):
+    
+    # Ensure output directory exists
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Generate plots
+    plot_execution_time_distribution(execution_times, output_dir)
+    plot_feature_importance(feature_importances, pearson_correlations, output_dir)
+    plot_scatter_for_top_features(df, feature_importances, output_dir)
+    
+    # Create HTML report
+    html_report = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Feature Importance Analysis Report</title>
+        <style>
+            body {{ font-family: Arial, sans-serif; margin: 20px; }}
+            h1, h2, h3 {{ color: #333; }}
+            table {{ border-collapse: collapse; width: 100%; margin-bottom: 20px; }}
+            th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
+            th {{ background-color: #f2f2f2; }}
+            tr:nth-child(even) {{ background-color: #f9f9f9; }}
+            .section {{ margin-bottom: 30px; }}
+            img {{ max-width: 100%; height: auto; }}
+        </style>
+    </head>
+    <body>
+        <h1>Feature Importance Analysis Report</h1>
+        
+        <div class="section">
+            <h2>Summary Statistics</h2>
+            <p>Total files processed: {len(file_paths)}</p>
+            <p>Execution time range: {execution_times.min():.2f} ms to {execution_times.max():.2f} ms</p>
+            <p>Mean execution time: {execution_times.mean():.2f} ms</p>
+            <p>Median execution time: {execution_times.median():.2f} ms</p>
+            <p>Standard deviation: {execution_times.std():.2f} ms</p>
             
-            # Print detailed info for the first successful file to help debug
-            if len(data_rows) == 1:
-                print("First file processed successfully. Example features:")
-                sample_features = {k: v for k, v in result.items() if k != 'file_path'}
-                print(f"Found {len(sample_features)} features, including:")
-                for k, v in list(sample_features.items())[:10]:  # Print first 10 features
-                    print(f"  {k}: {v} (type: {type(v).__name__})")
+            <h3>Execution Time Distribution</h3>
+            <img src="execution_time_distribution.png" alt="Execution Time Distribution">
+            <img src="execution_time_boxplot.png" alt="Execution Time Box Plot">
+        </div>
         
-        # Print progress
-        if (i+1) % 500 == 0 or i+1 == len(all_files):
-            print(f"Processed {i+1}/{len(all_files)} files, collected {len(data_rows)} valid entries")
+        <div class="section">
+            <h2>Feature Importance Analysis</h2>
+            
+            <h3>Top Features by Importance (Random Forest Model)</h3>
+            <img src="top_features_importance.png" alt="Top Features by Importance">
+            
+            <table>
+                <tr>
+                    <th>Rank</th>
+                    <th>Feature</th>
+                    <th>Importance Score</th>
+                </tr>
+    """
     
-    print(f"Creating dataset from {len(data_rows)} processed files")
-    if not data_rows:
-        print("No valid data found. Please check the file format or extraction functions.")
+    # Add feature importance rows
+    for i, (feature, importance) in enumerate(feature_importances.items()[:20], start=1):
+        html_report += f"""
+                <tr>
+                    <td>{i}</td>
+                    <td>{feature}</td>
+                    <td>{importance:.4f}</td>
+                </tr>
+        """
+    
+    html_report += """
+            </table>
+            
+            <h3>Top Features by Correlation (Pearson)</h3>
+            <img src="top_features_correlation.png" alt="Top Features by Correlation">
+            
+            <table>
+                <tr>
+                    <th>Rank</th>
+                    <th>Feature</th>
+                    <th>Pearson Correlation</th>
+                    <th>Spearman Correlation</th>
+                </tr>
+    """
+    
+    # Add correlation rows
+    for i, (feature, corr) in enumerate(pearson_correlations.items()[:20], start=1):
+        spearman_corr = spearman_correlations.get(feature, 0)
+        html_report += f"""
+                <tr>
+                    <td>{i}</td>
+                    <td>{feature}</td>
+                    <td>{corr:.4f}</td>
+                    <td>{spearman_corr:.4f}</td>
+                </tr>
+        """
+    
+    html_report += """
+            </table>
+        </div>
+        
+        <div class="section">
+            <h2>Scatter Plots of Top Features vs Execution Time</h2>
+    """
+    
+    # Add scatter plots
+    for feature in feature_importances.index[:10]:
+        safe_feature = feature.replace('/', '_')
+        html_report += f"""
+            <h3>{feature} vs Execution Time</h3>
+            <img src="scatter_{safe_feature}.png" alt="Scatter plot of {feature}">
+        """
+    
+    html_report += """
+        </div>
+        
+        <div class="section">
+            <h2>Files Processed</h2>
+            <table>
+                <tr>
+                    <th>#</th>
+                    <th>File Path</th>
+                </tr>
+    """
+    
+    # Add file paths
+    for i, file_path in enumerate(file_paths[:100], start=1):  # Show at most 100 files
+        html_report += f"""
+                <tr>
+                    <td>{i}</td>
+                    <td>{file_path}</td>
+                </tr>
+        """
+    
+    if len(file_paths) > 100:
+        html_report += f"""
+                <tr>
+                    <td colspan="2">... and {len(file_paths) - 100} more files</td>
+                </tr>
+        """
+    
+    html_report += """
+            </table>
+        </div>
+    </body>
+    </html>
+    """
+    
+    # Write HTML report
+    with open(f"{output_dir}/feature_importance_report.html", 'w') as f:
+        f.write(html_report)
+    
+    # Also generate text report for backward compatibility
+    with open(f"{output_dir}/feature_importance_report.txt", 'w') as f:
+        f.write("Feature Importance Analysis Report\n")
+        f.write("=================================\n\n")
+        
+        f.write("Summary Statistics:\n")
+        f.write(f"Total files processed: {len(file_paths)}\n")
+        f.write(f"Execution time range: {execution_times.min():.2f} ms to {execution_times.max():.2f} ms\n")
+        f.write(f"Mean execution time: {execution_times.mean():.2f} ms\n")
+        f.write(f"Median execution time: {execution_times.median():.2f} ms\n")
+        f.write(f"Standard deviation: {execution_times.std():.2f} ms\n\n")
+        
+        f.write("Feature Importance (Random Forest):\n")
+        f.write("----------------------------------\n")
+        for feature, importance in feature_importances.items()[:30]:
+            f.write(f"{feature}: {importance:.4f}\n")
+        f.write("\n")
+        
+        f.write("Correlation with Execution Time (Pearson):\n")
+        f.write("-----------------------------------------\n")
+        for feature, corr in pearson_correlations.items()[:30]:
+            f.write(f"{feature}: {corr:.4f}\n")
+        f.write("\n")
+        
+        f.write("Correlation with Execution Time (Spearman):\n")
+        f.write("------------------------------------------\n")
+        for feature, corr in spearman_correlations.items()[:30]:
+            f.write(f"{feature}: {corr:.4f}\n")
+        f.write("\n")
+    
+    print(f"Reports generated in the '{output_dir}' directory")
+    print(f"- HTML report: {output_dir}/feature_importance_report.html")
+    print(f"- Text report: {output_dir}/feature_importance_report.txt")
+
+def main(main_dir="synthetic_data", output_dir="analysis_results"):
+    print(f"Processing files in {main_dir}...")
+    features_list, file_paths = process_all_files(main_dir)
+    
+    if not features_list:
+        print("No valid data found in the files.")
         return
     
-    # Create DataFrame from collected data
-    df = pd.DataFrame(data_rows)
+    print(f"Extracted features from {len(features_list)} files.")
     
-    # Save the raw data for later reference
-    df.to_csv("raw_execution_time_data.csv", index=False)
+    print("Analyzing feature importance...")
+    feature_importances, pearson_correlations, spearman_correlations, execution_times, df, X = analyze_feature_importance(features_list)
     
-    # Perform analysis
-    print("Analyzing data...")
-    analysis_results = analyze_data(df)
+    print("Generating comprehensive report...")
+    generate_report(feature_importances, pearson_correlations, spearman_correlations, execution_times, file_paths, df, output_dir)
     
-    if isinstance(analysis_results, str):
-        print(f"Analysis failed: {analysis_results}")
-        return
-    
-    # Generate the report
-    print("Generating report...")
-    report_file = generate_report(analysis_results)
-    
-    print(f"Analysis complete! Report has been saved to '{report_file}'")
-    print(f"Visualizations have been saved to the '{analysis_results['plots_dir']}' directory")
-    print(f"Raw data has been saved to 'raw_execution_time_data.csv'")
+    print("Analysis complete.")
 
 if __name__ == "__main__":
     main()
