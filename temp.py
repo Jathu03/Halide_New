@@ -223,7 +223,6 @@ def process_main_directory(main_dir):
 def clean_and_transform_features(train_features, test_features, test_size=50):
     all_features_df = pd.DataFrame(train_features + test_features)
     
-    # Relaxed outlier removal (using 2.0 * IQR instead of 1.5)
     Q1 = all_features_df['execution_time'].quantile(0.25)
     Q3 = all_features_df['execution_time'].quantile(0.75)
     IQR = Q3 - Q1
@@ -239,7 +238,6 @@ def clean_and_transform_features(train_features, test_features, test_size=50):
     if train_size <= 0:
         raise ValueError("Not enough samples remaining for training after outlier removal and reserving test set.")
     
-    # Log-transform skewed features
     skewed_features = ['total_bytes_at_production', 'total_vectors', 'total_parallelism']
     for feature in skewed_features:
         if feature in all_features_df.columns:
@@ -258,10 +256,6 @@ def clean_and_transform_features(train_features, test_features, test_size=50):
     to_drop = [column for column in upper.columns if any(upper[column] > 0.9)]
     all_features_df = all_features_df.drop(columns=to_drop)
     print(f"Dropped {len(to_drop)} highly correlated features")
-    
-    # Avoid log-transforming execution_time to preserve scale
-    # if 'execution_time' in all_features_df.columns:
-    #     all_features_df['execution_time_log'] = np.log1p(all_features_df['execution_time'])
     
     if 'log_total_bytes_at_production' in all_features_df.columns and 'log_total_vectors' in all_features_df.columns:
         all_features_df['log_bytes_per_vector'] = all_features_df['log_total_bytes_at_production'] / (all_features_df['log_total_vectors'] + 1e-8)
@@ -283,13 +277,6 @@ def clean_and_transform_features(train_features, test_features, test_size=50):
 def prepare_data_for_model(train_features, test_features, test_size=50):
     train_df, test_df = clean_and_transform_features(train_features, test_features, test_size=test_size)
     
-    # if 'execution_time_log' in train_df.columns:
-    #     y_train = train_df['execution_time_log'].values.reshape(-1, 1)
-    #     y_test = test_df['execution_time_log'].values.reshape(-1, 1)
-    #     train_df = train_df.drop(['execution_time', 'execution_time_log'], axis=1)
-    #     test_df = test_df.drop(['execution_time', 'execution_time_log'], axis=1)
-    #     is_log_transformed = True
-    # else:
     y_train = train_df['execution_time'].values.reshape(-1, 1)
     y_test = test_df['execution_time'].values.reshape(-1, 1)
     train_df = train_df.drop('execution_time', axis=1)
@@ -311,11 +298,26 @@ def prepare_data_for_model(train_features, test_features, test_size=50):
     print(f"First 5 y_train scaled: {y_train_scaled[:5].flatten()}")
     print(f"First 5 y_test scaled: {y_test_scaled[:5].flatten()}")
     
-    noise = np.random.normal(0, 0.01, X_train_scaled.shape)
-    X_train_scaled += noise
+    # Data augmentation for small and large execution times
+    X_train_scaled_aug = []
+    y_train_scaled_aug = []
+    for i in range(len(y_train_scaled)):
+        actual_time = y_train[i][0]  # Original execution time
+        X_train_scaled_aug.append(X_train_scaled[i])
+        y_train_scaled_aug.append(y_train_scaled[i])
+        # Augment small (<100ms) and large (>500ms) execution times
+        if actual_time < 100 or actual_time > 500:
+            for _ in range(2):  # Create 2 augmented samples
+                noise_X = np.random.normal(0, 0.05, X_train_scaled[i].shape)
+                noise_y = np.random.normal(0, 0.05, y_train_scaled[i].shape)
+                X_train_scaled_aug.append(X_train_scaled[i] + noise_X)
+                y_train_scaled_aug.append(y_train_scaled[i] + noise_y)
     
-    X_train_tensor = torch.FloatTensor(X_train_scaled).unsqueeze(1)
-    y_train_tensor = torch.FloatTensor(y_train_scaled)
+    X_train_scaled_aug = np.array(X_train_scaled_aug)
+    y_train_scaled_aug = np.array(y_train_scaled_aug)
+    
+    X_train_tensor = torch.FloatTensor(X_train_scaled_aug).unsqueeze(1)
+    y_train_tensor = torch.FloatTensor(y_train_scaled_aug)
     X_test_tensor = torch.FloatTensor(X_test_scaled).unsqueeze(1)
     y_test_tensor = torch.FloatTensor(y_test_scaled)
     
@@ -325,45 +327,113 @@ def prepare_data_for_model(train_features, test_features, test_size=50):
     return (X_train_tensor, y_train_tensor, X_test_tensor, y_test_tensor, 
             scaler_y, input_size, is_log_transformed)
 
+class TransformerEncoderLayer(nn.Module):
+    def __init__(self, d_model, nhead, dim_feedforward=512, dropout=0.3):
+        super(TransformerEncoderLayer, self).__init__()
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.activation = nn.GELU()
+    
+    def forward(self, src):
+        src2 = self.self_attn(src, src, src)[0]
+        src = src + self.dropout1(src2)
+        src = self.norm1(src)
+        src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
+        src = src + self.dropout2(src2)
+        src = self.norm2(src)
+        return src
+
 class ImprovedLSTMModel(nn.Module):
-    def __init__(self, input_size, hidden_size=128, output_size=1, dropout_rate=0.2):
+    def __init__(self, input_size, hidden_size=192, output_size=1, dropout_rate=0.3):
         super(ImprovedLSTMModel, self).__init__()
         self.hidden_size = hidden_size
         self.num_layers = 2
+        self.input_size = input_size
         
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers=self.num_layers, batch_first=True, dropout=dropout_rate)
+        # Feature embedding
+        self.embedding = nn.Linear(input_size, hidden_size)
         
-        # Simplified fully connected layers
-        self.fc1 = nn.Linear(hidden_size, 64)
-        self.bn1 = nn.BatchNorm1d(64)
-        self.fc2 = nn.Linear(64, 32)
-        self.bn2 = nn.BatchNorm1d(32)
-        self.fc3 = nn.Linear(32, output_size)
+        # LSTM layers
+        self.lstm = nn.LSTM(hidden_size, hidden_size, num_layers=self.num_layers, batch_first=True, dropout=dropout_rate)
+        
+        # Transformer encoder to capture feature interactions
+        self.transformer_layer = TransformerEncoderLayer(
+            d_model=hidden_size,
+            nhead=4,  # Ensure hidden_size is divisible by nhead
+            dim_feedforward=768,
+            dropout=dropout_rate
+        )
+        
+        # Deeper fully connected head with residual connections
+        self.fc1 = nn.Linear(hidden_size, 128)
+        self.bn1 = nn.BatchNorm1d(128)
+        self.fc2 = nn.Linear(128, 64)
+        self.bn2 = nn.BatchNorm1d(64)
+        self.fc3 = nn.Linear(64, 32)
+        self.bn3 = nn.BatchNorm1d(32)
+        self.fc4 = nn.Linear(32, 16)
+        self.bn4 = nn.BatchNorm1d(16)
+        self.fc5 = nn.Linear(16, output_size)
+        
+        # Residual connection
+        self.residual = nn.Linear(hidden_size, 16)
         
         self.dropout = nn.Dropout(dropout_rate)
-        self.leaky_relu = nn.LeakyReLU(0.1)
+        self.gelu = nn.GELU()
     
     def forward(self, x):
+        # Input shape: [batch_size, seq_len=1, input_size]
         batch_size = x.size(0)
+        
+        # Feature embedding
+        x = self.embedding(x)  # [batch_size, seq_len=1, hidden_size]
+        
+        # LSTM
         h0 = torch.zeros(self.num_layers, batch_size, self.hidden_size).to(x.device)
         c0 = torch.zeros(self.num_layers, batch_size, self.hidden_size).to(x.device)
-        
         lstm_out, (hn, cn) = self.lstm(x, (h0, c0))
         
+        # Prepare for transformer: treat features as sequence
+        # Reshape to [seq_len, batch_size, hidden_size] for transformer
+        x = lstm_out.permute(1, 0, 2)  # [seq_len=1, batch_size, hidden_size]
+        x = self.transformer_layer(x)
+        x = x.permute(1, 0, 2)  # Back to [batch_size, seq_len=1, hidden_size]
+        
         # Use the last hidden state
-        x = hn[-1]
+        x = x[:, -1, :]  # [batch_size, hidden_size]
+        
+        # Fully connected head with residual connections
+        residual = self.residual(x)
         
         x = self.fc1(x)
         x = self.bn1(x)
-        x = self.leaky_relu(x)
+        x = self.gelu(x)
         x = self.dropout(x)
         
         x = self.fc2(x)
         x = self.bn2(x)
-        x = self.leaky_relu(x)
+        x = self.gelu(x)
         x = self.dropout(x)
         
         x = self.fc3(x)
+        x = self.bn3(x)
+        x = self.gelu(x)
+        x = self.dropout(x)
+        
+        x = self.fc4(x)
+        x = self.bn4(x)
+        x = self.gelu(x)
+        x = self.dropout(x)
+        
+        x = x + residual  # Residual connection
+        
+        x = self.fc5(x)
         return x
 
 def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=16):
@@ -375,28 +445,40 @@ def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=16):
     
     return train_loader, test_loader
 
-class CombinedLoss(nn.Module):
-    def __init__(self, mape_weight=0.5, mse_weight=0.5, epsilon=1e-4):
-        super(CombinedLoss, self).__init__()
+class WeightedCombinedLoss(nn.Module):
+    def __init__(self, mape_weight=0.4, mse_weight=0.6, epsilon=1e-4):
+        super(WeightedCombinedLoss, self).__init__()
         self.mape_weight = mape_weight
         self.mse_weight = mse_weight
         self.epsilon = epsilon
-        self.mse_loss = nn.MSELoss()
+        self.mse_loss = nn.MSELoss(reduction='none')
     
     def forward(self, outputs, targets):
-        mape = torch.mean(torch.abs((targets - outputs) / (targets + self.epsilon))) * 100
+        # Compute MSE loss per sample
         mse = self.mse_loss(outputs, targets)
-        return self.mape_weight * mape + self.mse_weight * mse
+        
+        # Compute MAPE per sample
+        mape = torch.abs((targets - outputs) / (targets + self.epsilon)) * 100
+        
+        # Weight the loss based on target value ranges
+        weights = torch.ones_like(targets)
+        weights = torch.where(targets < 0.5, 0.5, weights)  # Down-weight small scaled values
+        weights = torch.where(targets > 2.0, 1.5, weights)  # Up-weight large scaled values
+        
+        weighted_mse = (mse * weights).mean()
+        weighted_mape = (mape * weights).mean()
+        
+        return self.mape_weight * weighted_mape + self.mse_weight * weighted_mse
 
-def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=1000, patience=50, checkpoint_path='checkpoint_lstm.pth', save_freq=10):
+def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=1200, patience=60, checkpoint_path='checkpoint_lstm.pth', save_freq=10):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     model.to(device)
     
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=20, verbose=True)
     
-    warmup_epochs = 20
-    base_lr = 0.0005
+    warmup_epochs = 30
+    base_lr = 0.0003
     for param_group in optimizer.param_groups:
         param_group['lr'] = base_lr / warmup_epochs
     
@@ -555,7 +637,6 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_tran
         error_percentage = abs(actual_val - pred_val) / actual_val * 100 if actual_val > 0 else 0
         error_percentage = min(error_percentage, 1000.0)
         
-        # Categorize error by execution time range
         if actual_val < 100:
             error_by_range['small (<100ms)'].append(error_percentage)
         elif 100 <= actual_val <= 500:
@@ -627,13 +708,13 @@ def main(main_dir):
     
     model = ImprovedLSTMModel(
         input_size=input_size,
-        hidden_size=128,
+        hidden_size=192,
         output_size=1,
-        dropout_rate=0.2
+        dropout_rate=0.3
     )
     
-    criterion = CombinedLoss(mape_weight=0.5, mse_weight=0.5, epsilon=1e-4)
-    optimizer = optim.AdamW(model.parameters(), lr=0.0005, weight_decay=1e-3)
+    criterion = WeightedCombinedLoss(mape_weight=0.4, mse_weight=0.6, epsilon=1e-4)
+    optimizer = optim.AdamW(model.parameters(), lr=0.0003, weight_decay=1e-3)
     
     print("Building and training Improved LSTM model...")
     train_losses, val_losses = train_model(
@@ -642,8 +723,8 @@ def main(main_dir):
         test_loader, 
         criterion, 
         optimizer, 
-        num_epochs=1000,
-        patience=50,
+        num_epochs=1200,
+        patience=60,
         checkpoint_path='checkpoint_lstm.pth',
         save_freq=10
     )
