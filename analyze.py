@@ -309,7 +309,10 @@ def plot_scatter_for_top_features(df, top_features, output_dir):
     """Create scatter plots for top features vs execution time"""
     os.makedirs(output_dir, exist_ok=True)
     
-    for feature in top_features.index[:10]:  # Plot top 10 features
+    # Get top 10 features
+    top_feature_names = list(top_features.index[:10])
+    
+    for feature in top_feature_names:
         if feature in df.columns:
             plt.figure(figsize=(8, 6))
             sns.scatterplot(x=df[feature], y=df['execution_time'])
@@ -317,7 +320,8 @@ def plot_scatter_for_top_features(df, top_features, output_dir):
             plt.xlabel(feature)
             plt.ylabel('Execution Time (ms)')
             plt.tight_layout()
-            plt.savefig(f"{output_dir}/scatter_{feature.replace('/', '_')}.png")
+            safe_feature = feature.replace('/', '_').replace('\\', '_')
+            plt.savefig(f"{output_dir}/scatter_{safe_feature}.png")
             plt.close()
 
 def generate_report(feature_importances, pearson_correlations, spearman_correlations, 
@@ -378,8 +382,9 @@ def generate_report(feature_importances, pearson_correlations, spearman_correlat
                 </tr>
     """
     
-    # Add feature importance rows
-    for i, (feature, importance) in enumerate(feature_importances.items()[:20], start=1):
+    # Add feature importance rows - using list() to convert items view to a list
+    top_features = list(feature_importances.items())[:20]
+    for i, (feature, importance) in enumerate(top_features, start=1):
         html_report += f"""
                 <tr>
                     <td>{i}</td>
@@ -403,8 +408,9 @@ def generate_report(feature_importances, pearson_correlations, spearman_correlat
                 </tr>
     """
     
-    # Add correlation rows
-    for i, (feature, corr) in enumerate(pearson_correlations.items()[:20], start=1):
+    # Add correlation rows - using list() to convert items view to a list
+    top_pearson = list(pearson_correlations.items())[:20]
+    for i, (feature, corr) in enumerate(top_pearson, start=1):
         spearman_corr = spearman_correlations.get(feature, 0)
         html_report += f"""
                 <tr>
@@ -423,9 +429,10 @@ def generate_report(feature_importances, pearson_correlations, spearman_correlat
             <h2>Scatter Plots of Top Features vs Execution Time</h2>
     """
     
-    # Add scatter plots
-    for feature in feature_importances.index[:10]:
-        safe_feature = feature.replace('/', '_')
+    # Add scatter plots for top 10 features
+    top_feature_names = list(feature_importances.index[:10])
+    for feature in top_feature_names:
+        safe_feature = feature.replace('/', '_').replace('\\', '_')
         html_report += f"""
             <h3>{feature} vs Execution Time</h3>
             <img src="scatter_{safe_feature}.png" alt="Scatter plot of {feature}">
@@ -443,8 +450,9 @@ def generate_report(feature_importances, pearson_correlations, spearman_correlat
                 </tr>
     """
     
-    # Add file paths
-    for i, file_path in enumerate(file_paths[:100], start=1):  # Show at most 100 files
+    # Add file paths - limit to 100
+    display_files = file_paths[:100]
+    for i, file_path in enumerate(display_files, start=1):
         html_report += f"""
                 <tr>
                     <td>{i}</td>
@@ -484,19 +492,19 @@ def generate_report(feature_importances, pearson_correlations, spearman_correlat
         
         f.write("Feature Importance (Random Forest):\n")
         f.write("----------------------------------\n")
-        for feature, importance in feature_importances.items()[:30]:
+        for feature, importance in list(feature_importances.items())[:30]:
             f.write(f"{feature}: {importance:.4f}\n")
         f.write("\n")
         
         f.write("Correlation with Execution Time (Pearson):\n")
         f.write("-----------------------------------------\n")
-        for feature, corr in pearson_correlations.items()[:30]:
+        for feature, corr in list(pearson_correlations.items())[:30]:
             f.write(f"{feature}: {corr:.4f}\n")
         f.write("\n")
         
         f.write("Correlation with Execution Time (Spearman):\n")
         f.write("------------------------------------------\n")
-        for feature, corr in spearman_correlations.items()[:30]:
+        for feature, corr in list(spearman_correlations.items())[:30]:
             f.write(f"{feature}: {corr:.4f}\n")
         f.write("\n")
     
