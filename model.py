@@ -393,6 +393,25 @@ def train_model_with_fold(model, train_loader, val_loader, fold=0,
     print(f"Scheduler: steps_per_epoch={steps_per_epoch}, remaining_epochs={remaining_epochs}, total_steps={total_steps}")
     
     if use_warmup:
+        # Initialize a temporary scheduler to load the state
+        temp_scheduler = OneCycleLR(
+            optimizer, 
+            max_lr=learning_rate,
+            steps_per_epoch=steps_per_epoch,
+            epochs=remaining_epochs,
+            pct_start=max(0.05, warmup_epochs / remaining_epochs) if remaining_epochs > 0 else 0.05,
+            anneal_strategy='cos',
+            div_factor=25,
+            final_div_factor=1000,
+        )
+        
+        # Load the scheduler state from the checkpoint into the temporary scheduler
+        if os.path.exists(checkpoint_path):
+            checkpoint = torch.load(checkpoint_path, map_location=device)
+            temp_scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            # Get the last learning rates
+            last_lr = temp_scheduler.get_last_lr()
+        
         # Initialize the new scheduler with updated total steps
         scheduler = OneCycleLR(
             optimizer, 
@@ -405,18 +424,17 @@ def train_model_with_fold(model, train_loader, val_loader, fold=0,
             final_div_factor=1000,
         )
         
-        # Load the scheduler state from the checkpoint and adjust total steps
+        # Load the scheduler state and set the learning rate
         if os.path.exists(checkpoint_path):
             checkpoint = torch.load(checkpoint_path, map_location=device)
             old_state = checkpoint['scheduler_state_dict']
-            # Create a new state dictionary with updated total_steps
             new_state = scheduler.state_dict()
             new_state['_step_count'] = old_state['_step_count']
             new_state['last_epoch'] = old_state['last_epoch']
-            # Preserve the current learning rate
-            for i, param_group in enumerate(optimizer.param_groups):
-                param_group['lr'] = old_state['last_lr'][i]
             scheduler.load_state_dict(new_state)
+            # Update optimizer learning rates
+            for i, param_group in enumerate(optimizer.param_groups):
+                param_group['lr'] = last_lr[i]
     else:
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=remaining_epochs, eta_min=min_lr)
         if os.path.exists(checkpoint_path):
