@@ -20,6 +20,26 @@ def find_all_files(root_dir):
                 all_files.append(os.path.join(dirpath, filename))
     return all_files
 
+def convert_to_numeric(value):
+    """Try to convert a value to numeric, handling various formats."""
+    if isinstance(value, (int, float)):
+        return float(value)
+    elif isinstance(value, str):
+        # Remove any non-numeric characters except decimal points and negative signs
+        try:
+            # Try direct conversion first
+            return float(value)
+        except ValueError:
+            # If that fails, try to extract numeric part
+            import re
+            numeric_str = re.sub(r'[^0-9.-]', '', value)
+            if numeric_str:
+                try:
+                    return float(numeric_str)
+                except ValueError:
+                    return None
+    return None
+
 def extract_data_from_file(file_path):
     """Extract features and execution time from a JSON file."""
     try:
@@ -29,60 +49,94 @@ def extract_data_from_file(file_path):
         # Create a dictionary to store the data
         result = {'file_path': file_path}
         
-        # Extract execution time from the specific structure you mentioned
+        # Extract execution time from the specific structure
         execution_time = None
         
         # Check if scheduling_data exists and contains a list of items
         if 'scheduling_data' in data and isinstance(data['scheduling_data'], list):
+            # First, print all item names for the first file to help debug
+            if 'debug_first_file' not in globals():
+                global debug_first_file
+                debug_first_file = True
+                print("DEBUG: First file scheduling_data items:")
+                for item in data['scheduling_data']:
+                    if isinstance(item, dict) and 'name' in item:
+                        print(f"  Item name: {item['name']}, value type: {type(item.get('value', 'N/A'))}")
+            
+            # Extract all scheduling data items as features
             for item in data['scheduling_data']:
-                # Look for the execution time item with name "total_execution_time_ms"
                 if isinstance(item, dict) and 'name' in item and 'value' in item:
-                    if item['name'] == 'total_execution_time_ms':
-                        execution_time = item['value']
-                        break
-                    # Also look for other possible execution time names
-                    elif item['name'] in ['execution_time', 'runtime', 'time_ms', 'elapsed_time']:
-                        execution_time = item['value']
-                        # Keep searching in case we find the preferred "total_execution_time_ms" later
+                    # Get the name and value
+                    name = item['name']
+                    value = item['value']
+                    
+                    # If this is the execution time, store it separately
+                    if name == 'total_execution_time_ms':
+                        execution_time = convert_to_numeric(value)
+                    else:
+                        # Convert to numeric if possible
+                        numeric_value = convert_to_numeric(value)
+                        if numeric_value is not None:
+                            result[f"sched_{name}"] = numeric_value
+                        elif isinstance(value, (bool)):
+                            result[f"sched_{name}"] = 1 if value else 0
+                        elif isinstance(value, str) and value.lower() in ('true', 'false'):
+                            result[f"sched_{name}"] = 1 if value.lower() == 'true' else 0
         
-        # If we couldn't find execution time, print debug info and return None
+        # If execution time wasn't found, try alternate locations
+        if execution_time is None and 'scheduling_data' in data:
+            # Look directly in the scheduling_data object
+            for key, value in data.get('scheduling_data', {}).items():
+                if key in ('total_execution_time_ms', 'execution_time', 'runtime', 'time_ms', 'elapsed_time'):
+                    execution_time = convert_to_numeric(value)
+                    break
+        
+        # If we still couldn't find execution time, print debug info and return None
         if execution_time is None:
             print(f"Warning: Could not find execution time in {file_path}")
-            # Print more detailed structure to debug
-            if 'scheduling_data' in data:
-                print(f"Scheduling data contains {len(data['scheduling_data'])} items")
-                for i, item in enumerate(data['scheduling_data'][:5]):  # Print first 5 for debugging
-                    if isinstance(item, dict) and 'name' in item:
-                        print(f"  Item {i}: name={item['name']}")
             return None
         
-        result['execution_time'] = float(execution_time)
+        result['execution_time'] = execution_time
         
         # Extract features from programming_details if available
-        if 'programming_details' in data and isinstance(data['programming_details'], dict):
-            for key, value in data['programming_details'].items():
-                if isinstance(value, (int, float, bool)):
-                    result[f"prog_{key}"] = value
-                elif isinstance(value, str) and value.isdigit():
-                    result[f"prog_{key}"] = float(value)
+        if 'programming_details' in data:
+            if isinstance(data['programming_details'], dict):
+                # If it's a dictionary, process all key-value pairs
+                for key, value in data['programming_details'].items():
+                    numeric_value = convert_to_numeric(value)
+                    if numeric_value is not None:
+                        result[f"prog_{key}"] = numeric_value
+                    elif isinstance(value, (bool)):
+                        result[f"prog_{key}"] = 1 if value else 0
+                    elif isinstance(value, str) and value.lower() in ('true', 'false'):
+                        result[f"prog_{key}"] = 1 if value.lower() == 'true' else 0
+            elif isinstance(data['programming_details'], list):
+                # If it's a list of items like scheduling_data
+                for item in data['programming_details']:
+                    if isinstance(item, dict) and 'name' in item and 'value' in item:
+                        numeric_value = convert_to_numeric(item['value'])
+                        if numeric_value is not None:
+                            result[f"prog_{item['name']}"] = numeric_value
+                        elif isinstance(item['value'], (bool)):
+                            result[f"prog_{item['name']}"] = 1 if item['value'] else 0
+                        elif isinstance(item['value'], str) and item['value'].lower() in ('true', 'false'):
+                            result[f"prog_{item['name']}"] = 1 if item['value'].lower() == 'true' else 0
         
-        # Extract additional features from scheduling_data
-        if 'scheduling_data' in data and isinstance(data['scheduling_data'], list):
-            for item in data['scheduling_data']:
-                if isinstance(item, dict) and 'name' in item and 'value' in item:
-                    # Skip the execution time we already extracted
-                    if item['name'] == 'total_execution_time_ms':
-                        continue
-                    
-                    # Try to convert value to numeric if possible
-                    try:
-                        if isinstance(item['value'], (int, float)):
-                            result[f"sched_{item['name']}"] = float(item['value'])
-                        elif isinstance(item['value'], str) and item['value'].replace('.', '', 1).isdigit():
-                            result[f"sched_{item['name']}"] = float(item['value'])
-                    except:
-                        # If conversion fails, skip this item
-                        pass
+        # Extract any other top-level numeric features
+        for key, value in data.items():
+            if key not in ('scheduling_data', 'programming_details', 'file_path'):
+                numeric_value = convert_to_numeric(value)
+                if numeric_value is not None:
+                    result[f"other_{key}"] = numeric_value
+                elif isinstance(value, (bool)):
+                    result[f"other_{key}"] = 1 if value else 0
+                elif isinstance(value, str) and value.lower() in ('true', 'false'):
+                    result[f"other_{key}"] = 1 if value.lower() == 'true' else 0
+        
+        # Make sure we have at least one feature in addition to execution_time
+        if len(result) <= 2:  # file_path and execution_time only
+            print(f"Warning: No features found in {file_path}")
+            return None
         
         return result
     
@@ -99,17 +153,25 @@ def analyze_data(df):
     print(f"Dataset shape: {df.shape}")
     print(f"Execution time range: {df['execution_time'].min()} - {df['execution_time'].max()} ms")
     
-    # Convert all feature columns to numeric where possible
+    # Drop the file_path column for analysis
+    if 'file_path' in df.columns:
+        file_paths = df['file_path'].copy()
+        df = df.drop(columns=['file_path'])
+    
+    # Make sure all columns are numeric
     for col in df.columns:
-        if col != 'execution_time' and col != 'file_path':
+        if col != 'execution_time':
             try:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
             except:
-                pass
+                print(f"Warning: Dropping non-numeric column {col}")
+                df = df.drop(columns=[col])
     
-    # Drop non-numeric columns (except file_path which we'll keep for reference)
-    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-    feature_cols = [col for col in numeric_cols if col != 'execution_time']
+    # Drop columns with all NA values
+    df = df.dropna(axis=1, how='all')
+    
+    # Get numeric feature columns
+    feature_cols = [col for col in df.columns if col != 'execution_time']
     
     if not feature_cols:
         return "No numeric features found for analysis."
@@ -117,12 +179,12 @@ def analyze_data(df):
     print(f"Numeric features for analysis: {len(feature_cols)}")
     print(f"Sample features: {feature_cols[:10]}")
     
+    # Handle any remaining missing values
+    df = df.fillna(df.mean())
+    
     # Split data
     X = df[feature_cols]
     y = df['execution_time']
-    
-    # Handle missing values
-    X = X.fillna(X.mean())
     
     # Feature scaling
     scaler = StandardScaler()
@@ -165,7 +227,7 @@ def analyze_data(df):
     lr_r2 = r2_score(y_test, lr_predictions)
     
     # Create correlation matrix
-    correlation_matrix = df[numeric_cols].corr()
+    correlation_matrix = df.corr()
     correlation_with_time = correlation_matrix['execution_time'].sort_values(ascending=False)
     
     # Basic statistics
@@ -206,6 +268,10 @@ def analyze_data(df):
         plt.title(f'Execution Time vs {feature}')
         plt.tight_layout()
         plt.savefig(os.path.join(plots_dir, f'scatter_{feature}.png'))
+        
+    # Add file_path back for reference
+    if 'file_path' in locals():
+        df['file_path'] = file_paths
     
     return {
         'rf_feature_importance': rf_feature_importance,
@@ -216,7 +282,8 @@ def analyze_data(df):
         'rf_r2': rf_r2,
         'lr_mse': lr_mse,
         'lr_r2': lr_r2,
-        'plots_dir': plots_dir
+        'plots_dir': plots_dir,
+        'df': df
     }
 
 def generate_report(analysis_results, output_file="execution_time_analysis_report.txt"):
@@ -295,7 +362,24 @@ def generate_report(analysis_results, output_file="execution_time_analysis_repor
             f.write(f"{i}. {feature} (Importance: {importance:.4f})\n")
         
         f.write("\nThese features should be prioritized when optimizing scheduling algorithms for performance.\n")
-    
+        
+        # Add extremes analysis
+        f.write("\nEXTREME EXECUTION TIME ANALYSIS\n")
+        f.write("=============================\n")
+        
+        # Get fastest and slowest 5 files
+        df = analysis_results['df']
+        fastest = df.nsmallest(5, 'execution_time')
+        slowest = df.nlargest(5, 'execution_time')
+        
+        f.write("Fastest execution times:\n")
+        for _, row in fastest.iterrows():
+            f.write(f"  {row['file_path']}: {row['execution_time']:.2f} ms\n")
+        
+        f.write("\nSlowest execution times:\n")
+        for _, row in slowest.iterrows():
+            f.write(f"  {row['file_path']}: {row['execution_time']:.2f} ms\n")
+        
     return output_file
 
 def main():
@@ -313,6 +397,14 @@ def main():
         result = extract_data_from_file(file_path)
         if result:
             data_rows.append(result)
+            
+            # Print detailed info for the first successful file to help debug
+            if len(data_rows) == 1:
+                print("First file processed successfully. Example features:")
+                sample_features = {k: v for k, v in result.items() if k != 'file_path'}
+                print(f"Found {len(sample_features)} features, including:")
+                for k, v in list(sample_features.items())[:10]:  # Print first 10 features
+                    print(f"  {k}: {v} (type: {type(v).__name__})")
         
         # Print progress
         if (i+1) % 500 == 0 or i+1 == len(all_files):
