@@ -379,7 +379,6 @@ def train_model_with_fold(model, train_loader, val_loader, fold=0,
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
     
     # Initialize a dummy scheduler to pass to load_checkpoint
-    # This will be replaced after loading the checkpoint with the correct total steps
     dummy_scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=1.0)
     
     # Load checkpoint if exists
@@ -394,6 +393,7 @@ def train_model_with_fold(model, train_loader, val_loader, fold=0,
     print(f"Scheduler: steps_per_epoch={steps_per_epoch}, remaining_epochs={remaining_epochs}, total_steps={total_steps}")
     
     if use_warmup:
+        # Initialize the new scheduler with updated total steps
         scheduler = OneCycleLR(
             optimizer, 
             max_lr=learning_rate,
@@ -404,13 +404,24 @@ def train_model_with_fold(model, train_loader, val_loader, fold=0,
             div_factor=25,
             final_div_factor=1000,
         )
+        
+        # Load the scheduler state from the checkpoint and adjust total steps
+        if os.path.exists(checkpoint_path):
+            checkpoint = torch.load(checkpoint_path, map_location=device)
+            old_state = checkpoint['scheduler_state_dict']
+            # Create a new state dictionary with updated total_steps
+            new_state = scheduler.state_dict()
+            new_state['_step_count'] = old_state['_step_count']
+            new_state['last_epoch'] = old_state['last_epoch']
+            # Preserve the current learning rate
+            for i, param_group in enumerate(optimizer.param_groups):
+                param_group['lr'] = old_state['last_lr'][i]
+            scheduler.load_state_dict(new_state)
     else:
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=remaining_epochs, eta_min=min_lr)
-    
-    # Load the scheduler state from the checkpoint into the new scheduler
-    if os.path.exists(checkpoint_path):
-        checkpoint = torch.load(checkpoint_path, map_location=device)
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        if os.path.exists(checkpoint_path):
+            checkpoint = torch.load(checkpoint_path, map_location=device)
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
     
     scaler = GradScaler() if use_amp else None
     epochs_no_improve = 0
