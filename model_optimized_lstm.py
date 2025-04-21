@@ -343,20 +343,56 @@ class CustomMAPELoss(nn.Module):
         # Calculate MAPE with epsilon to avoid division by zero
         return torch.mean(torch.abs((targets - outputs) / (targets + self.epsilon))) * 100
 
-def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=200, patience=30):
+def save_checkpoint(model, optimizer, scheduler, epoch, train_losses, val_losses, best_val_loss, epochs_no_improve, checkpoint_path='checkpoint_lstm.pth'):
+    """
+    Save the training state to a checkpoint file.
+    """
+    checkpoint = {
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(),
+        'epoch': epoch,
+        'train_losses': train_losses,
+        'val_losses': val_losses,
+        'best_val_loss': best_val_loss,
+        'epochs_no_improve': epochs_no_improve
+    }
+    torch.save(checkpoint, checkpoint_path)
+    print(f"Checkpoint saved at {checkpoint_path}")
+
+def load_checkpoint(model, optimizer, scheduler, checkpoint_path='checkpoint_lstm.pth'):
+    """
+    Load the training state from a checkpoint file.
+    """
+    if os.path.exists(checkpoint_path):
+        checkpoint = torch.load(checkpoint_path, map_location=torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        start_epoch = checkpoint['epoch'] + 1
+        train_losses = checkpoint['train_losses']
+        val_losses = checkpoint['val_losses']
+        best_val_loss = checkpoint['best_val_loss']
+        epochs_no_improve = checkpoint['epochs_no_improve']
+        print(f"Loaded checkpoint from {checkpoint_path}, resuming from epoch {start_epoch}")
+        return start_epoch, train_losses, val_losses, best_val_loss, epochs_no_improve
+    else:
+        print(f"No checkpoint found at {checkpoint_path}, starting from scratch")
+        return 0, [], [], float('inf'), 0
+
+def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=200, patience=30, checkpoint_path='checkpoint_lstm.pth'):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     model.to(device)
     
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10, verbose=True)
     
-    best_val_loss = float('inf')
-    epochs_no_improve = 0
-    best_model_state = None
-    train_losses = []
-    val_losses = []
+    # Load checkpoint if it exists
+    start_epoch, train_losses, val_losses, best_val_loss, epochs_no_improve = load_checkpoint(
+        model, optimizer, scheduler, checkpoint_path
+    )
     
-    for epoch in range(num_epochs):
+    for epoch in range(start_epoch, num_epochs):
         model.train()
         running_loss = 0.0
         for inputs, targets in train_loader:
@@ -390,20 +426,27 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
         
         print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
         
+        # Save checkpoint after each epoch
+        save_checkpoint(
+            model, optimizer, scheduler, epoch, train_losses, val_losses, 
+            best_val_loss, epochs_no_improve, checkpoint_path
+        )
+        
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             epochs_no_improve = 0
-            best_model_state = model.state_dict().copy()
+            torch.save(model.state_dict(), 'best_lstm_model.pth')
         else:
             epochs_no_improve += 1
         
         if epochs_no_improve >= patience:
             print(f'Early stopping after {epoch+1} epochs')
-            model.load_state_dict(best_model_state)
             break
     
-    if best_model_state is not None and epochs_no_improve > 0:
-        model.load_state_dict(best_model_state)
+    # Load the best model state
+    if os.path.exists('best_lstm_model.pth'):
+        model.load_state_dict(torch.load('best_lstm_model.pth'))
+        print("Loaded best model state from 'best_lstm_model.pth'")
     
     return train_losses, val_losses
 
@@ -514,7 +557,8 @@ def main(main_dir):
         criterion, 
         optimizer, 
         num_epochs=200,
-        patience=30
+        patience=30,
+        checkpoint_path='checkpoint_lstm.pth'
     )
     
     plt.figure(figsize=(10, 6))
