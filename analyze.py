@@ -1,7 +1,6 @@
 import os
 import pandas as pd
 import numpy as np
-import re
 import json
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.linear_model import LinearRegression
@@ -13,65 +12,90 @@ import seaborn as sns
 from datetime import datetime
 
 def find_all_files(root_dir):
-    """Find all files recursively in the given directory."""
+    """Find all JSON files recursively in the given directory."""
     all_files = []
     for dirpath, dirnames, filenames in os.walk(root_dir):
         for filename in filenames:
-            # You might want to filter by file extension if needed
-            # if filename.endswith('.json'):  # example filter
-            all_files.append(os.path.join(dirpath, filename))
+            if filename.endswith('.json'):  # Filter for JSON files
+                all_files.append(os.path.join(dirpath, filename))
     return all_files
 
-def extract_execution_time(file_content):
-    """Extract execution time from file content."""
-    # This function needs to be customized based on your file format
-    # Example: Looking for patterns like "execution_time: 234ms" or "time: 1.2s"
-    time_pattern = re.search(r'execution_time[:\s]+(\d+\.?\d*)[\s]?ms', file_content)
-    if time_pattern:
-        return float(time_pattern.group(1))
-    
-    # Try another pattern if the first one fails
-    time_pattern = re.search(r'time[:\s]+(\d+\.?\d*)[\s]?ms', file_content)
-    if time_pattern:
-        return float(time_pattern.group(1))
-    
-    # Return None if no match is found
-    return None
-
-def extract_features(file_content):
-    """Extract scheduling features from file content."""
-    # This function needs to be customized based on your file format
-    # Example: trying to parse JSON content
+def extract_data_from_file(file_path):
+    """Extract features and execution time from a JSON file."""
     try:
-        data = json.loads(file_content)
-        # Assuming features are in a top-level key or can be accessed somehow
-        if 'features' in data:
-            return data['features']
-        else:
-            # Return all data if specific features key isn't found
-            # Filter out the execution time if it exists in the data
-            if 'execution_time' in data:
-                data_copy = data.copy()
-                del data_copy['execution_time']
-                return data_copy
-            return data
-    except json.JSONDecodeError:
-        # If not JSON, try to extract features using regex
-        features = {}
-        # Example: look for patterns like "feature_name: value"
-        feature_patterns = re.findall(r'(\w+):\s*([0-9.]+)', file_content)
-        for name, value in feature_patterns:
-            if name != 'execution_time' and name != 'time':  # Skip the time value
-                try:
-                    features[name] = float(value)
-                except ValueError:
-                    features[name] = value
-        return features
+        with open(file_path, 'r') as f:
+            data = json.load(f)
+        
+        # Create a dictionary to store the data
+        result = {'file_path': file_path}
+        
+        # Extract execution time - look for common fields that might contain time
+        time_fields = ['execution_time', 'time', 'runtime', 'elapsed_time', 'duration']
+        execution_time = None
+        
+        for field in time_fields:
+            if field in data:
+                execution_time = data[field]
+                break
+        
+        # If time not found in direct fields, look for nested structures
+        if execution_time is None:
+            for key, value in data.items():
+                if isinstance(value, dict):
+                    for time_field in time_fields:
+                        if time_field in value:
+                            execution_time = value[time_field]
+                            break
+        
+        # Convert execution time to milliseconds if it's in a different unit
+        if execution_time is not None:
+            # If it's a string ending with 'ms', extract the numeric part
+            if isinstance(execution_time, str):
+                if 'ms' in execution_time:
+                    execution_time = float(execution_time.replace('ms', '').strip())
+                elif 's' in execution_time and 'ms' not in execution_time:
+                    # Convert seconds to milliseconds
+                    execution_time = float(execution_time.replace('s', '').strip()) * 1000
+        
+        # If we couldn't find execution time, print debug info and return None
+        if execution_time is None:
+            print(f"Warning: Could not find execution time in {file_path}")
+            print(f"Available keys: {list(data.keys())}")
+            return None
+        
+        result['execution_time'] = execution_time
+        
+        # Extract features
+        # Exclude known time-related fields and file_path
+        exclude_fields = time_fields + ['file_path']
+        
+        # Add all other fields as features
+        for key, value in data.items():
+            if key not in exclude_fields:
+                # If the value is a dict, flatten it
+                if isinstance(value, dict):
+                    for sub_key, sub_value in value.items():
+                        if isinstance(sub_value, (int, float, bool)):
+                            result[f"{key}_{sub_key}"] = sub_value
+                # Otherwise, add the value directly if it's a numeric type
+                elif isinstance(value, (int, float, bool)):
+                    result[key] = value
+        
+        return result
+    
+    except Exception as e:
+        print(f"Error processing file {file_path}: {str(e)}")
+        return None
 
 def analyze_data(df):
     """Perform analysis on the collected data."""
     # Drop rows with missing execution times
     df = df.dropna(subset=['execution_time'])
+    
+    # Print basic info
+    print(f"Dataset shape: {df.shape}")
+    print(f"Features: {df.columns.tolist()}")
+    print(f"Execution time range: {df['execution_time'].min()} - {df['execution_time'].max()} ms")
     
     # Convert all feature columns to numeric where possible
     for col in df.columns:
@@ -87,6 +111,8 @@ def analyze_data(df):
     
     if not feature_cols:
         return "No numeric features found for analysis."
+    
+    print(f"Numeric features for analysis: {len(feature_cols)}")
     
     # Split data
     X = df[feature_cols]
@@ -148,22 +174,24 @@ def analyze_data(df):
     
     # Plot feature importance
     plt.figure(figsize=(12, 8))
-    sns.barplot(x='RF_Importance', y='Feature', data=rf_feature_importance)
-    plt.title('Feature Importance (Random Forest)')
+    top_n = min(20, len(rf_feature_importance))  # Limit to top 20 features
+    sns.barplot(x='RF_Importance', y='Feature', data=rf_feature_importance.head(top_n))
+    plt.title('Top Feature Importance (Random Forest)')
     plt.tight_layout()
     plt.savefig(os.path.join(plots_dir, 'rf_feature_importance.png'))
     
     # Plot correlation with execution time
     plt.figure(figsize=(12, 8))
     correlation_with_time_df = pd.DataFrame(correlation_with_time).drop('execution_time')
-    sns.barplot(x=correlation_with_time_df['execution_time'], y=correlation_with_time_df.index)
-    plt.title('Correlation with Execution Time')
+    top_corr = correlation_with_time_df.head(top_n)
+    sns.barplot(x=top_corr['execution_time'], y=top_corr.index)
+    plt.title('Top Correlations with Execution Time')
     plt.tight_layout()
     plt.savefig(os.path.join(plots_dir, 'correlation_with_time.png'))
     
     # Plot execution time distribution
     plt.figure(figsize=(12, 6))
-    sns.histplot(df['execution_time'], kde=True)
+    sns.histplot(df['execution_time'], kde=True, bins=50)
     plt.title('Execution Time Distribution')
     plt.tight_layout()
     plt.savefig(os.path.join(plots_dir, 'execution_time_distribution.png'))
@@ -212,24 +240,28 @@ def generate_report(analysis_results, output_file="execution_time_analysis_repor
         # Feature importance from Random Forest
         f.write("FEATURE IMPORTANCE (RANDOM FOREST)\n")
         f.write("================================\n")
-        for _, row in analysis_results['rf_feature_importance'].iterrows():
+        for _, row in analysis_results['rf_feature_importance'].head(20).iterrows():
             f.write(f"{row['Feature']}: {row['RF_Importance']:.4f}\n")
         f.write("\n")
         
         # Linear regression coefficients
-        f.write("LINEAR REGRESSION COEFFICIENTS\n")
-        f.write("============================\n")
-        for _, row in analysis_results['lr_feature_importance'].iterrows():
+        f.write("LINEAR REGRESSION COEFFICIENTS (TOP 20)\n")
+        f.write("====================================\n")
+        for _, row in analysis_results['lr_feature_importance'].head(20).iterrows():
             f.write(f"{row['Feature']}: Raw Coefficient = {row['LR_Coefficient']:.4f}, ")
             f.write(f"Standardized = {row['LR_Standardized_Coefficient']:.4f}\n")
         f.write("\n")
         
         # Correlation with execution time
-        f.write("CORRELATION WITH EXECUTION TIME\n")
-        f.write("==============================\n")
+        f.write("CORRELATION WITH EXECUTION TIME (TOP 20)\n")
+        f.write("====================================\n")
+        count = 0
         for feature, corr in analysis_results['correlation_with_time'].items():
             if feature != 'execution_time':
                 f.write(f"{feature}: {corr:.4f}\n")
+                count += 1
+                if count >= 20:
+                    break
         f.write("\n")
         
         # Basic statistics
@@ -251,7 +283,7 @@ def generate_report(analysis_results, output_file="execution_time_analysis_repor
         f.write("==========\n")
         
         # Get top features for conclusion
-        top_features = analysis_results['rf_feature_importance']['Feature'].tolist()[:3]
+        top_features = analysis_results['rf_feature_importance']['Feature'].tolist()[:5]
         f.write(f"The analysis indicates that the most significant features affecting execution time are:\n")
         for i, feature in enumerate(top_features, 1):
             importance = analysis_results['rf_feature_importance'].loc[
@@ -272,46 +304,35 @@ def main():
     all_files = find_all_files(root_dir)
     print(f"Found {len(all_files)} files")
     
-    # Initialize a list to store all the data
+    # Process each file and collect data
     data_rows = []
+    for i, file_path in enumerate(all_files):
+        result = extract_data_from_file(file_path)
+        if result:
+            data_rows.append(result)
+        
+        # Print progress
+        if (i+1) % 100 == 0:
+            print(f"Processed {i+1}/{len(all_files)} files, collected {len(data_rows)} valid entries")
     
-    # Process each file
-    for file_path in all_files:
-        try:
-            with open(file_path, 'r') as f:
-                content = f.read()
-            
-            # Extract execution time
-            execution_time = extract_execution_time(content)
-            
-            # Extract features
-            features = extract_features(content)
-            
-            # Skip files where we couldn't extract the required information
-            if execution_time is None or not features:
-                continue
-            
-            # Create a data row with features and execution time
-            data_row = features.copy() if isinstance(features, dict) else {}
-            data_row['execution_time'] = execution_time
-            data_row['file_path'] = file_path
-            
-            data_rows.append(data_row)
-            
-        except Exception as e:
-            print(f"Error processing file {file_path}: {str(e)}")
-    
-    # Create a DataFrame from all the collected data
     print(f"Creating dataset from {len(data_rows)} processed files")
     if not data_rows:
         print("No valid data found. Please check the file format or extraction functions.")
         return
     
+    # Create DataFrame from collected data
     df = pd.DataFrame(data_rows)
+    
+    # Save the raw data for later reference
+    df.to_csv("raw_execution_time_data.csv", index=False)
     
     # Perform analysis
     print("Analyzing data...")
     analysis_results = analyze_data(df)
+    
+    if isinstance(analysis_results, str):
+        print(f"Analysis failed: {analysis_results}")
+        return
     
     # Generate the report
     print("Generating report...")
@@ -319,6 +340,7 @@ def main():
     
     print(f"Analysis complete! Report has been saved to '{report_file}'")
     print(f"Visualizations have been saved to the '{analysis_results['plots_dir']}' directory")
+    print(f"Raw data has been saved to 'raw_execution_time_data.csv'")
 
 if __name__ == "__main__":
     main()
