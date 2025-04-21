@@ -302,12 +302,11 @@ def prepare_data_for_model(train_features, test_features, test_size=50):
     X_train_scaled_aug = []
     y_train_scaled_aug = []
     for i in range(len(y_train_scaled)):
-        actual_time = y_train[i][0]  # Original execution time
+        actual_time = y_train[i][0]
         X_train_scaled_aug.append(X_train_scaled[i])
         y_train_scaled_aug.append(y_train_scaled[i])
-        # Augment small (<100ms) and large (>500ms) execution times
         if actual_time < 100 or actual_time > 500:
-            for _ in range(2):  # Create 2 augmented samples
+            for _ in range(2):
                 noise_X = np.random.normal(0, 0.05, X_train_scaled[i].shape)
                 noise_y = np.random.normal(0, 0.05, y_train_scaled[i].shape)
                 X_train_scaled_aug.append(X_train_scaled[i] + noise_X)
@@ -327,120 +326,52 @@ def prepare_data_for_model(train_features, test_features, test_size=50):
     return (X_train_tensor, y_train_tensor, X_test_tensor, y_test_tensor, 
             scaler_y, input_size, is_log_transformed)
 
-class TransformerEncoderLayer(nn.Module):
-    def __init__(self, d_model, nhead, dim_feedforward=512, dropout=0.3):
-        super(TransformerEncoderLayer, self).__init__()
-        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
-        self.linear1 = nn.Linear(d_model, dim_feedforward)
-        self.dropout = nn.Dropout(dropout)
-        self.linear2 = nn.Linear(dim_feedforward, d_model)
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.dropout1 = nn.Dropout(dropout)
-        self.dropout2 = nn.Dropout(dropout)
-        self.activation = nn.GELU()
-    
-    def forward(self, src):
-        src2 = self.self_attn(src, src, src)[0]
-        src = src + self.dropout1(src2)
-        src = self.norm1(src)
-        src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
-        src = src + self.dropout2(src2)
-        src = self.norm2(src)
-        return src
-
 class ImprovedLSTMModel(nn.Module):
-    def __init__(self, input_size, hidden_size=192, output_size=1, dropout_rate=0.3):
+    def __init__(self, input_size, hidden_size=128, output_size=1, dropout_rate=0.2):
         super(ImprovedLSTMModel, self).__init__()
         self.hidden_size = hidden_size
         self.num_layers = 2
-        self.input_size = input_size
         
-        # Feature embedding
-        self.embedding = nn.Linear(input_size, hidden_size)
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers=self.num_layers, batch_first=True, dropout=dropout_rate)
         
-        # LSTM layers
-        self.lstm = nn.LSTM(hidden_size, hidden_size, num_layers=self.num_layers, batch_first=True, dropout=dropout_rate)
-        
-        # Transformer encoder to capture feature interactions
-        self.transformer_layer = TransformerEncoderLayer(
-            d_model=hidden_size,
-            nhead=4,  # Ensure hidden_size is divisible by nhead
-            dim_feedforward=768,
-            dropout=dropout_rate
-        )
-        
-        # Deeper fully connected head with residual connections
-        self.fc1 = nn.Linear(hidden_size, 128)
-        self.bn1 = nn.BatchNorm1d(128)
-        self.fc2 = nn.Linear(128, 64)
-        self.bn2 = nn.BatchNorm1d(64)
-        self.fc3 = nn.Linear(64, 32)
-        self.bn3 = nn.BatchNorm1d(32)
-        self.fc4 = nn.Linear(32, 16)
-        self.bn4 = nn.BatchNorm1d(16)
-        self.fc5 = nn.Linear(16, output_size)
-        
-        # Residual connection
-        self.residual = nn.Linear(hidden_size, 16)
+        # Simplified fully connected layers
+        self.fc1 = nn.Linear(hidden_size, 64)
+        self.bn1 = nn.BatchNorm1d(64)
+        self.fc2 = nn.Linear(64, 32)
+        self.bn2 = nn.BatchNorm1d(32)
+        self.fc3 = nn.Linear(32, output_size)
         
         self.dropout = nn.Dropout(dropout_rate)
-        self.gelu = nn.GELU()
+        self.leaky_relu = nn.LeakyReLU(0.1)
     
     def forward(self, x):
-        # Input shape: [batch_size, seq_len=1, input_size]
         batch_size = x.size(0)
-        
-        # Feature embedding
-        x = self.embedding(x)  # [batch_size, seq_len=1, hidden_size]
-        
-        # LSTM
         h0 = torch.zeros(self.num_layers, batch_size, self.hidden_size).to(x.device)
         c0 = torch.zeros(self.num_layers, batch_size, self.hidden_size).to(x.device)
+        
         lstm_out, (hn, cn) = self.lstm(x, (h0, c0))
         
-        # Prepare for transformer: treat features as sequence
-        # Reshape to [seq_len, batch_size, hidden_size] for transformer
-        x = lstm_out.permute(1, 0, 2)  # [seq_len=1, batch_size, hidden_size]
-        x = self.transformer_layer(x)
-        x = x.permute(1, 0, 2)  # Back to [batch_size, seq_len=1, hidden_size]
-        
-        # Use the last hidden state
-        x = x[:, -1, :]  # [batch_size, hidden_size]
-        
-        # Fully connected head with residual connections
-        residual = self.residual(x)
+        x = hn[-1]
         
         x = self.fc1(x)
         x = self.bn1(x)
-        x = self.gelu(x)
+        x = self.leaky_relu(x)
         x = self.dropout(x)
         
         x = self.fc2(x)
         x = self.bn2(x)
-        x = self.gelu(x)
+        x = self.leaky_relu(x)
         x = self.dropout(x)
         
         x = self.fc3(x)
-        x = self.bn3(x)
-        x = self.gelu(x)
-        x = self.dropout(x)
-        
-        x = self.fc4(x)
-        x = self.bn4(x)
-        x = self.gelu(x)
-        x = self.dropout(x)
-        
-        x = x + residual  # Residual connection
-        
-        x = self.fc5(x)
         return x
 
 def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=16):
     train_dataset = TensorDataset(X_train, y_train)
     test_dataset = TensorDataset(X_test, y_test)
     
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    # Use drop_last=True to avoid batches with size 1
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
     
     return train_loader, test_loader
@@ -454,31 +385,27 @@ class WeightedCombinedLoss(nn.Module):
         self.mse_loss = nn.MSELoss(reduction='none')
     
     def forward(self, outputs, targets):
-        # Compute MSE loss per sample
         mse = self.mse_loss(outputs, targets)
-        
-        # Compute MAPE per sample
         mape = torch.abs((targets - outputs) / (targets + self.epsilon)) * 100
         
-        # Weight the loss based on target value ranges
         weights = torch.ones_like(targets)
-        weights = torch.where(targets < 0.5, 0.5, weights)  # Down-weight small scaled values
-        weights = torch.where(targets > 2.0, 1.5, weights)  # Up-weight large scaled values
+        weights = torch.where(targets < 0.5, 0.5, weights)
+        weights = torch.where(targets > 2.0, 1.5, weights)
         
         weighted_mse = (mse * weights).mean()
         weighted_mape = (mape * weights).mean()
         
         return self.mape_weight * weighted_mape + self.mse_weight * weighted_mse
 
-def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=1200, patience=60, checkpoint_path='checkpoint_lstm.pth', save_freq=10):
+def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=1000, patience=50, checkpoint_path='checkpoint_lstm.pth', save_freq=10):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     model.to(device)
     
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=20, verbose=True)
     
-    warmup_epochs = 30
-    base_lr = 0.0003
+    warmup_epochs = 20
+    base_lr = 0.0005
     for param_group in optimizer.param_groups:
         param_group['lr'] = base_lr / warmup_epochs
     
@@ -708,13 +635,13 @@ def main(main_dir):
     
     model = ImprovedLSTMModel(
         input_size=input_size,
-        hidden_size=192,
+        hidden_size=128,
         output_size=1,
-        dropout_rate=0.3
+        dropout_rate=0.2
     )
     
     criterion = WeightedCombinedLoss(mape_weight=0.4, mse_weight=0.6, epsilon=1e-4)
-    optimizer = optim.AdamW(model.parameters(), lr=0.0003, weight_decay=1e-3)
+    optimizer = optim.AdamW(model.parameters(), lr=0.0005, weight_decay=1e-3)
     
     print("Building and training Improved LSTM model...")
     train_losses, val_losses = train_model(
@@ -723,8 +650,8 @@ def main(main_dir):
         test_loader, 
         criterion, 
         optimizer, 
-        num_epochs=1200,
-        patience=60,
+        num_epochs=1000,
+        patience=50,
         checkpoint_path='checkpoint_lstm.pth',
         save_freq=10
     )
