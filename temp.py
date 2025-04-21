@@ -109,9 +109,9 @@ def extract_features_from_file(file_path):
         'nodes_count': len(nodes_features),
         'edges_count': len(edges_features),
         'scheduling_count': len(scheduling_features),
-        'total_bytes_at_production': 0.0,  # Default value
-        'total_vectors': 0.0,              # Default value
-        'total_parallelism': 0.0           # Default value
+        'total_bytes_at_production': 0.0,
+        'total_vectors': 0.0,
+        'total_parallelism': 0.0
     }
     
     if len(nodes_features) > 0 and len(edges_features) > 0:
@@ -158,7 +158,6 @@ def extract_features_from_file(file_path):
         features['avg_ops_per_node'] = sum(op_counts.values()) / len(nodes_features)
         features['op_diversity'] = op_types / len(nodes_features) if len(nodes_features) > 0 else 0
     
-    # Add interaction features
     features['bytes_per_parallelism'] = features['total_bytes_at_production'] / (features['total_parallelism'] + 1e-8)
     if 'nodes_count' in features and 'scheduling_count' in features:
         features['nodes_per_schedule'] = features['nodes_count'] / (features['scheduling_count'] + 1e-8)
@@ -224,20 +223,18 @@ def process_main_directory(main_dir):
 def clean_and_transform_features(train_features, test_features, test_size=50):
     all_features_df = pd.DataFrame(train_features + test_features)
     
-    # Remove outliers in execution time using IQR
+    # Relaxed outlier removal (using 2.0 * IQR instead of 1.5)
     Q1 = all_features_df['execution_time'].quantile(0.25)
     Q3 = all_features_df['execution_time'].quantile(0.75)
     IQR = Q3 - Q1
-    lower_bound = Q1 - 1.5 * IQR
-    upper_bound = Q3 + 1.5 * IQR
+    lower_bound = Q1 - 2.0 * IQR
+    upper_bound = Q3 + 2.0 * IQR
     all_features_df = all_features_df[(all_features_df['execution_time'] >= lower_bound) & (all_features_df['execution_time'] <= upper_bound)]
     print(f"Removed {len(train_features + test_features) - len(all_features_df)} outliers based on execution time")
     
-    # After outlier removal, ensure we have enough samples for the test set
     if len(all_features_df) < test_size:
         raise ValueError(f"After outlier removal, only {len(all_features_df)} samples remain, but {test_size} are required for the test set.")
     
-    # Adjust the train-test split based on the remaining data
     train_size = len(all_features_df) - test_size
     if train_size <= 0:
         raise ValueError("Not enough samples remaining for training after outlier removal and reserving test set.")
@@ -256,31 +253,28 @@ def clean_and_transform_features(train_features, test_features, test_size=50):
     all_features_df = all_features_df.drop(columns=constant_columns)
     print(f"Dropped {len(constant_columns)} constant columns")
     
-    # Remove highly correlated features
     corr_matrix = all_features_df.drop(['execution_time'], axis=1).corr().abs()
     upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
     to_drop = [column for column in upper.columns if any(upper[column] > 0.9)]
     all_features_df = all_features_df.drop(columns=to_drop)
     print(f"Dropped {len(to_drop)} highly correlated features")
     
-    if 'execution_time' in all_features_df.columns:
-        all_features_df['execution_time_log'] = np.log1p(all_features_df['execution_time'])
+    # Avoid log-transforming execution_time to preserve scale
+    # if 'execution_time' in all_features_df.columns:
+    #     all_features_df['execution_time_log'] = np.log1p(all_features_df['execution_time'])
     
-    # Check if log-transformed columns exist before creating log_bytes_per_vector
     if 'log_total_bytes_at_production' in all_features_df.columns and 'log_total_vectors' in all_features_df.columns:
         all_features_df['log_bytes_per_vector'] = all_features_df['log_total_bytes_at_production'] / (all_features_df['log_total_vectors'] + 1e-8)
     else:
         print("Warning: 'log_total_bytes_at_production' or 'log_total_vectors' not found in DataFrame, skipping log_bytes_per_vector calculation")
-        all_features_df['log_bytes_per_vector'] = 0.0  # Default value if calculation cannot be performed
+        all_features_df['log_bytes_per_vector'] = 0.0
     
     numeric_cols = all_features_df.select_dtypes(include=['number']).columns
     all_features_df = all_features_df[numeric_cols]
     
-    # Split into train and test based on the adjusted sizes
     train_df = all_features_df.iloc[:train_size]
     test_df = all_features_df.iloc[train_size:]
     
-    # Verify that test_df has the expected number of samples
     if len(test_df) != test_size:
         raise ValueError(f"Test set has {len(test_df)} samples, but expected {test_size}.")
     
@@ -289,18 +283,18 @@ def clean_and_transform_features(train_features, test_features, test_size=50):
 def prepare_data_for_model(train_features, test_features, test_size=50):
     train_df, test_df = clean_and_transform_features(train_features, test_features, test_size=test_size)
     
-    if 'execution_time_log' in train_df.columns:
-        y_train = train_df['execution_time_log'].values.reshape(-1, 1)
-        y_test = test_df['execution_time_log'].values.reshape(-1, 1)
-        train_df = train_df.drop(['execution_time', 'execution_time_log'], axis=1)
-        test_df = test_df.drop(['execution_time', 'execution_time_log'], axis=1)
-        is_log_transformed = True
-    else:
-        y_train = train_df['execution_time'].values.reshape(-1, 1)
-        y_test = test_df['execution_time'].values.reshape(-1, 1)
-        train_df = train_df.drop('execution_time', axis=1)
-        test_df = test_df.drop('execution_time', axis=1)
-        is_log_transformed = False
+    # if 'execution_time_log' in train_df.columns:
+    #     y_train = train_df['execution_time_log'].values.reshape(-1, 1)
+    #     y_test = test_df['execution_time_log'].values.reshape(-1, 1)
+    #     train_df = train_df.drop(['execution_time', 'execution_time_log'], axis=1)
+    #     test_df = test_df.drop(['execution_time', 'execution_time_log'], axis=1)
+    #     is_log_transformed = True
+    # else:
+    y_train = train_df['execution_time'].values.reshape(-1, 1)
+    y_test = test_df['execution_time'].values.reshape(-1, 1)
+    train_df = train_df.drop('execution_time', axis=1)
+    test_df = test_df.drop('execution_time', axis=1)
+    is_log_transformed = False
     
     print("\nDebugging target values in prepare_data_for_model:")
     print(f"First 5 y_train raw: {y_train[:5].flatten()}")
@@ -317,7 +311,6 @@ def prepare_data_for_model(train_features, test_features, test_size=50):
     print(f"First 5 y_train scaled: {y_train_scaled[:5].flatten()}")
     print(f"First 5 y_test scaled: {y_test_scaled[:5].flatten()}")
     
-    # Add noise for data augmentation
     noise = np.random.normal(0, 0.01, X_train_scaled.shape)
     X_train_scaled += noise
     
@@ -332,64 +325,35 @@ def prepare_data_for_model(train_features, test_features, test_size=50):
     return (X_train_tensor, y_train_tensor, X_test_tensor, y_test_tensor, 
             scaler_y, input_size, is_log_transformed)
 
-class Attention(nn.Module):
-    def __init__(self, hidden_size):
-        super(Attention, self).__init__()
-        self.hidden_size = hidden_size
-        self.attn = nn.Linear(hidden_size * 2, hidden_size)
-        self.v = nn.Parameter(torch.rand(hidden_size))
-        stdv = 1. / (self.hidden_size ** 0.5)
-        self.v.data.uniform_(-stdv, stdv)
-    
-    def forward(self, hidden, encoder_outputs):
-        batch_size, seq_len, _ = encoder_outputs.size()
-        hidden = hidden.unsqueeze(1).repeat(1, seq_len, 1)
-        energy = torch.tanh(self.attn(torch.cat((hidden, encoder_outputs), dim=2)))
-        energy = energy @ self.v
-        attention_weights = torch.softmax(energy, dim=1)
-        context = (attention_weights.unsqueeze(-1) * encoder_outputs).sum(dim=1)
-        return context
-
 class ImprovedLSTMModel(nn.Module):
-    def __init__(self, input_size, hidden_size=256, output_size=1, dropout_rate=0.3):
+    def __init__(self, input_size, hidden_size=128, output_size=1, dropout_rate=0.2):
         super(ImprovedLSTMModel, self).__init__()
         self.hidden_size = hidden_size
-        self.num_layers = 3
+        self.num_layers = 2
         
-        # LSTM layers with batch_first=True
         self.lstm = nn.LSTM(input_size, hidden_size, num_layers=self.num_layers, batch_first=True, dropout=dropout_rate)
         
-        # Attention layer
-        self.attention = Attention(hidden_size)
-        
-        # Fully connected layers with batch normalization and residual connections
-        self.fc1 = nn.Linear(hidden_size, 128)
-        self.bn1 = nn.BatchNorm1d(128)
-        self.fc2 = nn.Linear(128, 64)
-        self.bn2 = nn.BatchNorm1d(64)
-        self.fc3 = nn.Linear(64, 32)
-        self.bn3 = nn.BatchNorm1d(32)
-        self.fc4 = nn.Linear(32, output_size)
-        
-        # Residual connection
-        self.residual = nn.Linear(hidden_size, 32)
+        # Simplified fully connected layers
+        self.fc1 = nn.Linear(hidden_size, 64)
+        self.bn1 = nn.BatchNorm1d(64)
+        self.fc2 = nn.Linear(64, 32)
+        self.bn2 = nn.BatchNorm1d(32)
+        self.fc3 = nn.Linear(32, output_size)
         
         self.dropout = nn.Dropout(dropout_rate)
         self.leaky_relu = nn.LeakyReLU(0.1)
     
     def forward(self, x):
-        # Input shape: [batch_size, seq_len=1, feature_dim]
         batch_size = x.size(0)
         h0 = torch.zeros(self.num_layers, batch_size, self.hidden_size).to(x.device)
         c0 = torch.zeros(self.num_layers, batch_size, self.hidden_size).to(x.device)
         
         lstm_out, (hn, cn) = self.lstm(x, (h0, c0))
         
-        # Apply attention
-        context = self.attention(hn[-1], lstm_out)
+        # Use the last hidden state
+        x = hn[-1]
         
-        # Fully connected layers
-        x = self.fc1(context)
+        x = self.fc1(x)
         x = self.bn1(x)
         x = self.leaky_relu(x)
         x = self.dropout(x)
@@ -400,15 +364,6 @@ class ImprovedLSTMModel(nn.Module):
         x = self.dropout(x)
         
         x = self.fc3(x)
-        x = self.bn3(x)
-        x = self.leaky_relu(x)
-        x = self.dropout(x)
-        
-        # Add residual connection
-        residual = self.residual(context)
-        x = x + residual
-        
-        x = self.fc4(x)
         return x
 
 def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=16):
@@ -421,7 +376,7 @@ def create_data_loaders(X_train, y_train, X_test, y_test, batch_size=16):
     return train_loader, test_loader
 
 class CombinedLoss(nn.Module):
-    def __init__(self, mape_weight=0.7, mse_weight=0.3, epsilon=1e-2):
+    def __init__(self, mape_weight=0.5, mse_weight=0.5, epsilon=1e-4):
         super(CombinedLoss, self).__init__()
         self.mape_weight = mape_weight
         self.mse_weight = mse_weight
@@ -433,26 +388,25 @@ class CombinedLoss(nn.Module):
         mse = self.mse_loss(outputs, targets)
         return self.mape_weight * mape + self.mse_weight * mse
 
-def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=500, patience=30, checkpoint_path='checkpoint_lstm.pth'):
+def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=1000, patience=50, checkpoint_path='checkpoint_lstm.pth', save_freq=10):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     model.to(device)
     
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10, verbose=True)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=20, verbose=True)
     
-    # Warm-up phase: linearly increase LR for the first 10 epochs
-    warmup_epochs = 10
-    base_lr = 0.001
+    warmup_epochs = 20
+    base_lr = 0.0005
     for param_group in optimizer.param_groups:
         param_group['lr'] = base_lr / warmup_epochs
     
-    # Load checkpoint if it exists
     start_epoch, train_losses, val_losses, best_val_loss, epochs_no_improve = load_checkpoint(
         model, optimizer, scheduler, checkpoint_path
     )
     
+    best_model_state = None
+    
     for epoch in range(start_epoch, num_epochs):
-        # Warm-up phase
         if epoch < warmup_epochs:
             lr = base_lr * (epoch + 1) / warmup_epochs
             for param_group in optimizer.param_groups:
@@ -468,7 +422,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
             loss = criterion(outputs, targets)
             loss.backward()
             
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             
             optimizer.step()
             running_loss += loss.item() * inputs.size(0)
@@ -493,16 +447,26 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
         
         print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
         
-        # Save checkpoint after each epoch
-        save_checkpoint(
-            model, optimizer, scheduler, epoch, train_losses, val_losses, 
-            best_val_loss, epochs_no_improve, checkpoint_path
-        )
+        if (epoch + 1) % save_freq == 0:
+            try:
+                save_checkpoint(
+                    model, optimizer, scheduler, epoch, train_losses, val_losses, 
+                    best_val_loss, epochs_no_improve, checkpoint_path
+                )
+            except (OSError, RuntimeError) as e:
+                print(f"Warning: Failed to save checkpoint at epoch {epoch+1}: {str(e)}")
+                print("Continuing training without saving checkpoint...")
         
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             epochs_no_improve = 0
-            torch.save(model.state_dict(), 'best_lstm_model.pth')
+            best_model_state = model.state_dict()
+            try:
+                torch.save(best_model_state, 'best_lstm_model.pth')
+                print("Saved best model state to 'best_lstm_model.pth'")
+            except (OSError, RuntimeError) as e:
+                print(f"Warning: Failed to save best model state at epoch {epoch+1}: {str(e)}")
+                print("Best model state retained in memory and will be used for evaluation.")
         else:
             epochs_no_improve += 1
         
@@ -510,10 +474,11 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
             print(f'Early stopping after {epoch+1} epochs')
             break
     
-    # Load the best model state
-    if os.path.exists('best_lstm_model.pth'):
-        model.load_state_dict(torch.load('best_lstm_model.pth'))
-        print("Loaded best model state from 'best_lstm_model.pth'")
+    if best_model_state is not None:
+        model.load_state_dict(best_model_state)
+        print("Loaded best model state from memory for evaluation.")
+    else:
+        print("No best model state available; using the final model state for evaluation.")
     
     return train_losses, val_losses
 
@@ -575,10 +540,11 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_tran
         y_test_actual = y_test_transformed
         y_pred_actual = y_pred_transformed
     
-    # Clip predictions to avoid negative values
     y_pred_actual = np.maximum(y_pred_actual, 1e-2)
     
     results_by_subfolder = {}
+    error_by_range = {'small (<100ms)': [], 'medium (100-500ms)': [], 'large (>500ms)': []}
+    
     for i, file_path in enumerate(file_names_test):
         subfolder = file_path.split('/')[0]
         if subfolder not in results_by_subfolder:
@@ -588,6 +554,14 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_tran
         pred_val = y_pred_actual[i][0]
         error_percentage = abs(actual_val - pred_val) / actual_val * 100 if actual_val > 0 else 0
         error_percentage = min(error_percentage, 1000.0)
+        
+        # Categorize error by execution time range
+        if actual_val < 100:
+            error_by_range['small (<100ms)'].append(error_percentage)
+        elif 100 <= actual_val <= 500:
+            error_by_range['medium (100-500ms)'].append(error_percentage)
+        else:
+            error_by_range['large (>500ms)'].append(error_percentage)
         
         results_by_subfolder[subfolder].append({
             'file': file_path,
@@ -614,6 +588,14 @@ def evaluate_model(model, X_test, y_test, y_scaler, file_names_test, is_log_tran
     else:
         mape = 0.0
         mdape = 0.0
+    
+    print("\nError Analysis by Execution Time Range:")
+    for range_name, errors in error_by_range.items():
+        if errors:
+            avg_error = np.mean(errors)
+            print(f"{range_name}: Average Error = {avg_error:.2f}% (n={len(errors)})")
+        else:
+            print(f"{range_name}: No samples")
     
     print("\nOverall Model Performance:")
     print(f"MSE: {mse}")
@@ -645,13 +627,13 @@ def main(main_dir):
     
     model = ImprovedLSTMModel(
         input_size=input_size,
-        hidden_size=256,
+        hidden_size=128,
         output_size=1,
-        dropout_rate=0.3
+        dropout_rate=0.2
     )
     
-    criterion = CombinedLoss(mape_weight=0.7, mse_weight=0.3, epsilon=1e-2)
-    optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-4)
+    criterion = CombinedLoss(mape_weight=0.5, mse_weight=0.5, epsilon=1e-4)
+    optimizer = optim.AdamW(model.parameters(), lr=0.0005, weight_decay=1e-3)
     
     print("Building and training Improved LSTM model...")
     train_losses, val_losses = train_model(
@@ -660,9 +642,10 @@ def main(main_dir):
         test_loader, 
         criterion, 
         optimizer, 
-        num_epochs=500,
-        patience=30,
-        checkpoint_path='checkpoint_lstm.pth'
+        num_epochs=1000,
+        patience=50,
+        checkpoint_path='checkpoint_lstm.pth',
+        save_freq=10
     )
     
     plt.figure(figsize=(10, 6))
@@ -673,9 +656,13 @@ def main(main_dir):
     plt.title('Training and Validation Loss over Epochs')
     plt.legend()
     plt.grid(True)
-    plt.savefig('loss_improved_model.png')
-    plt.close()
-    print("Training plot saved as 'loss_improved_model.png'")
+    try:
+        plt.savefig('loss_improved_model.png')
+        plt.close()
+        print("Training plot saved as 'loss_improved_model.png'")
+    except (OSError, RuntimeError) as e:
+        print(f"Warning: Failed to save training plot: {str(e)}")
+        plt.close()
     
     print("\nEvaluating model:")
     y_test_actual, y_pred_actual = evaluate_model(
@@ -693,7 +680,7 @@ def main(main_dir):
         traced_model = torch.jit.trace(model, sample_input)
         traced_model.save("lstm_model.pt")
         print("Model successfully saved as 'lstm_model.pt'")
-    except Exception as e:
+    except (OSError, RuntimeError) as e:
         print(f"Error saving the model: {str(e)}")
     
     return model, y_scaler, y_test_actual, y_pred_actual
