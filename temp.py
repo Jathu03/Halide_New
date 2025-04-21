@@ -108,7 +108,10 @@ def extract_features_from_file(file_path):
         'execution_time': execution_time,
         'nodes_count': len(nodes_features),
         'edges_count': len(edges_features),
-        'scheduling_count': len(scheduling_features)
+        'scheduling_count': len(scheduling_features),
+        'total_bytes_at_production': 0.0,  # Default value
+        'total_vectors': 0.0,              # Default value
+        'total_parallelism': 0.0           # Default value
     }
     
     if len(nodes_features) > 0 and len(edges_features) > 0:
@@ -156,8 +159,7 @@ def extract_features_from_file(file_path):
         features['op_diversity'] = op_types / len(nodes_features) if len(nodes_features) > 0 else 0
     
     # Add interaction features
-    if 'total_bytes_at_production' in features and 'total_parallelism' in features:
-        features['bytes_per_parallelism'] = features['total_bytes_at_production'] / (features['total_parallelism'] + 1e-8)
+    features['bytes_per_parallelism'] = features['total_bytes_at_production'] / (features['total_parallelism'] + 1e-8)
     if 'nodes_count' in features and 'scheduling_count' in features:
         features['nodes_per_schedule'] = features['nodes_count'] / (features['scheduling_count'] + 1e-8)
     
@@ -255,8 +257,12 @@ def clean_and_transform_features(train_features, test_features):
     if 'execution_time' in all_features_df.columns:
         all_features_df['execution_time_log'] = np.log1p(all_features_df['execution_time'])
     
-    if 'log_total_vectors' in all_features_df.columns:
+    # Check if log-transformed columns exist before creating log_bytes_per_vector
+    if 'log_total_bytes_at_production' in all_features_df.columns and 'log_total_vectors' in all_features_df.columns:
         all_features_df['log_bytes_per_vector'] = all_features_df['log_total_bytes_at_production'] / (all_features_df['log_total_vectors'] + 1e-8)
+    else:
+        print("Warning: 'log_total_bytes_at_production' or 'log_total_vectors' not found in DataFrame, skipping log_bytes_per_vector calculation")
+        all_features_df['log_bytes_per_vector'] = 0.0  # Default value if calculation cannot be performed
     
     numeric_cols = all_features_df.select_dtypes(include=['number']).columns
     all_features_df = all_features_df[numeric_cols]
