@@ -29,57 +29,60 @@ def extract_data_from_file(file_path):
         # Create a dictionary to store the data
         result = {'file_path': file_path}
         
-        # Extract execution time - look for common fields that might contain time
-        time_fields = ['execution_time', 'time', 'runtime', 'elapsed_time', 'duration']
+        # Extract execution time from the specific structure you mentioned
         execution_time = None
         
-        for field in time_fields:
-            if field in data:
-                execution_time = data[field]
-                break
-        
-        # If time not found in direct fields, look for nested structures
-        if execution_time is None:
-            for key, value in data.items():
-                if isinstance(value, dict):
-                    for time_field in time_fields:
-                        if time_field in value:
-                            execution_time = value[time_field]
-                            break
-        
-        # Convert execution time to milliseconds if it's in a different unit
-        if execution_time is not None:
-            # If it's a string ending with 'ms', extract the numeric part
-            if isinstance(execution_time, str):
-                if 'ms' in execution_time:
-                    execution_time = float(execution_time.replace('ms', '').strip())
-                elif 's' in execution_time and 'ms' not in execution_time:
-                    # Convert seconds to milliseconds
-                    execution_time = float(execution_time.replace('s', '').strip()) * 1000
+        # Check if scheduling_data exists and contains a list of items
+        if 'scheduling_data' in data and isinstance(data['scheduling_data'], list):
+            for item in data['scheduling_data']:
+                # Look for the execution time item with name "total_execution_time_ms"
+                if isinstance(item, dict) and 'name' in item and 'value' in item:
+                    if item['name'] == 'total_execution_time_ms':
+                        execution_time = item['value']
+                        break
+                    # Also look for other possible execution time names
+                    elif item['name'] in ['execution_time', 'runtime', 'time_ms', 'elapsed_time']:
+                        execution_time = item['value']
+                        # Keep searching in case we find the preferred "total_execution_time_ms" later
         
         # If we couldn't find execution time, print debug info and return None
         if execution_time is None:
             print(f"Warning: Could not find execution time in {file_path}")
-            print(f"Available keys: {list(data.keys())}")
+            # Print more detailed structure to debug
+            if 'scheduling_data' in data:
+                print(f"Scheduling data contains {len(data['scheduling_data'])} items")
+                for i, item in enumerate(data['scheduling_data'][:5]):  # Print first 5 for debugging
+                    if isinstance(item, dict) and 'name' in item:
+                        print(f"  Item {i}: name={item['name']}")
             return None
         
-        result['execution_time'] = execution_time
+        result['execution_time'] = float(execution_time)
         
-        # Extract features
-        # Exclude known time-related fields and file_path
-        exclude_fields = time_fields + ['file_path']
+        # Extract features from programming_details if available
+        if 'programming_details' in data and isinstance(data['programming_details'], dict):
+            for key, value in data['programming_details'].items():
+                if isinstance(value, (int, float, bool)):
+                    result[f"prog_{key}"] = value
+                elif isinstance(value, str) and value.isdigit():
+                    result[f"prog_{key}"] = float(value)
         
-        # Add all other fields as features
-        for key, value in data.items():
-            if key not in exclude_fields:
-                # If the value is a dict, flatten it
-                if isinstance(value, dict):
-                    for sub_key, sub_value in value.items():
-                        if isinstance(sub_value, (int, float, bool)):
-                            result[f"{key}_{sub_key}"] = sub_value
-                # Otherwise, add the value directly if it's a numeric type
-                elif isinstance(value, (int, float, bool)):
-                    result[key] = value
+        # Extract additional features from scheduling_data
+        if 'scheduling_data' in data and isinstance(data['scheduling_data'], list):
+            for item in data['scheduling_data']:
+                if isinstance(item, dict) and 'name' in item and 'value' in item:
+                    # Skip the execution time we already extracted
+                    if item['name'] == 'total_execution_time_ms':
+                        continue
+                    
+                    # Try to convert value to numeric if possible
+                    try:
+                        if isinstance(item['value'], (int, float)):
+                            result[f"sched_{item['name']}"] = float(item['value'])
+                        elif isinstance(item['value'], str) and item['value'].replace('.', '', 1).isdigit():
+                            result[f"sched_{item['name']}"] = float(item['value'])
+                    except:
+                        # If conversion fails, skip this item
+                        pass
         
         return result
     
@@ -94,7 +97,6 @@ def analyze_data(df):
     
     # Print basic info
     print(f"Dataset shape: {df.shape}")
-    print(f"Features: {df.columns.tolist()}")
     print(f"Execution time range: {df['execution_time'].min()} - {df['execution_time'].max()} ms")
     
     # Convert all feature columns to numeric where possible
@@ -113,6 +115,7 @@ def analyze_data(df):
         return "No numeric features found for analysis."
     
     print(f"Numeric features for analysis: {len(feature_cols)}")
+    print(f"Sample features: {feature_cols[:10]}")
     
     # Split data
     X = df[feature_cols]
@@ -312,7 +315,7 @@ def main():
             data_rows.append(result)
         
         # Print progress
-        if (i+1) % 100 == 0:
+        if (i+1) % 500 == 0 or i+1 == len(all_files):
             print(f"Processed {i+1}/{len(all_files)} files, collected {len(data_rows)} valid entries")
     
     print(f"Creating dataset from {len(data_rows)} processed files")
