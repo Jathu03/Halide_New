@@ -94,6 +94,7 @@ def extract_features_from_file(file_path):
                 sched_feature.update(sf)
             scheduling_features.append(sched_feature)
     
+    # Compute significant features for the sequence
     scheduling_sequence = []
     for sf in scheduling_features:
         seq_vector = [float(sf.get(metric, 0.0)) for metric in important_metrics]
@@ -104,15 +105,23 @@ def extract_features_from_file(file_path):
         working_set = sf.get('working_set', 0.0)
         inner_p = sf.get('inner_parallelism', 0.0)
         outer_p = sf.get('outer_parallelism', 0.0)
+        # Compute computation_efficiency for the sequence
+        comp_efficiency = points_total / max(bytes_prod, 1e-4) if bytes_prod != 0 else 0.0
+        # Compute memory_utilization_ratio
+        mem_util_ratio = working_set / max(bytes_prod, 1e-4) if bytes_prod != 0 else 0.0
+        # Add derived features
         seq_vector.append(np.log1p(abs(bytes_prod)) / np.log1p(max(abs(bytes_real), 1e-4)) if bytes_real != 0 else 0.0)
         seq_vector.append(np.log1p(bytes_prod) / np.log1p(max(num_vec, 1e-4)) if num_vec != 0 else 0.0)
         seq_vector.append(np.log1p(points_total) / np.log1p(max(num_vec, 1e-4)) if num_vec != 0 else 0.0)
         seq_vector.append(np.log1p(working_set) / np.log1p(max(bytes_prod, 1e-4)) if bytes_prod != 0 else 0.0)
         seq_vector.append(np.log1p(inner_p * outer_p))
         seq_vector.append(np.log1p(bytes_prod) / np.log1p(max(points_total, 1e-4)) if points_total != 0 else 0.0)
+        seq_vector.append(np.log1p(comp_efficiency))
+        seq_vector.append(np.log1p(inner_p) ** 2)  # Polynomial term for inner_parallelism
+        seq_vector.append(np.log1p(mem_util_ratio))
         scheduling_sequence.append(seq_vector)
     if not scheduling_sequence:
-        scheduling_sequence = [[0.0] * (len(important_metrics) + 6)]
+        scheduling_sequence = [[0.0] * (len(important_metrics) + 9)]
     
     seq_array = np.array(scheduling_sequence)
     scaler_seq = RobustScaler()
@@ -130,6 +139,13 @@ def extract_features_from_file(file_path):
     num_edges = len(edges_features)
     total_bytes = sum(sf.get('bytes_at_production', 0) for sf in scheduling_features)
     total_vectors = sum(sf.get('num_vectors', 0) for sf in scheduling_features)
+    total_parallelism = sum(sf.get('inner_parallelism', 0) * sf.get('outer_parallelism', 1) for sf in scheduling_features)
+    # Compute significant scalar features
+    comp_efficiency = sum(sf.get('points_computed_total', 0) for sf in scheduling_features) / max(total_bytes, 1e-4) if total_bytes != 0 else 0.0
+    bytes_processing_rate = total_bytes / max(execution_time, 1e-4) if execution_time != 0 else 0.0
+    mem_util_ratio = sum(sf.get('working_set', 0) for sf in scheduling_features) / max(total_bytes, 1e-4) if total_bytes != 0 else 0.0
+    scheduling_count = len(scheduling_features)
+    
     scalar_features = {
         'nodes_count': num_nodes,
         'edges_count': num_edges,
@@ -138,11 +154,19 @@ def extract_features_from_file(file_path):
         'op_diversity': len(op_counts) / num_nodes,
         'avg_ops_per_node': total_ops / num_nodes,
         'edge_density': num_edges / max(num_nodes * (num_nodes - 1), 1),
-        'total_parallelism': sum(sf.get('inner_parallelism', 0) * sf.get('outer_parallelism', 1) for sf in scheduling_features),
+        'total_parallelism': total_parallelism,
         'avg_bytes_per_node': total_bytes / num_nodes,
         'vector_op_ratio': op_counts.get('op_vector', 0) / max(total_ops, 1),
         'bytes_per_vector': total_bytes / max(total_vectors, 1e-4),
-        'ops_per_byte': total_ops / max(total_bytes, 1e-4)
+        'ops_per_byte': total_ops / max(total_bytes, 1e-4),
+        'computation_efficiency': comp_efficiency,
+        'bytes_processing_rate': bytes_processing_rate,
+        'memory_utilization_ratio': mem_util_ratio,
+        'scheduling_count': scheduling_count,
+        'comp_efficiency_total_vectors': comp_efficiency * total_vectors,
+        'inner_parallelism_total_parallelism': sum(sf.get('inner_parallelism', 0) for sf in scheduling_features) * total_parallelism,
+        'sched_inner_parallelism_squared': sum(sf.get('inner_parallelism', 0) ** 2 for sf in scheduling_features),
+        'computation_efficiency_squared': comp_efficiency ** 2
     }
     scalar_features.update(op_counts)
     
@@ -218,8 +242,31 @@ def prepare_data_for_model(train_features, test_features):
     train_scalar_df = pd.DataFrame([f['scalar_features'] for f in train_features])
     test_scalar_df = pd.DataFrame([f['scalar_features'] for f in test_features])
     
+    # Drop low-importance features
+    low_importance_features = [
+        'op_cast', 'op_eq', 'op_ne', 'op_or', 'op_and', 'op_le', 'op_lt', 'op_not',
+        'sched_num_scalars', 'sched_bytes_at_realization', 'sched_outer_parallelism',
+        'sched_num_realizations', 'sched_num_productions', 'sched_bytes_at_root'
+    ]
+    train_scalar_df = train_scalar_df.drop(columns=[col for col in low_importance_features if col in train_scalar_df.columns])
+    test_scalar_df = test_scalar_df.drop(columns=[col for col in low_importance_features if col in test_scalar_df.columns])
+    
+    # Log transform skewed features
+    skewed_features = ['computation_efficiency', 'bytes_processing_rate', 'total_parallelism', 'total_ops', 'bytes_per_vector']
+    for feature in skewed_features:
+        if feature in train_scalar_df.columns:
+            train_scalar_df[f'log_{feature}'] = np.log1p(train_scalar_df[feature])
+            test_scalar_df[f'log_{feature}'] = np.log1p(test_scalar_df[feature])
+            train_scalar_df = train_scalar_df.drop(columns=[feature])
+            test_scalar_df = test_scalar_df.drop(columns=[feature])
+    
     train_scalar_df = train_scalar_df.fillna(0)
     test_scalar_df = test_scalar_df.fillna(0)
+    
+    # Remove constant columns
+    constant_columns = [col for col in train_scalar_df.columns if train_scalar_df[col].nunique() == 1]
+    train_scalar_df = train_scalar_df.drop(columns=constant_columns)
+    test_scalar_df = test_scalar_df.drop(columns=constant_columns)
     
     y_train_raw = np.array([f['execution_time'] for f in train_features])
     y_test_raw = np.array([f['execution_time'] for f in test_features])
@@ -242,6 +289,40 @@ def prepare_data_for_model(train_features, test_features):
     y_train_scaled = np.nan_to_num(y_train_scaled, nan=0.0)
     y_test_scaled = np.nan_to_num(y_test_scaled, nan=0.0)
     
+    # Data augmentation for significant features
+    train_sequences_aug = []
+    train_scalar_aug = []
+    y_train_aug = []
+    for i in range(len(train_features)):
+        train_sequences_aug.append(train_sequences_padded[i])
+        train_scalar_aug.append(train_scalar_scaled[i])
+        y_train_aug.append(y_train_scaled[i])
+        
+        inner_parallelism_idx = train_scalar_df.columns.get_loc('inner_parallelism_total_parallelism') if 'inner_parallelism_total_parallelism' in train_scalar_df.columns else -1
+        comp_efficiency_idx = train_scalar_df.columns.get_loc('log_computation_efficiency') if 'log_computation_efficiency' in train_scalar_df.columns else -1
+        
+        is_significant = False
+        if inner_parallelism_idx != -1 and train_scalar_scaled[i, inner_parallelism_idx] > np.percentile(train_scalar_scaled[:, inner_parallelism_idx], 75):
+            is_significant = True
+        if comp_efficiency_idx != -1 and train_scalar_scaled[i, comp_efficiency_idx] > np.percentile(train_scalar_scaled[:, comp_efficiency_idx], 75):
+            is_significant = True
+        
+        augment_count = 3 if is_significant else 1
+        for _ in range(augment_count):
+            # Add noise directly to the PyTorch tensor
+            noise_seq = torch.normal(mean=0.0, std=0.05, size=train_sequences_padded[i].shape)
+            noise_scalar = np.random.normal(0, 0.05, train_scalar_scaled[i].shape)
+            noise_y = np.random.normal(0, 0.05, y_train_scaled[i].shape)
+            train_sequences_aug.append(train_sequences_padded[i] + noise_seq)
+            train_scalar_aug.append(train_scalar_scaled[i] + noise_scalar)
+            y_train_aug.append(y_train_scaled[i] + noise_y)
+    
+    # Re-pad the augmented sequences to ensure uniform length
+    train_sequences_padded = pad_sequence(train_sequences_aug, batch_first=True)
+    
+    train_scalar_scaled = np.array(train_scalar_aug)
+    y_train_scaled = np.array(y_train_aug)
+    
     train_scalar_tensor = torch.FloatTensor(train_scalar_scaled)
     test_scalar_tensor = torch.FloatTensor(test_scalar_scaled)
     y_train_tensor = torch.FloatTensor(y_train_scaled)
@@ -252,7 +333,7 @@ def prepare_data_for_model(train_features, test_features):
     
     return (train_sequences_padded, train_scalar_tensor, y_train_tensor,
             test_sequences_padded, test_scalar_tensor, y_test_tensor,
-            scaler_y, train_sequences_padded.shape[2], train_scalar_tensor.shape[1])
+            scaler_y, train_sequences_padded.shape[2], train_scalar_tensor.shape[1], train_scalar_df.columns)
 
 class MultiHeadAttention(nn.Module):
     def __init__(self, hidden_size, num_heads, dropout_rate=0.1):
@@ -348,11 +429,28 @@ class EnhancedRecursiveLSTMModel(nn.Module):
         
         return output
 
-def custom_loss(outputs, targets, huber_delta=0.5, mae_weight=0.3, l1_lambda=1e-5):
+def custom_loss(outputs, targets, scalar_inputs, feature_indices, feature_importances, huber_delta=0.5, mae_weight=0.3, l1_lambda=1e-5):
     huber = nn.HuberLoss(delta=huber_delta)(outputs, targets)
     mae = torch.mean(torch.abs(outputs - targets))
     l1_reg = sum(param.abs().sum() for param in model.parameters()) * l1_lambda
-    return huber + mae_weight * mae + l1_reg
+    
+    # Weight samples based on significant features
+    weights = torch.ones_like(targets)
+    for feature, idx in feature_indices.items():
+        if idx != -1 and feature in feature_importances:
+            feature_vals = scalar_inputs[:, idx]
+            importance = feature_importances[feature]
+            # Increase weight for samples with high values of significant features
+            weights = torch.where(
+                feature_vals > 1.0,  # Above 75th percentile in scaled space
+                weights * (1.0 + importance * 2.0),
+                weights
+            )
+    
+    weighted_huber = (huber * weights).mean()
+    weighted_mae = (mae * weights).mean()
+    
+    return weighted_huber + mae_weight * weighted_mae + l1_reg
 
 def create_data_loaders(train_sequences, train_scalar, y_train, test_sequences, test_scalar, y_test, batch_size=64):
     train_dataset = TensorDataset(train_sequences, train_scalar, y_train)
@@ -363,14 +461,12 @@ def create_data_loaders(train_sequences, train_scalar, y_train, test_sequences, 
     
     return train_loader, test_loader
 
-def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=700, patience=50, accumulation_steps=2):
+def train_model(model, train_loader, test_loader, criterion, optimizer, feature_indices, feature_importances, num_epochs=700, patience=50, accumulation_steps=2):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
-    # Move model to device after initialization and ensure CUDA is ready
     try:
         model.to(device)
-        # Explicitly flatten parameters for LSTM to ensure cuDNN compatibility
         for lstm in model.lstm_layers:
             lstm.flatten_parameters()
     except RuntimeError as e:
@@ -394,7 +490,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
         for i, (seq_inputs, scalar_inputs, targets) in enumerate(train_loader):
             seq_inputs, scalar_inputs, targets = seq_inputs.to(device), scalar_inputs.to(device), targets.to(device)
             outputs = model(seq_inputs, scalar_inputs)
-            loss = criterion(outputs, targets)
+            loss = criterion(outputs, targets, scalar_inputs, feature_indices, feature_importances)
             
             if torch.isnan(loss) or torch.isinf(loss):
                 print(f"Invalid loss detected at epoch {epoch+1}, batch {i+1}")
@@ -424,7 +520,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
             for seq_inputs, scalar_inputs, targets in test_loader:
                 seq_inputs, scalar_inputs, targets = seq_inputs.to(device), scalar_inputs.to(device), targets.to(device)
                 outputs = model(seq_inputs, scalar_inputs)
-                loss = criterion(outputs, targets)
+                loss = criterion(outputs, targets, scalar_inputs, feature_indices, feature_importances)
                 val_loss += loss.item() * seq_inputs.size(0)
         
         val_loss /= len(test_loader.dataset)
@@ -458,7 +554,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
     plt.legend()
     plt.grid(True)
     plt.savefig('loss_plot.png')
-    plt.show()
+    plt.close()
     
     return train_losses, val_losses
 
@@ -516,7 +612,6 @@ def evaluate_model(model, X_test_seq, X_test_scalar, y_test, y_scaler, file_name
     return y_test_actual, y_pred_actual
 
 def main(main_dir):
-    # Ensure CUDA is initialized properly
     if torch.cuda.is_available():
         torch.cuda.init()
         print(f"CUDA initialized. Using GPU: {torch.cuda.get_device_name(0)}")
@@ -535,7 +630,7 @@ def main(main_dir):
     
     (train_sequences, train_scalar, y_train,
      test_sequences, test_scalar, y_test,
-     y_scaler, seq_input_size, scalar_input_size) = prepare_data_for_model(train_features, test_features)
+     y_scaler, seq_input_size, scalar_input_size, feature_columns) = prepare_data_for_model(train_features, test_features)
     
     train_loader, test_loader = create_data_loaders(
         train_sequences, train_scalar, y_train,
@@ -555,10 +650,30 @@ def main(main_dir):
     
     optimizer = optim.AdamW(model.parameters(), lr=0.00005, weight_decay=1e-4)
     
+    # Define feature importances from the Random Forest report
+    feature_importances = {
+        'computation_efficiency': 0.6064,
+        'inner_parallelism_total_parallelism': 0.2135,  # Proxy for sched_inner_parallelism
+        'total_parallelism': 0.0038,
+        'bytes_per_vector': 0.0138,  # Proxy for total_vectors
+        'scheduling_count': 0.0454,
+        'avg_bytes_per_node': 0.0357,  # Proxy for total_bytes_at_production
+        'bytes_processing_rate': 0.0064
+    }
+    
+    # Map feature indices
+    feature_indices = {}
+    for feature in feature_importances.keys():
+        log_feature = f'log_{feature}' if feature in ['computation_efficiency', 'bytes_processing_rate', 'total_parallelism', 'bytes_per_vector'] else feature
+        if log_feature in feature_columns:
+            feature_indices[feature] = feature_columns.get_loc(log_feature)
+        else:
+            feature_indices[feature] = feature_columns.get_loc(feature) if feature in feature_columns else -1
+    
     print("Building and training Enhanced Recursive LSTM model...")
     train_losses, val_losses = train_model(
         model, train_loader, test_loader,
-        custom_loss, optimizer,
+        custom_loss, optimizer, feature_indices, feature_importances,
         num_epochs=700, patience=50, accumulation_steps=2
     )
     
