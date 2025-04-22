@@ -5,6 +5,6 @@ set(CMAKE_PREFIX_PATH "${CMAKE_PREFIX_PATH} /home/kowrisaan/jathu/libtorch")  # 
 
 find_package(Torch REQUIRED)
 
-add_executable(main main.cpp)
+add_executable(main test.cpp)
 target_link_libraries(main "${TORCH_LIBRARIES}")
 set_property(TARGET main PROPERTY CXX_STANDARD 14)
