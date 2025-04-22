@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.0 FATAL_ERROR)
-project(my_project)
+project(libtorch_test)
 
-set(CMAKE_PREFIX_PATH "${CMAKE_PREFIX_PATH} ~/jathu/libtorch")
+set(CMAKE_PREFIX_PATH "${CMAKE_PREFIX_PATH} /home/kowrisaan/jathu/libtorch")  # Adjust this path to your libtorch folder
 
 find_package(Torch REQUIRED)
 
