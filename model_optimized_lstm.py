@@ -140,10 +140,25 @@ def extract_features_from_file(file_path):
         total_bytes_at_production = sum(sf.get('bytes_at_production', 0) for sf in scheduling_features if isinstance(sf, dict))
         total_vectors = sum(sf.get('num_vectors', 0) for sf in scheduling_features if isinstance(sf, dict))
         total_parallelism = sum(sf.get('inner_parallelism', 0) * sf.get('outer_parallelism', 1) for sf in scheduling_features if isinstance(sf, dict))
+        points_computed_total = sum(sf.get('points_computed_total', 0) for sf in scheduling_features if isinstance(sf, dict))
+        working_set = sum(sf.get('working_set', 0) for sf in scheduling_features if isinstance(sf, dict))
+        total_inner_parallelism = sum(sf.get('inner_parallelism', 0) for sf in scheduling_features if isinstance(sf, dict))
+        
+        # Compute significant features
+        comp_efficiency = points_computed_total / max(total_bytes_at_production, 1e-4) if total_bytes_at_production != 0 else 0.0
+        bytes_processing_rate = total_bytes_at_production / max(execution_time, 1e-4) if execution_time != 0 else 0.0
+        mem_util_ratio = working_set / max(total_bytes_at_production, 1e-4) if total_bytes_at_production != 0 else 0.0
         
         features['total_bytes_at_production'] = total_bytes_at_production
         features['total_vectors'] = total_vectors
         features['total_parallelism'] = total_parallelism
+        features['computation_efficiency'] = comp_efficiency
+        features['bytes_processing_rate'] = bytes_processing_rate
+        features['memory_utilization_ratio'] = mem_util_ratio
+        features['sched_inner_parallelism_squared'] = total_inner_parallelism ** 2
+        features['computation_efficiency_squared'] = comp_efficiency ** 2
+        features['comp_efficiency_total_vectors'] = comp_efficiency * total_vectors
+        features['inner_parallelism_total_parallelism'] = total_inner_parallelism * total_parallelism
         
         if total_vectors > 0:
             features['bytes_per_vector'] = total_bytes_at_production / total_vectors
@@ -221,6 +236,15 @@ def clean_and_transform_features(train_features, test_features):
     
     all_features_df = all_features_df.fillna(0)
     
+    # Drop low-importance features based on the report
+    low_importance_features = [
+        'op_cast', 'op_eq', 'op_ne', 'op_or', 'op_and', 'op_le', 'op_lt', 'op_not',
+        'sched_num_scalars', 'sched_bytes_at_realization', 'sched_outer_parallelism',
+        'sched_num_realizations', 'sched_num_productions', 'sched_bytes_at_root'
+    ]
+    all_features_df = all_features_df.drop(columns=[col for col in low_importance_features if col in all_features_df.columns])
+    print(f"Dropped {len([col for col in low_importance_features if col in all_features_df.columns])} low-importance features")
+    
     constant_columns = [col for col in all_features_df.columns 
                        if col != 'execution_time' and all_features_df[col].nunique() == 1]
     all_features_df = all_features_df.drop(columns=constant_columns)
@@ -233,11 +257,15 @@ def clean_and_transform_features(train_features, test_features):
     all_features_df = all_features_df.drop(columns=to_drop)
     print(f"Dropped {len(to_drop)} highly correlated features")
     
+    # Log transform skewed features
+    skewed_features = ['computation_efficiency', 'bytes_processing_rate', 'total_parallelism', 'total_vectors', 'bytes_per_vector']
+    for feature in skewed_features:
+        if feature in all_features_df.columns:
+            all_features_df[f'log_{feature}'] = np.log1p(all_features_df[feature])
+            all_features_df = all_features_df.drop(columns=[feature])
+    
     if 'execution_time' in all_features_df.columns:
         all_features_df['execution_time_log'] = np.log1p(all_features_df['execution_time'])
-    
-    if 'total_vectors' in all_features_df.columns and all_features_df['total_vectors'].max() > 0:
-        all_features_df['bytes_per_vector'] = all_features_df['total_bytes_at_production'] / (all_features_df['total_vectors'] + 1e-8)
     
     numeric_cols = all_features_df.select_dtypes(include=['number']).columns
     all_features_df = all_features_df[numeric_cols]
@@ -272,12 +300,38 @@ def prepare_data_for_model(train_features, test_features):
     scaler_y = RobustScaler()
     
     X_train_scaled = scaler_X.fit_transform(train_df)
-    y_train_scaled = scaler_y.fit_transform(y_train)
     X_test_scaled = scaler_X.transform(test_df)
+    y_train_scaled = scaler_y.fit_transform(y_train)
     y_test_scaled = scaler_y.transform(y_test)
     
     print(f"First 5 y_train scaled: {y_train_scaled[:5].flatten()}")
     print(f"First 5 y_test scaled: {y_test_scaled[:5].flatten()}")
+    
+    # Data augmentation for significant features
+    X_train_aug = []
+    y_train_aug = []
+    inner_parallelism_idx = train_df.columns.get_loc('inner_parallelism_total_parallelism') if 'inner_parallelism_total_parallelism' in train_df.columns else -1
+    comp_efficiency_idx = train_df.columns.get_loc('log_computation_efficiency') if 'log_computation_efficiency' in train_df.columns else -1
+    
+    for i in range(len(X_train_scaled)):
+        X_train_aug.append(X_train_scaled[i])
+        y_train_aug.append(y_train_scaled[i])
+        
+        is_significant = False
+        if inner_parallelism_idx != -1 and X_train_scaled[i, inner_parallelism_idx] > np.percentile(X_train_scaled[:, inner_parallelism_idx], 75):
+            is_significant = True
+        if comp_efficiency_idx != -1 and X_train_scaled[i, comp_efficiency_idx] > np.percentile(X_train_scaled[:, comp_efficiency_idx], 75):
+            is_significant = True
+        
+        augment_count = 3 if is_significant else 1
+        for _ in range(augment_count):
+            noise_x = np.random.normal(0, 0.05, X_train_scaled[i].shape)
+            noise_y = np.random.normal(0, 0.05, y_train_scaled[i].shape)
+            X_train_aug.append(X_train_scaled[i] + noise_x)
+            y_train_aug.append(y_train_scaled[i] + noise_y)
+    
+    X_train_scaled = np.array(X_train_aug)
+    y_train_scaled = np.array(y_train_aug)
     
     X_train_tensor = torch.FloatTensor(X_train_scaled).unsqueeze(1)
     y_train_tensor = torch.FloatTensor(y_train_scaled)
@@ -287,7 +341,7 @@ def prepare_data_for_model(train_features, test_features):
     print(f"Input feature dimension: {X_train_scaled.shape[1]}")
     
     return (X_train_tensor, y_train_tensor, X_test_tensor, y_test_tensor, 
-            scaler_y, X_train_scaled.shape[1], is_log_transformed)
+            scaler_y, X_train_scaled.shape[1], is_log_transformed, train_df.columns)
 
 class PerfectLSTMModel(nn.Module):
     def __init__(self, input_size, hidden_size=128, output_size=1, dropout_rate=0.3):
@@ -339,14 +393,26 @@ class CustomMAPELoss(nn.Module):
         super(CustomMAPELoss, self).__init__()
         self.epsilon = epsilon
     
-    def forward(self, outputs, targets):
-        # Calculate MAPE with epsilon to avoid division by zero
-        return torch.mean(torch.abs((targets - outputs) / (targets + self.epsilon))) * 100
+    def forward(self, outputs, targets, inputs, feature_indices, feature_importances):
+        # Calculate base MAPE with epsilon to avoid division by zero
+        base_mape = torch.abs((targets - outputs) / (targets + self.epsilon))
+        
+        # Weight samples based on significant features
+        weights = torch.ones_like(targets)
+        for feature, idx in feature_indices.items():
+            if idx != -1 and feature in feature_importances:
+                feature_vals = inputs[:, -1, idx]  # inputs shape: [batch, seq_len=1, feature_dim]
+                importance = feature_importances[feature]
+                weights = torch.where(
+                    feature_vals > 1.0,  # Above 75th percentile in scaled space
+                    weights * (1.0 + importance * 2.0),
+                    weights
+                )
+        
+        weighted_mape = (base_mape * weights).mean() * 100
+        return weighted_mape
 
 def save_checkpoint(model, optimizer, scheduler, epoch, train_losses, val_losses, best_val_loss, epochs_no_improve, checkpoint_path='checkpoint_lstm.pth'):
-    """
-    Save the training state to a checkpoint file.
-    """
     checkpoint = {
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
@@ -361,9 +427,6 @@ def save_checkpoint(model, optimizer, scheduler, epoch, train_losses, val_losses
     print(f"Checkpoint saved at {checkpoint_path}")
 
 def load_checkpoint(model, optimizer, scheduler, checkpoint_path='checkpoint_lstm.pth'):
-    """
-    Load the training state from a checkpoint file.
-    """
     if os.path.exists(checkpoint_path):
         checkpoint = torch.load(checkpoint_path, map_location=torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
         model.load_state_dict(checkpoint['model_state_dict'])
@@ -380,7 +443,7 @@ def load_checkpoint(model, optimizer, scheduler, checkpoint_path='checkpoint_lst
         print(f"No checkpoint found at {checkpoint_path}, starting from scratch")
         return 0, [], [], float('inf'), 0
 
-def train_model(model, train_loader, test_loader, criterion, optimizer, num_epochs=500, patience=30, checkpoint_path='checkpoint_lstm.pth'):
+def train_model(model, train_loader, test_loader, criterion, optimizer, feature_indices, feature_importances, num_epochs=500, patience=30, checkpoint_path='checkpoint_lstm.pth'):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     model.to(device)
@@ -399,7 +462,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
             inputs, targets = inputs.to(device), targets.to(device)
             optimizer.zero_grad()
             outputs = model(inputs)
-            loss = criterion(outputs, targets)
+            loss = criterion(outputs, targets, inputs, feature_indices, feature_importances)
             loss.backward()
             
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -416,7 +479,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, num_epoc
             for inputs, targets in test_loader:
                 inputs, targets = inputs.to(device), targets.to(device)
                 outputs = model(inputs)
-                loss = criterion(outputs, targets)
+                loss = criterion(outputs, targets, inputs, feature_indices, feature_importances)
                 val_loss += loss.item() * inputs.size(0)
         
         val_loss /= len(test_loader.dataset)
@@ -535,7 +598,7 @@ def main(main_dir):
     for feature, fname in zip(test_features, test_file_names):
         original_execution_times[fname] = feature['execution_time']
     
-    X_train, y_train, X_test, y_test, y_scaler, input_size, is_log_transformed = prepare_data_for_model(train_features, test_features)
+    X_train, y_train, X_test, y_test, y_scaler, input_size, is_log_transformed, feature_columns = prepare_data_for_model(train_features, test_features)
     
     train_loader, test_loader = create_data_loaders(X_train, y_train, X_test, y_test, batch_size=32)
     
@@ -549,6 +612,26 @@ def main(main_dir):
     criterion = CustomMAPELoss(epsilon=1e-2)
     optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-4)
     
+    # Define feature importances from the Random Forest report
+    feature_importances = {
+        'computation_efficiency': 0.6064,
+        'inner_parallelism_total_parallelism': 0.2135,  # Proxy for sched_inner_parallelism
+        'total_parallelism': 0.0038,
+        'total_vectors': 0.0138,
+        'scheduling_count': 0.0454,
+        'total_bytes_at_production': 0.0357,
+        'bytes_processing_rate': 0.0064
+    }
+    
+    # Map feature indices
+    feature_indices = {}
+    for feature in feature_importances.keys():
+        log_feature = f'log_{feature}' if feature in ['computation_efficiency', 'bytes_processing_rate', 'total_parallelism', 'total_vectors'] else feature
+        if log_feature in feature_columns:
+            feature_indices[feature] = feature_columns.get_loc(log_feature)
+        else:
+            feature_indices[feature] = feature_columns.get_loc(feature) if feature in feature_columns else -1
+    
     print("Building and training Perfect LSTM model...")
     train_losses, val_losses = train_model(
         model, 
@@ -556,6 +639,8 @@ def main(main_dir):
         test_loader, 
         criterion, 
         optimizer, 
+        feature_indices,
+        feature_importances,
         num_epochs=500,
         patience=30,
         checkpoint_path='checkpoint_lstm.pth'
