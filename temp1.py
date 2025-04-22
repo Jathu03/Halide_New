@@ -309,14 +309,17 @@ def prepare_data_for_model(train_features, test_features):
         
         augment_count = 3 if is_significant else 1
         for _ in range(augment_count):
-            noise_seq = np.random.normal(0, 0.05, train_sequences_padded[i].shape)
+            # Add noise directly to the PyTorch tensor
+            noise_seq = torch.normal(mean=0.0, std=0.05, size=train_sequences_padded[i].shape)
             noise_scalar = np.random.normal(0, 0.05, train_scalar_scaled[i].shape)
             noise_y = np.random.normal(0, 0.05, y_train_scaled[i].shape)
             train_sequences_aug.append(train_sequences_padded[i] + noise_seq)
             train_scalar_aug.append(train_scalar_scaled[i] + noise_scalar)
             y_train_aug.append(y_train_scaled[i] + noise_y)
     
-    train_sequences_padded = torch.FloatTensor(np.array(train_sequences_aug))
+    # Re-pad the augmented sequences to ensure uniform length
+    train_sequences_padded = pad_sequence(train_sequences_aug, batch_first=True)
+    
     train_scalar_scaled = np.array(train_scalar_aug)
     y_train_scaled = np.array(y_train_aug)
     
