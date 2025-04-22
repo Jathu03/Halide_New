@@ -278,6 +278,10 @@ int main(int argc, char* argv[]) {
 
     std::string input_file = argv[1];
 
+    // Determine device
+    torch::Device device = torch::cuda::is_available() ? torch::kCUDA : torch::kCPU;
+    std::cout << "Using device: " << (device == torch::kCUDA ? "CUDA" : "CPU") << "\n";
+
     // Load final features
     std::ifstream features_file("final_features.json");
     if (!features_file.is_open()) {
@@ -320,17 +324,24 @@ int main(int argc, char* argv[]) {
     // Load the model
     torch::jit::script::Module module;
     try {
-        module = torch::jit::load("lstm_model.pt");
+        // Load the model onto the specified device
+        module = torch::jit::load("lstm_model.pt", device);
         module.eval();
     } catch (const std::exception& e) {
         std::cerr << "Error loading the model: " << e.what() << "\n";
         return 1;
     }
 
+    // Move the input tensor to the same device as the model
+    input_tensor = input_tensor.to(device);
+
     // Perform inference
     std::vector<torch::jit::IValue> inputs;
     inputs.push_back(input_tensor);
     auto output = module.forward(inputs).toTensor();
+
+    // Move the output back to CPU for further processing
+    output = output.to(torch::kCPU);
 
     // Reverse the scaling of the output (RobustScaler inverse_transform)
     float output_value = output.item<float>();
