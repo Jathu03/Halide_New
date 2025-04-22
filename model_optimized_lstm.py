@@ -330,8 +330,8 @@ def prepare_data_for_model(train_features, test_features):
         
         augment_count = 3 if is_significant else 1
         for _ in range(augment_count):
-            noise_x = np.random.normal(0, 0.05, X_train_scaled[i].shape)
-            noise_y = np.random.normal(0, 0.05, y_train_scaled[i].shape)
+            noise_x = np.random.normal(0, 0.01, X_train_scaled[i].shape)  # Reduced noise level
+            noise_y = np.random.normal(0, 0.01, y_train_scaled[i].shape)
             X_train_aug.append(X_train_scaled[i] + noise_x)
             y_train_aug.append(y_train_scaled[i] + noise_y)
     
@@ -349,17 +349,17 @@ def prepare_data_for_model(train_features, test_features):
             scaler_y, X_train_scaled.shape[1], is_log_transformed, train_df.columns)
 
 class PerfectLSTMModel(nn.Module):
-    def __init__(self, input_size, hidden_size=128, output_size=1, dropout_rate=0.3):
+    def __init__(self, input_size, hidden_size=256, output_size=1, dropout_rate=0.4):  # Increased hidden_size, dropout_rate
         super(PerfectLSTMModel, self).__init__()
         self.hidden_size = hidden_size
         
         self.lstm = nn.LSTM(input_size, hidden_size, num_layers=2, batch_first=True)
         
-        self.fc1 = nn.Linear(hidden_size, 64)
-        self.bn1 = nn.BatchNorm1d(64)
-        self.fc2 = nn.Linear(64, 32)
-        self.bn2 = nn.BatchNorm1d(32)
-        self.fc3 = nn.Linear(32, output_size)
+        self.fc1 = nn.Linear(hidden_size, 128)  # Increased layer sizes
+        self.bn1 = nn.BatchNorm1d(128)
+        self.fc2 = nn.Linear(128, 64)
+        self.bn2 = nn.BatchNorm1d(64)
+        self.fc3 = nn.Linear(64, output_size)
         
         self.dropout = nn.Dropout(dropout_rate)
         self.leaky_relu = nn.LeakyReLU(0.1)
@@ -405,7 +405,7 @@ class CustomMAPELoss(nn.Module):
                 importance = feature_importances[feature]
                 weights = torch.where(
                     feature_vals > 1.0,
-                    weights * (1.0 + importance * 2.0),
+                    weights * (1.0 + importance * 1.0),  # Reduced weighting factor
                     weights
                 )
         
@@ -430,18 +430,15 @@ def load_checkpoint(model, optimizer, scheduler, checkpoint_path='checkpoint_lst
     if os.path.exists(checkpoint_path):
         checkpoint = torch.load(checkpoint_path, map_location=torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
         
-        # Check architecture compatibility
         model_keys = set(model.state_dict().keys())
         checkpoint_keys = set(checkpoint['model_state_dict'].keys())
         if model_keys != checkpoint_keys:
             print(f"Architecture mismatch! Expected keys: {model_keys}, but found: {checkpoint_keys}")
             print("Starting training from scratch due to architecture incompatibility.")
-            # Optionally, delete the old checkpoint to avoid future issues
             os.remove(checkpoint_path)
             print(f"Deleted incompatible checkpoint at {checkpoint_path}")
             return 0, [], [], float('inf'), 0
         
-        # Check input size compatibility
         checkpoint_input_size = None
         for key, param in checkpoint['model_state_dict'].items():
             if key == 'lstm.weight_ih_l0':
@@ -455,7 +452,6 @@ def load_checkpoint(model, optimizer, scheduler, checkpoint_path='checkpoint_lst
             print(f"Deleted incompatible checkpoint at {checkpoint_path}")
             return 0, [], [], float('inf'), 0
         
-        # If all checks pass, load the checkpoint
         try:
             model.load_state_dict(checkpoint['model_state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -476,12 +472,12 @@ def load_checkpoint(model, optimizer, scheduler, checkpoint_path='checkpoint_lst
         print(f"No checkpoint found at {checkpoint_path}, starting from scratch")
         return 0, [], [], float('inf'), 0
 
-def train_model(model, train_loader, test_loader, criterion, optimizer, feature_indices, feature_importances, num_epochs=500, patience=30, checkpoint_path='checkpoint_lstm.pth'):
+def train_model(model, train_loader, test_loader, criterion, optimizer, feature_indices, feature_importances, num_epochs=500, patience=15, checkpoint_path='checkpoint_lstm.pth'):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     model.to(device)
     
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10, verbose=True)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.2, patience=5, verbose=True)  # More aggressive LR reduction
     
     start_epoch, train_losses, val_losses, best_val_loss, epochs_no_improve = load_checkpoint(
         model, optimizer, scheduler, checkpoint_path
@@ -497,7 +493,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, feature_
             loss = criterion(outputs, targets, inputs, feature_indices, feature_importances)
             loss.backward()
             
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)  # Reduced max_norm
             
             optimizer.step()
             running_loss += loss.item() * inputs.size(0)
@@ -631,13 +627,13 @@ def main(main_dir):
     
     model = PerfectLSTMModel(
         input_size=input_size,
-        hidden_size=128,
+        hidden_size=256,  # Increased
         output_size=1,
-        dropout_rate=0.3
+        dropout_rate=0.4  # Increased
     )
     
     criterion = CustomMAPELoss(epsilon=1e-2)
-    optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-4)
+    optimizer = optim.AdamW(model.parameters(), lr=0.0005, weight_decay=1e-3)  # Reduced LR, increased weight decay
     
     feature_importances = {
         'computation_efficiency': 0.6064,
@@ -667,7 +663,7 @@ def main(main_dir):
         feature_indices,
         feature_importances,
         num_epochs=500,
-        patience=30,
+        patience=15,  # Reduced patience
         checkpoint_path='checkpoint_lstm.pth'
     )
     
