@@ -11,6 +11,7 @@ from sklearn.metrics import mean_squared_error, r2_score
 import scipy.stats as stats
 from pathlib import Path
 import warnings
+import re
 warnings.filterwarnings('ignore')
 
 def get_execution_time(file_path):
@@ -194,35 +195,32 @@ def process_all_files(main_dir):
         print(f"Directory '{main_dir}' does not exist.")
         return all_features, file_paths
     
-    for subdir_path in main_dir_path.iterdir():
-        if not subdir_path.is_dir():
+    for batch_dir in main_dir_path.iterdir():
+        if not batch_dir.is_dir():
             continue
         
-        # List all files in the subfolder for debugging
-        all_files = [f.name for f in subdir_path.iterdir()]
-        if not all_files:
-            print(f"No files found in {subdir_path}")
+        # Look for numbered sub-subfolders (e.g., 1, 2, ..., 32)
+        numbered_dirs = [d for d in batch_dir.iterdir() if d.is_dir() and re.match(r'^\d+$', d.name)]
+        if not numbered_dirs:
+            print(f"No numbered subfolders found in {batch_dir}")
             continue
-        print(f"Files in {subdir_path}: {', '.join(all_files)}")
         
-        # First try to find tree_representation.json
-        json_files = [f for f in subdir_path.glob('tree_representation.json')]
+        print(f"Found {len(numbered_dirs)} numbered subfolders in {batch_dir}")
         
-        # If no tree_representation.json, try all .json files
-        if not json_files:
-            json_files = list(subdir_path.glob('*.json'))
-            if not json_files:
-                print(f"No JSON files found in {subdir_path}")
+        for numbered_dir in numbered_dirs:
+            # Look for tree_representation.json in the numbered sub-subfolder
+            json_file = numbered_dir / 'tree_representation.json'
+            if not json_file.exists():
+                print(f"No tree_representation.json found in {json_file}")
                 continue
-        
-        for file_path in json_files:
-            print(f"Processing {file_path}...", end='\r')
-            features = extract_features_from_file(file_path)
+            
+            print(f"Processing {json_file}...", end='\r')
+            features = extract_features_from_file(json_file)
             if features is not None:
                 all_features.append(features)
-                file_paths.append(f"{subdir_path.name}/{file_path.name}")
+                file_paths.append(f"{batch_dir.name}/{numbered_dir.name}/tree_representation.json")
             else:
-                print(f"Failed to process {file_path}")
+                print(f"Failed to process {json_file}")
     
     if not all_features:
         print("No valid files were processed successfully.")
