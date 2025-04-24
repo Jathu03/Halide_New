@@ -13,6 +13,30 @@ import random
 from collections import defaultdict
 import matplotlib.pyplot as plt
 
+# Define fixed set of features for sequences
+FIXED_FEATURES = [
+    'cache_hits', 'cache_misses', 'execution_time_ms', 'sched_num_realizations',
+    'sched_num_productions', 'sched_points_computed_total', 'sched_innermost_loop_extent',
+    'sched_inner_parallelism', 'sched_outer_parallelism', 'sched_bytes_at_realization',
+    'sched_bytes_at_production', 'sched_bytes_at_root', 'sched_unique_bytes_read_per_realization',
+    'sched_working_set', 'sched_vector_size', 'sched_num_vectors', 'sched_num_scalars',
+    'sched_bytes_at_task', 'sched_working_set_at_task', 'sched_working_set_at_production',
+    'sched_working_set_at_realization', 'sched_working_set_at_root', 'total_parallelism',
+    'scheduling_count', 'total_bytes_at_production', 'total_vectors', 'computation_efficiency',
+    'memory_pressure', 'memory_utilization_ratio', 'bytes_processing_rate', 'bytes_per_parallelism',
+    'bytes_per_vector', 'nodes_count', 'edges_count', 'node_edge_ratio', 'nodes_per_schedule',
+    'op_diversity',
+    # Common operation features (based on feature_analysis.csv)
+    'op_add', 'op_sub', 'op_mul', 'op_div', 'op_mod', 'op_eq', 'op_ne', 'op_lt', 'op_le',
+    'op_or', 'op_and', 'op_not', 'op_min', 'op_max', 'op_constant', 'op_variable',
+    'op_funccall', 'op_imagecall', 'op_externcall', 'op_let', 'op_param',
+    # Memory pattern features
+    'memory_transpose_0', 'memory_transpose_1', 'memory_transpose_2', 'memory_transpose_3',
+    'memory_slice_0', 'memory_slice_1', 'memory_slice_2', 'memory_slice_3',
+    'memory_broadcast_0', 'memory_broadcast_1', 'memory_broadcast_2', 'memory_broadcast_3',
+    'memory_pointwise_0', 'memory_pointwise_1', 'memory_pointwise_2', 'memory_pointwise_3'
+]
+
 # Feature extraction function
 def extract_features(json_data):
     features = {}
@@ -89,7 +113,9 @@ def extract_features(json_data):
     features['nodes_per_schedule'] = nodes_count / (features.get('scheduling_count', 1)) if features.get('scheduling_count', 0) != 0 else 0
     features['op_diversity'] = len([k for k, v in features.items() if k.startswith('op_') and v > 0])
     
-    return features
+    # Create fixed-length feature vector
+    fixed_features = {key: features.get(key, 0.0) for key in FIXED_FEATURES}
+    return fixed_features
 
 # Process Tree_Output directory with invalid execution time handling
 def process_tree_output_directory(main_dir):
@@ -170,12 +196,19 @@ def prepare_data_for_model(train_features, test_features):
         'sched_bytes_at_realization', 'sched_unique_bytes_read_per_realization'
     ]
     
-    train_sequences = [np.array([list(f.values())]) for f in train_features]
-    test_sequences = [np.array([list(f.values())]) for f in test_features]
+    # Create sequences with fixed features
+    train_sequences = [np.array([[features.get(key, 0.0) for key in FIXED_FEATURES]]) for features in train_features]
+    test_sequences = [np.array([[features.get(key, 0.0) for key in FIXED_FEATURES]]) for features in test_features]
     
+    # Convert to tensors
+    train_sequences_padded = torch.FloatTensor(np.array(train_sequences))
+    test_sequences_padded = torch.FloatTensor(np.array(test_sequences))
+    
+    # Create scalar features DataFrame
     train_scalar_df = pd.DataFrame(train_features)
     test_scalar_df = pd.DataFrame(test_features)
     
+    # Drop low-importance features
     low_importance_features = [
         'op_cast', 'op_selfcall', 'memory_pointwise_1', 'memory_transpose_1', 'memory_broadcast_1',
         'memory_slice_1', 'op_select', 'op_not', 'op_and', 'op_ne', 'op_mod', 'memory_pointwise_2',
@@ -185,6 +218,7 @@ def prepare_data_for_model(train_features, test_features):
     train_scalar_df = train_scalar_df.drop(columns=[col for col in low_importance_features if col in train_scalar_df.columns])
     test_scalar_df = test_scalar_df.drop(columns=[col for col in low_importance_features if col in test_scalar_df.columns])
     
+    # Log transform skewed features
     skewed_features = ['cache_hits', 'bytes_processing_rate', 'sched_bytes_at_task', 'computation_efficiency']
     for feature in skewed_features:
         if feature in train_scalar_df.columns:
@@ -196,10 +230,12 @@ def prepare_data_for_model(train_features, test_features):
     train_scalar_df = train_scalar_df.fillna(0)
     test_scalar_df = test_scalar_df.fillna(0)
     
+    # Remove constant columns
     constant_columns = [col for col in train_scalar_df.columns if train_scalar_df[col].nunique() == 1]
     train_scalar_df = train_scalar_df.drop(columns=constant_columns)
     test_scalar_df = test_scalar_df.drop(columns=constant_columns)
     
+    # Extract execution times
     y_train_raw = np.array([f['execution_time_ms'] for f in train_features])
     y_test_raw = np.array([f['execution_time_ms'] for f in test_features])
     y_train_raw = np.clip(y_train_raw, 0, np.percentile(y_train_raw, 99))
@@ -208,6 +244,7 @@ def prepare_data_for_model(train_features, test_features):
     y_train = np.log1p(y_train_raw).reshape(-1, 1)
     y_test = np.log1p(y_test_raw).reshape(-1, 1)
     
+    # Scale features and targets
     scaler_X_scalar = RobustScaler()
     scaler_y = RobustScaler()
     
@@ -221,9 +258,7 @@ def prepare_data_for_model(train_features, test_features):
     y_train_scaled = np.nan_to_num(y_train_scaled, nan=0.0)
     y_test_scaled = np.nan_to_num(y_test_scaled, nan=0.0)
     
-    train_sequences_padded = torch.FloatTensor(np.array(train_sequences))
-    test_sequences_padded = torch.FloatTensor(np.array(test_sequences))
-    
+    # Data augmentation for significant features
     train_sequences_aug = []
     train_scalar_aug = []
     y_train_aug = []
