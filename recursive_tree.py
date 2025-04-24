@@ -26,7 +26,7 @@ FIXED_FEATURES = [
     'memory_pressure', 'memory_utilization_ratio', 'bytes_processing_rate', 'bytes_per_parallelism',
     'bytes_per_vector', 'nodes_count', 'edges_count', 'node_edge_ratio', 'nodes_per_schedule',
     'op_diversity',
-    # Common operation features
+    # Common operation features (based on feature_analysis.csv)
     'op_add', 'op_sub', 'op_mul', 'op_div', 'op_mod', 'op_eq', 'op_ne', 'op_lt', 'op_le',
     'op_or', 'op_and', 'op_not', 'op_min', 'op_max', 'op_constant', 'op_variable',
     'op_funccall', 'op_imagecall', 'op_externcall', 'op_let', 'op_param',
@@ -287,7 +287,7 @@ def prepare_data_for_model(train_features, test_features):
     
     train_sequences_padded = torch.stack(train_sequences_aug)
     train_scalar_scaled = np.array(train_scalar_aug)
-    y_train_scaled = np.array(train_scalar_aug)
+    y_train_scaled = np.array(y_train_aug)
     
     train_scalar_tensor = torch.FloatTensor(train_scalar_scaled)
     test_scalar_tensor = torch.FloatTensor(test_scalar_scaled)
@@ -420,8 +420,8 @@ def create_data_loaders(train_sequences, train_scalar, y_train, test_sequences, 
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
     return train_loader, test_loader
 
-# Modified train_model function with checkpoint saving
-def train_model(model, train_loader, test_loader, criterion, optimizer, feature_indices, feature_importances, num_epochs=700, patience=50, accumulation_steps=2, checkpoint_path='recursive.pth'):
+# Train the model
+def train_model(model, train_loader, test_loader, criterion, optimizer, feature_indices, feature_importances, num_epochs=700, patience=50, accumulation_steps=2):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
@@ -441,23 +441,8 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, feature_
     best_model_state = None
     train_losses = []
     val_losses = []
-    start_epoch = 0
     
-    # Check if a checkpoint exists to resume training
-    if os.path.exists(checkpoint_path):
-        checkpoint = torch.load(checkpoint_path, map_location=device)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        start_epoch = checkpoint['epoch'] + 1
-        best_val_loss = checkpoint['best_val_loss']
-        train_losses = checkpoint['train_losses']
-        val_losses = checkpoint['val_losses']
-        epochs_no_improve = checkpoint['epochs_no_improve']
-        best_model_state = checkpoint['best_model_state']
-        print(f"Resuming training from epoch {start_epoch}")
-    
-    for epoch in range(start_epoch, num_epochs):
+    for epoch in range(num_epochs):
         model.train()
         running_loss = 0.0
         optimizer.zero_grad()
@@ -504,21 +489,6 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, feature_
         scheduler.step()
         print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
         
-        # Save checkpoint
-        checkpoint = {
-            'epoch': epoch,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'scheduler_state_dict': scheduler.state_dict(),
-            'best_val_loss': best_val_loss,
-            'train_losses': train_losses,
-            'val_losses': val_losses,
-            'epochs_no_improve': epochs_no_improve,
-            'best_model_state': best_model_state
-        }
-        torch.save(checkpoint, checkpoint_path)
-        print(f"Checkpoint saved at epoch {epoch+1} to {checkpoint_path}")
-        
         if val_loss < best_val_loss and not np.isnan(val_loss) and not np.isinf(val_loss):
             best_val_loss = val_loss
             epochs_no_improve = 0
@@ -546,15 +516,6 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, feature_
     plt.close()
     
     return train_losses, val_losses
-
-# New function to resume training explicitly
-def resume_training(model, train_loader, test_loader, criterion, optimizer, feature_indices, feature_importances, num_epochs=700, patience=50, accumulation_steps=2, checkpoint_path='recursive.pth'):
-    print(f"Attempting to resume training from checkpoint: {checkpoint_path}")
-    if not os.path.exists(checkpoint_path):
-        print(f"No checkpoint found at {checkpoint_path}. Starting training from scratch.")
-        return train_model(model, train_loader, test_loader, criterion, optimizer, feature_indices, feature_importances, num_epochs, patience, accumulation_steps, checkpoint_path)
-    
-    return train_model(model, train_loader, test_loader, criterion, optimizer, feature_indices, feature_importances, num_epochs, patience, accumulation_steps, checkpoint_path)
 
 # Evaluate the model
 def evaluate_model(model, X_test_seq, X_test_scalar, y_test, y_scaler, file_names_test):
@@ -665,10 +626,10 @@ def main(main_dir):
             feature_indices[feature] = feature_columns.get_loc(feature) if feature in feature_columns else -1
     
     print("Building and training Enhanced Recursive LSTM model...")
-    train_losses, val_losses = resume_training(
+    train_losses, val_losses = train_model(
         model, train_loader, test_loader,
         custom_loss, optimizer, feature_indices, feature_importances,
-        num_epochs=700, patience=50, accumulation_steps=2, checkpoint_path='recursive.pth'
+        num_epochs=700, patience=50, accumulation_steps=2
     )
     
     if train_losses is None or val_losses is None:
