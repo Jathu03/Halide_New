@@ -247,9 +247,14 @@ class RecursiveLSTM(nn.Module):
     def forward(self, node, device):
         # Process node features
         features = torch.FloatTensor([[node.features.get(key, 0.0) for key in FIXED_FEATURES]]).to(device)
-        lstm_out, _ = self.lstm(features)  # Shape: (1, 1, hidden_size * 2)
+        lstm_out, _ = self.lstm(features)  # Shape: (1, 1, hidden_size * 2) or (1, hidden_size * 2)
         lstm_out = self.ln(lstm_out)
-        node_out = lstm_out[:, -1, :]  # Take last time step
+        
+        # Handle LSTM output based on shape
+        if lstm_out.dim() == 3:
+            node_out = lstm_out[:, -1, :]  # Shape: (1, hidden_size * 2)
+        else:
+            node_out = lstm_out  # Shape: (1, hidden_size * 2)
         
         # Process children recursively
         if node.children:
@@ -257,8 +262,8 @@ class RecursiveLSTM(nn.Module):
             for child in node.children:
                 child_out = self.forward(child, device)
                 child_outputs.append(child_out)
-            child_outputs = torch.stack(child_outputs)  # Shape: (num_children, hidden_size * 2)
-            child_agg = child_outputs.mean(dim=0, keepdim=True)  # Aggregate by averaging
+            child_outputs = torch.stack(child_outputs)  # Shape: (num_children, output_size)
+            child_agg = child_outputs.mean(dim=0, keepdim=True)  # Shape: (1, output_size)
             node_out = node_out + child_agg  # Combine with node output
         
         # Final processing
