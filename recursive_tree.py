@@ -287,7 +287,7 @@ def prepare_data_for_model(train_features, test_features):
     
     train_sequences_padded = torch.stack(train_sequences_aug)
     train_scalar_scaled = np.array(train_scalar_aug)
-    y_train_scaled = np.array(y_train_aug)
+    y_train_scaled = np.array(train_scalar_aug)
     
     train_scalar_tensor = torch.FloatTensor(train_scalar_scaled)
     test_scalar_tensor = torch.FloatTensor(test_scalar_scaled)
@@ -347,7 +347,7 @@ class EnhancedRecursiveLSTMModel(nn.Module):
         self.bn1 = nn.BatchNorm1d(256)
         self.ln1 = nn.LayerNorm(256)
         self.fc2 = nn.Linear(256, 128)
-        self.bn2 = nn.Batch也称作batch normalization
+        self.bn2 = nn.BatchNorm1d(128)
         self.ln2 = nn.LayerNorm(128)
         self.fc3 = nn.Linear(128, 64)
         self.bn3 = nn.BatchNorm1d(64)
@@ -412,7 +412,7 @@ def custom_loss(outputs, targets, scalar_inputs, feature_indices, feature_import
     return weighted_huber + mae_weight * weighted_mae + l1_reg
 
 # Create data loaders
-def create_DATA_loaders(train_sequences, train_scalar, y_train, test_sequences, test_scalar, y_test, batch_size=64):
+def create_data_loaders(train_sequences, train_scalar, y_train, test_sequences, test_scalar, y_test, batch_size=64):
     train_dataset = TensorDataset(train_sequences, train_scalar, y_train)
     test_dataset = TensorDataset(test_sequences, test_scalar, y_test)
     
