@@ -258,20 +258,24 @@ class RecursiveLSTM(nn.Module):
         
         # Process children recursively
         if node.children:
-            child_outputs = []
+            child_hidden_states = []
             for child in node.children:
-                child_out = self.forward(child, device)
-                # Ensure child_out is [1, output_size]
-                child_out = child_out.view(1, -1)
-                child_outputs.append(child_out)
-            child_outputs = torch.stack(child_outputs)  # Shape: (num_children, output_size)
-            child_agg = child_outputs.mean(dim=0, keepdim=True)  # Shape: (1, output_size)
-            # Project child_agg to match node_out dimensions for combination
-            child_agg = self.output_layer(self.fc(self.gelu(self.dropout(child_agg))))
-            node_out = node_out + child_agg  # Combine with node output
+                child_out = self.forward(child, device)  # Shape: (1, output_size)
+                # Compute child's hidden state before output_layer
+                child_features = torch.FloatTensor([[child.features.get(key, 0.0) for key in FIXED_FEATURES]]).to(device)
+                child_lstm_out, _ = self.lstm(child_features)
+                child_lstm_out = self.ln(child_lstm_out)
+                if child_lstm_out.dim() == 3:
+                    child_hidden = child_lstm_out[:, -1, :]  # Shape: (1, hidden_size * 2)
+                else:
+                    child_hidden = child_lstm_out
+                child_hidden_states.append(child_hidden)
+            child_hidden_states = torch.stack(child_hidden_states)  # Shape: (num_children, hidden_size * 2)
+            child_agg = child_hidden_states.mean(dim=0, keepdim=True)  # Shape: (1, hidden_size * 2)
+            node_out = node_out + child_agg  # Combine with node output, Shape: (1, hidden_size * 2)
         
         # Final processing
-        node_out = self.dropout(self.gelu(self.fc(node_out)))
+        node_out = self.dropout(self.gelu(self.fc(node_out)))  # Shape: (1, hidden_size)
         output = self.output_layer(node_out)  # Shape: (1, output_size)
         return output.view(1, -1)  # Ensure output is [1, output_size]
 
