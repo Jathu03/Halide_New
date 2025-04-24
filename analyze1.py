@@ -2,664 +2,187 @@ import os
 import json
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.model_selection import train_test_split, cross_val_score
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import mean_squared_error, r2_score
-import scipy.stats as stats
-from pathlib import Path
-import warnings
-import re
-import logging
-warnings.filterwarnings('ignore')
+from scipy.stats import pearsonr, spearmanr
+from collections import defaultdict
+import uuid
 
-# Set up logging for debug and skipped files
-logging.basicConfig(filename='execution_time_debug.log', level=logging.DEBUG, 
-                    format='%(asctime)s - %(message)s')
-skipped_logger = logging.getLogger('skipped_files')
-skipped_handler = logging.FileHandler('skipped_files.log')
-skipped_handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
-skipped_logger.addHandler(skipped_handler)
-skipped_logger.setLevel(logging.INFO)
-
-def recursive_search_execution_time(data, depth=0, max_depth=5):
-    """Recursively search for execution time in a nested JSON structure."""
-    if depth > max_depth or not isinstance(data, (dict, list)):
-        return None
+# Function to extract features from a single JSON file
+def extract_features(json_data):
+    features = {}
     
-    if isinstance(data, dict):
-        for key, value in data.items():
-            if isinstance(value, (dict, list)):
-                result = recursive_search_execution_time(value, depth + 1, max_depth)
-                if result is not None:
-                    return result
-            if 'execution_time' in key.lower() or 'time_ms' in key.lower():
-                try:
-                    return float(value)
-                except (ValueError, TypeError):
-                    continue
-    elif isinstance(data, list):
-        for item in data:
-            result = recursive_search_execution_time(item, depth + 1, max_depth)
-            if result is not None:
-                return result
-    return None
-
-def get_execution_time(file_path):
-    try:
-        with open(file_path, 'rb') as f:
-            raw_content = f.read()
-            content = raw_content.decode('utf-8', errors='replace').replace('\0', '')
-            data = json.loads(content)
-        
-        # Check for empty or malformed JSON
-        if not data:
-            print(f"Empty JSON in {file_path}")
-            logging.debug(f"Empty JSON in {file_path}")
-            return None
-        
-        # Check root-level execution time
-        for key in ['execution_time_ms', 'total_execution_time_ms']:
-            if key in data:
-                try:
-                    return float(data[key])
-                except (ValueError, TypeError):
-                    print(f"Invalid execution time format in {file_path} at root: {data[key]}")
-                    continue
-        
-        # Check nodes if present
-        nodes = data.get('nodes', [])
-        if nodes:
-            for node in nodes:
-                # Check "Global Features" node
-                if node.get('name') == 'Global Features':
-                    execution_time = node.get('execution_time_ms') or node.get('total_execution_time_ms')
-                    if execution_time is not None:
-                        try:
-                            return float(execution_time)
-                        except (ValueError, TypeError):
-                            print(f"Invalid execution time format in {file_path}: {execution_time}")
-                            continue
-                
-                # Check for node with name == "total_execution_time_ms"
-                if node.get('name') == 'total_execution_time_ms' and 'value' in node:
-                    execution_time = node.get('value')
-                    if execution_time is not None:
-                        try:
-                            return float(execution_time)
-                        except (ValueError, TypeError):
-                            print(f"Invalid execution time format in {file_path}: {execution_time}")
-                            continue
-        
-        # Fallback: Recursive search for any execution time
-        execution_time = recursive_search_execution_time(data)
-        if execution_time is not None:
-            return execution_time
-        
-        # Log debug info
-        logging.debug(f"No execution time found in {file_path}. JSON structure: {json.dumps(data, indent=2)}")
-        print(f"No execution time found in {file_path}")
-        return None
+    # Extract global features
+    global_node = next((child for child in json_data['children'] if child['name'] == 'Global Features'), None)
+    if global_node:
+        features['cache_hits'] = global_node.get('cache_hits', 0)
+        features['cache_misses'] = global_node.get('cache_misses', 0)
+        features['execution_time_ms'] = global_node.get('execution_time_ms', 0)
     
-    except json.JSONDecodeError as e:
-        print(f"JSON parsing error in {file_path}: {str(e)}")
-        logging.debug(f"JSON parsing error in {file_path}: {str(e)}")
-        return None
-    except Exception as e:
-        print(f"Error processing {file_path}: {str(e)}")
-        logging.debug(f"Error processing {file_path}: {str(e)}")
-        return None
-
-def extract_features_from_file(file_path):
-    try:
-        with open(file_path, 'r') as f:
-            data = json.load(f)
+    # Extract op_histogram features (aggregate across all nodes)
+    op_histogram = defaultdict(int)
+    for node in json_data['children']:
+        if 'op_histogram' in node:
+            for op, count in node['op_histogram'].items():
+                op_histogram[op.lower()] += count
+    for op, count in op_histogram.items():
+        features[f'op_{op.lower()}'] = count
     
-        execution_time = get_execution_time(file_path)
-        if execution_time is None or execution_time <= 0:
-            print(f"Skipping {file_path}: No valid execution time")
-            skipped_logger.info(f"Skipped {file_path}: No valid execution time")
-            return None
+    # Extract memory patterns (aggregate as sum across nodes)
+    memory_patterns = defaultdict(lambda: [0, 0, 0, 0])
+    for node in json_data['children']:
+        if 'memory_patterns' in node:
+            for pattern, values in node['memory_patterns'].items():
+                memory_patterns[pattern] = [sum(x) for x in zip(memory_patterns[pattern], values)]
+    for pattern, values in memory_patterns.items():
+        for i, val in enumerate(values):
+            features[f'memory_{pattern.lower()}_{i}'] = val
     
-        nodes = data.get('nodes', [])
-        if not nodes:
-            print(f"Skipping {file_path}: No nodes found")
-            skipped_logger.info(f"Skipped {file_path}: No nodes found")
-            return None
-        
-        node_features = []
-        dependency_features = []
-        
-        for node in nodes:
-            node_feature = {}
-            node_feature['name'] = node.get('name', '')
-            node_feature['id'] = node.get('id', -1)
-            
-            # Extract op_histogram
-            op_hist = node.get('op_histogram', {})
-            for op_name, op_count in op_hist.items():
-                node_feature[f'op_{op_name.lower()}'] = op_count
-            
-            # Extract memory_patterns
-            mem_patterns = node.get('memory_patterns', {})
-            for pattern_name, pattern_value in mem_patterns.items():
-                if isinstance(pattern_value, list):
-                    node_feature[f'mem_{pattern_name.lower()}_sum'] = sum(pattern_value)
-                else:
-                    node_feature[f'mem_{pattern_name.lower()}'] = pattern_value
-            
-            # Extract scheduling features
-            sched = node.get('scheduling', {})
-            for key, value in sched.items():
-                node_feature[f'sched_{key}'] = value
-            
-            # Extract cache metrics for Global Features node
-            if node.get('name') == 'Global Features':
-                node_feature['cache_hits'] = node.get('cache_hits', 0)
-                node_feature['cache_misses'] = node.get('cache_misses', 0)
-            
-            node_features.append(node_feature)
-            
-            # Extract dependency features
-            for child in node.get('children', []):
-                dep_feature = {
-                    'from_id': node['id'],
-                    'to_id': child.get('target_id', -1),
-                    'footprint': child.get('footprint', []),
-                    'load_jacobian': child.get('load_jacobian', [])
-                }
-                dependency_features.append(dep_feature)
-        
-        if not node_features:
-            print(f"Skipping {file_path}: No valid node features extracted")
-            skipped_logger.info(f"Skipped {file_path}: No valid node features extracted")
-            return None
-    
-        features = {
-            'execution_time': execution_time,
-            'nodes_count': len(node_features),
-            'dependencies_count': len(dependency_features),
-            'total_bytes_at_realization': 0.0,
-            'total_vectors': 0.0,
-            'total_parallelism': 0.0
-        }
-        
-        if len(node_features) > 0 and len(dependency_features) > 0:
-            features['node_dep_ratio'] = len(node_features) / len(dependency_features)
+    # Extract scheduling features (aggregate as sum or average where appropriate)
+    scheduling_keys = [
+        'num_realizations', 'num_productions', 'points_computed_total', 'innermost_loop_extent',
+        'inner_parallelism', 'outer_parallelism', 'bytes_at_realization', 'bytes_at_production',
+        'bytes_at_root', 'unique_bytes_read_per_realization', 'working_set', 'vector_size',
+        'num_vectors', 'num_scalars', 'bytes_at_task', 'working_set_at_task', 'working_set_at_production',
+        'working_set_at_realization', 'working_set_at_root'
+    ]
+    scheduling_sums = defaultdict(float)
+    node_count = 0
+    for node in json_data['children']:
+        if 'scheduling' in node:
+            node_count += 1
+            for key in scheduling_keys:
+                scheduling_sums[key] += node['scheduling'].get(key, 0)
+    for key in scheduling_keys:
+        # Average for parallelism, sum for others
+        if key in ['inner_parallelism', 'outer_parallelism'] and node_count > 0:
+            features[f'sched_{key}'] = scheduling_sums[key] / node_count
         else:
-            features['node_dep_ratio'] = 0
-        
-        # Aggregate operation counts
-        op_counts = {}
-        for node in node_features:
-            for key, value in node.items():
-                if key.startswith('op_'):
-                    op_counts[key] = op_counts.get(key, 0) + value
-        features.update(op_counts)
-        
-        # Aggregate memory patterns
-        mem_counts = {}
-        for node in node_features:
-            for key, value in node.items():
-                if key.startswith('mem_'):
-                    mem_counts[key] = mem_counts.get(key, 0) + (value if isinstance(value, (int, float)) else 0)
-        features.update(mem_counts)
-        
-        # Aggregate scheduling features
-        if node_features:
-            important_metrics = [
-                'bytes_at_realization', 'bytes_at_root', 'bytes_at_task',
-                'inner_parallelism', 'outer_parallelism', 'num_realizations',
-                'num_vectors', 'points_computed_total', 'working_set_at_task'
-            ]
-            for metric in important_metrics:
-                metric_key = f'sched_{metric}'
-                values = [nf.get(metric_key, 0) for nf in node_features]
-                features[f'avg_{metric_key}'] = sum(values) / len(node_features) if values else 0
-            
-            total_bytes_at_realization = sum(nf.get('sched_bytes_at_realization', 0) for nf in node_features)
-            total_vectors = sum(nf.get('sched_num_vectors', 0) for nf in node_features)
-            total_parallelism = sum(nf.get('sched_inner_parallelism', 0) * nf.get('sched_outer_parallelism', 1) for nf in node_features)
-            
-            features['total_bytes_at_realization'] = total_bytes_at_realization
-            features['total_vectors'] = total_vectors
-            features['total_parallelism'] = total_parallelism
-            
-            if total_vectors > 0:
-                features['bytes_per_vector'] = total_bytes_at_realization / total_vectors
-            else:
-                features['bytes_per_vector'] = 0
-            
-            working_set = features.get('avg_sched_working_set_at_task', 0)
-            bytes_at_real = features.get('avg_sched_bytes_at_realization', 0)
-            if bytes_at_real > 0:
-                features['memory_pressure'] = working_set / bytes_at_real
-            else:
-                features['memory_pressure'] = 0
-        
-        # Global features
-        for node in node_features:
-            if node['name'] == 'Global Features':
-                features['cache_hits'] = node.get('cache_hits', 0)
-                features['cache_misses'] = node.get('cache_misses', 0)
-                features['cache_hit_ratio'] = features['cache_hits'] / (features['cache_hits'] + features['cache_misses'] + 1e-8)
-        
-        # Dependency features
-        if dependency_features:
-            footprint_lengths = [len(dep['footprint']) for dep in dependency_features]
-            jacobian_lengths = [len(dep['load_jacobian']) for dep in dependency_features]
-            features['avg_footprint_length'] = sum(footprint_lengths) / len(footprint_lengths) if footprint_lengths else 0
-            features['avg_jacobian_length'] = sum(jacobian_lengths) / len(jacobian_lengths) if jacobian_lengths else 0
-        
-        if len(node_features) > 0:
-            op_types = sum(1 for k in op_counts.keys())
-            features['avg_ops_per_node'] = sum(op_counts.values()) / len(node_features)
-            features['op_diversity'] = op_types / len(node_features) if len(node_features) > 0 else 0
-        
-        features['bytes_per_parallelism'] = features['total_bytes_at_realization'] / (features['total_parallelism'] + 1e-8)
-        features['nodes_per_dependency'] = features['nodes_count'] / (features['dependencies_count'] + 1e-8)
-        
-        return features
+            features[f'sched_{key}'] = scheduling_sums[key]
     
-    except Exception as e:
-        print(f"Error extracting features from {file_path}: {str(e)}")
-        skipped_logger.info(f"Skipped {file_path}: Error extracting features - {str(e)}")
-        return None
+    # Derived features
+    features['total_parallelism'] = features.get('sched_inner_parallelism', 0) + features.get('sched_outer_parallelism', 0)
+    features['scheduling_count'] = features.get('sched_num_realizations', 0) + features.get('sched_num_productions', 0)
+    features['total_bytes_at_production'] = features.get('sched_bytes_at_production', 0)
+    features['total_vectors'] = features.get('sched_num_vectors', 0)
+    features['computation_efficiency'] = (features.get('sched_points_computed_total', 0) /
+                                         (features.get('sched_bytes_at_realization', 0) + 1))
+    features['memory_pressure'] = (features.get('sched_working_set', 0) /
+                                  (features.get('sched_bytes_at_root', 0) + 1))
+    features['memory_utilization_ratio'] = (features.get('sched_unique_bytes_read_per_realization', 0) /
+                                           (features.get('sched_bytes_at_task', 0) + 1))
+    features['bytes_processing_rate'] = (features.get('sched_bytes_at_realization', 0) /
+                                        (features.get('execution_time_ms', 1)))
+    features['bytes_per_parallelism'] = (features.get('sched_bytes_at_task', 0) /
+                                        (features.get('total_parallelism', 1)))
+    features['bytes_per_vector'] = (features.get('sched_bytes_at_realization', 0) /
+                                   (features.get('sched_num_vectors', 1)))
+    
+    # Node and edge counts
+    nodes_count = len(json_data['children'])
+    edges_count = sum(len(node.get('children', [])) for node in json_data['children'])
+    features['nodes_count'] = nodes_count
+    features['edges_count'] = edges_count
+    features['node_edge_ratio'] = nodes_count / (edges_count + 1)
+    features['nodes_per_schedule'] = nodes_count / (features.get('scheduling_count', 1))
+    features['op_diversity'] = len([k for k, v in features.items() if k.startswith('op_') and v > 0])
+    
+    return features
 
-def process_all_files(main_dir):
-    all_features = []
-    file_paths = []
+# Main function to process all JSON files and generate report
+def generate_feature_importance_report(tree_output_dir):
+    data = []
+    file_count = 0
     
-    main_dir_path = Path(main_dir)
-    if not main_dir_path.exists():
-        print(f"Directory '{main_dir}' does not exist.")
-        return all_features, file_paths
+    # Recursively find all tree_representation.json files
+    for root, dirs, files in os.walk(tree_output_dir):
+        if 'tree_representation.json' in files:
+            file_path = os.path.join(root, 'tree_representation.json')
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    json_data = json.load(f)
+                features = extract_features(json_data)
+                data.append(features)
+                file_count += 1
+            except Exception as e:
+                print(f"Error processing {file_path}: {e}")
     
-    for batch_dir in main_dir_path.iterdir():
-        if not batch_dir.is_dir():
-            continue
-        
-        # Look for numbered sub-subfolders (e.g., 1, 2, ..., 32)
-        numbered_dirs = [d for d in batch_dir.iterdir() if d.is_dir() and re.match(r'^\d+$', d.name)]
-        if not numbered_dirs:
-            print(f"No numbered subfolders found in {batch_dir}")
-            continue
-        
-        print(f"Found {len(numbered_dirs)} numbered subfolders in {batch_dir}")
-        processed_files = 0
-        skipped_no_nodes = 0
-        skipped_no_time = 0
-        skipped_other = 0
-        
-        for numbered_dir in numbered_dirs:
-            json_file = numbered_dir / 'tree_representation.json'
-            if not json_file.exists():
-                print(f"No tree_representation.json found in {json_file}")
-                skipped_other += 1
-                skipped_logger.info(f"Skipped {json_file}: File not found")
-                continue
-            
-            features = extract_features_from_file(json_file)
-            if features is not None:
-                all_features.append(features)
-                file_paths.append(f"{batch_dir.name}/{numbered_dir.name}/tree_representation.json")
-                processed_files += 1
-            else:
-                # Categorize skip reason based on last log message
-                last_msg = skipped_logger.handlers[0].baseFilename  # Check skipped_files.log
-                with open(last_msg, 'r') as log_file:
-                    last_line = log_file.readlines()[-1]
-                    if 'No nodes found' in last_line:
-                        skipped_no_nodes += 1
-                    elif 'No valid execution time' in last_line:
-                        skipped_no_time += 1
-                    else:
-                        skipped_other += 1
-        
-        print(f"Batch {batch_dir.name}: Processed {processed_files}, "
-              f"Skipped (No nodes: {skipped_no_nodes}, No time: {skipped_no_time}, Other: {skipped_other})")
+    if not data:
+        return "No valid JSON files found in Tree_Output directory."
     
-    if not all_features:
-        print("No valid files were processed successfully. Check 'execution_time_debug.log' and 'skipped_files.log'.")
-    else:
-        print(f"Processed {len(all_features)} files successfully across all batches.")
-    return all_features, file_paths
-
-def create_additional_features(df):
-    df['log_execution_time'] = np.log1p(df['execution_time'])
+    # Convert to DataFrame
+    df = pd.DataFrame(data)
+    df.fillna(0, inplace=True)
     
-    if 'avg_sched_points_computed_total' in df.columns and 'execution_time' in df.columns:
-        df['computation_efficiency'] = df['avg_sched_points_computed_total'] / (df['execution_time'] + 1e-8)
+    # Extract execution time as target
+    y = df['execution_time_ms']
+    X = df.drop('execution_time_ms', axis=1)
     
-    if 'total_bytes_at_realization' in df.columns and 'execution_time' in df.columns:
-        df['bytes_processing_rate'] = df['total_bytes_at_realization'] / (df['execution_time'] + 1e-8)
+    # Summary statistics
+    exec_time_stats = {
+        'total_files': file_count,
+        'min_exec_time': y.min(),
+        'max_exec_time': y.max(),
+        'mean_exec_time': y.mean(),
+        'median_exec_time': y.median(),
+        'std_exec_time': y.std()
+    }
     
-    if 'avg_sched_working_set_at_task' in df.columns and 'avg_sched_bytes_at_realization' in df.columns:
-        df['memory_utilization_ratio'] = df['avg_sched_working_set_at_task'] / (df['avg_sched_bytes_at_realization'] + 1e-8)
-    
-    return df
-
-def analyze_feature_importance(features_list):
-    if not features_list:
-        print("No features to analyze.")
-        return None, None, None, None, None, None
-    
-    df = pd.DataFrame(features_list)
-    df = create_additional_features(df)
-    
-    print(f"\nExecution time statistics:")
-    print(f"Min: {df['execution_time'].min():.2f} ms")
-    print(f"Max: {df['execution_time'].max():.2f} ms")
-    print(f"Mean: {df['execution_time'].mean():.2f} ms")
-    print(f"Median: {df['execution_time'].median():.2f} ms")
-    print(f"Std Dev: {df['execution_time'].std():.2f} ms")
-    
-    y = df['execution_time']
-    X = df.drop(['execution_time', 'log_execution_time'] if 'log_execution_time' in df.columns else ['execution_time'], axis=1)
-    
-    X = X.fillna(0)
-    
-    constant_features = [col for col in X.columns if X[col].nunique() <= 1]
-    if constant_features:
-        print(f"\nRemoving {len(constant_features)} constant features")
-        X = X.drop(constant_features, axis=1)
-    
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-    
-    X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2, random_state=42)
-    
+    # Random Forest feature importance
     rf = RandomForestRegressor(n_estimators=100, random_state=42)
-    rf.fit(X_train, y_train)
+    rf.fit(X, y)
+    feature_importance = pd.Series(rf.feature_importances_, index=X.columns).sort_values(ascending=False)
     
-    y_pred = rf.predict(X_test)
-    mse = mean_squared_error(y_test, y_pred)
-    r2 = r2_score(y_test, y_pred)
+    # Pearson and Spearman correlations
+    pearson_corrs = {}
+    spearman_corrs = {}
+    for col in X.columns:
+        pearson_corrs[col] = pearsonr(X[col], y)[0]
+        spearman_corrs[col] = spearmanr(X[col], y)[0]
     
-    print(f"\nModel Evaluation:")
-    print(f"Mean Squared Error: {mse:.2f}")
-    print(f"R² Score: {r2:.4f}")
+    pearson_series = pd.Series(pearson_corrs).sort_values(key=abs, ascending=False)
+    spearman_series = pd.Series(spearman_corrs).sort_values(key=abs, ascending=False)
     
-    cv_scores = cross_val_score(rf, X_scaled, y, cv=5, scoring='r2')
-    print(f"Cross-validation R² scores: {cv_scores}")
-    print(f"Mean CV R²: {cv_scores.mean():.4f}")
-    
-    feature_importances = pd.Series(rf.feature_importances_, index=X.columns)
-    feature_importances = feature_importances.sort_values(ascending=False)
-    
-    pearson_correlations = {}
-    spearman_correlations = {}
-    
-    for column in X.columns:
-        p_corr, _ = stats.pearsonr(X[column], y)
-        s_corr, _ = stats.spearmanr(X[column], y)
-        pearson_correlations[column] = p_corr
-        spearman_correlations[column] = s_corr
-    
-    pearson_correlations = pd.Series(pearson_correlations).sort_values(ascending=False, key=abs)
-    spearman_correlations = pd.Series(spearman_correlations).sort_values(ascending=False, key=abs)
-    
-    return feature_importances, pearson_correlations, spearman_correlations, y, df, X
+    # Generate report
+    report = f"""
+Feature Importance Analysis Report
+=================================
 
-def plot_feature_importance(feature_importances, correlations, output_dir):
-    os.makedirs(output_dir, exist_ok=True)
-    
-    plt.figure(figsize=(12, 8))
-    top_features = feature_importances.head(15)
-    sns.barplot(x=top_features.values, y=top_features.index)
-    plt.title('Top 15 Features by Importance (Random Forest)')
-    plt.tight_layout()
-    plt.savefig(f"{output_dir}/top_features_importance.png")
-    
-    plt.figure(figsize=(12, 8))
-    top_correlations = correlations.head(15)
-    sns.barplot(x=top_correlations.values, y=top_correlations.index)
-    plt.title('Top 15 Features by Correlation with Execution Time')
-    plt.tight_layout()
-    plt.savefig(f"{output_dir}/top_features_correlation.png")
-    
-    plt.close('all')
+Summary Statistics:
+Total files processed: {exec_time_stats['total_files']}
+Execution time range: {exec_time_stats['min_exec_time']:.2f} ms to {exec_time_stats['max_exec_time']:.2f} ms
+Mean execution time: {exec_time_stats['mean_exec_time']:.2f} ms
+Median execution time: {exec_time_stats['median_exec_time']:.2f} ms
+Standard deviation: {exec_time_stats['std_exec_time']:.2f} ms
 
-def plot_execution_time_distribution(execution_times, output_dir):
-    os.makedirs(output_dir, exist_ok=True)
+Feature Importance (Random Forest):
+----------------------------------
+"""
+    for feature, importance in feature_importance.items():
+        report += f"{feature}: {importance:.4f}\n"
     
-    plt.figure(figsize=(10, 6))
-    sns.histplot(execution_times, kde=True)
-    plt.title('Distribution of Execution Times')
-    plt.xlabel('Execution Time (ms)')
-    plt.ylabel('Frequency')
-    plt.tight_layout()
-    plt.savefig(f"{output_dir}/execution_time_distribution.png")
+    report += f"""
+Correlation with Execution Time (Pearson):
+-----------------------------------------
+"""
+    for feature, corr in pearson_series.items():
+        report += f"{feature}: {corr:.4f}\n"
     
-    plt.figure(figsize=(10, 6))
-    sns.boxplot(x=execution_times)
-    plt.title('Execution Time Box Plot')
-    plt.xlabel('Execution Time (ms)')
-    plt.tight_layout()
-    plt.savefig(f"{output_dir}/execution_time_boxplot.png")
+    report += f"""
+Correlation with Execution Time (Spearman):
+------------------------------------------
+"""
+    for feature, corr in spearman_series.items():
+        report += f"{feature}: {corr:.4f}\n"
     
-    plt.close('all')
+    # Save report
+    output_path = os.path.join(tree_output_dir, 'feature_importance_report.txt')
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write(report)
+    
+    return report
 
-def plot_scatter_for_top_features(df, top_features, output_dir):
-    os.makedirs(output_dir, exist_ok=True)
-    
-    top_feature_names = list(top_features.index[:10])
-    
-    for feature in top_feature_names:
-        if feature in df.columns:
-            plt.figure(figsize=(8, 6))
-            sns.scatterplot(x=df[feature], y=df['execution_time'])
-            plt.title(f'{feature} vs Execution Time')
-            plt.xlabel(feature)
-            plt.ylabel('Execution Time (ms)')
-            plt.tight_layout()
-            safe_feature = feature.replace('/', '_').replace('\\', '_')
-            plt.savefig(f"{output_dir}/scatter_{safe_feature}.png")
-            plt.close()
-
-def generate_report(feature_importances, pearson_correlations, spearman_correlations, 
-                    execution_times, file_paths, df, output_dir='analysis_results'):
-    
-    if feature_importances is None:
-        print("Cannot generate report: No feature importance data available.")
-        return
-    
-    os.makedirs(output_dir, exist_ok=True)
-    
-    plot_execution_time_distribution(execution_times, output_dir)
-    plot_feature_importance(feature_importances, pearson_correlations, output_dir)
-    plot_scatter_for_top_features(df, feature_importances, output_dir)
-    
-    html_report = f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Feature Importance Analysis Report</title>
-        <style>
-            body {{ font-family: Arial, sans-serif; margin: 20px; }}
-            h1, h2, h3 {{ color: #333; }}
-            table {{ border-collapse: collapse; width: 100%; margin-bottom: 20px; }}
-            th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
-            th {{ background-color: #f2f2f2; }}
-            tr:nth-child(even) {{ background-color: #f9f9f9; }}
-            .section {{ margin-bottom: 30px; }}
-            img {{ max-width: 100%; height: auto; }}
-        </style>
-    </head>
-    <body>
-        <h1>Feature Importance Analysis Report</h1>
-        
-        <div class="section">
-            <h2>Summary Statistics</h2>
-            <p>Total files processed: {len(file_paths)}</p>
-            <p>Execution time range: {execution_times.min():.2f} ms to {execution_times.max():.2f} ms</p>
-            <p>Mean execution time: {execution_times.mean():.2f} ms</p>
-            <p>Median execution time: {execution_times.median():.2f} ms</p>
-            <p>Standard deviation: {execution_times.std():.2f} ms</p>
-            
-            <h3>Execution Time Distribution</h3>
-            <img src="execution_time_distribution.png" alt="Execution Time Distribution">
-            <img src="execution_time_boxplot.png" alt="Execution Time Box Plot">
-        </div>
-        
-        <div class="section">
-            <h2>Feature Importance Analysis</h2>
-            
-            <h3>Top Features by Importance (Random Forest Model)</h3>
-            <img src="top_features_importance.png" alt="Top Features by Importance">
-            
-            <table>
-                <tr>
-                    <th>Rank</th>
-                    <th>Feature</th>
-                    <th>Importance Score</th>
-                </tr>
-    """
-    
-    top_features = list(feature_importances.items())[:20]
-    for i, (feature, importance) in enumerate(top_features, start=1):
-        html_report += f"""
-                <tr>
-                    <td>{i}</td>
-                    <td>{feature}</td>
-                    <td>{importance:.4f}</td>
-                </tr>
-        """
-    
-    html_report += """
-            </table>
-            
-            <h3>Top Features by Correlation (Pearson)</h3>
-            <img src="top_features_correlation.png" alt="Top Features by Correlation">
-            
-            <table>
-                <tr>
-                    <th>Rank</th>
-                    <th>Feature</th>
-                    <th>Pearson Correlation</th>
-                    <th>Spearman Correlation</th>
-                </tr>
-    """
-    
-    top_pearson = list(pearson_correlations.items())[:20]
-    for i, (feature, corr) in enumerate(top_pearson, start=1):
-        spearman_corr = spearman_correlations.get(feature, 0)
-        html_report += f"""
-                <tr>
-                    <td>{i}</td>
-                    <td>{feature}</td>
-                    <td>{corr:.4f}</td>
-                    <td>{spearman_corr:.4f}</td>
-                </tr>
-        """
-    
-    html_report += """
-            </table>
-        </div>
-        
-        <div class="section">
-            <h2>Scatter Plots of Top Features vs Execution Time</h2>
-    """
-    
-    top_feature_names = list(feature_importances.index[:10])
-    for feature in top_feature_names:
-        safe_feature = feature.replace('/', '_').replace('\\', '_')
-        html_report += f"""
-            <h3>{feature} vs Execution Time</h3>
-            <img src="scatter_{safe_feature}.png" alt="Scatter plot of {feature}">
-        """
-    
-    html_report += """
-        </div>
-        
-        <div class="section">
-            <h2>Files Processed</h2>
-            <table>
-                <tr>
-                    <th>#</th>
-                    <th>File Path</th>
-                </tr>
-    """
-    
-    display_files = file_paths[:100]
-    for i, file_path in enumerate(display_files, start=1):
-        html_report += f"""
-                <tr>
-                    <td>{i}</td>
-                    <td>{file_path}</td>
-                </tr>
-        """
-    
-    if len(file_paths) > 100:
-        html_report += f"""
-                <tr>
-                    <td colspan="2">... and {len(file_paths) - 100} more files</td>
-                </tr>
-        """
-    
-    html_report += """
-            </table>
-        </div>
-    </body>
-    </html>
-    """
-    
-    with open(f"{output_dir}/feature_importance_report.html", 'w') as f:
-        f.write(html_report)
-    
-    with open(f"{output_dir}/feature_importance_report.txt", 'w') as f:
-        f.write("Feature Importance Analysis Report\n")
-        f.write("=================================\n\n")
-        
-        f.write("Summary Statistics:\n")
-        f.write(f"Total files processed: {len(file_paths)}\n")
-        f.write(f"Execution time range: {execution_times.min():.2f} ms to {execution_times.max():.2f} ms\n")
-        f.write(f"Mean execution time: {execution_times.mean():.2f} ms\n")
-        f.write(f"Median execution time: {execution_times.median():.2f} ms\n")
-        f.write(f"Standard deviation: {execution_times.std():.2f} ms\n\n")
-        
-        f.write("Feature Importance (Random Forest):\n")
-        f.write("----------------------------------\n")
-        for feature, importance in list(feature_importances.items())[:30]:
-            f.write(f"{feature}: {importance:.4f}\n")
-        f.write("\n")
-        
-        f.write("Correlation with Execution Time (Pearson):\n")
-        f.write("-----------------------------------------\n")
-        for feature, corr in list(pearson_correlations.items())[:30]:
-            f.write(f"{feature}: {corr:.4f}\n")
-        f.write("\n")
-        
-        f.write("Correlation with Execution Time (Spearman):\n")
-        f.write("------------------------------------------\n")
-        for feature, corr in list(spearman_correlations.items())[:30]:
-            f.write(f"{feature}: {corr:.4f}\n")
-        f.write("\n")
-    
-    print(f"Reports generated in the '{output_dir}' directory")
-    print(f"- HTML report: {output_dir}/feature_importance_report.html")
-    print(f"- Text report: {output_dir}/feature_importance_report.txt")
-
-def main(main_dir="Tree_Output", output_dir="analysis_results"):
-    print(f"Processing files in {main_dir}...")
-    features_list, file_paths = process_all_files(main_dir)
-    
-    if not features_list:
-        print("No valid data found in the files. Check 'execution_time_debug.log' and 'skipped_files.log'.")
-        return
-    
-    print(f"Extracted features from {len(features_list)} files.")
-    
-    print("Analyzing feature importance...")
-    feature_importances, pearson_correlations, spearman_correlations, execution_times, df, X = analyze_feature_importance(features_list)
-    
-    if feature_importances is not None:
-        print("Generating comprehensive report...")
-        generate_report(feature_importances, pearson_correlations, spearman_correlations, execution_times, file_paths, df, output_dir)
-    
-    print("Analysis complete.")
-
+# Example usage (replace with actual directory path)
 if __name__ == "__main__":
-    main()
+    tree_output_dir = "Tree_Output"  # Replace with actual path
+    report = generate_feature_importance_report(tree_output_dir)
+    print(report)
