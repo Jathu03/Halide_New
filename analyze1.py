@@ -6,6 +6,7 @@ from sklearn.ensemble import RandomForestRegressor
 from scipy.stats import pearsonr, spearmanr
 from collections import defaultdict
 import uuid
+import matplotlib.pyplot as plt
 
 # Function to extract features from a single JSON file
 def extract_features(json_data):
@@ -58,7 +59,6 @@ def extract_features(json_data):
         else:
             features[f'sched_{key}'] = scheduling_sums[key]
 
-    # Derived features with safe division
     features['total_parallelism'] = features.get('sched_inner_parallelism', 0) + features.get('sched_outer_parallelism', 0)
     features['scheduling_count'] = features.get('sched_num_realizations', 0) + features.get('sched_num_productions', 0)
     features['total_bytes_at_production'] = features.get('sched_bytes_at_production', 0)
@@ -77,7 +77,6 @@ def extract_features(json_data):
     features['bytes_per_vector'] = (features.get('sched_bytes_at_realization', 0) /
                                     features.get('sched_num_vectors', 1)) if features.get('sched_num_vectors', 0) != 0 else 0
 
-    # Node and edge counts
     nodes_count = len(json_data['children'])
     edges_count = sum(len(node.get('children', [])) for node in json_data['children'])
     features['nodes_count'] = nodes_count
@@ -110,7 +109,6 @@ def generate_feature_importance_report(tree_output_dir):
 
     df = pd.DataFrame(data)
     df.fillna(0, inplace=True)
-
     y = df['execution_time_ms']
     X = df.drop('execution_time_ms', axis=1)
 
@@ -127,11 +125,8 @@ def generate_feature_importance_report(tree_output_dir):
     rf.fit(X, y)
     feature_importance = pd.Series(rf.feature_importances_, index=X.columns).sort_values(ascending=False)
 
-    pearson_corrs = {}
-    spearman_corrs = {}
-    for col in X.columns:
-        pearson_corrs[col] = pearsonr(X[col], y)[0]
-        spearman_corrs[col] = spearmanr(X[col], y)[0]
+    pearson_corrs = {col: pearsonr(X[col], y)[0] for col in X.columns}
+    spearman_corrs = {col: spearmanr(X[col], y)[0] for col in X.columns}
 
     pearson_series = pd.Series(pearson_corrs).sort_values(key=abs, ascending=False)
     spearman_series = pd.Series(spearman_corrs).sort_values(key=abs, ascending=False)
@@ -167,19 +162,40 @@ Correlation with Execution Time (Spearman):
     for feature, corr in spearman_series.items():
         report += f"{feature}: {corr:.4f}\n"
 
-    # Save report to a .txt file
-    output_path = os.path.join(tree_output_dir, 'feature_importance_report.txt')
-    try:
-        with open(output_path, 'w', encoding='utf-8') as f:
-            f.write(report)
-        print(f"✅ Report successfully saved to: {output_path}")
-    except Exception as e:
-        print(f"❌ Failed to save the report: {e}")
+    report_path = os.path.join(tree_output_dir, 'feature_importance_report.txt')
+    with open(report_path, 'w', encoding='utf-8') as f:
+        f.write(report)
+
+    # Save CSV and Excel reports
+    csv_path = os.path.join(tree_output_dir, 'feature_analysis.csv')
+    excel_path = os.path.join(tree_output_dir, 'feature_analysis.xlsx')
+
+    analysis_df = pd.DataFrame({
+        'Feature': feature_importance.index,
+        'Importance_RF': feature_importance.values,
+        'Pearson': [pearson_corrs[f] for f in feature_importance.index],
+        'Spearman': [spearman_corrs[f] for f in feature_importance.index]
+    })
+
+    analysis_df.to_csv(csv_path, index=False)
+    analysis_df.to_excel(excel_path, index=False)
+
+    # Generate bar plot of top features
+    top_n = 20
+    plt.figure(figsize=(12, 8))
+    top_features = feature_importance.head(top_n)
+    plt.barh(top_features.index[::-1], top_features.values[::-1], color='skyblue')
+    plt.xlabel('Feature Importance')
+    plt.title(f'Top {top_n} Features by Random Forest Importance')
+    plt.tight_layout()
+    plot_path = os.path.join(tree_output_dir, 'feature_importance_plot.png')
+    plt.savefig(plot_path)
+    plt.close()
 
     return report
 
 # Example usage
 if __name__ == "__main__":
-    tree_output_dir = "Tree_Output"  # Replace with the actual path
+    tree_output_dir = "Tree_Output"  # Replace with actual path
     report = generate_feature_importance_report(tree_output_dir)
     print(report)
