@@ -11,6 +11,7 @@ from sklearn.metrics import mean_squared_error, r2_score
 import scipy.stats as stats
 from pathlib import Path
 import warnings
+import re
 warnings.filterwarnings('ignore')
 
 def get_execution_time(file_path):
@@ -26,6 +27,7 @@ def get_execution_time(file_path):
                 if execution_time is not None:
                     return float(execution_time)
         
+        print(f"No execution time found in {file_path}")
         return None
     
     except Exception as e:
@@ -39,9 +41,14 @@ def extract_features_from_file(file_path):
     
         execution_time = get_execution_time(file_path)
         if execution_time is None:
+            print(f"Skipping {file_path}: No valid execution time")
             return None
     
         nodes = data.get('nodes', [])
+        if not nodes:
+            print(f"Skipping {file_path}: No nodes found")
+            return None
+        
         node_features = []
         dependency_features = []
         
@@ -58,7 +65,10 @@ def extract_features_from_file(file_path):
             # Extract memory_patterns
             mem_patterns = node.get('memory_patterns', {})
             for pattern_name, pattern_value in mem_patterns.items():
-                node_feature[f'mem_{pattern_name.lower()}'] = pattern_value
+                if isinstance(pattern_value, list):
+                    node_feature[f'mem_{pattern_name.lower()}_sum'] = sum(pattern_value)
+                else:
+                    node_feature[f'mem_{pattern_name.lower()}'] = pattern_value
             
             # Extract scheduling features
             sched = node.get('scheduling', {})
@@ -81,6 +91,10 @@ def extract_features_from_file(file_path):
                     'load_jacobian': child.get('load_jacobian', [])
                 }
                 dependency_features.append(dep_feature)
+        
+        if not node_features:
+            print(f"Skipping {file_path}: No valid node features extracted")
+            return None
     
         features = {
             'execution_time': execution_time,
@@ -109,7 +123,7 @@ def extract_features_from_file(file_path):
         for node in node_features:
             for key, value in node.items():
                 if key.startswith('mem_'):
-                    mem_counts[key] = mem_counts.get(key, 0) + (value if isinstance(value, (int, float)) else sum(value))
+                    mem_counts[key] = mem_counts.get(key, 0) + (value if isinstance(value, (int, float)) else 0)
         features.update(mem_counts)
         
         # Aggregate scheduling features
@@ -185,18 +199,28 @@ def process_all_files(main_dir):
         if not subdir_path.is_dir():
             continue
         
-        for file_path in subdir_path.glob('tree_representation.json'):
+        # Look for JSON files with numeric names (e.g., 1.json, 2.json, ..., 32.json)
+        json_files = [f for f in subdir_path.glob('*.json') if re.match(r'^\d+\.json$', f.name)]
+        if not json_files:
+            print(f"No numeric JSON files found in {subdir_path}")
+            continue
+        
+        for file_path in json_files:
             print(f"Processing {file_path}...", end='\r')
             features = extract_features_from_file(file_path)
             if features is not None:
                 all_features.append(features)
                 file_paths.append(f"{subdir_path.name}/{file_path.name}")
+            else:
+                print(f"Failed to process {file_path}")
     
-    print(f"Processed {len(all_features)} files successfully.           ")
+    if not all_features:
+        print("No valid files were processed successfully.")
+    else:
+        print(f"Processed {len(all_features)} files successfully.")
     return all_features, file_paths
 
 def create_additional_features(df):
-    """Create additional derived features that might help the model"""
     df['log_execution_time'] = np.log1p(df['execution_time'])
     
     if 'avg_sched_points_computed_total' in df.columns and 'execution_time' in df.columns:
@@ -211,6 +235,10 @@ def create_additional_features(df):
     return df
 
 def analyze_feature_importance(features_list):
+    if not features_list:
+        print("No features to analyze.")
+        return None, None, None, None, None, None
+    
     df = pd.DataFrame(features_list)
     df = create_additional_features(df)
     
@@ -326,6 +354,10 @@ def plot_scatter_for_top_features(df, top_features, output_dir):
 
 def generate_report(feature_importances, pearson_correlations, spearman_correlations, 
                     execution_times, file_paths, df, output_dir='analysis_results'):
+    
+    if feature_importances is None:
+        print("Cannot generate report: No feature importance data available.")
+        return
     
     os.makedirs(output_dir, exist_ok=True)
     
@@ -508,7 +540,7 @@ def main(main_dir="Tree_Output", output_dir="analysis_results"):
     features_list, file_paths = process_all_files(main_dir)
     
     if not features_list:
-        print("No valid data found in the files.")
+        print("No valid data found in the files. Please check the JSON structure and file names.")
         return
     
     print(f"Extracted features from {len(features_list)} files.")
@@ -516,8 +548,9 @@ def main(main_dir="Tree_Output", output_dir="analysis_results"):
     print("Analyzing feature importance...")
     feature_importances, pearson_correlations, spearman_correlations, execution_times, df, X = analyze_feature_importance(features_list)
     
-    print("Generating comprehensive report...")
-    generate_report(feature_importances, pearson_correlations, spearman_correlations, execution_times, file_paths, df, output_dir)
+    if feature_importances is not None:
+        print("Generating comprehensive report...")
+        generate_report(feature_importances, pearson_correlations, spearman_correlations, execution_times, file_paths, df, output_dir)
     
     print("Analysis complete.")
 
