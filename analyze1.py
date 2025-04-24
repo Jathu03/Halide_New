@@ -12,7 +12,12 @@ import scipy.stats as stats
 from pathlib import Path
 import warnings
 import re
+import logging
 warnings.filterwarnings('ignore')
+
+# Set up logging to save debug information for files with missing execution times
+logging.basicConfig(filename='execution_time_debug.log', level=logging.DEBUG, 
+                    format='%(asctime)s - %(message)s')
 
 def get_execution_time(file_path):
     try:
@@ -21,12 +26,45 @@ def get_execution_time(file_path):
             content = raw_content.decode('utf-8', errors='replace').replace('\0', '')
             data = json.loads(content)
         
-        for node in data.get('nodes', []):
-            if node.get('name') == 'Global Features':
-                execution_time = node.get('execution_time_ms')
-                if execution_time is not None:
-                    return float(execution_time)
+        nodes = data.get('nodes', [])
+        if not nodes:
+            print(f"No nodes found in {file_path}")
+            return None
         
+        # Search for execution time in multiple possible locations
+        for node in nodes:
+            # Check for "Global Features" node with direct execution_time_ms
+            if node.get('name') == 'Global Features':
+                execution_time = node.get('execution_time_ms') or node.get('total_execution_time_ms')
+                if execution_time is not None:
+                    try:
+                        return float(execution_time)
+                    except (ValueError, TypeError):
+                        print(f"Invalid execution time format in {file_path}: {execution_time}")
+                        return None
+            
+            # Check for node with name == "total_execution_time_ms" and value
+            if node.get('name') == 'total_execution_time_ms' and 'value' in node:
+                execution_time = node.get('value')
+                if execution_time is not None:
+                    try:
+                        return float(execution_time)
+                    except (ValueError, TypeError):
+                        print(f"Invalid execution time format in {file_path}: {execution_time}")
+                        return None
+        
+        # Fallback: Search for any key containing "execution_time" (case-insensitive)
+        for node in nodes:
+            for key, value in node.items():
+                if 'execution_time' in key.lower() and value is not None:
+                    try:
+                        return float(value)
+                    except (ValueError, TypeError):
+                        print(f"Invalid execution time format in {file_path} for key {key}: {value}")
+                        continue
+        
+        # Log the JSON structure for debugging
+        logging.debug(f"No execution time found in {file_path}. JSON structure: {json.dumps(data, indent=2)}")
         print(f"No execution time found in {file_path}")
         return None
     
@@ -40,7 +78,7 @@ def extract_features_from_file(file_path):
             data = json.load(f)
     
         execution_time = get_execution_time(file_path)
-        if execution_time is None:
+        if execution_time is None or execution_time <= 0:
             print(f"Skipping {file_path}: No valid execution time")
             return None
     
@@ -206,12 +244,15 @@ def process_all_files(main_dir):
             continue
         
         print(f"Found {len(numbered_dirs)} numbered subfolders in {batch_dir}")
+        processed_files = 0
+        skipped_files = 0
         
         for numbered_dir in numbered_dirs:
             # Look for tree_representation.json in the numbered sub-subfolder
             json_file = numbered_dir / 'tree_representation.json'
             if not json_file.exists():
                 print(f"No tree_representation.json found in {json_file}")
+                skipped_files += 1
                 continue
             
             print(f"Processing {json_file}...", end='\r')
@@ -219,13 +260,17 @@ def process_all_files(main_dir):
             if features is not None:
                 all_features.append(features)
                 file_paths.append(f"{batch_dir.name}/{numbered_dir.name}/tree_representation.json")
+                processed_files += 1
             else:
                 print(f"Failed to process {json_file}")
+                skipped_files += 1
+        
+        print(f"Batch {batch_dir.name}: Processed {processed_files}, Skipped {skipped_files}")
     
     if not all_features:
         print("No valid files were processed successfully.")
     else:
-        print(f"Processed {len(all_features)} files successfully.")
+        print(f"Processed {len(all_features)} files successfully across all batches.")
     return all_features, file_paths
 
 def create_additional_features(df):
@@ -548,7 +593,7 @@ def main(main_dir="Tree_Output", output_dir="analysis_results"):
     features_list, file_paths = process_all_files(main_dir)
     
     if not features_list:
-        print("No valid data found in the files. Please check the JSON structure and file names.")
+        print("No valid data found in the files. Check 'execution_time_debug.log' for JSON structures of skipped files.")
         return
     
     print(f"Extracted features from {len(features_list)} files.")
