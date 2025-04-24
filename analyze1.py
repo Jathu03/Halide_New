@@ -59,23 +59,25 @@ def extract_features(json_data):
         else:
             features[f'sched_{key}'] = scheduling_sums[key]
     
-    # Derived features
+    # Derived features with division-by-zero protection
     features['total_parallelism'] = features.get('sched_inner_parallelism', 0) + features.get('sched_outer_parallelism', 0)
     features['scheduling_count'] = features.get('sched_num_realizations', 0) + features.get('sched_num_productions', 0)
     features['total_bytes_at_production'] = features.get('sched_bytes_at_production', 0)
     features['total_vectors'] = features.get('sched_num_vectors', 0)
+    
+    # Safe division: return 0 if denominator is 0
     features['computation_efficiency'] = (features.get('sched_points_computed_total', 0) /
-                                         (features.get('sched_bytes_at_realization', 0) + 1))
+                                         features.get('sched_bytes_at_realization', 1)) if features.get('sched_bytes_at_realization', 0) != 0 else 0
     features['memory_pressure'] = (features.get('sched_working_set', 0) /
-                                  (features.get('sched_bytes_at_root', 0) + 1))
+                                  features.get('sched_bytes_at_root', 1)) if features.get('sched_bytes_at_root', 0) != 0 else 0
     features['memory_utilization_ratio'] = (features.get('sched_unique_bytes_read_per_realization', 0) /
-                                           (features.get('sched_bytes_at_task', 0) + 1))
+                                           features.get('sched_bytes_at_task', 1)) if features.get('sched_bytes_at_task', 0) != 0 else 0
     features['bytes_processing_rate'] = (features.get('sched_bytes_at_realization', 0) /
-                                        (features.get('execution_time_ms', 1)))
+                                        features.get('execution_time_ms', 1)) if features.get('execution_time_ms', 0) != 0 else 0
     features['bytes_per_parallelism'] = (features.get('sched_bytes_at_task', 0) /
-                                        (features.get('total_parallelism', 1)))
+                                        features.get('total_parallelism', 1)) if features.get('total_parallelism', 0) != 0 else 0
     features['bytes_per_vector'] = (features.get('sched_bytes_at_realization', 0) /
-                                   (features.get('sched_num_vectors', 1)))
+                                   features.get('sched_num_vectors', 1)) if features.get('sched_num_vectors', 0) != 0 else 0
     
     # Node and edge counts
     nodes_count = len(json_data['children'])
@@ -83,7 +85,7 @@ def extract_features(json_data):
     features['nodes_count'] = nodes_count
     features['edges_count'] = edges_count
     features['node_edge_ratio'] = nodes_count / (edges_count + 1)
-    features['nodes_per_schedule'] = nodes_count / (features.get('scheduling_count', 1))
+    features['nodes_per_schedule'] = nodes_count / (features.get('scheduling_count', 1)) if features.get('scheduling_count', 0) != 0 else 0
     features['op_diversity'] = len([k for k, v in features.items() if k.startswith('op_') and v > 0])
     
     return features
