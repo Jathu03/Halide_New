@@ -40,7 +40,7 @@ class TreeNode:
 def extract_features(json_data, execution_time_ms=None):
     features = {}
     
-    # Extract global features
+    # Extract global features from root or Global Features node
     features['cache_hits'] = json_data.get('cache_hits', 0)
     features['cache_misses'] = json_data.get('cache_misses', 0)
     
@@ -108,10 +108,12 @@ def extract_features(json_data, execution_time_ms=None):
 def build_tree(json_data, execution_time_ms=None):
     features = extract_features(json_data, execution_time_ms)
     children = []
-    for child in json_data.get('children', []):
-        if child['name'] != 'Global Features':  # Skip global features node
-            child_tree = build_tree(child, execution_time_ms)
-            children.append(child_tree)
+    if 'children' in json_data:
+        for child in json_data['children']:
+            # Skip Global Features node if present and extract its data at root
+            if 'name' in child and child['name'] == 'Global Features':
+                continue
+            children.append(build_tree(child, execution_time_ms))
     return TreeNode(features, children)
 
 # Process Tree_Output directory
@@ -128,13 +130,20 @@ def process_tree_output_directory(main_dir):
             try:
                 with open(file_path, 'r', encoding='utf-8') as f:
                     json_data = json.load(f)
-                global_node = next((child for child in json_data['children'] if child['name'] == 'Global Features'), None)
-                if global_node:
-                    exec_time = global_node.get('execution_time_ms', 0)
-                    if exec_time > 0 and np.isfinite(exec_time):
-                        valid_execution_times.append(exec_time)
+                # Try to find execution_time_ms
+                exec_time = json_data.get('execution_time_ms', 0)
+                if 'children' in json_data:
+                    for child in json_data['children']:
+                        if isinstance(child, dict) and child.get('name') == 'Global Features':
+                            exec_time = child.get('execution_time_ms', exec_time)
+                            break
+                if exec_time > 0 and np.isfinite(exec_time):
+                    valid_execution_times.append(exec_time)
+                else:
+                    invalid_files.append(file_path)
             except Exception as e:
-                print(f"Error processing {file_path}: {e}")
+                print(f"Error processing {file_path}: {str(e)}")
+                invalid_files.append(file_path)
     
     # Compute median execution time
     median_exec_time = np.median(valid_execution_times) if valid_execution_times else 1.0
@@ -147,8 +156,13 @@ def process_tree_output_directory(main_dir):
             try:
                 with open(file_path, 'r', encoding='utf-8') as f:
                     json_data = json.load(f)
-                global_node = next((child for child in json_data['children'] if child['name'] == 'Global Features'), None)
-                exec_time = global_node.get('execution_time_ms', 0) if global_node else 0
+                # Extract execution_time_ms
+                exec_time = json_data.get('execution_time_ms', 0)
+                if 'children' in json_data:
+                    for child in json_data['children']:
+                        if isinstance(child, dict) and child.get('name') == 'Global Features':
+                            exec_time = child.get('execution_time_ms', exec_time)
+                            break
                 if exec_time <= 0 or not np.isfinite(exec_time):
                     invalid_files.append(file_path)
                     exec_time = median_exec_time
@@ -158,7 +172,8 @@ def process_tree_output_directory(main_dir):
                 trees.append(tree)
                 file_names.append(file_path)
             except Exception as e:
-                print(f"Error processing {file_path}: {e}")
+                print(f"Error processing {file_path}: {str(e)}")
+                invalid_files.append(file_path)
     
     if not trees:
         raise ValueError("No valid JSON files found in Tree_Output directory.")
@@ -166,13 +181,13 @@ def process_tree_output_directory(main_dir):
     # Save invalid files log
     log_path = os.path.join(main_dir, 'invalid_files_log.txt')
     with open(log_path, 'w', encoding='utf-8') as f:
-        f.write("Files with invalid execution times (imputed with median):\n")
+        f.write("Files with invalid execution times or structure (skipped or imputed):\n")
         for file_path in invalid_files:
             f.write(f"{file_path}\n")
     
     total_files = len(trees)
     print(f"Total files found: {total_files}")
-    print(f"Files with invalid execution times (imputed): {len(invalid_files)}")
+    print(f"Files with invalid execution times or structure: {len(invalid_files)}")
     if total_files < 50:
         raise ValueError(f"Expected at least 50 files total, found {total_files}")
     
@@ -243,11 +258,8 @@ class RecursiveLSTM(nn.Module):
         
         # Final processing
         node_out = self.dropout(self.gelu(self.fc(node_out)))
-        if not node.children:  # Only leaf nodes contribute to output
-            output = self.output_layer(node_out)
-        else:
-            output = self.output_layer(node_out)
-        return node_out
+        output = self.output_layer(node_out)
+        return output
 
 # Custom loss function
 def custom_loss(outputs, targets, feature_importances, huber_delta=0.5, mae_weight=0.3, l1_lambda=1e-5):
