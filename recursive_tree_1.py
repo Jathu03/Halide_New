@@ -261,15 +261,19 @@ class RecursiveLSTM(nn.Module):
             child_outputs = []
             for child in node.children:
                 child_out = self.forward(child, device)
+                # Ensure child_out is [1, output_size]
+                child_out = child_out.view(1, -1)
                 child_outputs.append(child_out)
             child_outputs = torch.stack(child_outputs)  # Shape: (num_children, output_size)
             child_agg = child_outputs.mean(dim=0, keepdim=True)  # Shape: (1, output_size)
+            # Project child_agg to match node_out dimensions for combination
+            child_agg = self.output_layer(self.fc(self.gelu(self.dropout(child_agg))))
             node_out = node_out + child_agg  # Combine with node output
         
         # Final processing
         node_out = self.dropout(self.gelu(self.fc(node_out)))
-        output = self.output_layer(node_out)
-        return output
+        output = self.output_layer(node_out)  # Shape: (1, output_size)
+        return output.view(1, -1)  # Ensure output is [1, output_size]
 
 # Custom loss function
 def custom_loss(outputs, targets, feature_importances, huber_delta=0.5, mae_weight=0.3, l1_lambda=1e-5):
