@@ -15,9 +15,37 @@ import re
 import logging
 warnings.filterwarnings('ignore')
 
-# Set up logging to save debug information for files with missing execution times
+# Set up logging for debug and skipped files
 logging.basicConfig(filename='execution_time_debug.log', level=logging.DEBUG, 
                     format='%(asctime)s - %(message)s')
+skipped_logger = logging.getLogger('skipped_files')
+skipped_handler = logging.FileHandler('skipped_files.log')
+skipped_handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
+skipped_logger.addHandler(skipped_handler)
+skipped_logger.setLevel(logging.INFO)
+
+def recursive_search_execution_time(data, depth=0, max_depth=5):
+    """Recursively search for execution time in a nested JSON structure."""
+    if depth > max_depth or not isinstance(data, (dict, list)):
+        return None
+    
+    if isinstance(data, dict):
+        for key, value in data.items():
+            if isinstance(value, (dict, list)):
+                result = recursive_search_execution_time(value, depth + 1, max_depth)
+                if result is not None:
+                    return result
+            if 'execution_time' in key.lower() or 'time_ms' in key.lower():
+                try:
+                    return float(value)
+                except (ValueError, TypeError):
+                    continue
+    elif isinstance(data, list):
+        for item in data:
+            result = recursive_search_execution_time(item, depth + 1, max_depth)
+            if result is not None:
+                return result
+    return None
 
 def get_execution_time(file_path):
     try:
@@ -26,50 +54,62 @@ def get_execution_time(file_path):
             content = raw_content.decode('utf-8', errors='replace').replace('\0', '')
             data = json.loads(content)
         
-        nodes = data.get('nodes', [])
-        if not nodes:
-            print(f"No nodes found in {file_path}")
+        # Check for empty or malformed JSON
+        if not data:
+            print(f"Empty JSON in {file_path}")
+            logging.debug(f"Empty JSON in {file_path}")
             return None
         
-        # Search for execution time in multiple possible locations
-        for node in nodes:
-            # Check for "Global Features" node with direct execution_time_ms
-            if node.get('name') == 'Global Features':
-                execution_time = node.get('execution_time_ms') or node.get('total_execution_time_ms')
-                if execution_time is not None:
-                    try:
-                        return float(execution_time)
-                    except (ValueError, TypeError):
-                        print(f"Invalid execution time format in {file_path}: {execution_time}")
-                        return None
-            
-            # Check for node with name == "total_execution_time_ms" and value
-            if node.get('name') == 'total_execution_time_ms' and 'value' in node:
-                execution_time = node.get('value')
-                if execution_time is not None:
-                    try:
-                        return float(execution_time)
-                    except (ValueError, TypeError):
-                        print(f"Invalid execution time format in {file_path}: {execution_time}")
-                        return None
+        # Check root-level execution time
+        for key in ['execution_time_ms', 'total_execution_time_ms']:
+            if key in data:
+                try:
+                    return float(data[key])
+                except (ValueError, TypeError):
+                    print(f"Invalid execution time format in {file_path} at root: {data[key]}")
+                    continue
         
-        # Fallback: Search for any key containing "execution_time" (case-insensitive)
-        for node in nodes:
-            for key, value in node.items():
-                if 'execution_time' in key.lower() and value is not None:
-                    try:
-                        return float(value)
-                    except (ValueError, TypeError):
-                        print(f"Invalid execution time format in {file_path} for key {key}: {value}")
-                        continue
+        # Check nodes if present
+        nodes = data.get('nodes', [])
+        if nodes:
+            for node in nodes:
+                # Check "Global Features" node
+                if node.get('name') == 'Global Features':
+                    execution_time = node.get('execution_time_ms') or node.get('total_execution_time_ms')
+                    if execution_time is not None:
+                        try:
+                            return float(execution_time)
+                        except (ValueError, TypeError):
+                            print(f"Invalid execution time format in {file_path}: {execution_time}")
+                            continue
+                
+                # Check for node with name == "total_execution_time_ms"
+                if node.get('name') == 'total_execution_time_ms' and 'value' in node:
+                    execution_time = node.get('value')
+                    if execution_time is not None:
+                        try:
+                            return float(execution_time)
+                        except (ValueError, TypeError):
+                            print(f"Invalid execution time format in {file_path}: {execution_time}")
+                            continue
         
-        # Log the JSON structure for debugging
+        # Fallback: Recursive search for any execution time
+        execution_time = recursive_search_execution_time(data)
+        if execution_time is not None:
+            return execution_time
+        
+        # Log debug info
         logging.debug(f"No execution time found in {file_path}. JSON structure: {json.dumps(data, indent=2)}")
         print(f"No execution time found in {file_path}")
         return None
     
+    except json.JSONDecodeError as e:
+        print(f"JSON parsing error in {file_path}: {str(e)}")
+        logging.debug(f"JSON parsing error in {file_path}: {str(e)}")
+        return None
     except Exception as e:
         print(f"Error processing {file_path}: {str(e)}")
+        logging.debug(f"Error processing {file_path}: {str(e)}")
         return None
 
 def extract_features_from_file(file_path):
@@ -80,11 +120,13 @@ def extract_features_from_file(file_path):
         execution_time = get_execution_time(file_path)
         if execution_time is None or execution_time <= 0:
             print(f"Skipping {file_path}: No valid execution time")
+            skipped_logger.info(f"Skipped {file_path}: No valid execution time")
             return None
     
         nodes = data.get('nodes', [])
         if not nodes:
             print(f"Skipping {file_path}: No nodes found")
+            skipped_logger.info(f"Skipped {file_path}: No nodes found")
             return None
         
         node_features = []
@@ -132,6 +174,7 @@ def extract_features_from_file(file_path):
         
         if not node_features:
             print(f"Skipping {file_path}: No valid node features extracted")
+            skipped_logger.info(f"Skipped {file_path}: No valid node features extracted")
             return None
     
         features = {
@@ -222,6 +265,7 @@ def extract_features_from_file(file_path):
     
     except Exception as e:
         print(f"Error extracting features from {file_path}: {str(e)}")
+        skipped_logger.info(f"Skipped {file_path}: Error extracting features - {str(e)}")
         return None
 
 def process_all_files(main_dir):
@@ -245,30 +289,40 @@ def process_all_files(main_dir):
         
         print(f"Found {len(numbered_dirs)} numbered subfolders in {batch_dir}")
         processed_files = 0
-        skipped_files = 0
+        skipped_no_nodes = 0
+        skipped_no_time = 0
+        skipped_other = 0
         
         for numbered_dir in numbered_dirs:
-            # Look for tree_representation.json in the numbered sub-subfolder
             json_file = numbered_dir / 'tree_representation.json'
             if not json_file.exists():
                 print(f"No tree_representation.json found in {json_file}")
-                skipped_files += 1
+                skipped_other += 1
+                skipped_logger.info(f"Skipped {json_file}: File not found")
                 continue
             
-            print(f"Processing {json_file}...", end='\r')
             features = extract_features_from_file(json_file)
             if features is not None:
                 all_features.append(features)
                 file_paths.append(f"{batch_dir.name}/{numbered_dir.name}/tree_representation.json")
                 processed_files += 1
             else:
-                print(f"Failed to process {json_file}")
-                skipped_files += 1
+                # Categorize skip reason based on last log message
+                last_msg = skipped_logger.handlers[0].baseFilename  # Check skipped_files.log
+                with open(last_msg, 'r') as log_file:
+                    last_line = log_file.readlines()[-1]
+                    if 'No nodes found' in last_line:
+                        skipped_no_nodes += 1
+                    elif 'No valid execution time' in last_line:
+                        skipped_no_time += 1
+                    else:
+                        skipped_other += 1
         
-        print(f"Batch {batch_dir.name}: Processed {processed_files}, Skipped {skipped_files}")
+        print(f"Batch {batch_dir.name}: Processed {processed_files}, "
+              f"Skipped (No nodes: {skipped_no_nodes}, No time: {skipped_no_time}, Other: {skipped_other})")
     
     if not all_features:
-        print("No valid files were processed successfully.")
+        print("No valid files were processed successfully. Check 'execution_time_debug.log' and 'skipped_files.log'.")
     else:
         print(f"Processed {len(all_features)} files successfully across all batches.")
     return all_features, file_paths
@@ -593,7 +647,7 @@ def main(main_dir="Tree_Output", output_dir="analysis_results"):
     features_list, file_paths = process_all_files(main_dir)
     
     if not features_list:
-        print("No valid data found in the files. Check 'execution_time_debug.log' for JSON structures of skipped files.")
+        print("No valid data found in the files. Check 'execution_time_debug.log' and 'skipped_files.log'.")
         return
     
     print(f"Extracted features from {len(features_list)} files.")
