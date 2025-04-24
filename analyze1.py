@@ -11,7 +11,6 @@ from sklearn.metrics import mean_squared_error, r2_score
 import scipy.stats as stats
 from pathlib import Path
 import warnings
-import re
 warnings.filterwarnings('ignore')
 
 def get_execution_time(file_path):
@@ -199,11 +198,22 @@ def process_all_files(main_dir):
         if not subdir_path.is_dir():
             continue
         
-        # Look for JSON files with numeric names (e.g., 1.json, 2.json, ..., 32.json)
-        json_files = [f for f in subdir_path.glob('*.json') if re.match(r'^\d+\.json$', f.name)]
-        if not json_files:
-            print(f"No numeric JSON files found in {subdir_path}")
+        # List all files in the subfolder for debugging
+        all_files = [f.name for f in subdir_path.iterdir()]
+        if not all_files:
+            print(f"No files found in {subdir_path}")
             continue
+        print(f"Files in {subdir_path}: {', '.join(all_files)}")
+        
+        # First try to find tree_representation.json
+        json_files = [f for f in subdir_path.glob('tree_representation.json')]
+        
+        # If no tree_representation.json, try all .json files
+        if not json_files:
+            json_files = list(subdir_path.glob('*.json'))
+            if not json_files:
+                print(f"No JSON files found in {subdir_path}")
+                continue
         
         for file_path in json_files:
             print(f"Processing {file_path}...", end='\r')
