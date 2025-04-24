@@ -13,7 +13,7 @@ import random
 from collections import defaultdict
 import matplotlib.pyplot as plt
 
-# Feature extraction function (adapted from feature_importance_analysis.py)
+# Feature extraction function
 def extract_features(json_data):
     features = {}
     
@@ -91,11 +91,31 @@ def extract_features(json_data):
     
     return features
 
-# Process Tree_Output directory
+# Process Tree_Output directory with invalid execution time handling
 def process_tree_output_directory(main_dir):
     all_features = []
     file_names = []
+    invalid_files = []
+    valid_execution_times = []
     
+    # First pass: collect valid execution times
+    for root, dirs, files in os.walk(main_dir):
+        if 'tree_representation.json' in files:
+            file_path = os.path.join(root, 'tree_representation.json')
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    json_data = json.load(f)
+                features = extract_features(json_data)
+                if features['execution_time_ms'] > 0 and np.isfinite(features['execution_time_ms']):
+                    valid_execution_times.append(features['execution_time_ms'])
+            except Exception as e:
+                print(f"Error processing {file_path}: {e}")
+    
+    # Compute median execution time for imputation
+    median_exec_time = np.median(valid_execution_times) if valid_execution_times else 1.0
+    print(f"Median execution time for imputation: {median_exec_time:.2f} ms")
+    
+    # Second pass: process files and impute invalid execution times
     for root, dirs, files in os.walk(main_dir):
         if 'tree_representation.json' in files:
             file_path = os.path.join(root, 'tree_representation.json')
@@ -104,8 +124,9 @@ def process_tree_output_directory(main_dir):
                     json_data = json.load(f)
                 features = extract_features(json_data)
                 if features['execution_time_ms'] <= 0 or not np.isfinite(features['execution_time_ms']):
-                    print(f"Warning: Invalid execution time in {file_path}")
-                    continue
+                    invalid_files.append(file_path)
+                    features['execution_time_ms'] = median_exec_time
+                    print(f"Imputed execution time {median_exec_time:.2f} ms for {file_path}")
                 all_features.append(features)
                 file_names.append(file_path)
             except Exception as e:
@@ -114,8 +135,16 @@ def process_tree_output_directory(main_dir):
     if not all_features:
         raise ValueError("No valid JSON files found in Tree_Output directory.")
     
+    # Save invalid files log
+    log_path = os.path.join(main_dir, 'invalid_files_log.txt')
+    with open(log_path, 'w', encoding='utf-8') as f:
+        f.write("Files with invalid execution times (imputed with median):\n")
+        for file_path in invalid_files:
+            f.write(f"{file_path}\n")
+    
     total_files = len(all_features)
     print(f"Total files found: {total_files}")
+    print(f"Files with invalid execution times (imputed): {len(invalid_files)}")
     if total_files < 50:
         raise ValueError(f"Expected at least 50 files total, found {total_files}")
     
@@ -136,21 +165,17 @@ def process_tree_output_directory(main_dir):
 
 # Prepare data for model
 def prepare_data_for_model(train_features, test_features):
-    # Define top features from feature_analysis.csv (Random Forest importance > 0.01)
     important_features = [
         'cache_hits', 'bytes_processing_rate', 'sched_bytes_at_task', 'sched_working_set_at_root',
         'sched_bytes_at_realization', 'sched_unique_bytes_read_per_realization'
     ]
     
-    # Create sequence features (simplified to per-file aggregates)
     train_sequences = [np.array([list(f.values())]) for f in train_features]
     test_sequences = [np.array([list(f.values())]) for f in test_features]
     
-    # Convert to DataFrame for scalar features
     train_scalar_df = pd.DataFrame(train_features)
     test_scalar_df = pd.DataFrame(test_features)
     
-    # Drop low-importance features (RF importance < 0.001)
     low_importance_features = [
         'op_cast', 'op_selfcall', 'memory_pointwise_1', 'memory_transpose_1', 'memory_broadcast_1',
         'memory_slice_1', 'op_select', 'op_not', 'op_and', 'op_ne', 'op_mod', 'memory_pointwise_2',
@@ -160,7 +185,6 @@ def prepare_data_for_model(train_features, test_features):
     train_scalar_df = train_scalar_df.drop(columns=[col for col in low_importance_features if col in train_scalar_df.columns])
     test_scalar_df = test_scalar_df.drop(columns=[col for col in low_importance_features if col in test_scalar_df.columns])
     
-    # Log transform skewed features
     skewed_features = ['cache_hits', 'bytes_processing_rate', 'sched_bytes_at_task', 'computation_efficiency']
     for feature in skewed_features:
         if feature in train_scalar_df.columns:
@@ -172,12 +196,10 @@ def prepare_data_for_model(train_features, test_features):
     train_scalar_df = train_scalar_df.fillna(0)
     test_scalar_df = test_scalar_df.fillna(0)
     
-    # Remove constant columns
     constant_columns = [col for col in train_scalar_df.columns if train_scalar_df[col].nunique() == 1]
     train_scalar_df = train_scalar_df.drop(columns=constant_columns)
     test_scalar_df = test_scalar_df.drop(columns=constant_columns)
     
-    # Extract execution times
     y_train_raw = np.array([f['execution_time_ms'] for f in train_features])
     y_test_raw = np.array([f['execution_time_ms'] for f in test_features])
     y_train_raw = np.clip(y_train_raw, 0, np.percentile(y_train_raw, 99))
@@ -186,7 +208,6 @@ def prepare_data_for_model(train_features, test_features):
     y_train = np.log1p(y_train_raw).reshape(-1, 1)
     y_test = np.log1p(y_test_raw).reshape(-1, 1)
     
-    # Scale features and targets
     scaler_X_scalar = RobustScaler()
     scaler_y = RobustScaler()
     
@@ -200,11 +221,9 @@ def prepare_data_for_model(train_features, test_features):
     y_train_scaled = np.nan_to_num(y_train_scaled, nan=0.0)
     y_test_scaled = np.nan_to_num(y_test_scaled, nan=0.0)
     
-    # Convert to tensors
     train_sequences_padded = torch.FloatTensor(np.array(train_sequences))
     test_sequences_padded = torch.FloatTensor(np.array(test_sequences))
     
-    # Data augmentation for significant features
     train_sequences_aug = []
     train_scalar_aug = []
     y_train_aug = []
@@ -336,7 +355,7 @@ class EnhancedRecursiveLSTMModel(nn.Module):
         output = self.output_layer(x)
         return output
 
-# Custom loss function with feature importance weighting
+# Custom loss function
 def custom_loss(outputs, targets, scalar_inputs, feature_indices, feature_importances, huber_delta=0.5, mae_weight=0.3, l1_lambda=1e-5):
     huber = nn.HuberLoss(delta=huber_delta)(outputs, targets)
     mae = torch.mean(torch.abs(outputs - targets))
@@ -554,7 +573,6 @@ def main(main_dir):
     
     optimizer = optim.AdamW(model.parameters(), lr=0.00005, weight_decay=1e-4)
     
-    # Feature importances from feature_analysis.csv (top features with RF importance)
     feature_importances = {
         'cache_hits': 0.5860,
         'bytes_processing_rate': 0.2893,
@@ -564,7 +582,6 @@ def main(main_dir):
         'sched_unique_bytes_read_per_realization': 0.0049
     }
     
-    # Map feature indices
     feature_indices = {}
     for feature in feature_importances.keys():
         log_feature = f'log_{feature}' if feature in ['cache_hits', 'bytes_processing_rate'] else feature
