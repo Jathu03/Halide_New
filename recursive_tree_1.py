@@ -227,6 +227,11 @@ class TreeDataset(Dataset):
     def __getitem__(self, idx):
         return self.trees[idx], torch.FloatTensor(self.y_scaled[idx])
 
+# Custom collate function for TreeNode objects
+def tree_collate_fn(batch):
+    trees, targets = zip(*batch)
+    return list(trees), torch.stack(targets)
+
 # Recursive LSTM model
 class RecursiveLSTM(nn.Module):
     def __init__(self, input_size, hidden_size=256, output_size=1, num_layers=2, dropout_rate=0.2):
@@ -280,8 +285,8 @@ def create_data_loaders(train_trees, test_trees, batch_size=32):
     train_dataset = TreeDataset(train_trees)
     test_dataset = TreeDataset(test_trees, scaler_y=train_dataset.scaler_y)
     
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=tree_collate_fn)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=tree_collate_fn)
     return train_loader, test_loader, train_dataset.scaler_y
 
 # Train the model with checkpointing
@@ -301,7 +306,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, feature_
     
     # Load checkpoint if exists
     if os.path.exists(checkpoint_path):
-        checkpoint = torch.load(checkpoint_path)
+        checkpoint = torch.load(checkpoint_path, map_location=device)
         model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         start_epoch = checkpoint['epoch'] + 1
