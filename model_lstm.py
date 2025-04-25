@@ -269,7 +269,7 @@ def prepare_data_for_model(train_features, test_features):
     
     train_sequences_padded = torch.stack(train_sequences_aug)
     train_scalar_scaled = np.array(train_scalar_aug)
-    y_train_scaled = np.array(train_aug)
+    y_train_scaled = np.array(y_train_aug)
     
     train_scalar_tensor = torch.FloatTensor(train_scalar_scaled)
     test_scalar_tensor = torch.FloatTensor(test_scalar_scaled)
