@@ -421,7 +421,7 @@ def create_data_loaders(train_sequences, train_scalar, y_train, test_sequences, 
     return train_loader, test_loader
 
 # Train the model
-def train_model(model, train_loader, test_loader, criterion, optimizer, feature_indices, feature_importances, num_epochs=700, patience=50, accumulation_steps=2):
+def train_model(model, train_loader, test_loader, criterion, optimizer, feature_indices, feature_importances, num_epochs=1000, patience=50, accumulation_steps=2):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
@@ -629,7 +629,7 @@ def main(main_dir):
     train_losses, val_losses = train_model(
         model, train_loader, test_loader,
         custom_loss, optimizer, feature_indices, feature_importances,
-        num_epochs=700, patience=50, accumulation_steps=2
+        num_epochs=1000, patience=50, accumulation_steps=2
     )
     
     if train_losses is None or val_losses is None:
