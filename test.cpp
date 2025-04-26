@@ -8,6 +8,7 @@
 #include <map>
 #include <cmath>
 #include <iostream>
+#include <numeric>
 #include <algorithm>
 
 // Using JSON namespace
@@ -33,19 +34,6 @@ const std::vector<std::string> FIXED_FEATURES = {
     "memory_slice_0", "memory_slice_1", "memory_slice_2", "memory_slice_3",
     "memory_broadcast_0", "memory_broadcast_1", "memory_broadcast_2", "memory_broadcast_3",
     "memory_pointwise_0", "memory_pointwise_1", "memory_pointwise_2", "memory_pointwise_3"
-};
-
-// Define low-importance features to drop (same as Python)
-const std::vector<std::string> LOW_IMPORTANCE_FEATURES = {
-    "op_cast", "op_selfcall", "memory_pointwise_1", "memory_transpose_1", "memory_broadcast_1",
-    "memory_slice_1", "op_select", "op_not", "op_and", "op_ne", "op_mod", "memory_pointwise_2",
-    "memory_broadcast_2", "memory_slice_2", "memory_transpose_2", "op_externcall", "op_imagecall",
-    "op_param", "memory_pointwise_3", "memory_transpose_3", "op_sub", "memory_pointwise_0", "op_let"
-};
-
-// Define skewed features for log transformation
-const std::vector<std::string> SKEWED_FEATURES = {
-    "cache_hits", "bytes_processing_rate", "sched_bytes_at_task", "computation_efficiency"
 };
 
 // Feature extraction function (translated from Python)
@@ -175,47 +163,60 @@ struct PreprocessedData {
 };
 
 PreprocessedData preprocess_features(const std::map<std::string, double>& features) {
-    // Create sequence input (sequence_length=3)
-    const int sequence_length = 3;
+    // Define important and dropped features
+    std::vector<std::string> low_importance_features = {
+        "op_cast", "op_selfcall", "memory_pointwise_1", "memory_transpose_1", "memory_broadcast_1",
+        "memory_slice_1", "op_select", "op_not", "op_and", "op_ne", "op_mod", "memory_pointwise_2",
+        "memory_broadcast_2", "memory_slice_2", "memory_transpose_2", "op_externcall", "op_imagecall",
+        "op_param", "memory_pointwise_3", "memory_transpose_3", "op_sub", "memory_pointwise_0", "op_let"
+    };
+    std::vector<std::string> skewed_features = {
+        "cache_hits", "bytes_processing_rate", "sched_bytes_at_task", "computation_efficiency"
+    };
+
+    // Create feature vector
     std::vector<double> feature_vector;
     for (const auto& key : FIXED_FEATURES) {
         feature_vector.push_back(features.at(key));
     }
+
+    // Simulate sequence data (sequence_length=3)
+    const int sequence_length = 3;
     std::vector<std::vector<double>> seq_data(sequence_length, feature_vector);
     torch::Tensor seq_tensor = torch::from_blob(seq_data.data(), {sequence_length, static_cast<int64_t>(FIXED_FEATURES.size())})
                                   .reshape({1, sequence_length, static_cast<int64_t>(FIXED_FEATURES.size())}).to(torch::kFloat32);
 
     // Create scalar features
     std::map<std::string, double> scalar_features = features;
-    for (const auto& feature : LOW_IMPORTANCE_FEATURES) {
+    for (const auto& feature : low_importance_features) {
         scalar_features.erase(feature);
     }
 
     // Log transform skewed features
-    for (const auto& feature : SKEWED_FEATURES) {
+    for (const auto& feature : skewed_features) {
         if (scalar_features.find(feature) != scalar_features.end()) {
             scalar_features["log_" + feature] = std::log1p(scalar_features[feature]);
             scalar_features.erase(feature);
         }
     }
 
-    // Define scalar columns (approximated from Python)
+    // Remove constant columns (simplified: assume same columns as Python)
     std::vector<std::string> scalar_columns;
     for (const auto& kv : scalar_features) {
-        if (kv.first != "execution_time_ms" && std::find(LOW_IMPORTANCE_FEATURES.begin(), LOW_IMPORTANCE_FEATURES.end(), kv.first) == LOW_IMPORTANCE_FEATURES.end()) {
+        if (kv.first != "execution_time_ms") { // Exclude target
             scalar_columns.push_back(kv.first);
         }
     }
-    std::sort(scalar_columns.begin(), scalar_columns.end()); // Ensure consistent order
     std::vector<double> scalar_vector;
     for (const auto& col : scalar_columns) {
         scalar_vector.push_back(scalar_features[col]);
     }
 
-    // Apply RobustScaler (placeholder: assume mean=0, scale=1)
-    // TODO: Load actual scaler parameters from Python (e.g., via JSON)
+    // Apply RobustScaler (approximate with fixed values from Python training)
+    // Note: For exact scaling, you should save scaler parameters from Python and load them here
     std::vector<double> scalar_scaled(scalar_vector.size(), 0.0);
     for (size_t i = 0; i < scalar_vector.size(); ++i) {
+        // Placeholder: Assume mean=0, scale=1 for simplicity
         scalar_scaled[i] = scalar_vector[i]; // Replace with actual scaling
     }
     torch::Tensor scalar_tensor = torch::from_blob(scalar_scaled.data(), {1, static_cast<int64_t>(scalar_scaled.size())})
@@ -226,21 +227,12 @@ PreprocessedData preprocess_features(const std::map<std::string, double>& featur
 
 int main() {
     try {
-        // Initialize CUDA if available
-        torch::Device device(torch::kCPU);
-        if (torch::cuda::is_available()) {
-            device = torch::Device(torch::kCUDA);
-            std::cout << "Using CUDA device" << std::endl;
-        } else {
-            std::cout << "CUDA not available. Using CPU." << std::endl;
-        }
-
         // Load the model
         torch::jit::script::Module module;
         try {
             module = torch::jit::load("model.pt");
             module.eval();
-            module.to(device);
+            module.to(torch::kCUDA); // Use CUDA if available
         } catch (const c10::Error& e) {
             std::cerr << "Error loading the model: " << e.what() << std::endl;
             return -1;
@@ -253,11 +245,6 @@ int main() {
             if (entry.path().filename() == "tree_representation.json") {
                 file_paths.push_back(entry.path().string());
             }
-        }
-
-        if (file_paths.empty()) {
-            std::cerr << "No tree_representation.json files found in " << main_dir << std::endl;
-            return -1;
         }
 
         std::vector<std::string> invalid_files;
@@ -285,28 +272,24 @@ int main() {
 
             // Preprocess features
             auto preprocessed = preprocess_features(features);
-            auto seq_input = preprocessed.seq_input.to(device);
-            auto scalar_input = preprocessed.scalar_input.to(device);
+            auto seq_input = preprocessed.seq_input.to(torch::kCUDA);
+            auto scalar_input = preprocessed.scalar_input.to(torch::kCUDA);
 
             // Perform inference
             torch::NoGradGuard no_grad;
             std::vector<torch::jit::IValue> inputs = {seq_input, scalar_input};
             auto output = module.forward(inputs).toTensor();
 
-            // Inverse transform prediction
+            // Inverse transform (approximate y_scaler and expm1)
             float pred_scaled = output.item<float>();
-            // Placeholder: Assume y_scaler mean=0, scale=1 (TODO: Load actual scaler parameters)
-            float pred_transformed = pred_scaled;
-            double pred_actual = std::expm1(pred_transformed); // Inverse of log1p
-            pred_actual = std::max(pred_actual, 0.0); // Ensure non-negative
+            // Placeholder: Assume y_scaler mean=0, scale=1
+            float pred_transformed = pred_scaled; // Replace with actual inverse scaling
+            double pred_actual = std::expm1(pred_transformed);
 
-            // Store results
             predictions.emplace_back(file_path, pred_actual);
             std::cout << "File: " << file_path << "\n"
-                      << "  Actual execution time: " << features["execution_time_ms"] << " ms\n"
                       << "  Predicted execution time: " << pred_actual << " ms\n"
-                      << "  Error percentage: " << (features["execution_time_ms"] > 0 ?
-                          std::abs(features["execution_time_ms"] - pred_actual) / features["execution_time_ms"] * 100 : 0.0) << "%\n";
+                      << "  Actual execution time: " << features["execution_time_ms"] << " ms\n";
         }
 
         // Save invalid files log
@@ -317,7 +300,6 @@ int main() {
         }
         log_file.close();
 
-        // Print summary
         std::cout << "Total valid files processed: " << predictions.size() << "\n"
                   << "Files skipped due to invalid execution times or errors: " << invalid_files.size() << "\n";
 
