@@ -26,7 +26,7 @@ FIXED_FEATURES = [
     'memory_pressure', 'memory_utilization_ratio', 'bytes_processing_rate', 'bytes_per_parallelism',
     'bytes_per_vector', 'nodes_count', 'edges_count', 'node_edge_ratio', 'nodes_per_schedule',
     'op_diversity',
-    # Common operation features (based on feature_analysis.csv)
+    # Common operation features
     'op_add', 'op_sub', 'op_mul', 'op_div', 'op_mod', 'op_eq', 'op_ne', 'op_lt', 'op_le',
     'op_or', 'op_and', 'op_not', 'op_min', 'op_max', 'op_constant', 'op_variable',
     'op_funccall', 'op_imagecall', 'op_externcall', 'op_let', 'op_param',
@@ -117,14 +117,13 @@ def extract_features(json_data):
     fixed_features = {key: features.get(key, 0.0) for key in FIXED_FEATURES}
     return fixed_features
 
-# Process Tree_Output directory with invalid execution time handling
+# Process Tree_Output directory, ignoring invalid execution times
 def process_tree_output_directory(main_dir):
     all_features = []
     file_names = []
-    invalid_files = []
-    valid_execution_times = []
+    skipped_files = []
     
-    # First pass: collect valid execution times
+    # Process files, keeping only those with valid execution times
     for root, dirs, files in os.walk(main_dir):
         if 'tree_representation.json' in files:
             file_path = os.path.join(root, 'tree_representation.json')
@@ -133,52 +132,37 @@ def process_tree_output_directory(main_dir):
                     json_data = json.load(f)
                 features = extract_features(json_data)
                 if features['execution_time_ms'] > 0 and np.isfinite(features['execution_time_ms']):
-                    valid_execution_times.append(features['execution_time_ms'])
+                    all_features.append(features)
+                    file_names.append(file_path)
+                else:
+                    skipped_files.append(file_path)
+                    print(f"Skipped {file_path} due to invalid execution time: {features['execution_time_ms']}")
             except Exception as e:
                 print(f"Error processing {file_path}: {e}")
-    
-    # Compute median execution time for imputation
-    median_exec_time = np.median(valid_execution_times) if valid_execution_times else 1.0
-    print(f"Median execution time for imputation: {median_exec_time:.2f} ms")
-    
-    # Second pass: process files and impute invalid execution times
-    for root, dirs, files in os.walk(main_dir):
-        if 'tree_representation.json' in files:
-            file_path = os.path.join(root, 'tree_representation.json')
-            try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    json_data = json.load(f)
-                features = extract_features(json_data)
-                if features['execution_time_ms'] <= 0 or not np.isfinite(features['execution_time_ms']):
-                    invalid_files.append(file_path)
-                    features['execution_time_ms'] = median_exec_time
-                    print(f"Imputed execution time {median_exec_time:.2f} ms for {file_path}")
-                all_features.append(features)
-                file_names.append(file_path)
-            except Exception as e:
-                print(f"Error processing {file_path}: {e}")
+                skipped_files.append(file_path)
     
     if not all_features:
-        raise ValueError("No valid JSON files found in Tree_Output directory.")
+        raise ValueError("No valid JSON files with valid execution times found in Tree_Output directory.")
     
-    # Save invalid files log
-    log_path = os.path.join(main_dir, 'invalid_files_log.txt')
+    # Save skipped files log
+    log_path = os.path.join(main_dir, 'skipped_files_log.txt')
     with open(log_path, 'w', encoding='utf-8') as f:
-        f.write("Files with invalid execution times (imputed with median):\n")
-        for file_path in invalid_files:
+        f.write("Files skipped due to invalid execution times or errors:\n")
+        for file_path in skipped_files:
             f.write(f"{file_path}\n")
     
-    total_files = len(all_features)
+    total_files = len(all_features) + len(skipped_files)
     print(f"Total files found: {total_files}")
-    print(f"Files with invalid execution times (imputed): {len(invalid_files)}")
-    if total_files < 50:
-        raise ValueError(f"Expected at least 50 files total, found {total_files}")
+    print(f"Files skipped due to invalid execution times or errors: {len(skipped_files)}")
+    print(f"Valid files retained: {len(all_features)}")
+    if len(all_features) < 50:
+        raise ValueError(f"Expected at least 50 valid files, found {len(all_features)}")
     
     combined = list(zip(all_features, file_names))
     random.shuffle(combined)
     all_features, file_names = zip(*combined)
     
-    test_size = min(50, total_files)
+    test_size = min(50, len(all_features))
     train_features = all_features[:-test_size]
     test_features = all_features[-test_size:]
     train_file_names = file_names[:-test_size]
@@ -420,8 +404,8 @@ def create_data_loaders(train_sequences, train_scalar, y_train, test_sequences, 
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
     return train_loader, test_loader
 
-# Train the model
-def train_model(model, train_loader, test_loader, criterion, optimizer, feature_indices, feature_importances, num_epochs=1000, patience=50, accumulation_steps=2):
+# Modified train_model function with checkpoint saving
+def train_model(model, train_loader, test_loader, criterion, optimizer, feature_indices, feature_importances, num_epochs=1000, patience=50, accumulation_steps=2, checkpoint_path='recursive.pth'):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
@@ -441,8 +425,23 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, feature_
     best_model_state = None
     train_losses = []
     val_losses = []
+    start_epoch = 0
     
-    for epoch in range(num_epochs):
+    # Check if a checkpoint exists to resume training
+    if os.path.exists(checkpoint_path):
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        start_epoch = checkpoint['epoch'] + 1
+        best_val_loss = checkpoint['best_val_loss']
+        train_losses = checkpoint['train_losses']
+        val_losses = checkpoint['val_losses']
+        epochs_no_improve = checkpoint['epochs_no_improve']
+        best_model_state = checkpoint['best_model_state']
+        print(f"Resuming training from epoch {start_epoch}")
+    
+    for epoch in range(start_epoch, num_epochs):
         model.train()
         running_loss = 0.0
         optimizer.zero_grad()
@@ -489,6 +488,21 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, feature_
         scheduler.step()
         print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
         
+        # Save checkpoint
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'best_val_loss': best_val_loss,
+            'train_losses': train_losses,
+            'val_losses': val_losses,
+            'epochs_no_improve': epochs_no_improve,
+            'best_model_state': best_model_state
+        }
+        torch.save(checkpoint, checkpoint_path)
+        print(f"Checkpoint saved at epoch {epoch+1} to {checkpoint_path}")
+        
         if val_loss < best_val_loss and not np.isnan(val_loss) and not np.isinf(val_loss):
             best_val_loss = val_loss
             epochs_no_improve = 0
@@ -516,6 +530,15 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, feature_
     plt.close()
     
     return train_losses, val_losses
+
+# New function to resume training explicitly
+def resume_training(model, train_loader, test_loader, criterion, optimizer, feature_indices, feature_importances, num_epochs=1000, patience=50, accumulation_steps=2, checkpoint_path='recursive.pth'):
+    print(f"Attempting to resume training from checkpoint: {checkpoint_path}")
+    if not os.path.exists(checkpoint_path):
+        print(f"No checkpoint found at {checkpoint_path}. Starting training from scratch.")
+        return train_model(model, train_loader, test_loader, criterion, optimizer, feature_indices, feature_importances, num_epochs, patience, accumulation_steps, checkpoint_path)
+    
+    return train_model(model, train_loader, test_loader, criterion, optimizer, feature_indices, feature_importances, num_epochs, patience, accumulation_steps, checkpoint_path)
 
 # Evaluate the model
 def evaluate_model(model, X_test_seq, X_test_scalar, y_test, y_scaler, file_names_test):
@@ -626,10 +649,10 @@ def main(main_dir):
             feature_indices[feature] = feature_columns.get_loc(feature) if feature in feature_columns else -1
     
     print("Building and training Enhanced Recursive LSTM model...")
-    train_losses, val_losses = train_model(
+    train_losses, val_losses = resume_training(
         model, train_loader, test_loader,
         custom_loss, optimizer, feature_indices, feature_importances,
-        num_epochs=1000, patience=50, accumulation_steps=2
+        num_epochs=1000, patience=50, accumulation_steps=2, checkpoint_path='recursive.pth'
     )
     
     if train_losses is None or val_losses is None:
