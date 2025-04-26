@@ -281,7 +281,7 @@ def custom_loss(y_pred, y_true, feature_indices, feature_importances):
     mse_loss = nn.MSELoss()(y_pred, y_true)
     return mse_loss  # Simplified; add feature-based loss if needed
 
-def train_model(model, train_loader, val_loader, criterion, optimizer, feature_indices, feature_importances, num_epochs=1000, patience=50, accumulation_steps=2):
+def train_model(model, train_loader, val_loader, criterion, optimizer, feature_indices, feature_importances, num_epochs=50, patience=50, accumulation_steps=2):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     best_val_loss = float("inf")
@@ -383,7 +383,7 @@ def main(main_dir):
     train_losses, val_losses = train_model(
         model, train_loader, test_loader,
         custom_loss_fn, optimizer, feature_indices, feature_importances,
-        num_epochs=1000, patience=50, accumulation_steps=2
+        num_epochs=50, patience=50, accumulation_steps=2
     )
 
     if train_losses is None or val_losses is None:
