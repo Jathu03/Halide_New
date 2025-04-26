@@ -230,7 +230,7 @@ int main() {
         torch::Device device(torch::kCPU);
         if (torch::cuda::is_available()) {
             device = torch::Device(torch::kCUDA);
-            std::cout << "Using CUDA device: " << torch::cuda::get_device_name(0) << std::endl;
+            std::cout << "Using CUDA device" << std::endl;
         } else {
             std::cout << "CUDA not available. Using CPU." << std::endl;
         }
