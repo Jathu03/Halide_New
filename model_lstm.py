@@ -566,7 +566,7 @@ def evaluate_model(model, X_test_seq, X_test_scalar, y_test, y_scaler, file_name
     
     return y_test_actual, y_pred_actual
 
-# Main function
+# Modified main function to save the model
 def main(main_dir):
     if torch.cuda.is_available():
         torch.cuda.init()
@@ -631,6 +631,10 @@ def main(main_dir):
     if train_losses is None or val_losses is None:
         print("Training failed due to invalid values")
         return None
+    
+    # Save the trained model
+    torch.save(model.state_dict(), "model.pt")
+    print("Model saved to model.pt")
     
     print("\nEvaluating model:")
     y_test_actual, y_pred_actual = evaluate_model(
