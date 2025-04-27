@@ -294,15 +294,33 @@ double inverseTransformPrediction(float scaled_value, const ScalerParams& scaler
     return std::expm1(unscaled);
 }
 
-int main(int argc, char* argv[]) {
-    if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <path_to_json_file> [model_path] [scaler_params_path]" << std::endl;
-        return 1;
-    }
+// Prepare tensors for the model
+std::vector<torch::Tensor> prepareDataForModel(
+    const std::map<std::string, double>& features,
+    const ScalerParams& scalerParams
+) {
+    // [... existing code remains the same ...]
     
-    std::string jsonFilePath = argv[1];
-    std::string modelPath = (argc > 2) ? argv[2] : "model.pt";
-    std::string scalerParamsPath = (argc > 3) ? argv[3] : "scaler_params.json";
+    // Create the 3D sequence tensor [1, sequence_length, feature_count]
+    auto sequenceTensor = torch::from_blob(sequenceData.data(), 
+                                           {1, sequenceLength, static_cast<int64_t>(FIXED_FEATURES.size())}, 
+                                           torch::kFloat32).clone();
+    
+    // [... existing code remains the same ...]
+    
+    // Create the tensor
+    auto scalarTensor = torch::from_blob(scalarData.data(), 
+                                         {1, static_cast<int64_t>(scalarData.size())}, 
+                                         torch::kFloat32).clone();
+    
+    // [... existing code remains the same ...]
+    
+    return {sequenceTensor, scalarTensor};
+}
+
+// In main function:
+int main(int argc, char* argv[]) {
+    // [... existing code remains the same ...]
     
     try {
         // Load the TorchScript model
@@ -317,34 +335,25 @@ int main(int argc, char* argv[]) {
             return 1;
         }
         
-        // Load scaler parameters
-        std::cout << "Loading scaler parameters from " << scalerParamsPath << std::endl;
-        ScalerParams scalerParams = loadScalerParams(scalerParamsPath);
-        
-        // Load and process the JSON file
-        std::cout << "Processing JSON file: " << jsonFilePath << std::endl;
-        std::ifstream file(jsonFilePath);
-        if (!file.is_open()) {
-            std::cerr << "Failed to open JSON file: " << jsonFilePath << std::endl;
-            return 1;
+        // Get the device that the model is on
+        torch::Device device(torch::kCPU);
+        try {
+            // Try to get device from first parameter
+            for (const auto& param : model.parameters()) {
+                device = param.device();
+                break;
+            }
+            std::cout << "Model is on device: " << (device.is_cuda() ? "CUDA:" + std::to_string(device.index()) : "CPU") << std::endl;
+        } catch (const std::exception& e) {
+            std::cout << "Could not determine model device, defaulting to CPU. Error: " << e.what() << std::endl;
         }
         
-        json jsonData;
-        file >> jsonData;
-        
-        // Extract features
-        std::map<std::string, double> features = extractFeatures(jsonData);
-        
-        // Print some key features
-        std::cout << "Extracted features:" << std::endl;
-        std::cout << "  cache_hits: " << features["cache_hits"] << std::endl;
-        std::cout << "  execution_time_ms: " << features["execution_time_ms"] << std::endl;
-        std::cout << "  sched_bytes_at_realization: " << features["sched_bytes_at_realization"] << std::endl;
+        // [... existing code remains the same ...]
         
         // Prepare tensors for the model
         std::vector<torch::Tensor> modelInputs = prepareDataForModel(features, scalerParams);
-        torch::Tensor sequenceInput = modelInputs[0];
-        torch::Tensor scalarInput = modelInputs[1];
+        torch::Tensor sequenceInput = modelInputs[0].to(device);
+        torch::Tensor scalarInput = modelInputs[1].to(device);
         
         // Perform inference
         std::cout << "Running inference..." << std::endl;
@@ -355,22 +364,10 @@ int main(int argc, char* argv[]) {
         
         at::Tensor output = model.forward(inputs).toTensor();
         
-        // Process the output
-        float predictedScaled = output[0][0].item<float>();
-        double predictedExecutionTime = inverseTransformPrediction(predictedScaled, scalerParams);
+        // Process the output (move to CPU for further processing if needed)
+        float predictedScaled = output.to(torch::kCPU)[0][0].item<float>();
         
-        std::cout << "Prediction Results:" << std::endl;
-        std::cout << "  Actual execution time from JSON: " << features["execution_time_ms"] << " ms" << std::endl;
-        std::cout << "  Predicted execution time: " << predictedExecutionTime << " ms" << std::endl;
-        
-        double errorPercentage = features["execution_time_ms"] > 0 ?
-            std::abs(features["execution_time_ms"] - predictedExecutionTime) / features["execution_time_ms"] * 100 : 0;
-        std::cout << "  Error percentage: " << errorPercentage << "%" << std::endl;
-        
-        return 0;
+        // [... rest of the code remains the same ...]
     }
-    catch (const std::exception& e) {
-        std::cerr << "Error: " << e.what() << std::endl;
-        return 1;
-    }
+    // [... rest of the code remains the same ...]
 }
