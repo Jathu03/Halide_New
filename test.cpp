@@ -161,8 +161,8 @@ std::map<std::string, double> extract_features(const json& json_data) {
 
     // Create fixed-length feature vector
     std::map<std::string, double> fixed_features;
-    for (const auto& keyRV: FIXED_FEATURES) {
-        fixed_features[key] = features[key];
+    for (const auto& keyRV : FIXED_FEATURES) {
+        fixed_features[keyRV] = features[keyRV];
     }
     return fixed_features;
 }
@@ -244,4 +244,152 @@ PreprocessedData preprocess_features(const std::map<std::string, double>& featur
     std::vector<double> scalar_vector;
     for (const auto& col : scalar_columns) {
         double val = scalar_features[col];
-        if (!std::isfinite
+        if (!std::isfinite(val)) {
+            std::cerr << "Warning: Non-finite value for scalar feature " << col << ": " << val << std::endl;
+            val = 0.0;
+        }
+        scalar_vector.push_back(val);
+    }
+
+    // Apply RobustScaler
+    std::vector<double> scalar_scaled(scalar_vector.size());
+    for (size_t i = 0; i < scalar_vector.size(); ++i) {
+        if (scaler_params.x_scalar_scale[i] == 0) {
+            std::cerr << "Error: Zero scale for feature " << scaler_params.feature_columns[i] << std::endl;
+            scalar_scaled[i] = 0.0;
+        } else {
+            scalar_scaled[i] = (scalar_vector[i] - scaler_params.x_scalar_center[i]) / scaler_params.x_scalar_scale[i];
+            if (!std::isfinite(scalar_scaled[i])) {
+                std::cerr << "Warning: Non-finite scaled value for " << scaler_params.feature_columns[i]
+                          << ": " << scalar_scaled[i]
+                          << " (value=" << scalar_vector[i]
+                          << ", center=" << scaler_params.x_scalar_center[i]
+                          << ", scale=" << scaler_params.x_scalar_scale[i] << ")" << std::endl;
+                scalar_scaled[i] = 0.0;
+            }
+            // Clip to [-10, 10] to prevent numerical instability
+            scalar_scaled[i] = std::max(-10.0, std::min(10.0, scalar_scaled[i]));
+        }
+    }
+    torch::Tensor scalar_tensor = torch::from_blob(scalar_scaled.data(), {1, static_cast<int64_t>(scalar_scaled.size())})
+                                     .to(torch::kFloat32);
+    if (!scalar_tensor.isfinite().all().item<bool>()) {
+        std::cerr << "Warning: Scalar tensor contains non-finite values" << std::endl;
+    }
+
+    return {seq_tensor, scalar_tensor, features.at("execution_time_ms")};
+}
+
+int main(int argc, char* argv[]) {
+    try {
+        // Check for input JSON file
+        if (argc != 2) {
+            std::cerr << "Usage: " << argv[0] << " <input_json_file>" << std::endl;
+            return -1;
+        }
+        std::string input_json_file = argv[1];
+
+        // Initialize CUDA if available
+        torch::Device device(torch::kCPU);
+        if (torch::cuda::is_available()) {
+            device = torch::Device(torch::kCUDA);
+            std::cout << "Using CUDA device" << std::endl;
+        } else {
+            std::cout << "CUDA not available. Using CPU." << std::endl;
+        }
+
+        // Load scaler parameters
+        ScalerParams scaler_params;
+        try {
+            scaler_params = load_scaler_params("scaler_params.json");
+        } catch (const std::exception& e) {
+            std::cerr << "Error loading scaler_params.json: " << e.what() << std::endl;
+            return -1;
+        }
+
+        // Validate scaler parameters
+        if (scaler_params.y_scale.empty() || scaler_params.y_scale[0] == 0) {
+            std::cerr << "Error: Invalid or zero y_scale in scaler_params.json" << std::endl;
+            return -1;
+        }
+
+        // Load the model
+        torch::jit::script::Module module;
+        try {
+            module = torch::jit::load("model.pt");
+            module.eval();
+            module.to(device);
+        } catch (const c10::Error& e) {
+            std::cerr << "Error loading the model: " << e.what() << std::endl;
+            return -1;
+        }
+
+        // Read JSON file
+        std::ifstream ifs(input_json_file);
+        if (!ifs.is_open()) {
+            std::cerr << "Error: Could not open " << input_json_file << std::endl;
+            return -1;
+        }
+        json json_data;
+        try {
+            ifs >> json_data;
+        } catch (const json::parse_error& e) {
+            std::cerr << "Error parsing " << input_json_file << ": " << e.what() << std::endl;
+            return -1;
+        }
+
+        // Extract features
+        auto features = extract_features(json_data);
+        if (features["execution_time_ms"] <= 0 || !std::isfinite(features["execution_time_ms"])) {
+            std::cerr << "Invalid execution time in " << input_json_file << std::endl;
+            return -1;
+        }
+
+        // Preprocess features
+        auto preprocessed = preprocess_features(features, scaler_params);
+        auto seq_input = preprocessed.seq_input.to(device);
+        auto scalar_input = preprocessed.scalar_input.to(device);
+
+        // Print input tensor stats
+        std::cout << "Sequence input min: " << seq_input.min().item<float>()
+                  << ", max: " << seq_input.max().item<float>() << std::endl;
+        std::cout << "Scalar input min: " << scalar_input.min().item<float>()
+                  << ", max: " << scalar_input.max().item<float>() << std::endl;
+
+        // Perform inference
+        torch::NoGradGuard no_grad;
+        std::vector<torch::jit::IValue> inputs = {seq_input, scalar_input};
+        auto output = module.forward(inputs).toTensor();
+        float pred_scaled = output.item<float>();
+        std::cout << "Model output (scaled): " << pred_scaled << std::endl;
+
+        // Clip model output to prevent nan
+        if (!std::isfinite(pred_scaled)) {
+            std::cerr << "Warning: Non-finite model output, setting to 0" << std::endl;
+            pred_scaled = 0.0;
+        }
+        pred_scaled = std::max(-100.0f, std::min(100.0f, pred_scaled));
+
+        // Inverse transform prediction
+        float pred_transformed = (pred_scaled * scaler_params.y_scale[0]) + scaler_params.y_center[0];
+        std::cout << "Inverse scaled output: " << pred_transformed << std::endl;
+
+        // Clip to prevent expm1 overflow
+        pred_transformed = std::max(-100.0f, std::min(100.0f, pred_transformed));
+        double pred_actual = std::expm1(pred_transformed);
+        pred_actual = std::max(pred_actual, 0.0);
+
+        // Output results
+        std::cout << "File: " << input_json_file << "\n"
+                  << "  Actual execution time: " << features["execution_time_ms"] << " ms\n"
+                  << "  Predicted execution time: " << pred_actual << " ms\n"
+                  << "  Error percentage: " << (features["execution_time_ms"] > 0 ?
+                      std::abs(features["execution_time_ms"] - pred_actual) / features["execution_time_ms"] * 100 : 0.0) << "%\n";
+
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        return -1;
+    }
+
+    return 0;
+}
