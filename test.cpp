@@ -205,11 +205,19 @@ PreprocessedData preprocess_features(const std::map<std::string, double>& featur
     const int sequence_length = 3;
     std::vector<double> feature_vector;
     for (const auto& key : FIXED_FEATURES) {
-        feature_vector.push_back(features.at(key));
+        double val = features.at(key);
+        if (!std::isfinite(val)) {
+            std::cerr << "Warning: Non-finite value for feature " << key << ": " << val << std::endl;
+            val = 0.0;
+        }
+        feature_vector.push_back(val);
     }
     std::vector<std::vector<double>> seq_data(sequence_length, feature_vector);
     torch::Tensor seq_tensor = torch::from_blob(seq_data.data(), {sequence_length, static_cast<int64_t>(FIXED_FEATURES.size())})
                                   .reshape({1, sequence_length, static_cast<int64_t>(FIXED_FEATURES.size())}).to(torch::kFloat32);
+    if (!seq_tensor.isfinite().all().item<bool>()) {
+        std::cerr << "Warning: Sequence tensor contains non-finite values" << std::endl;
+    }
 
     // Create scalar features
     std::map<std::string, double> scalar_features = features;
@@ -220,30 +228,52 @@ PreprocessedData preprocess_features(const std::map<std::string, double>& featur
     // Log transform skewed features
     for (const auto& feature : SKEWED_FEATURES) {
         if (scalar_features.find(feature) != scalar_features.end()) {
-            scalar_features["log_" + feature] = std::log1p(scalar_features[feature]);
+            double val = scalar_features[feature];
+            double log_val = std::log1p(val);
+            if (!std::isfinite(log_val)) {
+                std::cerr << "Warning: Non-finite log value for " << feature << ": " << log_val << std::endl;
+                log_val = 0.0;
+            }
+            scalar_features["log_" + feature] = log_val;
             scalar_features.erase(feature);
         }
     }
 
-    // Remove constant columns (assumed same as training)
-    std::vector<std::string> scalar_columns = scaler_params.feature_columns;
-
     // Create scalar vector
+    std::vector<std::string> scalar_columns = scaler_params.feature_columns;
     std::vector<double> scalar_vector;
     for (const auto& col : scalar_columns) {
-        scalar_vector.push_back(scalar_features[col]);
+        double val = scalar_features[col];
+        if (!std::isfinite(val)) {
+            std::cerr << "Warning: Non-finite value for scalar feature " << col << ": " << val << std::endl;
+            val = 0.0;
+        }
+        scalar_vector.push_back(val);
     }
 
     // Apply RobustScaler
     std::vector<double> scalar_scaled(scalar_vector.size());
     for (size_t i = 0; i < scalar_vector.size(); ++i) {
-        scalar_scaled[i] = (scalar_vector[i] - scaler_params.x_scalar_center[i]) / scaler_params.x_scalar_scale[i];
-        if (!std::isfinite(scalar_scaled[i])) {
-            scalar_scaled[i] = 0.0; // Handle NaN/inf
+        if (scaler_params.x_scalar_scale[i] == 0) {
+            std::cerr << "Error: Zero scale for feature " << scaler_params.feature_columns[i] << std::endl;
+            scalar_scaled[i] = 0.0;
+        } else {
+            scalar_scaled[i] = (scalar_vector[i] - scaler_params.x_scalar_center[i]) / scaler_params.x_scalar_scale[i];
+            if (!std::isfinite(scalar_scaled[i])) {
+                std::cerr << "Warning: Non-finite scaled value for " << scaler_params.feature_columns[i]
+                          << ": " << scalar_scaled[i]
+                          << " (value=" << scalar_vector[i]
+                          << ", center=" << scaler_params.x_scalar_center[i]
+                          << ", scale=" << scaler_params.x_scalar_scale[i] << ")" << std::endl;
+                scalar_scaled[i] = 0.0;
+            }
         }
     }
     torch::Tensor scalar_tensor = torch::from_blob(scalar_scaled.data(), {1, static_cast<int64_t>(scalar_scaled.size())})
                                      .to(torch::kFloat32);
+    if (!scalar_tensor.isfinite().all().item<bool>()) {
+        std::cerr << "Warning: Scalar tensor contains non-finite values" << std::endl;
+    }
 
     return {seq_tensor, scalar_tensor, features.at("execution_time_ms")};
 }
@@ -316,12 +346,15 @@ int main(int argc, char* argv[]) {
         torch::NoGradGuard no_grad;
         std::vector<torch::jit::IValue> inputs = {seq_input, scalar_input};
         auto output = module.forward(inputs).toTensor();
+        float pred_scaled = output.item<float>();
+        std::cout << "Model output (scaled): " << pred_scaled << std::endl;
 
         // Inverse transform prediction
-        float pred_scaled = output.item<float>();
         float pred_transformed = (pred_scaled * scaler_params.y_scale[0]) + scaler_params.y_center[0];
-        double pred_actual = std::expm1(pred_transformed); // Inverse of log1p
-        pred_actual = std::max(pred_actual, 0.0); // Ensure non-negative
+        std::cout << "Inverse scaled output: " << pred_transformed << std::endl;
+        double pred_actual = std::expm1(pred_transformed);
+        std::cout << "Final prediction (expm1): " << pred_actual << std::endl;
+        pred_actual = std::max(pred_actual, 0.0);
 
         // Output results
         std::cout << "File: " << input_json_file << "\n"
