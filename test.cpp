@@ -12,8 +12,14 @@
 #include <sstream>
 #include <numeric>
 
+// Add CUDA runtime headers if CUDA is available
+#ifdef __CUDACC__
+#include <cuda_runtime.h>
+#endif
+
 using json = nlohmann::json;
 namespace fs = std::filesystem;
+
 
 // Define FIXED_FEATURES as in Python
 const std::vector<std::string> FIXED_FEATURES = {
@@ -557,9 +563,13 @@ int main(int argc, char* argv[]) {
         std::cout << "CUDA is available! Using GPU." << std::endl;
         // Print CUDA device info
         if (torch::cuda::device_count() > 0) {
+            #ifdef __CUDACC__
             cudaDeviceProp prop;
             cudaGetDeviceProperties(&prop, 0);
             std::cout << "Using GPU: " << prop.name << std::endl;
+            #else
+            std::cout << "CUDA device info not available (compiled without CUDA support)" << std::endl;
+            #endif
         }
     } else {
         std::cout << "CUDA is not available. Using CPU." << std::endl;
