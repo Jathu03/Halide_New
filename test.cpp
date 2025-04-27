@@ -342,6 +342,12 @@ int main(int argc, char* argv[]) {
         auto seq_input = preprocessed.seq_input.to(device);
         auto scalar_input = preprocessed.scalar_input.to(device);
 
+        // Print input tensor stats
+        std::cout << "Sequence input min: " << seq_input.min().item<float>()
+                  << ", max: " << seq_input.max().item<float>() << std::endl;
+        std::cout << "Scalar input min: " << scalar_input.min().item<float>()
+                  << ", max: " << scalar_input.max().item<float>() << std::endl;
+
         // Perform inference
         torch::NoGradGuard no_grad;
         std::vector<torch::jit::IValue> inputs = {seq_input, scalar_input};
