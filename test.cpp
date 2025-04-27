@@ -15,7 +15,6 @@
 #include <memory>
 #include <chrono>
 
-// Conditional CUDA includes
 #if defined(__CUDACC__) || defined(__CUDA_ARCH__)
 #include <cuda_runtime.h>
 #endif
@@ -26,15 +25,14 @@ using namespace std::chrono;
 
 // Constants
 constexpr size_t SEQUENCE_LENGTH = 3;
-constexpr double EPSILON = 1e-8;  // Small value to prevent division by zero
+constexpr double EPSILON = 1e-8;
 
-// Feature names - using constexpr array for better performance
 constexpr std::array<const char*, 66> FIXED_FEATURES = {
     "cache_hits", "cache_misses", "execution_time_ms", "sched_num_realizations",
-    // ... [rest of your feature names]
+    // Add your remaining 62 feature names here
 };
 
-// Enhanced hardware correction factors with constexpr
+// Correction Factors
 struct HardwareCorrectionFactors {
     const double base_correction;
     const double gpu_correction;
@@ -45,7 +43,6 @@ struct HardwareCorrectionFactors {
     const double confidence_threshold;
 };
 
-// Using constexpr for compile-time constants
 constexpr HardwareCorrectionFactors GPU_CORRECTION_FACTORS = {
     0.28, 0.9, 0.95, 100.0, 2.0, 0.1, 0.7
 };
@@ -54,14 +51,13 @@ constexpr HardwareCorrectionFactors CPU_CORRECTION_FACTORS = {
     0.35, 1.0, 0.97, 50.0, 2.0, 0.1, 0.6
 };
 
-// Feature extraction with optimizations
+// FeatureExtractor
 class FeatureExtractor {
 public:
     static std::unordered_map<std::string, double> extract(const json& json_data) {
         std::unordered_map<std::string, double> features;
         features.reserve(FIXED_FEATURES.size());
 
-        // Initialize all features to 0
         for (const auto& feature : FIXED_FEATURES) {
             features[feature] = 0.0;
         }
@@ -72,52 +68,82 @@ public:
             extract_memory_patterns(json_data, features);
             extract_scheduling_features(json_data, features);
             compute_derived_features(features);
-        } catch (const json::exception& e) {
-            std::cerr << "JSON error in feature extraction: " << e.what() << '\n';
         } catch (const std::exception& e) {
-            std::cerr << "Error in feature extraction: " << e.what() << '\n';
+            std::cerr << "Feature extraction error: " << e.what() << '\n';
         }
 
         return features;
     }
 
 private:
-    // [Private helper methods for each extraction step]
+    static void extract_global_features(const json& j, std::unordered_map<std::string, double>& f) {
+        for (const auto& item : j.items()) {
+            if (f.find(item.key()) != f.end() && item.value().is_number()) {
+                f[item.key()] = item.value().get<double>();
+            }
+        }
+    }
+
+    static void extract_op_histogram(const json& j, std::unordered_map<std::string, double>& f) {
+        if (j.contains("op_histogram")) {
+            for (const auto& [op, count] : j["op_histogram"].items()) {
+                if (count.is_number()) {
+                    f["op_" + op] = count.get<double>();
+                }
+            }
+        }
+    }
+
+    static void extract_memory_patterns(const json& j, std::unordered_map<std::string, double>& f) {
+        if (j.contains("memory_accesses")) {
+            for (const auto& [pattern, access] : j["memory_accesses"].items()) {
+                if (access.is_number()) {
+                    f["mem_" + pattern] = access.get<double>();
+                }
+            }
+        }
+    }
+
+    static void extract_scheduling_features(const json& j, std::unordered_map<std::string, double>& f) {
+        if (j.contains("scheduling")) {
+            for (const auto& [feat, val] : j["scheduling"].items()) {
+                if (val.is_number()) {
+                    f["sched_" + feat] = val.get<double>();
+                }
+            }
+        }
+    }
+
+    static void compute_derived_features(std::unordered_map<std::string, double>& f) {
+        f["cache_hit_ratio"] = f["cache_hits"] / (f["cache_hits"] + f["cache_misses"] + EPSILON);
+    }
 };
 
-// Prediction corrector with improved algorithms
+// PredictionCorrector
 class PredictionCorrector {
 public:
     static double correct(double raw_prediction, double actual_time, bool is_gpu,
-                        const HardwareCorrectionFactors& factors,
-                        const std::unordered_map<std::string, std::pair<double, double>>& calibration_data,
-                        const std::string& file_path,
-                        const std::unordered_map<std::string, double>& features) {
+                           const HardwareCorrectionFactors& factors,
+                           const std::unordered_map<std::string, std::pair<double, double>>& calibration_data,
+                           const std::string& file_path,
+                           const std::unordered_map<std::string, double>& features) {
         
-        // Check for calibration data first
         if (auto it = calibration_data.find(file_path); it != calibration_data.end()) {
             const auto& [scale, bias] = it->second;
             return std::max(scale * raw_prediction + bias, 0.0);
         }
 
-        // Calculate confidence based on features
         double confidence = calculate_confidence(features);
-        
-        // Apply hardware-specific correction
         double correction = factors.base_correction * (is_gpu ? factors.gpu_correction : 1.0);
         double corrected = raw_prediction * correction;
 
-        // Apply confidence weighting
         corrected = confidence * corrected + (1.0 - confidence) * raw_prediction;
 
-        // Non-linear correction for large predictions
         if (raw_prediction > factors.min_time_ms) {
             double excess = raw_prediction - factors.min_time_ms;
-            corrected = (factors.min_time_ms * correction) + 
-                       (excess * correction * factors.scaling_factor);
+            corrected = (factors.min_time_ms * correction) + (excess * correction * factors.scaling_factor);
         }
 
-        // Fine-tuning with actual time if available
         if (actual_time > 0) {
             corrected = blend_with_actual(corrected, actual_time, factors);
         }
@@ -126,50 +152,52 @@ public:
     }
 
 private:
-    // [Private helper methods]
+    static double calculate_confidence(const std::unordered_map<std::string, double>& features) {
+        double confidence = 0.0;
+        confidence += features.at("cache_hit_ratio");
+        confidence = std::clamp(confidence, 0.0, 1.0);
+        return confidence;
+    }
+
+    static double blend_with_actual(double predicted, double actual, const HardwareCorrectionFactors& factors) {
+        double weight = factors.confidence_threshold;
+        return weight * actual + (1.0 - weight) * predicted;
+    }
 };
 
-// Model wrapper for better resource management
+// PredictionModel
 class PredictionModel {
 public:
-    PredictionModel(const std::string& model_path, torch::Device device) 
+    PredictionModel(const std::string& model_path, torch::Device device)
         : device_(device) {
-        try {
-            model_ = torch::jit::load(model_path);
-            model_.to(device_);
-            model_.eval();
-        } catch (const c10::Error& e) {
-            throw std::runtime_error("Failed to load model: " + std::string(e.what()));
-        }
+        model_ = torch::jit::load(model_path);
+        model_.to(device_);
+        model_.eval();
     }
 
     double predict(torch::Tensor seq_input, torch::Tensor scalar_input,
-                  double y_center, double y_scale) {
+                   double y_center, double y_scale) {
         torch::NoGradGuard no_grad;
-        
+
         try {
-            // Move inputs to device
             seq_input = seq_input.to(device_);
             scalar_input = scalar_input.to(device_);
 
-            // Run inference
             auto output = model_.forward({seq_input, scalar_input}).toTensor();
-            
-            // Transform and validate output
             auto transformed = output * y_scale + y_center;
             auto prediction = torch::expm1(transformed);
 
             if (torch::isnan(prediction).any().item<bool>() || 
                 torch::isinf(prediction).any().item<bool>()) {
-                throw std::runtime_error("Model returned invalid prediction");
+                throw std::runtime_error("Invalid model output.");
             }
 
             return prediction.item<double>();
-        } catch (const c10::Error& e) {
+        } catch (const c10::Error&) {
             if (device_.is_cuda()) {
                 return fallback_to_cpu(seq_input, scalar_input, y_center, y_scale);
             }
-            throw std::runtime_error("Prediction failed: " + std::string(e.what()));
+            throw;
         }
     }
 
@@ -178,22 +206,36 @@ private:
     torch::Device device_;
 
     double fallback_to_cpu(torch::Tensor seq_input, torch::Tensor scalar_input,
-                          double y_center, double y_scale) {
-        // [CPU fallback implementation]
+                           double y_center, double y_scale) {
+        torch::Device cpu_device(torch::kCPU);
+        model_.to(cpu_device);
+        seq_input = seq_input.to(cpu_device);
+        scalar_input = scalar_input.to(cpu_device);
+
+        auto output = model_.forward({seq_input, scalar_input}).toTensor();
+        auto transformed = output * y_scale + y_center;
+        auto prediction = torch::expm1(transformed);
+
+        if (torch::isnan(prediction).any().item<bool>() || 
+            torch::isinf(prediction).any().item<bool>()) {
+            throw std::runtime_error("CPU fallback failed.");
+        }
+
+        return prediction.item<double>();
     }
 };
 
-// Main application class
+// HalidePredictor
 class HalidePredictor {
 public:
-    HalidePredictor(const std::string& model_path, 
-                   const std::string& scaler_params_path,
-                   const std::string& calibration_path = "")
+    HalidePredictor(const std::string& model_path,
+                    const std::string& scaler_path,
+                    const std::string& calibration_path = "")
         : device_(torch::cuda::is_available() ? torch::kCUDA : torch::kCPU),
           model_(model_path, device_),
           factors_(device_.is_cuda() ? GPU_CORRECTION_FACTORS : CPU_CORRECTION_FACTORS) {
-        
-        load_scaler_params(scaler_params_path);
+
+        load_scaler_params(scaler_path);
         if (!calibration_path.empty()) {
             calibration_data_ = load_calibration_data(calibration_path);
         }
@@ -201,36 +243,103 @@ public:
 
     void process_files(const std::vector<std::string>& files) {
         auto start = high_resolution_clock::now();
-        size_t processed = 0;
+        size_t count = 0;
 
         for (const auto& file : files) {
             try {
                 process_single_file(file);
-                processed++;
+                count++;
             } catch (const std::exception& e) {
                 std::cerr << "Error processing " << file << ": " << e.what() << '\n';
             }
         }
 
         auto duration = duration_cast<milliseconds>(high_resolution_clock::now() - start);
-        std::cout << "Processed " << processed << "/" << files.size() 
+        std::cout << "Processed " << count << "/" << files.size()
                   << " files in " << duration.count() << "ms\n";
     }
 
     void save_calibration_data(const std::string& path) {
-        // [Implementation]
+        std::ofstream ofs(path);
+        for (const auto& [file, params] : calibration_data_) {
+            ofs << file << " " << params.first << " " << params.second << "\n";
+        }
     }
 
 private:
-    // [Private member functions and variables]
+    torch::Device device_;
+    PredictionModel model_;
+    HardwareCorrectionFactors factors_;
+    std::unordered_map<std::string, double> scalar_centers_;
+    std::unordered_map<std::string, double> scalar_scales_;
+    std::unordered_map<std::string, std::pair<double, double>> calibration_data_;
+
+    void load_scaler_params(const std::string& path) {
+        std::ifstream ifs(path);
+        json j;
+        ifs >> j;
+
+        for (const auto& [k, v] : j.items()) {
+            scalar_centers_[k] = v["center"];
+            scalar_scales_[k] = v["scale"];
+        }
+    }
+
+    std::unordered_map<std::string, std::pair<double, double>> load_calibration_data(const std::string& path) {
+        std::unordered_map<std::string, std::pair<double, double>> calibration;
+        std::ifstream ifs(path);
+        std::string file;
+        double scale, bias;
+
+        while (ifs >> file >> scale >> bias) {
+            calibration[file] = {scale, bias};
+        }
+        return calibration;
+    }
+
+    void process_single_file(const std::string& file) {
+        std::ifstream ifs(file);
+        json j;
+        ifs >> j;
+
+        auto features = FeatureExtractor::extract(j);
+
+        torch::Tensor seq_input = torch::zeros({1, SEQUENCE_LENGTH, static_cast<int64_t>(features.size())});
+        torch::Tensor scalar_input = torch::zeros({1, static_cast<int64_t>(features.size())});
+
+        int idx = 0;
+        for (const auto& [k, v] : features) {
+            double center = scalar_centers_.count(k) ? scalar_centers_.at(k) : 0.0;
+            double scale = scalar_scales_.count(k) ? scalar_scales_.at(k) : 1.0;
+            scalar_input[0][idx] = (v - center) / (scale + EPSILON);
+            idx++;
+        }
+
+        double y_center = 0.0, y_scale = 1.0;
+        double raw_pred = model_.predict(seq_input, scalar_input, y_center, y_scale);
+
+        double corrected = PredictionCorrector::correct(
+            raw_pred, features["execution_time_ms"], device_.is_cuda(), factors_, calibration_data_, file, features
+        );
+
+        std::cout << "Prediction for " << file << ": " << corrected << " ms\n";
+    }
 };
+
+std::vector<std::string> load_test_files(const std::string& filename) {
+    std::ifstream ifs(filename);
+    std::vector<std::string> files;
+    std::string line;
+    while (std::getline(ifs, line)) {
+        files.push_back(line);
+    }
+    return files;
+}
 
 int main(int argc, char* argv[]) {
     try {
-        // Initialize with paths
         HalidePredictor predictor("model.pt", "scaler_params.json", "calibration_data.txt");
 
-        // Get input files
         std::vector<std::string> input_files;
         if (argc > 1) {
             input_files.assign(argv + 1, argv + argc);
@@ -239,11 +348,10 @@ int main(int argc, char* argv[]) {
         }
 
         if (input_files.empty()) {
-            std::cerr << "No input files specified\n";
+            std::cerr << "No input files specified.\n";
             return 1;
         }
 
-        // Process files
         predictor.process_files(input_files);
         predictor.save_calibration_data("calibration_data.txt");
 
