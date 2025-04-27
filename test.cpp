@@ -165,6 +165,15 @@ std::vector<std::string> load_test_files(const std::string& filename) {
 }
 
 int main() {
+    // Check if CUDA is available and set device accordingly
+    torch::Device device = torch::kCPU;
+    if (torch::cuda::is_available()) {
+        std::cout << "CUDA is available! Using GPU." << std::endl;
+        device = torch::Device(torch::kCUDA, 0);
+    } else {
+        std::cout << "CUDA is not available. Using CPU." << std::endl;
+    }
+
     // Load scaler parameters
     json scaler_params;
     std::ifstream scaler_file("scaler_params.json");
@@ -244,15 +253,16 @@ int main() {
         return 1;
     }
 
-    // Stack into batched tensors
-    torch::Tensor seq_inputs_tensor = torch::cat(seq_inputs, 0);
-    torch::Tensor scalar_inputs_tensor = torch::cat(scalar_inputs, 0);
+    // Stack into batched tensors and move to the appropriate device
+    torch::Tensor seq_inputs_tensor = torch::cat(seq_inputs, 0).to(device);
+    torch::Tensor scalar_inputs_tensor = torch::cat(scalar_inputs, 0).to(device);
 
-    // Load the model with the correct type
+    // Load the model
     torch::jit::script::Module model;
     try {
-        // Fixed line: Using the correct return type
+        // Load the model and move to the appropriate device
         model = torch::jit::load("model.pt");
+        model.to(device);
         model.eval();
     } catch (const c10::Error& e) {
         std::cerr << "Error loading the model: " << e.what() << std::endl;
@@ -260,8 +270,37 @@ int main() {
     }
 
     // Run inference
+    torch::NoGradGuard no_grad; // Disable gradient computation for inference
     std::vector<torch::jit::IValue> inputs = {seq_inputs_tensor, scalar_inputs_tensor};
-    torch::Tensor y_pred_scaled = model.forward(inputs).toTensor();
+    torch::Tensor y_pred_scaled;
+    
+    try {
+        y_pred_scaled = model.forward(inputs).toTensor();
+    } catch (const c10::Error& e) {
+        std::cerr << "Error during model inference: " << e.what() << std::endl;
+        
+        // If CUDA is available but there was an error, try CPU as fallback
+        if (device.is_cuda()) {
+            std::cout << "Trying CPU as fallback..." << std::endl;
+            device = torch::kCPU;
+            
+            // Move model and inputs to CPU
+            model.to(device);
+            seq_inputs_tensor = seq_inputs_tensor.to(device);
+            scalar_inputs_tensor = scalar_inputs_tensor.to(device);
+            
+            // Try inference again
+            inputs = {seq_inputs_tensor, scalar_inputs_tensor};
+            try {
+                y_pred_scaled = model.forward(inputs).toTensor();
+            } catch (const c10::Error& e) {
+                std::cerr << "Error during fallback CPU inference: " << e.what() << std::endl;
+                return 1;
+            }
+        } else {
+            return 1;
+        }
+    }
 
     // Inverse transform predictions
     torch::Tensor y_pred_transformed = y_pred_scaled * y_scale + y_center;
