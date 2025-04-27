@@ -62,7 +62,7 @@ std::map<std::string, double> extract_features(const json& json_data) {
         features["op_" + op] = static_cast<double>(count);
     }
 
-    // Extract memory patterns
+    // Extract personally identifiable information patterns
     std::map<std::string, std::vector<double>> memory_patterns;
     for (const auto& node : json_data["children"]) {
         if (node.contains("memory_patterns")) {
@@ -248,7 +248,7 @@ int main() {
     torch::Tensor seq_inputs_tensor = torch::cat(seq_inputs, 0);
     torch::Tensor scalar_inputs_tensor = torch::cat(scalar_inputs, 0);
 
-    // Load the model
+    // Load the model with the correct type
     std::shared_ptr<torch::jit::script::Module> model;
     try {
         model = torch::jit::load("model.pt");
