@@ -15,7 +15,7 @@
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 
-// Define FIXED_FEATURES as in Python
+// Define FIXED_FEATURES as in the original model (74 features, excluding new ones)
 const std::vector<std::string> FIXED_FEATURES = {
     "cache_hits", "cache_misses", "execution_time_ms", "sched_num_realizations",
     "sched_num_productions", "sched_points_computed_total", "sched_innermost_loop_extent",
@@ -34,8 +34,7 @@ const std::vector<std::string> FIXED_FEATURES = {
     "memory_transpose_0", "memory_transpose_1", "memory_transpose_2", "memory_transpose_3",
     "memory_slice_0", "memory_slice_1", "memory_slice_2", "memory_slice_3",
     "memory_broadcast_0", "memory_broadcast_1", "memory_broadcast_2", "memory_broadcast_3",
-    "memory_pointwise_0", "memory_pointwise_1", "memory_pointwise_2", "memory_pointwise_3",
-    "cache_hit_ratio", "bytes_per_point_computed" // New features
+    "memory_pointwise_0", "memory_pointwise_1", "memory_pointwise_2", "memory_pointwise_3"
 };
 
 // Hardware-specific correction factors
@@ -55,7 +54,7 @@ const HardwareCorrectionFactors CPU_CORRECTION_FACTORS = {
     0.35, 1.0, 0.97, 50.0
 };
 
-// Function to extract features from JSON data with enhanced engineering
+// Function to extract features from JSON data
 std::map<std::string, double> extract_features(const json& json_data) {
     std::map<std::string, double> features;
 
@@ -67,10 +66,6 @@ std::map<std::string, double> extract_features(const json& json_data) {
         features["cache_misses"] = global_node->value("cache_misses", 0.0);
         features["execution_time_ms"] = global_node->value("execution_time_ms", 0.0);
     }
-
-    // New feature: cache hit ratio
-    double total_cache = features["cache_hits"] + features["cache_misses"];
-    features["cache_hit_ratio"] = total_cache > 0 ? features["cache_hits"] / total_cache : 0.0;
 
     // Extract op_histogram features
     std::map<std::string, int> op_histogram;
@@ -145,7 +140,6 @@ std::map<std::string, double> extract_features(const json& json_data) {
     features["total_vectors"] = features["sched_num_vectors"];
     double bytes_at_realization = features["sched_bytes_at_realization"];
     features["computation_efficiency"] = bytes_at_realization != 0 ? features["sched_points_computed_total"] / bytes_at_realization : 0.0;
-    features["bytes_per_point_computed"] = features["sched_points_computed_total"] != 0 ? bytes_at_realization / features["sched_points_computed_total"] : 0.0; // New feature
     double bytes_at_root = features["sched_bytes_at_root"];
     features["memory_pressure"] = bytes_at_root != 0 ? features["sched_working_set"] / bytes_at_root : 0.0;
     double bytes_at_task = features["sched_bytes_at_task"];
@@ -174,10 +168,10 @@ std::map<std::string, double> extract_features(const json& json_data) {
     }
     features["op_diversity"] = op_diversity;
 
-    // Normalize features to reduce variance
+    // Log-transform features to reduce variance
     for (const auto& key : FIXED_FEATURES) {
         if (features[key] > 0) {
-            features[key] = std::log1p(features[key]); // Log-transform to reduce scale
+            features[key] = std::log1p(features[key]);
         }
     }
 
@@ -241,10 +235,10 @@ double correct_prediction(double raw_prediction, double actual_time, bool is_gpu
     // Dynamic correction based on workload complexity
     double complexity_factor = 1.0;
     if (features.at("sched_bytes_at_realization") > 1e6) {
-        complexity_factor *= 0.8; // Reduce for memory-intensive workloads
+        complexity_factor *= 0.8;
     }
     if (features.at("total_parallelism") > 10) {
-        complexity_factor *= 0.9; // Adjust for highly parallel workloads
+        complexity_factor *= 0.9;
     }
 
     // Apply hardware-specific correction
@@ -308,14 +302,6 @@ void save_calibration_data(const std::string& filename,
         file << filepath << " " << calib.scale_factor << " " << calib.bias << " " << calib.count << std::endl;
     }
     std::cout << "Saved " << calibration_map.size() << " calibration entries." << std::endl;
-}
-
-// Update calibration data
-void update_calibration_data(std::map<std::string, DynamicCorrection>& calibration_map,
-                            const std::string& file_path, double raw_prediction, double actual_time) {
-    if (actual_time <= 0 || raw_prediction <= 0) return;
-    auto& calib = calibration_map[file_path];
-    calib.update(raw_prediction, actual_time);
 }
 
 // Extract file category
@@ -442,7 +428,7 @@ int main(int argc, char* argv[]) {
     std::vector<double> actual_times;
     std::vector<std::map<std::string, double>> feature_sets;
     const int sequence_length = 3;
-    const int batch_size = 32; // Process up to 32 files at a time
+    const int batch_size = 32;
 
     for (const auto& file : test_files) {
         std::ifstream json_file(file);
