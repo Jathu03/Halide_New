@@ -62,7 +62,7 @@ std::map<std::string, double> extract_features(const json& json_data) {
         features["op_" + op] = static_cast<double>(count);
     }
 
-    // Extract personally identifiable information patterns
+    // Extract memory patterns
     std::map<std::string, std::vector<double>> memory_patterns;
     for (const auto& node : json_data["children"]) {
         if (node.contains("memory_patterns")) {
