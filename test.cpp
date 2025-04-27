@@ -48,6 +48,14 @@ const std::vector<std::string> SKEWED_FEATURES = {
     "cache_hits", "bytes_processing_rate", "sched_bytes_at_task", "computation_efficiency"
 };
 
+// Features to clip to prevent extreme values
+const std::vector<std::string> FEATURES_TO_CLIP = {
+    "sched_bytes_at_realization", "sched_bytes_at_production", "sched_bytes_at_root",
+    "sched_unique_bytes_read_per_realization", "sched_working_set", "sched_bytes_at_task",
+    "sched_working_set_at_task", "sched_working_set_at_production", "sched_working_set_at_realization",
+    "sched_working_set_at_root", "sched_points_computed_total"
+};
+
 // Feature extraction function (translated from Python)
 std::map<std::string, double> extract_features(const json& json_data) {
     std::map<std::string, double> features;
@@ -117,7 +125,12 @@ std::map<std::string, double> extract_features(const json& json_data) {
         if (node.contains("scheduling")) {
             ++node_count;
             for (const auto& key : scheduling_keys) {
-                scheduling_sums[key] += node["scheduling"].value(key, 0.0);
+                double val = node["scheduling"].value(key, 0.0);
+                // Clip large scheduling features
+                if (std::find(FEATURES_TO_CLIP.begin(), FEATURES_TO_CLIP.end(), "sched_" + key) != FEATURES_TO_CLIP.end()) {
+                    val = std::min(val, 1e9);
+                }
+                scheduling_sums[key] += val;
             }
         }
     }
@@ -135,17 +148,17 @@ std::map<std::string, double> extract_features(const json& json_data) {
     features["total_bytes_at_production"] = features["sched_bytes_at_production"];
     features["total_vectors"] = features["sched_num_vectors"];
     features["computation_efficiency"] = features["sched_bytes_at_realization"] != 0 ?
-        features["sched_points_computed_total"] / features["sched_bytes_at_realization"] : 0.0;
+        std::min(features["sched_points_computed_total"] / features["sched_bytes_at_realization"], 1e9) : 0.0;
     features["memory_pressure"] = features["sched_bytes_at_root"] != 0 ?
-        features["sched_working_set"] / features["sched_bytes_at_root"] : 0.0;
+        std::min(features["sched_working_set"] / features["sched_bytes_at_root"], 1e9) : 0.0;
     features["memory_utilization_ratio"] = features["sched_bytes_at_task"] != 0 ?
-        features["sched_unique_bytes_read_per_realization"] / features["sched_bytes_at_task"] : 0.0;
+        std::min(features["sched_unique_bytes_read_per_realization"] / features["sched_bytes_at_task"], 1e9) : 0.0;
     features["bytes_processing_rate"] = features["execution_time_ms"] != 0 ?
-        features["sched_bytes_at_realization"] / features["execution_time_ms"] : 0.0;
+        std::min(features["sched_bytes_at_realization"] / features["execution_time_ms"], 1e9) : 0.0;
     features["bytes_per_parallelism"] = features["total_parallelism"] != 0 ?
-        features["sched_bytes_at_task"] / features["total_parallelism"] : 0.0;
+        std::min(features["sched_bytes_at_task"] / features["total_parallelism"], 1e9) : 0.0;
     features["bytes_per_vector"] = features["sched_num_vectors"] != 0 ?
-        features["sched_bytes_at_realization"] / features["sched_num_vectors"] : 0.0;
+        std::min(features["sched_bytes_at_realization"] / features["sched_num_vectors"], 1e9) : 0.0;
     double nodes_count = json_data["children"].size();
     double edges_count = 0;
     for (const auto& node : json_data["children"]) {
@@ -158,6 +171,13 @@ std::map<std::string, double> extract_features(const json& json_data) {
         nodes_count / features["scheduling_count"] : 0.0;
     features["op_diversity"] = std::count_if(features.begin(), features.end(),
         [](const auto& kv) { return kv.first.find("op_") == 0 && kv.second > 0; });
+
+    // Clip other large features
+    for (const auto& feature : FEATURES_TO_CLIP) {
+        if (features.find(feature) != features.end()) {
+            features[feature] = std::min(features[feature], 1e9);
+        }
+    }
 
     // Create fixed-length feature vector
     std::map<std::string, double> fixed_features;
@@ -213,10 +233,12 @@ PreprocessedData preprocess_features(const std::map<std::string, double>& featur
         feature_vector.push_back(val);
     }
     std::vector<std::vector<double>> seq_data(sequence_length, feature_vector);
-    torch::Tensor seq_tensor = torch::from_blob(seq_data.data(), {sequence_length, static_cast<int64_t>(FIXED_FEATURES.size())})
+    torch::Tensor seq_tensor = torch::from_blob(seq_data.data(), {sequence_length, static_cast<int64_t>(FIXED FEATURES.size())})
                                   .reshape({1, sequence_length, static_cast<int64_t>(FIXED_FEATURES.size())}).to(torch::kFloat32);
+    // Clip sequence inputs to [-10, 10]
+    seq_tensor = torch::clamp(seq_tensor, -10.0, 10.0);
     if (!seq_tensor.isfinite().all().item<bool>()) {
-        std::cerr << "Warning: Sequence tensor contains non-finite values" << std::endl;
+        std::cerr << "Warning: Sequence tensor contains non-finite values after clamping" << std::endl;
     }
 
     // Create scalar features
@@ -274,7 +296,7 @@ PreprocessedData preprocess_features(const std::map<std::string, double>& featur
     torch::Tensor scalar_tensor = torch::from_blob(scalar_scaled.data(), {1, static_cast<int64_t>(scalar_scaled.size())})
                                      .to(torch::kFloat32);
     if (!scalar_tensor.isfinite().all().item<bool>()) {
-        std::cerr << "Warning: Scalar tensor contains non-finite values" << std::endl;
+        std::cerr << "Warning: Scalar tensor contains non-finite values after clamping" << std::endl;
     }
 
     return {seq_tensor, scalar_tensor, features.at("execution_time_ms")};
