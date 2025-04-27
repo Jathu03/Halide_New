@@ -158,7 +158,7 @@ std::map<std::string, double> extract_features(const json& json_data) {
     features["bytes_per_parallelism"] = features["total_parallelism"] != 0 ?
         std::min(features["sched_bytes_at_task"] / features["total_parallelism"], 1e9) : 0.0;
     features["bytes_per_vector"] = features["sched_num_vectors"] != 0 ?
-        std::min(features["sched_bytes_at_realization"] / features["sched_num_vectors"], 1e9) : 4e9) : 0.0;
+        std::min(features["sched_bytes_at_realization"] / features["sched_num_vectors"], 1e9) : 0.0;
     double nodes_count = json_data["children"].size();
     double edges_count = 0;
     for (const auto& node : json_data["children"]) {
