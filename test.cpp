@@ -1,19 +1,18 @@
-#include <torch/torch.h>
 #include <torch/script.h>
-#include <nlohmann/json.hpp>
+#include <iostream>
 #include <fstream>
+#include <sstream>
 #include <vector>
-#include <string>
 #include <map>
 #include <cmath>
-#include <iostream>
 #include <algorithm>
-#include <filesystem>
+#include <string>
+#include <memory>
+#include <nlohmann/json.hpp>
 
-// Using JSON namespace
 using json = nlohmann::json;
 
-// Define fixed features (same as Python)
+// Constants
 const std::vector<std::string> FIXED_FEATURES = {
     "cache_hits", "cache_misses", "execution_time_ms", "sched_num_realizations",
     "sched_num_productions", "sched_points_computed_total", "sched_innermost_loop_extent",
@@ -35,383 +34,343 @@ const std::vector<std::string> FIXED_FEATURES = {
     "memory_pointwise_0", "memory_pointwise_1", "memory_pointwise_2", "memory_pointwise_3"
 };
 
-// Define low-importance features to drop (same as Python)
-const std::vector<std::string> LOW_IMPORTANCE_FEATURES = {
-    "op_cast", "op_selfcall", "memory_pointwise_1", "memory_transpose_1", "memory_broadcast_1",
-    "memory_slice_1", "op_select", "op_not", "op_and", "op_ne", "op_mod", "memory_pointwise_2",
-    "memory_broadcast_2", "memory_slice_2", "memory_transpose_2", "op_externcall", "op_imagecall",
-    "op_param", "memory_pointwise_3", "memory_transpose_3", "op_sub", "memory_pointwise_0", "op_let"
+// Structure to hold scaler parameters
+struct ScalerParams {
+    std::vector<double> X_scalar_center;
+    std::vector<double> X_scalar_scale;
+    std::vector<double> y_center;
+    std::vector<double> y_scale;
+    std::vector<std::string> feature_columns;
 };
 
-// Define skewed features for log transformation
-const std::vector<std::string> SKEWED_FEATURES = {
-    "cache_hits", "bytes_processing_rate", "sched_bytes_at_task", "computation_efficiency"
-};
-
-// Features to clip to prevent extreme values
-const std::vector<std::string> FEATURES_TO_CLIP = {
-    "sched_bytes_at_realization", "sched_bytes_at_production", "sched_bytes_at_root",
-    "sched_unique_bytes_read_per_realization", "sched_working_set", "sched_bytes_at_task",
-    "sched_working_set_at_task", "sched_working_set_at_production", "sched_working_set_at_realization",
-    "sched_working_set_at_root", "sched_points_computed_total"
-};
-
-// Feature extraction function (translated from Python)
-std::map<std::string, double> extract_features(const json& json_data) {
-    std::map<std::string, double> features;
-
-    // Extract global features
-    for (const auto& child : json_data["children"]) {
-        if (child["name"] == "Global Features") {
-            features["cache_hits"] = child.value("cache_hits", 0.0);
-            features["cache_misses"] = child.value("cache_misses", 0.0);
-            features["execution_time_ms"] = child.value("execution_time_ms", 0.0);
-            break;
-        }
+// Function to load scaler parameters from JSON file
+ScalerParams loadScalerParams(const std::string& filename) {
+    std::ifstream file(filename);
+    if (!file.is_open()) {
+        throw std::runtime_error("Failed to open scaler params file: " + filename);
     }
+    
+    json j;
+    file >> j;
+    
+    ScalerParams params;
+    params.X_scalar_center = j["X_scalar_center"].get<std::vector<double>>();
+    params.X_scalar_scale = j["X_scalar_scale"].get<std::vector<double>>();
+    params.y_center = j["y_center"].get<std::vector<double>>();
+    params.y_scale = j["y_scale"].get<std::vector<double>>();
+    params.feature_columns = j["feature_columns"].get<std::vector<std::string>>();
+    
+    return params;
+}
 
+// Function to extract features from JSON similar to the Python implementation
+std::map<std::string, double> extractFeatures(const json& jsonData) {
+    std::map<std::string, double> features;
+    
+    // Initialize all features to 0
+    for (const auto& feature : FIXED_FEATURES) {
+        features[feature] = 0.0;
+    }
+    
+    // Extract global features
+    auto it = std::find_if(jsonData["children"].begin(), jsonData["children"].end(),
+                         [](const json& child) { return child["name"] == "Global Features"; });
+    if (it != jsonData["children"].end()) {
+        const auto& globalNode = *it;
+        features["cache_hits"] = globalNode.contains("cache_hits") ? globalNode["cache_hits"].get<double>() : 0.0;
+        features["cache_misses"] = globalNode.contains("cache_misses") ? globalNode["cache_misses"].get<double>() : 0.0;
+        features["execution_time_ms"] = globalNode.contains("execution_time_ms") ? globalNode["execution_time_ms"].get<double>() : 0.0;
+    }
+    
     // Extract op_histogram features
-    std::map<std::string, double> op_histogram;
-    for (const auto& node : json_data["children"]) {
+    std::map<std::string, int> opHistogram;
+    for (const auto& node : jsonData["children"]) {
         if (node.contains("op_histogram")) {
-            for (const auto& [op, count] : node["op_histogram"].items()) {
-                std::string op_lower = op;
-                std::transform(op_lower.begin(), op_lower.end(), op_lower.begin(), ::tolower);
-                op_histogram[op_lower] += count.get<double>();
+            for (auto& [op, count] : node["op_histogram"].items()) {
+                std::string opLower = op;
+                std::transform(opLower.begin(), opLower.end(), opLower.begin(), ::tolower);
+                opHistogram[opLower] += count.get<int>();
             }
         }
     }
-    for (const auto& [op, count] : op_histogram) {
+    
+    for (const auto& [op, count] : opHistogram) {
         features["op_" + op] = count;
     }
-
+    
     // Extract memory patterns
-    std::map<std::string, std::vector<double>> memory_patterns;
-    for (const auto& node : json_data["children"]) {
+    std::map<std::string, std::vector<double>> memoryPatterns;
+    for (const auto& node : jsonData["children"]) {
         if (node.contains("memory_patterns")) {
-            for (const auto& [pattern, values] : node["memory_patterns"].items()) {
-                std::vector<double> curr_values(4, 0.0);
-                for (size_t i = 0; i < values.size() && i < 4; ++i) {
-                    curr_values[i] = values[i].get<double>();
+            for (auto& [pattern, values] : node["memory_patterns"].items()) {
+                std::string patternLower = pattern;
+                std::transform(patternLower.begin(), patternLower.end(), patternLower.begin(), ::tolower);
+                
+                std::vector<double> currValues;
+                if (values.is_array()) {
+                    for (const auto& val : values) {
+                        currValues.push_back(val.get<double>());
+                    }
                 }
-                if (memory_patterns.find(pattern) == memory_patterns.end()) {
-                    memory_patterns[pattern] = std::vector<double>(4, 0.0);
+                
+                // Ensure 4 elements, padding with zeros if needed
+                while (currValues.size() < 4) {
+                    currValues.push_back(0.0);
                 }
+                
+                // If pattern doesn't exist, initialize it
+                if (memoryPatterns.find(patternLower) == memoryPatterns.end()) {
+                    memoryPatterns[patternLower] = {0.0, 0.0, 0.0, 0.0};
+                }
+                
+                // Add to existing values
                 for (size_t i = 0; i < 4; ++i) {
-                    memory_patterns[pattern][i] += curr_values[i];
+                    memoryPatterns[patternLower][i] += currValues[i];
                 }
             }
         }
     }
-    for (const auto& [pattern, values] : memory_patterns) {
-        std::string pattern_lower = pattern;
-        std::transform(pattern_lower.begin(), pattern_lower.end(), pattern_lower.begin(), ::tolower);
+    
+    for (const auto& [pattern, values] : memoryPatterns) {
         for (size_t i = 0; i < values.size(); ++i) {
-            features["memory_" + pattern_lower + "_" + std::to_string(i)] = values[i];
+            features["memory_" + pattern + "_" + std::to_string(i)] = values[i];
         }
     }
-
+    
     // Extract scheduling features
-    std::vector<std::string> scheduling_keys = {
+    std::vector<std::string> schedulingKeys = {
         "num_realizations", "num_productions", "points_computed_total", "innermost_loop_extent",
         "inner_parallelism", "outer_parallelism", "bytes_at_realization", "bytes_at_production",
         "bytes_at_root", "unique_bytes_read_per_realization", "working_set", "vector_size",
         "num_vectors", "num_scalars", "bytes_at_task", "working_set_at_task", "working_set_at_production",
         "working_set_at_realization", "working_set_at_root"
     };
-    std::map<std::string, double> scheduling_sums;
-    int node_count = 0;
-    for (const auto& node : json_data["children"]) {
+    
+    std::map<std::string, double> schedulingSums;
+    int nodeCount = 0;
+    
+    for (const auto& node : jsonData["children"]) {
         if (node.contains("scheduling")) {
-            ++node_count;
-            for (const auto& key : scheduling_keys) {
-                double val = node["scheduling"].value(key, 0.0);
-                // Clip large scheduling features
-                if (std::find(FEATURES_TO_CLIP.begin(), FEATURES_TO_CLIP.end(), "sched_" + key) != FEATURES_TO_CLIP.end()) {
-                    val = std::min(val, 1e9);
+            nodeCount++;
+            for (const auto& key : schedulingKeys) {
+                if (node["scheduling"].contains(key)) {
+                    schedulingSums[key] += node["scheduling"][key].get<double>();
                 }
-                scheduling_sums[key] += val;
             }
         }
     }
-    for (const auto& key : scheduling_keys) {
-        if (key == "inner_parallelism" || key == "outer_parallelism") {
-            features["sched_" + key] = node_count > 0 ? scheduling_sums[key] / node_count : 0.0;
+    
+    for (const auto& key : schedulingKeys) {
+        if ((key == "inner_parallelism" || key == "outer_parallelism") && nodeCount > 0) {
+            features["sched_" + key] = schedulingSums[key] / nodeCount;
         } else {
-            features["sched_" + key] = scheduling_sums[key];
+            features["sched_" + key] = schedulingSums[key];
         }
     }
-
+    
     // Derived features with division-by-zero protection
     features["total_parallelism"] = features["sched_inner_parallelism"] + features["sched_outer_parallelism"];
     features["scheduling_count"] = features["sched_num_realizations"] + features["sched_num_productions"];
     features["total_bytes_at_production"] = features["sched_bytes_at_production"];
     features["total_vectors"] = features["sched_num_vectors"];
+    
     features["computation_efficiency"] = features["sched_bytes_at_realization"] != 0 ?
-        std::min(features["sched_points_computed_total"] / features["sched_bytes_at_realization"], 1e9) : 0.0;
+        features["sched_points_computed_total"] / features["sched_bytes_at_realization"] : 0;
+    
     features["memory_pressure"] = features["sched_bytes_at_root"] != 0 ?
-        std::min(features["sched_working_set"] / features["sched_bytes_at_root"], 1e9) : 0.0;
+        features["sched_working_set"] / features["sched_bytes_at_root"] : 0;
+    
     features["memory_utilization_ratio"] = features["sched_bytes_at_task"] != 0 ?
-        std::min(features["sched_unique_bytes_read_per_realization"] / features["sched_bytes_at_task"], 1e9) : 0.0;
+        features["sched_unique_bytes_read_per_realization"] / features["sched_bytes_at_task"] : 0;
+    
     features["bytes_processing_rate"] = features["execution_time_ms"] != 0 ?
-        std::min(features["sched_bytes_at_realization"] / features["execution_time_ms"], 1e9) : 0.0;
+        features["sched_bytes_at_realization"] / features["execution_time_ms"] : 0;
+    
     features["bytes_per_parallelism"] = features["total_parallelism"] != 0 ?
-        std::min(features["sched_bytes_at_task"] / features["total_parallelism"], 1e9) : 0.0;
+        features["sched_bytes_at_task"] / features["total_parallelism"] : 0;
+    
     features["bytes_per_vector"] = features["sched_num_vectors"] != 0 ?
-        std::min(features["sched_bytes_at_realization"] / features["sched_num_vectors"], 1e9) : 0.0;
-    double nodes_count = json_data["children"].size();
-    double edges_count = 0;
-    for (const auto& node : json_data["children"]) {
-        edges_count += node.value("children", json::array()).size();
+        features["sched_bytes_at_realization"] / features["sched_num_vectors"] : 0;
+    
+    int nodesCount = jsonData["children"].size();
+    int edgesCount = 0;
+    for (const auto& node : jsonData["children"]) {
+        if (node.contains("children")) {
+            edgesCount += node["children"].size();
+        }
     }
-    features["nodes_count"] = nodes_count;
-    features["edges_count"] = edges_count;
-    features["node_edge_ratio"] = edges_count + 1 != 0 ? nodes_count / (edges_count + 1) : 0.0;
+    
+    features["nodes_count"] = nodesCount;
+    features["edges_count"] = edgesCount;
+    features["node_edge_ratio"] = edgesCount != 0 ? static_cast<double>(nodesCount) / edgesCount : nodesCount;
     features["nodes_per_schedule"] = features["scheduling_count"] != 0 ?
-        nodes_count / features["scheduling_count"] : 0.0;
-    features["op_diversity"] = std::count_if(features.begin(), features.end(),
-        [](const auto& kv) { return kv.first.find("op_") == 0 && kv.second > 0; });
-
-    // Clip other large features
-    for (const auto& feature : FEATURES_TO_CLIP) {
-        if (features.find(feature) != features.end()) {
-            features[feature] = std::min(features[feature], 1e9);
+        nodesCount / features["scheduling_count"] : nodesCount;
+    
+    // Count op diversity
+    int opDiversity = 0;
+    for (const auto& [key, value] : features) {
+        if (key.substr(0, 3) == "op_" && value > 0) {
+            opDiversity++;
         }
     }
-
-    // Create fixed-length feature vector
-    std::map<std::string, double> fixed_features;
-    for (const auto& keyRV : FIXED_FEATURES) {
-        fixed_features[keyRV] = features[keyRV];
-    }
-    return fixed_features;
+    features["op_diversity"] = opDiversity;
+    
+    return features;
 }
 
-// Structure to hold scaler parameters
-struct ScalerParams {
-    std::vector<double> x_scalar_center;
-    std::vector<double> x_scalar_scale;
-    std::vector<double> y_center;
-    std::vector<double> y_scale;
-    std::vector<std::string> feature_columns;
-};
-
-// Load scaler parameters from JSON
-ScalerParams load_scaler_params(const std::string& scaler_file) {
-    ScalerParams params;
-    std::ifstream ifs(scaler_file);
-    if (!ifs.is_open()) {
-        throw std::runtime_error("Could not open scaler_params.json");
-    }
-    json scaler_data;
-    ifs >> scaler_data;
-    params.x_scalar_center = scaler_data["X_scalar_center"].get<std::vector<double>>();
-    params.x_scalar_scale = scaler_data["X_scalar_scale"].get<std::vector<double>>();
-    params.y_center = scaler_data["y_center"].get<std::vector<double>>();
-    params.y_scale = scaler_data["y_scale"].get<std::vector<double>>();
-    params.feature_columns = scaler_data["feature_columns"].get<std::vector<std::string>>();
-    return params;
-}
-
-// Preprocessing function
-struct PreprocessedData {
-    torch::Tensor seq_input;
-    torch::Tensor scalar_input;
-    double execution_time_ms;
-};
-
-PreprocessedData preprocess_features(const std::map<std::string, double>& features, const ScalerParams& scaler_params) {
-    // Create sequence input (sequence_length=3)
-    const int sequence_length = 3;
-    std::vector<double> feature_vector;
-    for (const auto& key : FIXED_FEATURES) {
-        double val = features.at(key);
-        if (!std::isfinite(val)) {
-            std::cerr << "Warning: Non-finite value for feature " << key << ": " << val << std::endl;
-            val = 0.0;
-        }
-        feature_vector.push_back(val);
-    }
-    std::vector<std::vector<double>> seq_data(sequence_length, feature_vector);
-    torch::Tensor seq_tensor = torch::from_blob(seq_data.data(), {sequence_length, static_cast<int64_t>(FIXED_FEATURES.size())}, torch::TensorOptions().dtype(torch::kDouble))
-                                  .reshape({1, sequence_length, static_cast<int64_t>(FIXED_FEATURES.size())}).to(torch::kFloat32);
-    // Clip sequence inputs to [-10, 10]
-    seq_tensor = torch::clamp(seq_tensor, -10.0, 10.0);
-    if (!seq_tensor.isfinite().all().item<bool>()) {
-        std::cerr << "Warning: Sequence tensor contains non-finite values after clamping" << std::endl;
-    }
-
-    // Create scalar features
-    std::map<std::string, double> scalar_features = features;
-    for (const auto& feature : LOW_IMPORTANCE_FEATURES) {
-        scalar_features.erase(feature);
-    }
-
-    // Log transform skewed features
-    for (const auto& feature : SKEWED_FEATURES) {
-        if (scalar_features.find(feature) != scalar_features.end()) {
-            double val = scalar_features[feature];
-            double log_val = std::log1p(val);
-            if (!std::isfinite(log_val)) {
-                std::cerr << "Warning: Non-finite log value for " << feature << ": " << log_val << std::endl;
-                log_val = 0.0;
-            }
-            scalar_features["log_" + feature] = log_val;
-            scalar_features.erase(feature);
+// Transform data similarly to the Python code
+std::vector<torch::Tensor> prepareDataForModel(
+    const std::map<std::string, double>& features,
+    const ScalerParams& scalerParams
+) {
+    // Create log transformations for specified features
+    std::map<std::string, double> transformedFeatures = features;
+    
+    // Apply log1p transformation to selected features
+    std::vector<std::string> skewedFeatures = {"cache_hits", "bytes_processing_rate", "sched_bytes_at_task", "computation_efficiency"};
+    for (const auto& feature : skewedFeatures) {
+        if (transformedFeatures.find(feature) != transformedFeatures.end()) {
+            transformedFeatures["log_" + feature] = std::log1p(transformedFeatures[feature]);
+            transformedFeatures.erase(feature);
         }
     }
-
-    // Create scalar vector
-    std::vector<std::string> scalar_columns = scaler_params.feature_columns;
-    std::vector<double> scalar_vector;
-    for (const auto& col : scalar_columns) {
-        double val = scalar_features[col];
-        if (!std::isfinite(val)) {
-            std::cerr << "Warning: Non-finite value for scalar feature " << col << ": " << val << std::endl;
-            val = 0.0;
+    
+    // Create sequence input tensor (always 3 length sequence in this model)
+    const int sequenceLength = 3;
+    std::vector<float> sequenceData;
+    
+    // Add each fixed feature to the sequence data
+    for (int i = 0; i < sequenceLength; ++i) {
+        for (const auto& feature : FIXED_FEATURES) {
+            sequenceData.push_back(features.find(feature) != features.end() ? features.at(feature) : 0.0f);
         }
-        scalar_vector.push_back(val);
     }
-
-    // Apply RobustScaler
-    std::vector<double> scalar_scaled(scalar_vector.size());
-    for (size_t i = 0; i < scalar_vector.size(); ++i) {
-        if (scaler_params.x_scalar_scale[i] == 0) {
-            std::cerr << "Error: Zero scale for feature " << scaler_params.feature_columns[i] << std::endl;
-            scalar_scaled[i] = 0.0;
+    
+    // Create the 3D sequence tensor [1, sequence_length, feature_count]
+    auto sequenceTensor = torch::from_blob(sequenceData.data(), 
+                                           {1, sequenceLength, static_cast<int64_t>(FIXED_FEATURES.size())}, 
+                                           torch::kFloat32).clone();
+    
+    // Create scalar input tensor
+    std::vector<float> scalarData;
+    
+    // Add each scalar feature in the correct order according to scalerParams.feature_columns
+    for (const auto& featureCol : scalerParams.feature_columns) {
+        if (transformedFeatures.find(featureCol) != transformedFeatures.end()) {
+            scalarData.push_back(transformedFeatures.at(featureCol));
         } else {
-            scalar_scaled[i] = (scalar_vector[i] - scaler_params.x_scalar_center[i]) / scaler_params.x_scalar_scale[i];
-            if (!std::isfinite(scalar_scaled[i])) {
-                std::cerr << "Warning: Non-finite scaled value for " << scaler_params.feature_columns[i]
-                          << ": " << scalar_scaled[i]
-                          << " (value=" << scalar_vector[i]
-                          << ", center=" << scaler_params.x_scalar_center[i]
-                          << ", scale=" << scaler_params.x_scalar_scale[i] << ")" << std::endl;
-                scalar_scaled[i] = 0.0;
-            }
-            // Clip to [-10, 10] to prevent numerical instability
-            scalar_scaled[i] = std::max(-10.0, std::min(10.0, scalar_scaled[i]));
+            scalarData.push_back(0.0f);  // Default to 0 if feature not found
         }
     }
-    torch::Tensor scalar_tensor = torch::from_blob(scalar_scaled.data(), {1, static_cast<int64_t>(scalar_scaled.size())}, torch::TensorOptions().dtype(torch::kDouble))
-                                     .to(torch::kFloat32);
-    if (!scalar_tensor.isfinite().all().item<bool>()) {
-        std::cerr << "Warning: Scalar tensor contains non-finite values after clamping" << std::endl;
+    
+    // Create the tensor
+    auto scalarTensor = torch::from_blob(scalarData.data(), 
+                                         {1, static_cast<int64_t>(scalarData.size())}, 
+                                         torch::kFloat32).clone();
+    
+    // Apply robust scaling to scalar tensor
+    for (int i = 0; i < scalarData.size(); ++i) {
+        float center = i < scalerParams.X_scalar_center.size() ? scalerParams.X_scalar_center[i] : 0.0f;
+        float scale = i < scalerParams.X_scalar_scale.size() ? scalerParams.X_scalar_scale[i] : 1.0f;
+        scale = scale != 0 ? scale : 1.0f;  // Avoid division by zero
+        
+        scalarTensor[0][i] = (scalarTensor[0][i].item<float>() - center) / scale;
     }
+    
+    // Replace NaN values with 0
+    scalarTensor = torch::nan_to_num(scalarTensor, 0.0, std::numeric_limits<float>::infinity(), -std::numeric_limits<float>::infinity());
+    
+    return {sequenceTensor, scalarTensor};
+}
 
-    return {seq_tensor, scalar_tensor, features.at("execution_time_ms")};
+// Inverse transform the model's output to get the actual prediction
+double inverseTransformPrediction(float scaled_value, const ScalerParams& scalerParams) {
+    // Un-scale the value
+    double center = scalerParams.y_center[0];
+    double scale = scalerParams.y_scale[0];
+    double unscaled = scaled_value * scale + center;
+    
+    // Inverse of log1p is expm1
+    return std::expm1(unscaled);
 }
 
 int main(int argc, char* argv[]) {
-    try {
-        // Check for input JSON file
-        if (argc != 2) {
-            std::cerr << "Usage: " << argv[0] << " <input_json_file>" << std::endl;
-            return -1;
-        }
-        std::string input_json_file = argv[1];
-
-        // Initialize CUDA if available
-        torch::Device device(torch::kCPU);
-        if (torch::cuda::is_available()) {
-            device = torch::Device(torch::kCUDA);
-            std::cout << "Using CUDA device" << std::endl;
-        } else {
-            std::cout << "CUDA not available. Using CPU." << std::endl;
-        }
-
-        // Load scaler parameters
-        ScalerParams scaler_params;
-        try {
-            scaler_params = load_scaler_params("scaler_params.json");
-        } catch (const std::exception& e) {
-            std::cerr << "Error loading scaler_params.json: " << e.what() << std::endl;
-            return -1;
-        }
-
-        // Validate scaler parameters
-        if (scaler_params.y_scale.empty() || scaler_params.y_scale[0] == 0) {
-            std::cerr << "Error: Invalid or zero y_scale in scaler_params.json" << std::endl;
-            return -1;
-        }
-
-        // Load the model
-        torch::jit::script::Module module;
-        try {
-            module = torch::jit::load("model.pt");
-            module.eval();
-            module.to(device);
-        } catch (const c10::Error& e) {
-            std::cerr << "Error loading the model: " << e.what() << std::endl;
-            return -1;
-        }
-
-        // Read JSON file
-        std::ifstream ifs(input_json_file);
-        if (!ifs.is_open()) {
-            std::cerr << "Error: Could not open " << input_json_file << std::endl;
-            return -1;
-        }
-        json json_data;
-        try {
-            ifs >> json_data;
-        } catch (const json::parse_error& e) {
-            std::cerr << "Error parsing " << input_json_file << ": " << e.what() << std::endl;
-            return -1;
-        }
-
-        // Extract features
-        auto features = extract_features(json_data);
-        if (features["execution_time_ms"] <= 0 || !std::isfinite(features["execution_time_ms"])) {
-            std::cerr << "Invalid execution time in " << input_json_file << std::endl;
-            return -1;
-        }
-
-        // Preprocess features
-        auto preprocessed = preprocess_features(features, scaler_params);
-        auto seq_input = preprocessed.seq_input.to(device);
-        auto scalar_input = preprocessed.scalar_input.to(device);
-
-        // Print input tensor stats
-        std::cout << "Sequence input min: " << seq_input.min().item<float>()
-                  << ", max: " << seq_input.max().item<float>() << std::endl;
-        std::cout << "Scalar input min: " << scalar_input.min().item<float>()
-                  << ", max: " << scalar_input.max().item<float>() << std::endl;
-
-        // Perform inference
-        torch::NoGradGuard no_grad;
-        std::vector<torch::jit::IValue> inputs = {seq_input, scalar_input};
-        auto output = module.forward(inputs).toTensor();
-        float pred_scaled = output.item<float>();
-        std::cout << "Model output (scaled): " << pred_scaled << std::endl;
-
-        // Clip model output to prevent nan
-        if (!std::isfinite(pred_scaled)) {
-            std::cerr << "Warning: Non-finite model output, setting to 0" << std::endl;
-            pred_scaled = 0.0;
-        }
-        pred_scaled = std::max(-100.0f, std::min(100.0f, pred_scaled));
-
-        // Inverse transform prediction
-        float pred_transformed = (pred_scaled * scaler_params.y_scale[0]) + scaler_params.y_center[0];
-        std::cout << "Inverse scaled output: " << pred_transformed << std::endl;
-
-        // Clip to prevent expm1 overflow
-        pred_transformed = std::max(-100.0f, std::min(100.0f, pred_transformed));
-        double pred_actual = std::expm1(pred_transformed);
-        pred_actual = std::max(pred_actual, 0.0);
-
-        // Output results
-        std::cout << "File: " << input_json_file << "\n"
-                  << "  Actual execution time: " << features["execution_time_ms"] << " ms\n"
-                  << "  Predicted execution time: " << pred_actual << " ms\n"
-                  << "  Error percentage: " << (features["execution_time_ms"] > 0 ?
-                      std::abs(features["execution_time_ms"] - pred_actual) / features["execution_time_ms"] * 100 : 0.0) << "%\n";
-
-    } catch (const std::exception& e) {
-        std::cerr << "Error: " << e.what() << std::endl;
-        return -1;
+    if (argc < 2) {
+        std::cerr << "Usage: " << argv[0] << " <path_to_json_file> [model_path] [scaler_params_path]" << std::endl;
+        return 1;
     }
-
-    return 0;
+    
+    std::string jsonFilePath = argv[1];
+    std::string modelPath = (argc > 2) ? argv[2] : "model.pt";
+    std::string scalerParamsPath = (argc > 3) ? argv[3] : "scaler_params.json";
+    
+    try {
+        // Load the TorchScript model
+        std::cout << "Loading model from " << modelPath << std::endl;
+        torch::jit::script::Module model;
+        try {
+            model = torch::jit::load(modelPath);
+            model.eval();
+        }
+        catch (const c10::Error& e) {
+            std::cerr << "Error loading the model: " << e.what() << std::endl;
+            return 1;
+        }
+        
+        // Load scaler parameters
+        std::cout << "Loading scaler parameters from " << scalerParamsPath << std::endl;
+        ScalerParams scalerParams = loadScalerParams(scalerParamsPath);
+        
+        // Load and process the JSON file
+        std::cout << "Processing JSON file: " << jsonFilePath << std::endl;
+        std::ifstream file(jsonFilePath);
+        if (!file.is_open()) {
+            std::cerr << "Failed to open JSON file: " << jsonFilePath << std::endl;
+            return 1;
+        }
+        
+        json jsonData;
+        file >> jsonData;
+        
+        // Extract features
+        std::map<std::string, double> features = extractFeatures(jsonData);
+        
+        // Print some key features
+        std::cout << "Extracted features:" << std::endl;
+        std::cout << "  cache_hits: " << features["cache_hits"] << std::endl;
+        std::cout << "  execution_time_ms: " << features["execution_time_ms"] << std::endl;
+        std::cout << "  sched_bytes_at_realization: " << features["sched_bytes_at_realization"] << std::endl;
+        
+        // Prepare tensors for the model
+        std::vector<torch::Tensor> modelInputs = prepareDataForModel(features, scalerParams);
+        torch::Tensor sequenceInput = modelInputs[0];
+        torch::Tensor scalarInput = modelInputs[1];
+        
+        // Perform inference
+        std::cout << "Running inference..." << std::endl;
+        torch::NoGradGuard no_grad;
+        std::vector<torch::jit::IValue> inputs;
+        inputs.push_back(sequenceInput);
+        inputs.push_back(scalarInput);
+        
+        at::Tensor output = model.forward(inputs).toTensor();
+        
+        // Process the output
+        float predictedScaled = output[0][0].item<float>();
+        double predictedExecutionTime = inverseTransformPrediction(predictedScaled, scalerParams);
+        
+        std::cout << "Prediction Results:" << std::endl;
+        std::cout << "  Actual execution time from JSON: " << features["execution_time_ms"] << " ms" << std::endl;
+        std::cout << "  Predicted execution time: " << predictedExecutionTime << " ms" << std::endl;
+        
+        double errorPercentage = features["execution_time_ms"] > 0 ?
+            std::abs(features["execution_time_ms"] - predictedExecutionTime) / features["execution_time_ms"] * 100 : 0;
+        std::cout << "  Error percentage: " << errorPercentage << "%" << std::endl;
+        
+        return 0;
+    }
+    catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        return 1;
+    }
 }
