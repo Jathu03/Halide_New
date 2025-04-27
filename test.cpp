@@ -129,7 +129,7 @@ std::map<std::string, double> extract_features(const json& json_data) {
         }
     }
 
-    // Derived features
+    // Derived features with division-by-zero protection
     features["total_parallelism"] = features["sched_inner_parallelism"] + features["sched_outer_parallelism"];
     features["scheduling_count"] = features["sched_num_realizations"] + features["sched_num_productions"];
     features["total_bytes_at_production"] = features["sched_bytes_at_production"];
@@ -267,6 +267,8 @@ PreprocessedData preprocess_features(const std::map<std::string, double>& featur
                           << ", scale=" << scaler_params.x_scalar_scale[i] << ")" << std::endl;
                 scalar_scaled[i] = 0.0;
             }
+            // Clip to [-10, 10] to prevent numerical instability
+            scalar_scaled[i] = std::max(-10.0, std::min(10.0, scalar_scaled[i]));
         }
     }
     torch::Tensor scalar_tensor = torch::from_blob(scalar_scaled.data(), {1, static_cast<int64_t>(scalar_scaled.size())})
@@ -342,24 +344,15 @@ int main(int argc, char* argv[]) {
         auto seq_input = preprocessed.seq_input.to(device);
         auto scalar_input = preprocessed.scalar_input.to(device);
 
-        // Print input tensor stats
-        std::cout << "Sequence input min: " << seq_input.min().item<float>()
-                  << ", max: " << seq_input.max().item<float>() << std::endl;
-        std::cout << "Scalar input min: " << scalar_input.min().item<float>()
-                  << ", max: " << scalar_input.max().item<float>() << std::endl;
-
         // Perform inference
         torch::NoGradGuard no_grad;
         std::vector<torch::jit::IValue> inputs = {seq_input, scalar_input};
         auto output = module.forward(inputs).toTensor();
         float pred_scaled = output.item<float>();
-        std::cout << "Model output (scaled): " << pred_scaled << std::endl;
 
         // Inverse transform prediction
         float pred_transformed = (pred_scaled * scaler_params.y_scale[0]) + scaler_params.y_center[0];
-        std::cout << "Inverse scaled output: " << pred_transformed << std::endl;
         double pred_actual = std::expm1(pred_transformed);
-        std::cout << "Final prediction (expm1): " << pred_actual << std::endl;
         pred_actual = std::max(pred_actual, 0.0);
 
         // Output results
