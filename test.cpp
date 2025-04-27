@@ -1,15 +1,14 @@
 #include <torch/torch.h>
 #include <torch/script.h>
 #include <nlohmann/json.hpp>
-#include <filesystem>
 #include <fstream>
 #include <vector>
 #include <string>
 #include <map>
 #include <cmath>
 #include <iostream>
-#include <numeric>
 #include <algorithm>
+#include <filesystem>
 
 // Using JSON namespace
 using json = nlohmann::json;
@@ -34,6 +33,19 @@ const std::vector<std::string> FIXED_FEATURES = {
     "memory_slice_0", "memory_slice_1", "memory_slice_2", "memory_slice_3",
     "memory_broadcast_0", "memory_broadcast_1", "memory_broadcast_2", "memory_broadcast_3",
     "memory_pointwise_0", "memory_pointwise_1", "memory_pointwise_2", "memory_pointwise_3"
+};
+
+// Define low-importance features to drop (same as Python)
+const std::vector<std::string> LOW_IMPORTANCE_FEATURES = {
+    "op_cast", "op_selfcall", "memory_pointwise_1", "memory_transpose_1", "memory_broadcast_1",
+    "memory_slice_1", "op_select", "op_not", "op_and", "op_ne", "op_mod", "memory_pointwise_2",
+    "memory_broadcast_2", "memory_slice_2", "memory_transpose_2", "op_externcall", "op_imagecall",
+    "op_param", "memory_pointwise_3", "memory_transpose_3", "op_sub", "memory_pointwise_0", "op_let"
+};
+
+// Define skewed features for log transformation
+const std::vector<std::string> SKEWED_FEATURES = {
+    "cache_hits", "bytes_processing_rate", "sched_bytes_at_task", "computation_efficiency"
 };
 
 // Feature extraction function (translated from Python)
@@ -155,69 +167,80 @@ std::map<std::string, double> extract_features(const json& json_data) {
     return fixed_features;
 }
 
-// Preprocessing function (mimics prepare_data_for_model)
+// Structure to hold scaler parameters
+struct ScalerParams {
+    std::vector<double> x_scalar_center;
+    std::vector<double> x_scalar_scale;
+    std::vector<double> y_center;
+    std::vector<double> y_scale;
+    std::vector<std::string> feature_columns;
+};
+
+// Load scaler parameters from JSON
+ScalerParams load_scaler_params(const std::string& scaler_file) {
+    ScalerParams params;
+    std::ifstream ifs(scaler_file);
+    if (!ifs.is_open()) {
+        throw std::runtime_error("Could not open scaler_params.json");
+    }
+    json scaler_data;
+    ifs >> scaler_data;
+    params.x_scalar_center = scaler_data["X_scalar_center"].get<std::vector<double>>();
+    params.x_scalar_scale = scaler_data["X_scalar_scale"].get<std::vector<double>>();
+    params.y_center = scaler_data["y_center"].get<std::vector<double>>();
+    params.y_scale = scaler_data["y_scale"].get<std::vector<double>>();
+    params.feature_columns = scaler_data["feature_columns"].get<std::vector<std::string>>();
+    return params;
+}
+
+// Preprocessing function
 struct PreprocessedData {
     torch::Tensor seq_input;
     torch::Tensor scalar_input;
     double execution_time_ms;
 };
 
-PreprocessedData preprocess_features(const std::map<std::string, double>& features) {
-    // Define important and dropped features
-    std::vector<std::string> low_importance_features = {
-        "op_cast", "op_selfcall", "memory_pointwise_1", "memory_transpose_1", "memory_broadcast_1",
-        "memory_slice_1", "op_select", "op_not", "op_and", "op_ne", "op_mod", "memory_pointwise_2",
-        "memory_broadcast_2", "memory_slice_2", "memory_transpose_2", "op_externcall", "op_imagecall",
-        "op_param", "memory_pointwise_3", "memory_transpose_3", "op_sub", "memory_pointwise_0", "op_let"
-    };
-    std::vector<std::string> skewed_features = {
-        "cache_hits", "bytes_processing_rate", "sched_bytes_at_task", "computation_efficiency"
-    };
-
-    // Create feature vector
+PreprocessedData preprocess_features(const std::map<std::string, double>& features, const ScalerParams& scaler_params) {
+    // Create sequence input (sequence_length=3)
+    const int sequence_length = 3;
     std::vector<double> feature_vector;
     for (const auto& key : FIXED_FEATURES) {
         feature_vector.push_back(features.at(key));
     }
-
-    // Simulate sequence data (sequence_length=3)
-    const int sequence_length = 3;
     std::vector<std::vector<double>> seq_data(sequence_length, feature_vector);
     torch::Tensor seq_tensor = torch::from_blob(seq_data.data(), {sequence_length, static_cast<int64_t>(FIXED_FEATURES.size())})
                                   .reshape({1, sequence_length, static_cast<int64_t>(FIXED_FEATURES.size())}).to(torch::kFloat32);
 
     // Create scalar features
     std::map<std::string, double> scalar_features = features;
-    for (const auto& feature : low_importance_features) {
+    for (const auto& feature : LOW_IMPORTANCE_FEATURES) {
         scalar_features.erase(feature);
     }
 
     // Log transform skewed features
-    for (const auto& feature : skewed_features) {
+    for (const auto& feature : SKEWED_FEATURES) {
         if (scalar_features.find(feature) != scalar_features.end()) {
             scalar_features["log_" + feature] = std::log1p(scalar_features[feature]);
             scalar_features.erase(feature);
         }
     }
 
-    // Remove constant columns (simplified: assume same columns as Python)
-    std::vector<std::string> scalar_columns;
-    for (const auto& kv : scalar_features) {
-        if (kv.first != "execution_time_ms") { // Exclude target
-            scalar_columns.push_back(kv.first);
-        }
-    }
+    // Remove constant columns (assumed same as training)
+    std::vector<std::string> scalar_columns = scaler_params.feature_columns;
+
+    // Create scalar vector
     std::vector<double> scalar_vector;
     for (const auto& col : scalar_columns) {
         scalar_vector.push_back(scalar_features[col]);
     }
 
-    // Apply RobustScaler (approximate with fixed values from Python training)
-    // Note: For exact scaling, you should save scaler parameters from Python and load them here
-    std::vector<double> scalar_scaled(scalar_vector.size(), 0.0);
+    // Apply RobustScaler
+    std::vector<double> scalar_scaled(scalar_vector.size());
     for (size_t i = 0; i < scalar_vector.size(); ++i) {
-        // Placeholder: Assume mean=0, scale=1 for simplicity
-        scalar_scaled[i] = scalar_vector[i]; // Replace with actual scaling
+        scalar_scaled[i] = (scalar_vector[i] - scaler_params.x_scalar_center[i]) / scaler_params.x_scalar_scale[i];
+        if (!std::isfinite(scalar_scaled[i])) {
+            scalar_scaled[i] = 0.0; // Handle NaN/inf
+        }
     }
     torch::Tensor scalar_tensor = torch::from_blob(scalar_scaled.data(), {1, static_cast<int64_t>(scalar_scaled.size())})
                                      .to(torch::kFloat32);
@@ -225,83 +248,87 @@ PreprocessedData preprocess_features(const std::map<std::string, double>& featur
     return {seq_tensor, scalar_tensor, features.at("execution_time_ms")};
 }
 
-int main() {
+int main(int argc, char* argv[]) {
     try {
+        // Check for input JSON file
+        if (argc != 2) {
+            std::cerr << "Usage: " << argv[0] << " <input_json_file>" << std::endl;
+            return -1;
+        }
+        std::string input_json_file = argv[1];
+
+        // Initialize CUDA if available
+        torch::Device device(torch::kCPU);
+        if (torch::cuda::is_available()) {
+            device = torch::Device(torch::kCUDA);
+            std::cout << "Using CUDA device" << std::endl;
+        } else {
+            std::cout << "CUDA not available. Using CPU." << std::endl;
+        }
+
+        // Load scaler parameters
+        ScalerParams scaler_params;
+        try {
+            scaler_params = load_scaler_params("scaler_params.json");
+        } catch (const std::exception& e) {
+            std::cerr << "Error loading scaler_params.json: " << e.what() << std::endl;
+            return -1;
+        }
+
         // Load the model
         torch::jit::script::Module module;
         try {
             module = torch::jit::load("model.pt");
             module.eval();
-            module.to(torch::kCUDA); // Use CUDA if available
+            module.to(device);
         } catch (const c10::Error& e) {
             std::cerr << "Error loading the model: " << e.what() << std::endl;
             return -1;
         }
 
-        // Process Tree_Output directory
-        std::string main_dir = "Tree_Output";
-        std::vector<std::string> file_paths;
-        for (const auto& entry : std::filesystem::recursive_directory_iterator(main_dir)) {
-            if (entry.path().filename() == "tree_representation.json") {
-                file_paths.push_back(entry.path().string());
-            }
+        // Read JSON file
+        std::ifstream ifs(input_json_file);
+        if (!ifs.is_open()) {
+            std::cerr << "Error: Could not open " << input_json_file << std::endl;
+            return -1;
+        }
+        json json_data;
+        try {
+            ifs >> json_data;
+        } catch (const json::parse_error& e) {
+            std::cerr << "Error parsing " << input_json_file << ": " << e.what() << std::endl;
+            return -1;
         }
 
-        std::vector<std::string> invalid_files;
-        std::vector<std::pair<std::string, double>> predictions;
-
-        for (const auto& file_path : file_paths) {
-            // Read JSON file
-            std::ifstream ifs(file_path);
-            json json_data;
-            try {
-                ifs >> json_data;
-            } catch (const json::parse_error& e) {
-                std::cerr << "Error parsing " << file_path << ": " << e.what() << std::endl;
-                invalid_files.push_back(file_path);
-                continue;
-            }
-
-            // Extract features
-            auto features = extract_features(json_data);
-            if (features["execution_time_ms"] <= 0 || !std::isfinite(features["execution_time_ms"])) {
-                std::cerr << "Invalid execution time in " << file_path << std::endl;
-                invalid_files.push_back(file_path);
-                continue;
-            }
-
-            // Preprocess features
-            auto preprocessed = preprocess_features(features);
-            auto seq_input = preprocessed.seq_input.to(torch::kCUDA);
-            auto scalar_input = preprocessed.scalar_input.to(torch::kCUDA);
-
-            // Perform inference
-            torch::NoGradGuard no_grad;
-            std::vector<torch::jit::IValue> inputs = {seq_input, scalar_input};
-            auto output = module.forward(inputs).toTensor();
-
-            // Inverse transform (approximate y_scaler and expm1)
-            float pred_scaled = output.item<float>();
-            // Placeholder: Assume y_scaler mean=0, scale=1
-            float pred_transformed = pred_scaled; // Replace with actual inverse scaling
-            double pred_actual = std::expm1(pred_transformed);
-
-            predictions.emplace_back(file_path, pred_actual);
-            std::cout << "File: " << file_path << "\n"
-                      << "  Predicted execution time: " << pred_actual << " ms\n"
-                      << "  Actual execution time: " << features["execution_time_ms"] << " ms\n";
+        // Extract features
+        auto features = extract_features(json_data);
+        if (features["execution_time_ms"] <= 0 || !std::isfinite(features["execution_time_ms"])) {
+            std::cerr << "Invalid execution time in " << input_json_file << std::endl;
+            return -1;
         }
 
-        // Save invalid files log
-        std::ofstream log_file(main_dir + "/invalid_files_log.txt");
-        log_file << "Files with invalid execution times or errors (skipped):\n";
-        for (const auto& file : invalid_files) {
-            log_file << file << "\n";
-        }
-        log_file.close();
+        // Preprocess features
+        auto preprocessed = preprocess_features(features, scaler_params);
+        auto seq_input = preprocessed.seq_input.to(device);
+        auto scalar_input = preprocessed.scalar_input.to(device);
 
-        std::cout << "Total valid files processed: " << predictions.size() << "\n"
-                  << "Files skipped due to invalid execution times or errors: " << invalid_files.size() << "\n";
+        // Perform inference
+        torch::NoGradGuard no_grad;
+        std::vector<torch::jit::IValue> inputs = {seq_input, scalar_input};
+        auto output = module.forward(inputs).toTensor();
+
+        // Inverse transform prediction
+        float pred_scaled = output.item<float>();
+        float pred_transformed = (pred_scaled * scaler_params.y_scale[0]) + scaler_params.y_center[0];
+        double pred_actual = std::expm1(pred_transformed); // Inverse of log1p
+        pred_actual = std::max(pred_actual, 0.0); // Ensure non-negative
+
+        // Output results
+        std::cout << "File: " << input_json_file << "\n"
+                  << "  Actual execution time: " << features["execution_time_ms"] << " ms\n"
+                  << "  Predicted execution time: " << pred_actual << " ms\n"
+                  << "  Error percentage: " << (features["execution_time_ms"] > 0 ?
+                      std::abs(features["execution_time_ms"] - pred_actual) / features["execution_time_ms"] * 100 : 0.0) << "%\n";
 
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;
