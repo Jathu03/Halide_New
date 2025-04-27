@@ -249,10 +249,11 @@ int main() {
     torch::Tensor scalar_inputs_tensor = torch::cat(scalar_inputs, 0);
 
     // Load the model with the correct type
-    std::shared_ptr<torch::jit::script::Module> model;
+    torch::jit::script::Module model;
     try {
+        // Fixed line: Using the correct return type
         model = torch::jit::load("model.pt");
-        model->eval();
+        model.eval();
     } catch (const c10::Error& e) {
         std::cerr << "Error loading the model: " << e.what() << std::endl;
         return 1;
@@ -260,7 +261,7 @@ int main() {
 
     // Run inference
     std::vector<torch::jit::IValue> inputs = {seq_inputs_tensor, scalar_inputs_tensor};
-    torch::Tensor y_pred_scaled = model->forward(inputs).toTensor();
+    torch::Tensor y_pred_scaled = model.forward(inputs).toTensor();
 
     // Inverse transform predictions
     torch::Tensor y_pred_transformed = y_pred_scaled * y_scale + y_center;
