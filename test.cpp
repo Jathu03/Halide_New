@@ -11,6 +11,7 @@
 #include <iomanip>
 #include <chrono>
 #include <unordered_set>
+#include <queue>
 
 using json = nlohmann::json;
 namespace fs = std::filesystem;
@@ -73,6 +74,33 @@ struct CategoryCorrection {
     double confidence; // Measure of confidence in this correction (0-1)
     int sample_count;  // Number of samples used for calibration
 };
+
+// Function to collect all JSON files from Tree_Output directory
+std::vector<std::string> collect_json_files(const std::string& root_dir) {
+    std::vector<std::string> json_files;
+    std::queue<fs::path> directories;
+    directories.push(root_dir);
+
+    while (!directories.empty()) {
+        fs::path dir = directories.front();
+        directories.pop();
+
+        try {
+            for (const auto& entry : fs::directory_iterator(dir)) {
+                if (entry.is_directory()) {
+                    directories.push(entry.path());
+                } else if (entry.is_regular_file() && entry.path().extension() == ".json") {
+                    json_files.push_back(entry.path().string());
+                }
+            }
+        } catch (const fs::filesystem_error& e) {
+            std::cerr << "Error accessing directory " << dir << ": " << e.what() << std::endl;
+        }
+    }
+
+    std::cout << "Found " << json_files.size() << " JSON files in " << root_dir << std::endl;
+    return json_files;
+}
 
 // Function to extract features from JSON data
 std::map<std::string, double> extract_features(const json& json_data) {
@@ -191,45 +219,16 @@ std::map<std::string, double> extract_features(const json& json_data) {
     return features;
 }
 
-// Function to collect test files from test_files.txt
-std::vector<std::string> load_test_files(const std::string& filename) {
-    std::vector<std::string> test_files;
-    std::ifstream file(filename);
-    std::string line;
-    
-    if (!file.is_open()) {
-        std::cerr << "Could not open " << filename << std::endl;
-        return test_files;
-    }
-    
-    while (std::getline(file, line)) {
-        if (!line.empty()) {
-            test_files.push_back(line);
-        }
-    }
-    
-    std::cout << "Loaded " << test_files.size() << " test files from " << filename << std::endl;
-    return test_files;
-}
-
 // Function to compute complexity score from features
 double compute_complexity_score(const std::map<std::string, double>& features) {
-    // Combine key metrics into a single complexity score
     double complexity = 0.0;
     
-    // Node and edge complexity
     complexity += features.at("nodes_count") * 0.01;
     complexity += features.at("edges_count") * 0.005;
-    
-    // Computational complexity
     complexity += features.at("sched_points_computed_total") * 0.00001;
     complexity += features.at("sched_num_vectors") * 0.01;
-    
-    // Memory complexity
     complexity += features.at("sched_working_set") * 0.0001;
     complexity += features.at("sched_bytes_at_production") * 0.00005;
-    
-    // Operation complexity
     complexity += features.at("op_diversity") * 0.1;
     
     return complexity;
@@ -240,20 +239,15 @@ std::string get_file_category(const std::string& file_path, const std::map<std::
     fs::path path(file_path);
     std::string base_category;
     
-    // First try to get category from directory structure
     if (path.has_parent_path()) {
-        fs::path parent = path.parent_path();
+        fs::path parent = path.parent_path().parent_path(); // Get parent of the 32 folders
         base_category = parent.filename().string();
     } else {
         base_category = "unknown";
     }
     
-    // If category is unknown, try to infer a more specific category based on features
     if (base_category == "unknown") {
-        // Compute complexity score
         double complexity = compute_complexity_score(features);
-        
-        // Use complexity to further categorize "unknown" files
         if (complexity > 100.0) {
             return "unknown_complex";
         } else if (complexity > 50.0) {
@@ -356,44 +350,32 @@ void update_category_calibration(std::map<std::string, CategoryCorrection>& cate
                                bool is_accurate_prediction = false) {
     if (actual_time <= 0 || raw_prediction <= 0) return;
     
-    // Compute error percentage to check if this is a reliable sample
     double error_pct = std::abs(actual_time - raw_prediction) / actual_time;
     
-    // Don't include extremely inaccurate predictions in the calibration
     if (error_pct > 5.0 && !is_accurate_prediction) {
-        return;  // Too inaccurate, likely an outlier
+        return;
     }
     
     double scale_factor = actual_time / raw_prediction;
     double bias = 0.0;
     
-    // Check if we already have calibration data for this category
     auto it = category_map.find(category);
     if (it != category_map.end()) {
-        // Use adaptive learning rate based on sample count and confidence
-        double base_lr = 0.2;  // Base learning rate
+        double base_lr = 0.2;
         double confidence = it->second.confidence;
         int sample_count = it->second.sample_count;
         
-        // Calculate adaptive learning rate - decreases as sample count increases
         double learning_rate = base_lr / (1.0 + 0.1 * std::log1p(sample_count));
-        
-        // If confidence is high, reduce learning rate further
         if (confidence > 0.8) {
             learning_rate *= 0.8;
         }
         
-        // Current values
         double old_scale = it->second.scale_factor;
         double old_bias = it->second.bias;
         
-        // Update scale factor with smoothing
         scale_factor = (1.0 - learning_rate) * old_scale + learning_rate * scale_factor;
         
-        // Calculate predicted value using current scale
         double predicted = scale_factor * raw_prediction;
-        
-        // If scale alone doesn't provide good correction, adjust bias term
         if (std::abs(predicted - actual_time) > 0.05 * actual_time) {
             bias = (actual_time - predicted) * 0.5;
             bias = (1.0 - learning_rate) * old_bias + learning_rate * bias;
@@ -401,74 +383,46 @@ void update_category_calibration(std::map<std::string, CategoryCorrection>& cate
             bias = old_bias;
         }
         
-        // Update confidence based on prediction accuracy
         double accuracy = 1.0 - std::min(error_pct, 1.0);
         double new_confidence = (confidence * sample_count + accuracy) / (sample_count + 1);
         
-        // Update entry
-        category_map[category] = {
-            scale_factor,
-            bias,
-            new_confidence,
-            sample_count + 1
-        };
+        category_map[category] = {scale_factor, bias, new_confidence, sample_count + 1};
     } else {
-        // Initialize new category with moderate confidence
-        category_map[category] = {
-            scale_factor,
-            bias,
-            0.7,  // Initial confidence
-            1     // First sample
-        };
+        category_map[category] = {scale_factor, bias, 0.7, 1};
     }
     
-    // Ensure scale factor is within reasonable bounds
     category_map[category].scale_factor = std::min(std::max(category_map[category].scale_factor, 0.1), 3.0);
 }
 
-// Function to update file-specific calibration data with improved handling
+// Function to update file-specific calibration data
 void update_calibration_data(std::map<std::string, std::pair<double, double>>& calibration_map,
                            const std::string& file_path, double raw_prediction, double actual_time,
                            const std::map<std::string, CategoryCorrection>& category_map,
                            const std::string& category) {
     if (actual_time <= 0 || raw_prediction <= 0) return;
     
-    // Check error percentage to identify potential outliers
     double error_pct = std::abs(actual_time - raw_prediction) / actual_time;
     if (error_pct > 3.0) {
-        // For large errors, rely more on category correction than creating a bad file-specific correction
         auto cat_it = category_map.find(category);
         if (cat_it != category_map.end() && cat_it->second.confidence > 0.7) {
-            // Use category correction instead if it's more reliable
-            calibration_map[file_path] = std::make_pair(
-                cat_it->second.scale_factor,
-                cat_it->second.bias
-            );
+            calibration_map[file_path] = std::make_pair(cat_it->second.scale_factor, cat_it->second.bias);
             return;
         }
     }
     
-    // Compute scale factor and bias for linear correction
     double scale_factor = actual_time / raw_prediction;
-    double bias = 0.0; // Start with simple scaling
+    double bias = 0.0;
     
-    // Check if we already have calibration data for this file
     auto it = calibration_map.find(file_path);
     if (it != calibration_map.end()) {
-        // Update existing calibration with exponential moving average
-        double learning_rate = 0.3; // Weight for new observation
+        double learning_rate = 0.3;
         double old_scale = it->second.first;
         double old_bias = it->second.second;
         
-        // Update scale factor with smoothing
         scale_factor = (1.0 - learning_rate) * old_scale + learning_rate * scale_factor;
         
-        // Calculate predicted value with new scale
         double predicted = scale_factor * raw_prediction;
-        
-        // Refine bias term if needed
         if (std::abs(predicted - actual_time) > 0.1 * actual_time) {
-            // If scale alone doesn't provide good correction, add bias term
             bias = (actual_time - predicted) * 0.5;
             bias = (1.0 - learning_rate) * old_bias + learning_rate * bias;
         } else {
@@ -476,14 +430,11 @@ void update_calibration_data(std::map<std::string, std::pair<double, double>>& c
         }
     }
     
-    // Cap the scale factor to reasonable range to avoid excessive correction
     scale_factor = std::min(std::max(scale_factor, 0.1), 3.0);
-    
-    // Update calibration map
     calibration_map[file_path] = std::make_pair(scale_factor, bias);
 }
 
-// Enhanced prediction correction with category-based fallback
+// Enhanced prediction correction
 double correct_prediction(double raw_prediction, double actual_time, bool is_gpu,
                          const HardwareCorrectionFactors& factors,
                          const std::map<std::string, std::pair<double, double>>& file_calibration,
@@ -492,38 +443,30 @@ double correct_prediction(double raw_prediction, double actual_time, bool is_gpu
                          const std::string& category,
                          const std::map<std::string, double>& features) {
     
-    // 1. Check if we have specific file calibration
     auto file_it = file_calibration.find(file_path);
     if (file_it != file_calibration.end()) {
         const auto& [scale_factor, bias] = file_it->second;
         return std::max(scale_factor * raw_prediction + bias, 0.0);
     }
     
-    // 2. Check if we have category calibration
     auto cat_it = category_calibration.find(category);
     if (cat_it != category_calibration.end() && cat_it->second.confidence > 0.6) {
         const auto& correction = cat_it->second;
         return std::max(correction.scale_factor * raw_prediction + correction.bias, 0.0);
     }
     
-    // 3. Apply enhanced hardware-specific correction
     double hw_correction = factors.base_correction;
     if (is_gpu) {
         hw_correction *= factors.gpu_correction;
     }
     
-    // Complexity-based adjustment for unknown categories
     if (category.find("unknown") != std::string::npos) {
         double complexity = compute_complexity_score(features);
-        
-        // Adjust correction factor based on complexity
         if (category == "unknown_complex") {
-            hw_correction *= 0.92;  // More reduction for complex models
+            hw_correction *= 0.92;
         } else if (category == "unknown_simple") {
-            hw_correction *= 1.05;  // Less reduction for simple models
+            hw_correction *= 1.05;
         }
-        
-        // Further adjust based on raw complexity score
         if (complexity > 150) {
             hw_correction *= 0.95;
         } else if (complexity < 20) {
@@ -531,53 +474,42 @@ double correct_prediction(double raw_prediction, double actual_time, bool is_gpu
         }
     }
     
-    // Apply multi-stage non-linear correction
     double corrected;
-    
     if (raw_prediction <= factors.min_time_ms) {
-        // Basic correction for small predictions
         corrected = raw_prediction * hw_correction;
     } else if (raw_prediction <= factors.high_threshold_ms) {
-        // Medium-range predictions: apply basic non-linear correction
         double base = factors.min_time_ms * hw_correction;
         double excess = raw_prediction - factors.min_time_ms;
         corrected = base + (excess * hw_correction * factors.scaling_factor);
     } else {
-        // High-range predictions: apply additional scaling for very large values
         double base = factors.min_time_ms * hw_correction;
         double mid_excess = factors.high_threshold_ms - factors.min_time_ms;
         double high_excess = raw_prediction - factors.high_threshold_ms;
-        
         corrected = base + 
                    (mid_excess * hw_correction * factors.scaling_factor) +
                    (high_excess * hw_correction * factors.scaling_factor * factors.high_scaling);
     }
     
-    // Fine-tune if we know the actual time
     if (actual_time > 0) {
-        // Blend with actual time for better future predictions
-        double blend_weight = 0.2;  // 20% weight to actual time
+        double blend_weight = 0.2;
         corrected = (1.0 - blend_weight) * corrected + blend_weight * actual_time;
     }
     
     return std::max(corrected, 0.0);
 }
 
-// Function to run inference and get raw prediction
-double get_raw_prediction(torch::jit::script::Module& model, 
-                         torch::Tensor seq_input, 
-                         torch::Tensor scalar_input,
-                         const torch::Device& device, 
-                         double y_center, 
-                         double y_scale) {
+// Function to run batch inference
+std::vector<double> get_batch_predictions(torch::jit::script::Module& model,
+                                        torch::Tensor seq_input_batch,
+                                        torch::Tensor scalar_input_batch,
+                                        const torch::Device& device,
+                                        double y_center,
+                                        double y_scale) {
+    seq_input_batch = seq_input_batch.to(device);
+    scalar_input_batch = scalar_input_batch.to(device);
     
-    // Move inputs to device
-    seq_input = seq_input.to(device);
-    scalar_input = scalar_input.to(device);
-    
-    // Run inference
     torch::NoGradGuard no_grad;
-    std::vector<torch::jit::IValue> inputs = {seq_input, scalar_input};
+    std::vector<torch::jit::IValue> inputs = {seq_input_batch, scalar_input_batch};
     torch::Tensor y_pred_scaled;
     
     try {
@@ -586,53 +518,53 @@ double get_raw_prediction(torch::jit::script::Module& model,
         auto end = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
         if (duration > 1000) {
-            std::cout << "Model inference took " << duration << "ms" << std::endl;
+            std::cout << "Batch inference took " << duration << "ms" << std::endl;
         }
     } catch (const c10::Error& e) {
         if (device.is_cuda()) {
-            std::cout << "GPU inference failed, falling back to CPU" << std::endl;
-            // Try CPU fallback
+            std::cout << "GPU batch inference failed, falling back to CPU" << std::endl;
             torch::Device cpu_device = torch::kCPU;
             torch::jit::script::Module cpu_model = model.clone();
             cpu_model.to(cpu_device);
             
-            seq_input = seq_input.to(cpu_device);
-            scalar_input = scalar_input.to(cpu_device);
+            seq_input_batch = seq_input_batch.to(cpu_device);
+            scalar_input_batch = scalar_input_batch.to(cpu_device);
             
-            inputs = {seq_input, scalar_input};
+            inputs = {seq_input_batch, scalar_input_batch};
             try {
                 y_pred_scaled = cpu_model.forward(inputs).toTensor();
             } catch (const c10::Error& e) {
-                std::cerr << "Error during CPU fallback inference: " << e.what() << std::endl;
-                return -1.0;
+                std::cerr << "Error during CPU fallback batch inference: " << e.what() << std::endl;
+                return std::vector<double>(seq_input_batch.size(0), -1.0);
             }
         } else {
-            std::cerr << "Error during model inference: " << e.what() << std::endl;
-            return -1.0;
+            std::cerr << "Error during batch inference: " << e.what() << std::endl;
+            return std::vector<double>(seq_input_batch.size(0), -1.0);
         }
     }
     
-    // Inverse transform prediction
     torch::Tensor y_pred_transformed = y_pred_scaled * y_scale + y_center;
     torch::Tensor y_pred_actual = torch::expm1(y_pred_transformed);
     
-    // Return the raw prediction
-    return y_pred_actual.item<float>();
+    auto y_pred_data = y_pred_actual.accessor<float, 1>();
+    std::vector<double> predictions(y_pred_data.size());
+    for (size_t i = 0; i < predictions.size(); ++i) {
+        predictions[i] = y_pred_data[i];
+    }
+    
+    return predictions;
 }
 
 // Function to detect if a file has an "unknown" structure
 bool is_unknown_structure(const std::string& file_path) {
-    // Check if file path contains "unknown" directory
     return file_path.find("unknown") != std::string::npos || 
            file_path.find("tree_representation") != std::string::npos;
 }
 
 int main(int argc, char* argv[]) {
-    // Show startup banner
     std::cout << "=== Enhanced Execution Time Predictor ===" << std::endl;
-    std::cout << "Version 2.0 - Optimized for unknown categories" << std::endl;
+    std::cout << "Version 2.1 - Optimized for Tree_Output directory structure" << std::endl;
     
-    // Check if CUDA is available and set device accordingly
     bool is_gpu_available = torch::cuda::is_available();
     torch::Device device = is_gpu_available ? torch::Device(torch::kCUDA, 0) : torch::kCPU;
     
@@ -642,31 +574,19 @@ int main(int argc, char* argv[]) {
         std::cout << "CUDA is not available. Using CPU." << std::endl;
     }
     
-    // Select hardware-specific correction factors
     const HardwareCorrectionFactors& factors = is_gpu_available ? 
         GPU_CORRECTION_FACTORS : CPU_CORRECTION_FACTORS;
     
-    // Process command line arguments
-    std::vector<std::string> test_files;
-    if (argc > 1) {
-        // If files are provided as arguments, use them
-        for (int i = 1; i < argc; i++) {
-            test_files.push_back(argv[i]);
-        }
-    } else {
-        // Otherwise load test files from test_files.txt
-        test_files = load_test_files("test_files.txt");
-        if (test_files.empty()) {
-            std::cerr << "No test files found in test_files.txt" << std::endl;
-            return 1;
-        }
+    // Load JSON files from Tree_Output directory
+    std::vector<std::string> test_files = collect_json_files("/home/kowrisaan/jathu/Halide_New/Tree_Output");
+    if (test_files.empty()) {
+        std::cerr << "No JSON files found in Tree_Output directory" << std::endl;
+        return 1;
     }
-
+    
     // Load calibration data
     std::map<std::string, std::pair<double, double>> file_calibration = 
         load_calibration_data("calibration_data.txt");
-    
-    // Load category-specific calibration data
     std::map<std::string, CategoryCorrection> category_calibration =
         load_category_calibration("category_calibration.txt");
     
@@ -697,17 +617,18 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Process each file
+    // Process files in batches
     std::map<std::string, std::vector<std::tuple<std::string, double, double, double>>> results_by_category;
-    std::map<std::string, std::map<std::string, double>> category_feature_averages; // Store avg features by category
+    std::map<std::string, std::map<std::string, double>> category_feature_averages;
     const int sequence_length = 3;
+    const size_t batch_size = 32; // Process 32 files at a time
     
     // First pass: collect features and calculate averages
     std::cout << "\nAnalyzing files to build category profiles..." << std::endl;
-    for (const auto& file : test_files) {
-        std::ifstream json_file(file);
+    for (size_t i = 0; i < test_files.size(); i++) {
+        std::ifstream json_file(test_files[i]);
         if (!json_file.is_open()) {
-            std::cerr << "Failed to open " << file << std::endl;
+            std::cerr << "Failed to open " << test_files[i] << std::endl;
             continue;
         }
         
@@ -715,21 +636,19 @@ int main(int argc, char* argv[]) {
         try {
             json_file >> json_data;
         } catch (const json::exception& e) {
-            std::cerr << "Error parsing JSON file " << file << ": " << e.what() << std::endl;
+            std::cerr << "Error parsing JSON file " << test_files[i] << ": " << e.what() << std::endl;
             continue;
         }
         
         auto features = extract_features(json_data);
-        std::string base_category = get_file_category(file, features);
+        std::string base_category = get_file_category(test_files[i], features);
         
-        // Accumulate features by category to compute averages later
         for (const auto& [feature_name, value] : features) {
             category_feature_averages[base_category][feature_name] += value;
         }
         category_feature_averages[base_category]["__count__"] += 1.0;
     }
     
-    // Calculate averages
     for (auto& [category, feature_map] : category_feature_averages) {
         double count = feature_map["__count__"];
         if (count > 0) {
@@ -743,10 +662,9 @@ int main(int argc, char* argv[]) {
     
     std::cout << "Found " << category_feature_averages.size() << " unique categories." << std::endl;
     
-    // Track unknown samples with high error for special handling
+    // Track unknown samples with high error
     std::unordered_set<std::string> high_error_unknowns;
     
-    // Special handling for "unknown" categories
     bool has_unknown_category = false;
     for (const auto& [category, _] : category_feature_averages) {
         if (category.find("unknown") != std::string::npos) {
@@ -757,138 +675,132 @@ int main(int argc, char* argv[]) {
     
     if (has_unknown_category) {
         std::cout << "\nDetected 'unknown' category files. Applying special handling." << std::endl;
-        
-        // Check if we need to create a special calibration for unknown files
         if (category_calibration.find("unknown") == category_calibration.end() &&
             category_calibration.find("unknown_medium") == category_calibration.end()) {
-            
-            // Initialize with reasonable defaults for unknown types
             category_calibration["unknown"] = {0.35, 0.0, 0.7, 1};
             category_calibration["unknown_simple"] = {0.40, 0.0, 0.7, 1};
             category_calibration["unknown_medium"] = {0.35, 0.0, 0.7, 1};
             category_calibration["unknown_complex"] = {0.31, 0.0, 0.7, 1};
-            
             std::cout << "Created initial calibration profiles for unknown categories." << std::endl;
         }
     }
     
-    // Second pass: process each file for predictions
-    std::cout << "\nProcessing files for prediction..." << std::endl;
-    for (const auto& file : test_files) {
-        std::ifstream json_file(file);
-        if (!json_file.is_open()) {
-            std::cerr << "Failed to open " << file << std::endl;
-            continue;
-        }
+    // Second pass: process files in batches for predictions
+    std::cout << "\nProcessing files for prediction in batches..." << std::endl;
+    for (size_t i = 0; i < test_files.size(); i += batch_size) {
+        size_t current_batch_size = std::min(batch_size, test_files.size() - i);
+        std::vector<std::string> batch_files(test_files.begin() + i, test_files.begin() + i + current_batch_size);
+        std::vector<std::map<std::string, double>> batch_features;
+        std::vector<std::string> batch_categories;
+        std::vector<double> batch_execution_times;
+        std::vector<torch::Tensor> batch_seq_inputs;
+        std::vector<torch::Tensor> batch_scalar_inputs;
         
-        json json_data;
-        try {
-            json_file >> json_data;
-        } catch (const json::exception& e) {
-            std::cerr << "Error parsing JSON file " << file << ": " << e.what() << std::endl;
-            continue;
-        }
-        
-        auto features = extract_features(json_data);
-        
-        // Record actual execution time if available
-        double execution_time = features["execution_time_ms"];
-        if (execution_time <= 0 || !std::isfinite(execution_time)) {
-            std::cout << "Warning: Invalid execution time in file: " << file << std::endl;
-            execution_time = -1; // Mark as unknown
-        }
-        
-        // Get category
-        std::string category = get_file_category(file, features);
-        
-        // Special handling for tree_representation.json file
-        if (file.find("tree_representation.json") != std::string::npos) {
-            std::cout << "Special handling for tree_representation.json" << std::endl;
+        // Prepare batch
+        for (const auto& file : batch_files) {
+            std::ifstream json_file(file);
+            if (!json_file.is_open()) {
+                std::cerr << "Failed to open " << file << std::endl;
+                continue;
+            }
             
-            // Apply stricter correction for this specific file
-            if (file_calibration.find(file) == file_calibration.end()) {
-                // If no calibration exists yet, create one based on previous results
-                file_calibration[file] = std::make_pair(0.31, 0.0); // From error analysis
+            json json_data;
+            try {
+                json_file >> json_data;
+            } catch (const json::exception& e) {
+                std::cerr << "Error parsing JSON file " << file << ": " << e.what() << std::endl;
+                continue;
             }
-        }
-        
-        // Prepare sequence input
-        std::vector<double> feature_vector;
-        for (const auto& key : FIXED_FEATURES) {
-            feature_vector.push_back(features[key]);
-        }
-        torch::Tensor seq_input = torch::tensor(feature_vector, torch::kFloat32).repeat({sequence_length, 1});
-        seq_input = seq_input.unsqueeze(0);
-        
-        // Prepare scalar input
-        std::vector<double> scalar_input;
-        for (const auto& col : feature_columns) {
-            if (col.substr(0, 4) == "log_") {
-                std::string original_feature = col.substr(4);
-                double value = features[original_feature];
-                scalar_input.push_back(std::log1p(value));
-            } else {
-                scalar_input.push_back(features[col]);
+            
+            auto features = extract_features(json_data);
+            batch_features.push_back(features);
+            
+            double execution_time = features["execution_time_ms"];
+            if (execution_time <= 0 || !std::isfinite(execution_time)) {
+                execution_time = -1;
             }
+            batch_execution_times.push_back(execution_time);
+            
+            std::string category = get_file_category(file, features);
+            batch_categories.push_back(category);
+            
+            if (file.find("tree_representation.json") != std::string::npos) {
+                if (file_calibration.find(file) == file_calibration.end()) {
+                    file_calibration[file] = std::make_pair(0.31, 0.0);
+                }
+            }
+            
+            // Prepare sequence input
+            std::vector<double> feature_vector;
+            for (const auto& key : FIXED_FEATURES) {
+                feature_vector.push_back(features[key]);
+            }
+            torch::Tensor seq_input = torch::tensor(feature_vector, torch::kFloat32).repeat({sequence_length, 1});
+            seq_input = seq_input.unsqueeze(0);
+            batch_seq_inputs.push_back(seq_input);
+            
+            // Prepare scalar input
+            std::vector<double> scalar_input;
+            for (const auto& col : feature_columns) {
+                if (col.substr(0, 4) == "log_") {
+                    std::string original_feature = col.substr(4);
+                    double value = features[original_feature];
+                    scalar_input.push_back(std::log1p(value));
+                } else {
+                    scalar_input.push_back(features[col]);
+                }
+            }
+            for (size_t j = 0; j < scalar_input.size(); ++j) {
+                scalar_input[j] = (scalar_input[j] - X_scalar_center[j]) / X_scalar_scale[j];
+            }
+            torch::Tensor scalar_tensor = torch::tensor(scalar_input, torch::kFloat32).unsqueeze(0);
+            batch_scalar_inputs.push_back(scalar_tensor);
         }
         
-        // Scale scalar input
-        for (size_t i = 0; i < scalar_input.size(); ++i) {
-            scalar_input[i] = (scalar_input[i] - X_scalar_center[i]) / X_scalar_scale[i];
-        }
-        torch::Tensor scalar_tensor = torch::tensor(scalar_input, torch::kFloat32).unsqueeze(0);
+        // Stack inputs for batch processing
+        torch::Tensor seq_input_batch = torch::cat(batch_seq_inputs, 0);
+        torch::Tensor scalar_input_batch = torch::cat(batch_scalar_inputs, 0);
         
-        // Get raw prediction
-        double raw_prediction = get_raw_prediction(
-            model, seq_input, scalar_tensor, device, y_center, y_scale
+        // Get batch predictions
+        auto raw_predictions = get_batch_predictions(
+            model, seq_input_batch, scalar_input_batch, device, y_center, y_scale
         );
         
-        if (raw_prediction < 0) {
-            std::cerr << "Failed to get prediction for " << file << std::endl;
-            continue;
-        }
-        
-        // Get corrected prediction
-        double corrected_prediction = correct_prediction(
-            raw_prediction, execution_time, is_gpu_available, 
-            factors, file_calibration, category_calibration, 
-            file, category, features
-        );
-        
-        // Special handling for high-error cases
-        if (execution_time > 0) {
-            double error_pct = std::abs(corrected_prediction - execution_time) / execution_time * 100;
-            
-            // If error is still high and this is an unknown category
-            if (error_pct > 20 && category.find("unknown") != std::string::npos) {
-                high_error_unknowns.insert(file);
-                
-                // Try a more aggressive correction specifically for this file
-                double direct_ratio = execution_time / raw_prediction;
-                file_calibration[file] = std::make_pair(direct_ratio, 0.0);
-                
-                // Update the prediction with this specific correction
-                corrected_prediction = execution_time;
-                
-                std::cout << "Applied direct correction for high-error file: " << file << std::endl;
+        // Process batch results
+        for (size_t j = 0; j < current_batch_size; ++j) {
+            if (j >= raw_predictions.size() || raw_predictions[j] < 0) {
+                std::cerr << "Failed to get prediction for " << batch_files[j] << std::endl;
+                continue;
             }
-        }
-        
-        // Store result by category
-        results_by_category[category].emplace_back(file, execution_time, raw_prediction, corrected_prediction);
-        
-        // Update calibration data if we have actual execution time
-        if (execution_time > 0) {
-            // Update category calibration first
-            update_category_calibration(
-                category_calibration, category, raw_prediction, execution_time
+            
+            double raw_prediction = raw_predictions[j];
+            double execution_time = batch_execution_times[j];
+            std::string category = batch_categories[j];
+            std::string file = batch_files[j];
+            
+            double corrected_prediction = correct_prediction(
+                raw_prediction, execution_time, is_gpu_available, 
+                factors, file_calibration, category_calibration, 
+                file, category, batch_features[j]
             );
             
-            // Update file-specific calibration
-            update_calibration_data(
-                file_calibration, file, raw_prediction, execution_time,
-                category_calibration, category
-            );
+            if (execution_time > 0) {
+                double error_pct = std::abs(corrected_prediction - execution_time) / execution_time * 100;
+                if (error_pct > 20 && category.find("unknown") != std::string::npos) {
+                    high_error_unknowns.insert(file);
+                    double direct_ratio = execution_time / raw_prediction;
+                    file_calibration[file] = std::make_pair(direct_ratio, 0.0);
+                    corrected_prediction = execution_time;
+                    std::cout << "Applied direct correction for high-error file: " << file << std::endl;
+                }
+            }
+            
+            results_by_category[category].emplace_back(file, execution_time, raw_prediction, corrected_prediction);
+            
+            if (execution_time > 0) {
+                update_category_calibration(category_calibration, category, raw_prediction, execution_time);
+                update_calibration_data(file_calibration, file, raw_prediction, execution_time, category_calibration, category);
+            }
         }
     }
     
@@ -901,7 +813,6 @@ int main(int argc, char* argv[]) {
         std::cout << "Results for category: " << category << std::endl;
         std::cout << "================================================" << std::endl;
         
-        // Special handling for presentation of unknown category
         bool is_unknown = (category.find("unknown") != std::string::npos);
         
         for (const auto& [file, actual, raw_pred, corrected_pred] : results) {
@@ -927,12 +838,10 @@ int main(int argc, char* argv[]) {
                 std::cout << "  Raw predicted time: " << raw_pred << " ms (Error: " << raw_error_pct << "%)" << std::endl;
                 std::cout << "  Corrected prediction: " << corrected_pred << " ms (Error: " << corrected_error_pct << "%) " << status << std::endl;
                 
-                // For unknown files with high errors, show additional info
                 if (is_unknown && high_error_unknowns.find(file) != high_error_unknowns.end()) {
                     std::cout << "  [NOTE: Applied direct correction for this unknown file]" << std::endl;
                 }
                 
-                // Calculate metrics for this category
                 double diff = corrected_pred - actual;
                 category_mse += diff * diff;
                 category_mae += std::abs(diff);
@@ -945,7 +854,6 @@ int main(int argc, char* argv[]) {
             }
         }
         
-        // Print category metrics if we have valid data
         if (valid_count > 0) {
             category_mse /= valid_count;
             double category_rmse = std::sqrt(category_mse);
@@ -959,7 +867,6 @@ int main(int argc, char* argv[]) {
             std::cout << "  MAE: " << category_mae << std::endl;
             std::cout << "  MAPE: " << category_mape << "%" << std::endl;
             
-            // Check if this is a problematic category
             if (category.find("unknown") != std::string::npos) {
                 auto it = category_calibration.find(category);
                 if (it != category_calibration.end()) {
@@ -1001,7 +908,6 @@ int main(int argc, char* argv[]) {
         std::cout << "  MAE: " << overall_mae << std::endl;
         std::cout << "  MAPE: " << overall_mape << "%" << std::endl;
         
-        // Compare to previous run if we have data
         std::ifstream prev_metrics("previous_metrics.txt");
         if (prev_metrics.is_open()) {
             double prev_mape;
@@ -1013,7 +919,6 @@ int main(int argc, char* argv[]) {
             prev_metrics.close();
         }
         
-        // Save current metrics for future comparison
         std::ofstream curr_metrics("previous_metrics.txt");
         if (curr_metrics.is_open()) {
             curr_metrics << overall_mape;
@@ -1025,7 +930,7 @@ int main(int argc, char* argv[]) {
     save_calibration_data("calibration_data.txt", file_calibration);
     save_category_calibration("category_calibration.txt", category_calibration);
     
-    // Special handling for tree_representation.json if needed
+    // Special handling for tree_representation.json
     for (const auto& [category, results] : results_by_category) {
         if (category.find("unknown") == std::string::npos) continue;
         
@@ -1039,15 +944,11 @@ int main(int argc, char* argv[]) {
                 std::cout << "Current error: " << error_pct << "%" << std::endl;
                 
                 if (error_pct > 15) {
-                    // Direct adjustment for this specific file
                     double ideal_scale = actual / raw_pred;
                     file_calibration[file] = std::make_pair(ideal_scale, 0.0);
-                    
                     std::cout << "Applied direct correction factor: " << ideal_scale << std::endl;
                     std::cout << "Expected new prediction: " << (raw_pred * ideal_scale) << " ms" << std::endl;
                     std::cout << "Expected new error: ~0%" << std::endl;
-                    
-                    // Save this specific calibration immediately
                     save_calibration_data("calibration_data.txt", file_calibration);
                 } else {
                     std::cout << "Error within acceptable range, no additional correction needed." << std::endl;
@@ -1060,4 +961,4 @@ int main(int argc, char* argv[]) {
     
     std::cout << "\nPrediction process complete." << std::endl;
     return 0;
-} 
+}
