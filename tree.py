@@ -41,7 +41,7 @@ FIXED_FEATURES = [
 class TreeNode:
     def __init__(self, name, node_type, features=None):
         self.name = name
-        self.node_type = node_type  # e.g., 'operation', 'scheduling', 'global'
+        self.node_type = node_type
         self.features = features if features else {}
         self.children = []
         self.depth = 0
@@ -65,7 +65,6 @@ def create_tree_representation(json_data):
         for child_data in node_data.get('children', []):
             build_tree(child_data, node)
     
-    # Build tree from JSON children
     for child_data in json_data.get('children', []):
         build_tree(child_data, root)
     
@@ -75,7 +74,6 @@ def create_tree_representation(json_data):
 def extract_tree_features(root):
     tree_features = {}
     
-    # Calculate maximum depth
     def get_max_depth(node):
         if not node.children:
             return node.depth
@@ -83,7 +81,6 @@ def extract_tree_features(root):
     
     tree_features['tree_max_depth'] = get_max_depth(root)
     
-    # Calculate average branching factor
     branching_factors = []
     def collect_branching(node):
         if node.children:
@@ -94,7 +91,6 @@ def extract_tree_features(root):
     collect_branching(root)
     tree_features['tree_avg_branching'] = np.mean(branching_factors) if branching_factors else 0.0
     
-    # Count leaf nodes
     def count_leaves(node):
         if not node.children:
             return 1
@@ -102,7 +98,6 @@ def extract_tree_features(root):
     
     tree_features['tree_leaf_count'] = count_leaves(root)
     
-    # Node type diversity
     node_types = set()
     def collect_node_types(node):
         node_types.add(node.node_type)
@@ -114,25 +109,20 @@ def extract_tree_features(root):
     
     return tree_features
 
-# Feature extraction function (modified to include tree features)
+# Feature extraction function
 def extract_features(json_data):
     features = {}
     
-    # Create tree representation
     root = create_tree_representation(json_data)
-    
-    # Extract tree-specific features
     tree_features = extract_tree_features(root)
     features.update(tree_features)
     
-    # Extract global features
     global_node = next((child for child in json_data['children'] if child['name'] == 'Global Features'), None)
     if global_node:
         features['cache_hits'] = global_node.get('cache_hits', 0)
         features['cache_misses'] = global_node.get('cache_misses', 0)
         features['execution_time_ms'] = global_node.get('execution_time_ms', 0)
     
-    # Extract op_histogram features
     op_histogram = defaultdict(int)
     for node in json_data['children']:
         if 'op_histogram' in node:
@@ -141,7 +131,6 @@ def extract_features(json_data):
     for op, count in op_histogram.items():
         features[f'op_{op.lower()}'] = count
     
-    # Extract memory patterns
     memory_patterns = defaultdict(lambda: [0, 0, 0, 0])
     for node in json_data['children']:
         if 'memory_patterns' in node:
@@ -151,7 +140,6 @@ def extract_features(json_data):
         for i, val in enumerate(values):
             features[f'memory_{pattern.lower()}_{i}'] = val
     
-    # Extract scheduling features
     scheduling_keys = [
         'num_realizations', 'num_productions', 'points_computed_total', 'innermost_loop_extent',
         'inner_parallelism', 'outer_parallelism', 'bytes_at_realization', 'bytes_at_production',
@@ -172,7 +160,6 @@ def extract_features(json_data):
         else:
             features[f'sched_{key}'] = scheduling_sums[key]
     
-    # Derived features with division-by-zero protection
     features['total_parallelism'] = features.get('sched_inner_parallelism', 0) + features.get('sched_outer_parallelism', 0)
     features['scheduling_count'] = features.get('sched_num_realizations', 0) + features.get('sched_num_productions', 0)
     features['total_bytes_at_production'] = features.get('sched_bytes_at_production', 0)
@@ -182,7 +169,7 @@ def extract_features(json_data):
     features['memory_pressure'] = (features.get('sched_working_set', 0) /
                                   features.get('sched_bytes_at_root', 1)) if features.get('sched_bytes_at_root', 0) != 0 else 0
     features['memory_utilization_ratio'] = (features.get('sched_unique_bytes_read_per_realization', 0) /
-                                           features.get(' sched_bytes_at_task', 1)) if features.get('sched_bytes_at_task', 0) != 0 else 0
+                                           features.get('sched_bytes_at_task', 1)) if features.get('sched_bytes_at_task', 0) != 0 else 0
     features['bytes_processing_rate'] = (features.get('sched_bytes_at_realization', 0) /
                                         features.get('execution_time_ms', 1)) if features.get('execution_time_ms', 0) != 0 else 0
     features['bytes_per_parallelism'] = (features.get('sched_bytes_at_task', 0) /
@@ -197,18 +184,16 @@ def extract_features(json_data):
     features['nodes_per_schedule'] = nodes_count / (features.get('scheduling_count', 1)) if features.get('scheduling_count', 0) != 0 else 0
     features['op_diversity'] = len([k for k, v in features.items() if k.startswith('op_') and v > 0])
     
-    # Create fixed-length feature vector
     fixed_features = {key: features.get(key, 0.0) for key in FIXED_FEATURES}
     return fixed_features, root
 
-# Process Tree_Output directory, creating tree representations
+# Process Tree_Output directory
 def process_tree_output_directory(main_dir):
     all_features = []
     all_trees = []
     file_names = []
     skipped_files = []
     
-    # Process files, keeping only those with valid execution times
     for root, dirs, files in os.walk(main_dir):
         if 'tree_representation.json' in files:
             file_path = os.path.join(root, 'tree_representation.json')
@@ -230,7 +215,6 @@ def process_tree_output_directory(main_dir):
     if not all_features:
         raise ValueError("No valid JSON files with valid execution times found in Tree_Output directory.")
     
-    # Save skipped files log
     log_path = os.path.join(main_dir, 'skipped_files_log.txt')
     with open(log_path, 'w', encoding='utf-8') as f:
         f.write("Files skipped due to invalid execution times or errors:\n")
@@ -261,7 +245,7 @@ def process_tree_output_directory(main_dir):
     
     return train_features, test_features, list(test_file_names), train_trees, test_trees
 
-# Prepare data for model (modified to handle tree sequences)
+# Prepare data for model
 def prepare_data_for_model(train_features, test_features, train_trees, test_trees):
     important_features = [
         'cache_hits', 'bytes_processing_rate', 'sched_bytes_at_task', 'sched_working_set_at_root',
@@ -269,14 +253,11 @@ def prepare_data_for_model(train_features, test_features, train_trees, test_tree
         'tree_max_depth', 'tree_avg_branching'
     ]
     
-    # Create sequences from tree features
     def tree_to_sequence(tree, max_sequence_length=5):
-        # Perform DFS traversal to create a sequence of node features
         sequence = []
         def dfs(node):
             if len(sequence) >= max_sequence_length:
                 return
-            # Extract node-specific features
             node_features = [
                 node.depth,
                 len(node.children),
@@ -289,23 +270,19 @@ def prepare_data_for_model(train_features, test_features, train_trees, test_tree
                 dfs(child)
         
         dfs(tree)
-        # Pad sequence to fixed length
         while len(sequence) < max_sequence_length:
-            sequence.append([0.0] * 5)  # Pad with zeros
+            sequence.append([0.0] * 5)
         return np.array(sequence[:max_sequence_length])
     
     train_sequences = [tree_to_sequence(tree) for tree in train_trees]
     test_sequences = [tree_to_sequence(tree) for tree in test_trees]
     
-    # Convert to tensors
     train_sequences_padded = torch.FloatTensor(np.array(train_sequences))
     test_sequences_padded = torch.FloatTensor(np.array(test_sequences))
     
-    # Create scalar features DataFrame
     train_scalar_df = pd.DataFrame(train_features)
     test_scalar_df = pd.DataFrame(test_features)
     
-    # Drop low-importance features
     low_importance_features = [
         'op_cast', 'op_selfcall', 'memory_pointwise_1', 'memory_transpose_1', 'memory_broadcast_1',
         'memory_slice_1', 'op_select', 'op_not', 'op_and', 'op_ne', 'op_mod', 'memory_pointwise_2',
@@ -315,7 +292,6 @@ def prepare_data_for_model(train_features, test_features, train_trees, test_tree
     train_scalar_df = train_scalar_df.drop(columns=[col for col in low_importance_features if col in train_scalar_df.columns])
     test_scalar_df = test_scalar_df.drop(columns=[col for col in low_importance_features if col in test_scalar_df.columns])
     
-    # Log transform skewed features
     skewed_features = ['cache_hits', 'bytes_processing_rate', 'sched_bytes_at_task', 'computation_efficiency']
     for feature in skewed_features:
         if feature in train_scalar_df.columns:
@@ -327,12 +303,10 @@ def prepare_data_for_model(train_features, test_features, train_trees, test_tree
     train_scalar_df = train_scalar_df.fillna(0)
     test_scalar_df = test_scalar_df.fillna(0)
     
-    # Remove constant columns
     constant_columns = [col for col in train_scalar_df.columns if train_scalar_df[col].nunique() == 1]
     train_scalar_df = train_scalar_df.drop(columns=constant_columns)
     test_scalar_df = test_scalar_df.drop(columns=constant_columns)
     
-    # Extract execution times
     y_train_raw = np.array([f['execution_time_ms'] for f in train_features])
     y_test_raw = np.array([f['execution_time_ms'] for f in test_features])
     y_train_raw = np.clip(y_train_raw, 0, np.percentile(y_train_raw, 99))
@@ -341,7 +315,6 @@ def prepare_data_for_model(train_features, test_features, train_trees, test_tree
     y_train = np.log1p(y_train_raw).reshape(-1, 1)
     y_test = np.log1p(y_test_raw).reshape(-1, 1)
     
-    # Scale features and targets
     scaler_X_scalar = RobustScaler()
     scaler_y = RobustScaler()
     
@@ -355,7 +328,6 @@ def prepare_data_for_model(train_features, test_features, train_trees, test_tree
     y_train_scaled = np.nan_to_num(y_train_scaled, nan=0.0)
     y_test_scaled = np.nan_to_num(y_test_scaled, nan=0.0)
     
-    # Data augmentation for significant features
     train_sequences_aug = []
     train_scalar_aug = []
     y_train_aug = []
@@ -398,7 +370,7 @@ def prepare_data_for_model(train_features, test_features, train_trees, test_tree
             test_sequences_padded, test_scalar_tensor, y_test_tensor,
             scaler_y, train_sequences_padded.shape[2], train_scalar_tensor.shape[1], train_scalar_df.columns)
 
-# Model definition (unchanged)
+# Model definition
 class MultiHeadAttention(nn.Module):
     def __init__(self, hidden_size, num_heads, dropout_rate=0.1):
         super(MultiHeadAttention, self).__init__()
@@ -487,7 +459,7 @@ class EnhancedRecursiveLSTMModel(nn.Module):
         output = self.output_layer(x)
         return output
 
-# Custom loss function (unchanged)
+# Custom loss function
 def custom_loss(outputs, targets, scalar_inputs, feature_indices, feature_importances, huber_delta=0.5, mae_weight=0.3, l1_lambda=1e-5):
     huber = nn.HuberLoss(delta=huber_delta)(outputs, targets)
     mae = torch.mean(torch.abs(outputs - targets))
@@ -508,7 +480,7 @@ def custom_loss(outputs, targets, scalar_inputs, feature_indices, feature_import
     weighted_mae = (mae * weights).mean()
     return weighted_huber + mae_weight * weighted_mae + l1_reg
 
-# Create data loaders (unchanged)
+# Create data loaders
 def create_data_loaders(train_sequences, train_scalar, y_train, test_sequences, test_scalar, y_test, batch_size=64):
     train_dataset = TensorDataset(train_sequences, train_scalar, y_train)
     test_dataset = TensorDataset(test_sequences, test_scalar, y_test)
@@ -517,7 +489,7 @@ def create_data_loaders(train_sequences, train_scalar, y_train, test_sequences, 
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
     return train_loader, test_loader
 
-# Train model function (unchanged)
+# Modified train_model function with robust checkpoint handling
 def train_model(model, train_loader, test_loader, criterion, optimizer, feature_indices, feature_importances, num_epochs=1000, patience=50, accumulation_steps=2, checkpoint_path='recursive.pth'):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
@@ -540,19 +512,30 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, feature_
     val_losses = []
     start_epoch = 0
     
-    # Check if a checkpoint exists to resume training
+    # Check if a checkpoint exists and try to load it
     if os.path.exists(checkpoint_path):
-        checkpoint = torch.load(checkpoint_path, map_location=device)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        start_epoch = checkpoint['epoch'] + 1
-        best_val_loss = checkpoint['best_val_loss']
-        train_losses = checkpoint['train_losses']
-        val_losses = checkpoint['val_losses']
-        epochs_no_improve = checkpoint['epochs_no_improve']
-        best_model_state = checkpoint['best_model_state']
-        print(f"Resuming training from epoch {start_epoch}")
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location=device)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            start_epoch = checkpoint['epoch'] + 1
+            best_val_loss = checkpoint['best_val_loss']
+            train_losses = checkpoint['train_losses']
+            val_losses = checkpoint['val_losses']
+            epochs_no_improve = checkpoint['epochs_no_improve']
+            best_model_state = checkpoint['best_model_state']
+            print(f"Successfully loaded checkpoint from epoch {start_epoch}")
+        except RuntimeError as e:
+            print(f"Error loading checkpoint due to architecture mismatch: {e}")
+            print(f"Starting training from scratch with new model architecture.")
+            # Reset training parameters
+            start_epoch = 0
+            best_val_loss = float('inf')
+            epochs_no_improve = 0
+            best_model_state = None
+            train_losses = []
+            val_losses = []
     
     for epoch in range(start_epoch, num_epochs):
         model.train()
@@ -601,7 +584,6 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, feature_
         scheduler.step()
         print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
         
-        # Save checkpoint
         checkpoint = {
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
@@ -644,16 +626,12 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, feature_
     
     return train_losses, val_losses
 
-# Resume training function (unchanged)
+# Modified resume_training function
 def resume_training(model, train_loader, test_loader, criterion, optimizer, feature_indices, feature_importances, num_epochs=1000, patience=50, accumulation_steps=2, checkpoint_path='recursive.pth'):
     print(f"Attempting to resume training from checkpoint: {checkpoint_path}")
-    if not os.path.exists(checkpoint_path):
-        print(f"No checkpoint found at {checkpoint_path}. Starting training from scratch.")
-        return train_model(model, train_loader, test_loader, criterion, optimizer, feature_indices, feature_importances, num_epochs, patience, accumulation_steps, checkpoint_path)
-    
     return train_model(model, train_loader, test_loader, criterion, optimizer, feature_indices, feature_importances, num_epochs, patience, accumulation_steps, checkpoint_path)
 
-# Evaluate the model (unchanged)
+# Evaluate the model
 def evaluate_model(model, X_test_seq, X_test_scalar, y_test, y_scaler, file_names_test):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.to(device)
@@ -707,7 +685,7 @@ def evaluate_model(model, X_test_seq, X_test_scalar, y_test, y_scaler, file_name
     
     return y_test_actual, y_pred_actual
 
-# Main function (modified to include tree processing)
+# Main function
 def main(main_dir):
     if torch.cuda.is_available():
         torch.cuda.init()
