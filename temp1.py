@@ -46,32 +46,29 @@ class DeviceManager:
         self.usage_threshold = usage_threshold  # % usage above which device is considered busy
         self.device_loads = {}
         
-        # Check CPU availability
-        self.devices.append(torch.device('cpu'))
-        self.device_loads['cpu'] = {'usage': 0.0, 'memory': 0.0}
-        
-        # Check GPU availability
+        # Check GPU availability first, use only one GPU if available
         if torch.cuda.is_available():
             torch.cuda.init()
-            num_gpus = torch.cuda.device_count()
-            for i in range(num_gpus):
-                device = torch.device(f'cuda:{i}')
-                self.devices.append(device)
-                self.device_loads[f'cuda:{i}'] = {'usage': 0.0, 'memory': 0.0}
-                print(f"Found GPU: {torch.cuda.get_device_name(i)}")
+            device = torch.device('cuda:0')  # Use only the first GPU
+            self.devices.append(device)
+            self.device_loads['cuda:0'] = {'usage': 0.0, 'memory': 0.0}
+            print(f"Found GPU: {torch.cuda.get_device_name(0)}")
         else:
             print("No GPUs available. Using CPU only.")
+            self.devices.append(torch.device('cpu'))
+            self.device_loads['cpu'] = {'usage': 0.0, 'memory': 0.0}
         
         print(f"Available devices: {[str(d) for d in self.devices]}")
 
     def update_device_loads(self):
         # Update CPU load
-        cpu_usage = psutil.cpu_percent(interval=0.1)
-        cpu_memory = psutil.virtual_memory().percent
-        self.device_loads['cpu']['usage'] = cpu_usage
-        self.device_loads['cpu']['memory'] = cpu_memory
+        if 'cpu' in self.device_loads:
+            cpu_usage = psutil.cpu_percent(interval=0.1)
+            cpu_memory = psutil.virtual_memory().percent
+            self.device_loads['cpu']['usage'] = cpu_usage
+            self.device_loads['cpu']['memory'] = cpu_memory
         
-        # Update GPU loads
+        # Update GPU load
         for device in self.devices:
             if device.type == 'cuda':
                 torch.cuda.synchronize(device)
@@ -79,15 +76,13 @@ class DeviceManager:
                 memory_reserved = torch.cuda.memory_reserved(device) / 1024**3  # GB
                 total_memory = torch.cuda.get_device_properties(device).total_memory / 1024**3  # GB
                 memory_usage = (memory_allocated / total_memory) * 100 if total_memory > 0 else 0
-                # Approximate GPU usage (requires NVIDIA tools or approximation)
-                # Here, we use memory usage as a proxy for load
                 self.device_loads[str(device)]['usage'] = memory_usage
                 self.device_loads[str(device)]['memory'] = memory_usage
 
     def get_least_loaded_device(self):
         self.update_device_loads()
         least_load = float('inf')
-        best_device = self.devices[0]  # Default to CPU
+        best_device = self.devices[0]  # Default to first device (CPU or cuda:0)
         
         for device in self.devices:
             device_str = str(device)
@@ -100,37 +95,8 @@ class DeviceManager:
         return best_device
 
     def distribute_batch(self, batch, batch_size):
-        # Split batch across devices based on load
-        self.update_device_loads()
-        available_devices = [d for d in self.devices if max(self.device_loads[str(d)]['usage'], 
-                                                            self.device_loads[str(d)]['memory']) < self.usage_threshold]
-        if not available_devices:
-            print("All devices are busy. Using least loaded device.")
-            available_devices = [self.get_least_loaded_device()]
-        
-        num_devices = len(available_devices)
-        if num_devices == 1:
-            return [(available_devices[0], batch)]
-        
-        # Split batch proportionally based on device load
-        batch_splits = []
-        total_load = sum(max(self.device_loads[str(d)]['usage'], self.device_loads[str(d)]['memory']) for d in available_devices)
-        if total_load == 0:
-            total_load = 1e-8  # Avoid division by zero
-        
-        remaining_size = batch_size
-        for i, device in enumerate(available_devices):
-            device_load = max(self.device_loads[str(device)]['usage'], self.device_loads[str(device)]['memory'])
-            # Inverse load: less loaded devices get more data
-            inverse_load = (total_load - device_load) if total_load > device_load else 1e-8
-            proportion = inverse_load / sum((total_load - max(self.device_loads[str(d)]['usage'], 
-                                                              self.device_loads[str(d)]['memory'])) 
-                                            for d in available_devices)
-            split_size = int(proportion * batch_size) if i < num_devices - 1 else remaining_size
-            batch_splits.append((device, split_size))
-            remaining_size -= split_size
-        
-        return batch_splits
+        # Since we're using only one device, assign the entire batch to it
+        return [(self.devices[0], batch_size)]
 
 # Feature extraction function
 def extract_features(json_data):
@@ -488,7 +454,7 @@ def custom_loss(outputs, targets, schedule_inputs, feature_indices, feature_impo
     return weighted_huber + mae_weight * weighted_mae + l1_reg
 
 # Create data loaders with optimized workers
-def create_data_loaders(train_program, train_schedule, y_train, test_program, test_schedule, y_test, batch_size=64):
+def create_data_loaders(train_program, train_schedule, y_train, test_program, test_schedule, y_test, batch_size=16):  # Reduced batch size to 16
     # Optimize number of workers based on CPU cores
     num_workers = min(os.cpu_count(), 4)  # Limit to 4 to avoid overloading CPU
     print(f"Using {num_workers} workers for DataLoader")
@@ -502,11 +468,14 @@ def create_data_loaders(train_program, train_schedule, y_train, test_program, te
 
 # Train the model with distributed workload
 def train_model(model, train_loader, test_loader, criterion, optimizer, feature_indices, feature_importances, 
-                device_manager, num_epochs=1000, patience=50, accumulation_steps=2):
-    # Create a model copy for each device
-    models = {}
-    optimizers = {}
-    for device in device_manager.devices:
+                device_manager, num_epochs=1000, patience=50, accumulation_steps=4):  # Increased accumulation_steps to 4
+    # Clear GPU memory before training
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
+    # Create a model copy for the single device
+    device = device_manager.devices[0]
+    try:
         model_copy = SimpleLSTMModel(
             program_input_size=model.program_fc.in_features,
             schedule_input_size=model.schedule_fc.in_features,
@@ -518,9 +487,17 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, feature_
         model_copy.load_state_dict(model.state_dict())
         model_copy.to(device)
         model_copy.train()
-        models[device] = model_copy
-        optimizers[device] = optim.AdamW(model_copy.parameters(), lr=0.00005, weight_decay=1e-4)
+    except RuntimeError as e:
+        if "out of memory" in str(e):
+            print(f"GPU out of memory on {device}. Falling back to CPU.")
+            device = torch.device('cpu')
+            model_copy.to(device)
+            model_copy.train()
+        else:
+            raise e
     
+    models = {device: model_copy}
+    optimizers = {device: optim.AdamW(model_copy.parameters(), lr=0.00005, weight_decay=1e-4)}
     schedulers = {device: CosineAnnealingWarmRestarts(opt, T_0=50, T_mult=2, eta_min=1e-6) for device, opt in optimizers.items()}
     
     best_val_loss = float('inf')
@@ -535,32 +512,32 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, feature_
         
         for i, (program_inputs, schedule_inputs, targets) in enumerate(train_loader):
             batch_size = program_inputs.size(0)
-            # Distribute batch across devices
+            # Distribute batch (single device, so entire batch goes to device[0])
             batch_splits = device_manager.distribute_batch((program_inputs, schedule_inputs, targets), batch_size)
             
             batch_loss = 0.0
             batch_samples = 0
             
-            for device, split_size in batch_splits:
+            for dev, split_size in batch_splits:
                 if split_size == 0:
                     continue
                 
                 # Split the batch
                 start_idx = batch_samples
                 end_idx = start_idx + split_size
-                prog_batch = program_inputs[start_idx:end_idx].to(device)
-                sched_batch = schedule_inputs[start_idx:end_idx].to(device)
-                target_batch = targets[start_idx:end_idx].to(device)
+                prog_batch = program_inputs[start_idx:end_idx].to(dev)
+                sched_batch = schedule_inputs[start_idx:end_idx].to(dev)
+                target_batch = targets[start_idx:end_idx].to(dev)
                 
-                model_copy = models[device]
-                optimizer_copy = optimizers[device]
+                model_copy = models[dev]
+                optimizer_copy = optimizers[dev]
                 optimizer_copy.zero_grad()
                 
                 outputs = model_copy(prog_batch, sched_batch)
                 loss = criterion(outputs, target_batch, sched_batch, feature_indices, feature_importances)
                 
                 if torch.isnan(loss) or torch.isinf(loss):
-                    print(f"Invalid loss detected at epoch {epoch+1}, batch {i+1} on {device}")
+                    print(f"Invalid loss detected at epoch {epoch+1}, batch {i+1} on {dev}")
                     return None, None, None
                 
                 loss = loss / accumulation_steps
@@ -577,38 +554,25 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, feature_
             running_loss += batch_loss
             total_samples += batch_samples
         
-        # Synchronize models across devices by averaging weights
-        with torch.no_grad():
-            avg_state_dict = models[device_manager.devices[0]].state_dict()
-            for key in avg_state_dict.keys():
-                avg_state_dict[key] = torch.zeros_like(avg_state_dict[key])
-                for device in device_manager.devices:
-                    avg_state_dict[key] += models[device].state_dict()[key].cpu()
-                avg_state_dict[key] = avg_state_dict[key] / float(len(device_manager.devices))
-            
-            for device in device_manager.devices:
-                models[device].load_state_dict(avg_state_dict)
-        
+        # No need to average state dict since using single device
         if len(train_loader) % accumulation_steps != 0:
-            for device, optimizer_copy in optimizers.items():
-                torch.nn.utils.clip_grad_norm_(models[device].parameters(), max_norm=1.0)
-                optimizer_copy.step()
-                optimizer_copy.zero_grad()
+            torch.nn.utils.clip_grad_norm_(model_copy.parameters(), max_norm=1.0)
+            optimizers[device].step()
+            optimizers[device].zero_grad()
         
         train_loss = running_loss / len(train_loader.dataset)
         train_losses.append(train_loss)
         
-        # Validation phase (use least loaded device)
-        val_device = device_manager.get_least_loaded_device()
-        models[val_device].eval()
+        # Validation phase
+        model_copy.eval()
         val_loss = 0.0
         val_samples = 0
         with torch.no_grad():
             for program_inputs, schedule_inputs, targets in test_loader:
-                prog_batch = program_inputs.to(val_device)
-                sched_batch = schedule_inputs.to(val_device)
-                target_batch = targets.to(val_device)
-                outputs = models[val_device](prog_batch, sched_batch)
+                prog_batch = program_inputs.to(device)
+                sched_batch = schedule_inputs.to(device)
+                target_batch = targets.to(device)
+                outputs = model_copy(prog_batch, sched_batch)
                 loss = criterion(outputs, target_batch, sched_batch, feature_indices, feature_importances)
                 val_loss += loss.item() * program_inputs.size(0)
                 val_samples += program_inputs.size(0)
@@ -616,15 +580,14 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, feature_
         val_loss /= len(test_loader.dataset)
         val_losses.append(val_loss)
         
-        for device in device_manager.devices:
-            schedulers[device].step()
+        schedulers[device].step()
         
         print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
         
         if val_loss < best_val_loss and not np.isnan(val_loss) and not np.isinf(val_loss):
             best_val_loss = val_loss
             epochs_no_improve = 0
-            best_model_state = models[val_device].state_dict().copy()
+            best_model_state = model_copy.state_dict().copy()
         else:
             epochs_no_improve += 1
         
@@ -633,13 +596,11 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, feature_
             break
         
         # Clear GPU memory
-        for device in device_manager.devices:
-            if device.type == 'cuda':
-                torch.cuda.empty_cache()
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
     
     if best_model_state is not None and epochs_no_improve > 0:
-        for device in device_manager.devices:
-            models[device].load_state_dict(best_model_state)
+        model_copy.load_state_dict(best_model_state)
     
     plt.figure(figsize=(10, 6))
     plt.plot(range(1, len(train_losses) + 1), train_losses, label='Training Loss')
@@ -652,7 +613,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, feature_
     plt.savefig('loss_plot.png')
     plt.close()
     
-    return train_losses, val_losses, models[device_manager.devices[0]]
+    return train_losses, val_losses, model_copy
 
 # Evaluate the model with distributed inference
 def evaluate_model(model, X_test_program, X_test_schedule, y_test, y_scaler, file_names_test, device_manager):
@@ -662,38 +623,19 @@ def evaluate_model(model, X_test_program, X_test_schedule, y_test, y_scaler, fil
     
     # Create a DataLoader for inference
     test_dataset = TensorDataset(X_test_program, X_test_schedule, y_test)
-    test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False, num_workers=min(os.cpu_count(), 4))
+    test_loader = DataLoader(test_dataset, batch_size=16, shuffle=False, num_workers=min(os.cpu_count(), 4))  # Match batch size
     
+    device = device_manager.devices[0]
     for program_inputs, schedule_inputs, targets in test_loader:
-        batch_size = program_inputs.size(0)
-        batch_splits = device_manager.distribute_batch((program_inputs, schedule_inputs, targets), batch_size)
+        prog_batch = program_inputs.to(device)
+        sched_batch = schedule_inputs.to(device)
+        target_batch = targets.to(device)
         
-        y_pred_scaled_batch = []
-        y_test_batch = []
-        idx = 0
+        with torch.no_grad():
+            y_pred_scaled = model(prog_batch, sched_batch)
         
-        for device, split_size in batch_splits:
-            if split_size == 0:
-                continue
-            
-            start_idx = idx
-            end_idx = start_idx + split_size
-            prog_batch = program_inputs[start_idx:end_idx].to(device)
-            sched_batch = schedule_inputs[start_idx:end_idx].to(device)
-            target_batch = targets[start_idx:end_idx].to(device)
-            
-            with torch.no_grad():
-                y_pred_scaled = model(prog_batch, sched_batch)
-            
-            y_pred_scaled_batch.append(y_pred_scaled.cpu())
-            y_test_batch.append(target_batch.cpu())
-            idx += split_size
-        
-        y_pred_scaled_batch = torch.cat(y_pred_scaled_batch, dim=0)
-        y_test_batch = torch.cat(y_test_batch, dim=0)
-        
-        y_pred_transformed = y_scaler.inverse_transform(y_pred_scaled_batch.numpy())
-        y_test_transformed = y_scaler.inverse_transform(y_test_batch.numpy())
+        y_pred_transformed = y_scaler.inverse_transform(y_pred_scaled.cpu().numpy())
+        y_test_transformed = y_scaler.inverse_transform(target_batch.cpu().numpy())
         
         y_pred_actual = np.expm1(y_pred_transformed)
         y_test_actual = np.expm1(y_test_transformed)
@@ -749,7 +691,7 @@ def main(main_dir):
     
     if len(train_program_features) == 0 or len(test_program_features) == 0:
         print("Error: No valid training or test data found")
-        return None
+        return None, None, None, None
     
     (train_program_tensor, train_schedule_tensor, y_train,
      test_program_tensor, test_schedule_tensor, y_test,
@@ -760,7 +702,7 @@ def main(main_dir):
     train_loader, test_loader = create_data_loaders(
         train_program_tensor, train_schedule_tensor, y_train,
         test_program_tensor, test_schedule_tensor, y_test,
-        batch_size=64
+        batch_size=16  # Match batch size
     )
     
     global model
@@ -796,7 +738,7 @@ def main(main_dir):
     train_losses, val_losses, trained_model = train_model(
         model, train_loader, test_loader,
         custom_loss, optimizer, feature_indices, feature_importances,
-        device_manager, num_epochs=1000, patience=50, accumulation_steps=2
+        device_manager, num_epochs=1000, patience=50, accumulation_steps=4  # Match accumulation_steps
     )
     
     if train_losses is None or val_losses is None:
