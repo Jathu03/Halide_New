@@ -106,7 +106,7 @@ def process_tree_output_directory(main_dir):
     combined = list(zip(all_features, file_names))
     random.shuffle(combined)
     all_features, file_names = zip(*combined)
-    test_size = min(60, len(all_features))
+    test_size = min(100, len(all_features))  # Changed from 30 to 100
     train_features = all_features[:-test_size]
     test_features = all_features[-test_size:]
     train_file_names = file_names[:-test_size]
@@ -169,7 +169,7 @@ class EnhancedRecursiveLSTMModel(nn.Module):
         output = self.fc2(x)
         return output
 
-def train_model(model, train_loader, test_loader, optimizer, num_epochs=100, patience=10, use_amp=False):
+def train_model(model, train_loader, test_loader, optimizer, num_epochs=200, patience=10, use_amp=False):
     """Trains the model with early stopping and optional mixed precision."""
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.to(device)
@@ -254,7 +254,7 @@ def main(main_dir,
          batch_size=64,
          learning_rate=0.0005,
          weight_decay=1e-4,
-         num_epochs=100,
+         num_epochs=200,  # Increased from 100 to 200
          patience=10,
          use_amp=False,
          seed=42):
@@ -284,4 +284,4 @@ def main(main_dir,
 
 if __name__ == "__main__":
     main_dir = "Tree_Output"
-    main(main_dir)
+    main(main_dir, num_epochs=200)
