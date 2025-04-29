@@ -40,61 +40,59 @@ const std::vector<std::string> SCHEDULE_FEATURES = {
     "bytes_per_vector", "nodes_per_schedule", "cache_hits_bytes_rate", "bytes_task_parallelism"
 };
 
-// Enhanced hardware-specific correction factors
+// Hardware-specific correction factors
 struct HardwareCorrectionFactors {
     double base_correction;
-    double gpu_correction;    // Additional correction for GPU
-    double scaling_factor;    // For non-linear scaling
-    double min_time_ms;       // Minimum execution time threshold
-    double high_threshold_ms; // Threshold for high-execution time behavior
-    double high_scaling;      // Special scaling for high execution times
+    double gpu_correction;
+    double scaling_factor;
+    double min_time_ms;
+    double high_threshold_ms;
+    double high_scaling;
 };
 
-// Updated correction factors aligned with new model
 const HardwareCorrectionFactors GPU_CORRECTION_FACTORS = {
-    0.25,   // Adjusted for new model
-    0.85,   // Slightly tighter GPU correction
-    0.93,   // More aggressive scaling
-    80.0,   // Lower minimum threshold
-    450.0,  // Adjusted high threshold
-    0.90    // Tighter high scaling
+    0.25, 0.85, 0.93, 80.0, 450.0, 0.90
 };
 
 const HardwareCorrectionFactors CPU_CORRECTION_FACTORS = {
-    0.30,   // Adjusted for new model
-    1.0,    // No GPU correction
-    0.95,   // More aggressive scaling
-    40.0,   // Lower minimum threshold
-    250.0,  // Adjusted high threshold
-    0.92    // Tighter high scaling
+    0.30, 1.0, 0.95, 40.0, 250.0, 0.92
 };
 
 // Category-specific correction factors
 struct CategoryCorrection {
     double scale_factor;
     double bias;
-    double confidence; // Measure of confidence (0-1)
-    int sample_count;  // Number of samples used for calibration
+    double confidence;
+    int sample_count;
 };
 
-// Function to extract features from JSON data, including interaction features
-std::map<std::string, double> extract_features(const json& json_data) {
+// Function to extract features from JSON data with robust error handling
+std::map<std::string, double> extract_features(const json& json_data, const std::string& file_path) {
     std::map<std::string, double> features;
+
+    // Validate that "children" exists and is an array
+    if (!json_data.contains("children") || !json_data["children"].is_array()) {
+        std::cerr << "Error: 'children' field missing or not an array in " << file_path << std::endl;
+        return features; // Return empty features to skip this file
+    }
 
     // Extract global features
     auto global_node = std::find_if(json_data["children"].begin(), json_data["children"].end(),
-        [](const json& child) { return child["name"] == "Global Features"; });
+        [](const json& child) { return child.contains("name") && child["name"] == "Global Features"; });
     if (global_node != json_data["children"].end()) {
         features["cache_hits"] = global_node->value("cache_hits", 0.0);
         features["cache_misses"] = global_node->value("cache_misses", 0.0);
         features["execution_time_ms"] = global_node->value("execution_time_ms", 0.0);
+    } else {
+        std::cout << "Warning: No 'Global Features' node found in " << file_path << std::endl;
     }
 
     // Extract op_histogram features
     std::map<std::string, int> op_histogram;
     for (const auto& node : json_data["children"]) {
-        if (node.contains("op_histogram")) {
+        if (node.contains("op_histogram") && node["op_histogram"].is_object()) {
             for (const auto& [op, count] : node["op_histogram"].items()) {
+                if (!count.is_number()) continue; // Skip invalid counts
                 std::string op_lower = op;
                 std::transform(op_lower.begin(), op_lower.end(), op_lower.begin(), ::tolower);
                 op_histogram[op_lower] += count.get<int>();
@@ -108,8 +106,9 @@ std::map<std::string, double> extract_features(const json& json_data) {
     // Extract memory patterns
     std::map<std::string, std::vector<double>> memory_patterns;
     for (const auto& node : json_data["children"]) {
-        if (node.contains("memory_patterns")) {
+        if (node.contains("memory_patterns") && node["memory_patterns"].is_object()) {
             for (const auto& [pattern, values] : node["memory_patterns"].items()) {
+                if (!values.is_array()) continue; // Skip invalid values
                 std::string pattern_lower = pattern;
                 std::transform(pattern_lower.begin(), pattern_lower.end(), pattern_lower.begin(), ::tolower);
                 if (memory_patterns.find(pattern_lower) == memory_patterns.end()) {
@@ -141,10 +140,12 @@ std::map<std::string, double> extract_features(const json& json_data) {
     std::map<std::string, double> scheduling_sums;
     int node_count = 0;
     for (const auto& node : json_data["children"]) {
-        if (node.contains("scheduling")) {
+        if (node.contains("scheduling") && node["scheduling"].is_object()) {
             node_count++;
             for (const auto& key : scheduling_keys) {
-                scheduling_sums[key] += node["scheduling"].value(key, 0.0);
+                if (node["scheduling"].contains(key) && node["scheduling"][key].is_number()) {
+                    scheduling_sums[key] += node["scheduling"][key].get<double>();
+                }
             }
         }
     }
@@ -176,7 +177,9 @@ std::map<std::string, double> extract_features(const json& json_data) {
     int nodes_count = json_data["children"].size();
     int edges_count = 0;
     for (const auto& node : json_data["children"]) {
-        edges_count += node.value("children", json::array()).size();
+        if (node.contains("children") && node["children"].is_array()) {
+            edges_count += node["children"].size();
+        }
     }
     features["nodes_count"] = nodes_count;
     features["edges_count"] = edges_count;
@@ -224,22 +227,13 @@ std::vector<std::string> load_test_files(const std::string& filename) {
 double compute_complexity_score(const std::map<std::string, double>& features) {
     double complexity = 0.0;
     
-    // Node and edge complexity with log-transformed features
     complexity += std::log1p(features.at("nodes_count")) * 0.02;
     complexity += std::log1p(features.at("edges_count")) * 0.01;
-    
-    // Computational complexity
     complexity += features.at("sched_points_computed_total") * 0.00001;
     complexity += features.at("sched_num_vectors") * 0.01;
-    
-    // Memory complexity
     complexity += features.at("sched_working_set") * 0.0001;
     complexity += features.at("sched_bytes_at_production") * 0.00005;
-    
-    // Operation complexity
     complexity += std::log1p(features.at("op_diversity")) * 0.15;
-    
-    // Interaction feature contribution
     complexity += features.at("op_diversity_nodes") * 0.005;
     
     return complexity;
@@ -257,7 +251,7 @@ std::string get_file_category(const std::string& file_path, const std::map<std::
         base_category = "unknown";
     }
     
-    if (base_category == "unknown") {
+    if (base_category == "unknown" && !features.empty()) {
         double complexity = compute_complexity_score(features);
         if (complexity > 120.0) {
             return "unknown_complex";
@@ -363,7 +357,7 @@ void update_category_calibration(std::map<std::string, CategoryCorrection>& cate
     
     double error_pct = std::abs(actual_time - raw_prediction) / actual_time;
     if (error_pct > 3.0 && !is_accurate_prediction) {
-        return; // Skip outliers
+        return;
     }
     
     double scale_factor = actual_time / raw_prediction;
@@ -371,7 +365,7 @@ void update_category_calibration(std::map<std::string, CategoryCorrection>& cate
     
     auto it = category_map.find(category);
     if (it != category_map.end()) {
-        double base_lr = 0.15; // Reduced learning rate for stability
+        double base_lr = 0.15;
         double confidence = it->second.confidence;
         int sample_count = it->second.sample_count;
         double learning_rate = base_lr / (1.0 + 0.05 * std::log1p(sample_count));
@@ -467,7 +461,7 @@ double correct_prediction(double raw_prediction, double actual_time, bool is_gpu
         hw_correction *= factors.gpu_correction;
     }
     
-    if (category.find("unknown") != std::string::npos) {
+    if (category.find("unknown") != std::string::npos && !features.empty()) {
         double complexity = compute_complexity_score(features);
         if (category == "unknown_complex") {
             hw_correction *= 0.90;
@@ -565,7 +559,7 @@ bool is_unknown_structure(const std::string& file_path) {
 
 int main(int argc, char* argv[]) {
     std::cout << "=== Enhanced Execution Time Predictor ===" << std::endl;
-    std::cout << "Version 3.0 - Optimized for New Model" << std::endl;
+    std::cout << "Version 3.1 - Robust JSON Handling" << std::endl;
     
     bool is_gpu_available = torch::cuda::is_available();
     torch::Device device = is_gpu_available ? torch::Device(torch::kCUDA, 0) : torch::kCPU;
@@ -644,7 +638,12 @@ int main(int argc, char* argv[]) {
             continue;
         }
         
-        auto features = extract_features(json_data);
+        auto features = extract_features(json_data, file);
+        if (features.empty()) {
+            std::cerr << "Skipping " << file << " due to invalid feature extraction" << std::endl;
+            continue;
+        }
+        
         std::string base_category = get_file_category(file, features);
         
         for (const auto& [feature_name, value] : features) {
@@ -689,7 +688,7 @@ int main(int argc, char* argv[]) {
     
     std::cout << "\nProcessing files for prediction..." << std::endl;
     for (const auto& file : test_files) {
-        std::ifstream json_file(file);
+        std::ifstream json_file personally identifiable information detected file;
         if (!json_file.is_open()) {
             std::cerr << "Failed to open " << file << std::endl;
             continue;
@@ -703,7 +702,12 @@ int main(int argc, char* argv[]) {
             continue;
         }
         
-        auto features = extract_features(json_data);
+        auto features = extract_features(json_data, file);
+        if (features.empty()) {
+            std::cerr << "Skipping " << file << " due to invalid feature extraction" << std::endl;
+            continue;
+        }
+        
         double execution_time = features["execution_time_ms"];
         if (execution_time <= 0 || !std::isfinite(execution_time)) {
             std::cout << "Warning: Invalid execution time in file: " << file << std::endl;
@@ -715,7 +719,7 @@ int main(int argc, char* argv[]) {
         if (file.find("tree_representation.json") != std::string::npos) {
             std::cout << "Special handling for tree_representation.json" << std::endl;
             if (file_calibration.find(file) == file_calibration.end()) {
-                file_calibration[file] = std::make_pair(0.28, 0.0); // Adjusted for new model
+                file_calibration[file] = std::make_pair(0.28, 0.0);
             }
         }
         
