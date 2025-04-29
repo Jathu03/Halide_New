@@ -665,7 +665,6 @@ int main(int argc, char* argv[]) {
                     feature_map[feature_name] = value / count;
                 }
             }
-       
         }
     }
     
