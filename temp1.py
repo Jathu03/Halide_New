@@ -132,7 +132,7 @@ class DeviceManager:
         
         return batch_splits
 
-# Feature extraction function (unchanged)
+# Feature extraction function
 def extract_features(json_data):
     program_features = {}
     schedule_features = {}
@@ -208,7 +208,7 @@ def extract_features(json_data):
     fixed_schedule_features = {key: schedule_features.get(key, 0.0) for key in SCHEDULE_FEATURES}
     return fixed_program_features, fixed_schedule_features
 
-# Process Tree_Output directory (unchanged)
+# Process Tree_Output directory
 def process_tree_output_directory(main_dir):
     all_program_features = []
     all_schedule_features = []
@@ -265,7 +265,7 @@ def process_tree_output_directory(main_dir):
     
     return train_program_features, train_schedule_features, test_program_features, test_schedule_features, list(test_file_names)
 
-# Prepare data for model (unchanged)
+# Prepare data for model
 def prepare_data_for_model(train_program_features, train_schedule_features, test_program_features, test_schedule_features):
     important_features = [
         'cache_hits', 'bytes_processing_rate', 'sched_bytes_at_task', 'sched_working_set_at_root',
@@ -376,7 +376,7 @@ def prepare_data_for_model(train_program_features, train_schedule_features, test
             scaler_y, train_program_tensor.shape[1], train_schedule_tensor.shape[1],
             train_program_df.columns, train_schedule_df.columns)
 
-# Multi-Head Attention mechanism (unchanged)
+# Multi-Head Attention mechanism
 class MultiHeadAttention(nn.Module):
     def __init__(self, hidden_size, num_heads, dropout_rate=0.1):
         super(MultiHeadAttention, self).__init__()
@@ -404,7 +404,7 @@ class MultiHeadAttention(nn.Module):
         out = self.fc_out(out)
         return out
 
-# Modified LSTM Model (unchanged)
+# Modified LSTM Model
 class SimpleLSTMModel(nn.Module):
     def __init__(self, program_input_size, schedule_input_size, hidden_sizes=[512, 256, 128], output_size=1, dropout_rate=0.2, num_heads=8):
         super(SimpleLSTMModel, self).__init__()
@@ -466,7 +466,7 @@ class SimpleLSTMModel(nn.Module):
         output = self.output_layer(x)
         return output
 
-# Custom loss function (unchanged)
+# Custom loss function
 def custom_loss(outputs, targets, schedule_inputs, feature_indices, feature_importances, huber_delta=0.5, mae_weight=0.3, l1_lambda=1e-5):
     huber = nn.HuberLoss(delta=huber_delta)(outputs, targets)
     mae = torch.mean(torch.abs(outputs - targets))
@@ -561,7 +561,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, feature_
                 
                 if torch.isnan(loss) or torch.isinf(loss):
                     print(f"Invalid loss detected at epoch {epoch+1}, batch {i+1} on {device}")
-                    return None, None
+                    return None, None, None
                 
                 loss = loss / accumulation_steps
                 loss.backward()
@@ -584,7 +584,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, feature_
                 avg_state_dict[key] = torch.zeros_like(avg_state_dict[key])
                 for device in device_manager.devices:
                     avg_state_dict[key] += models[device].state_dict()[key].cpu()
-                avg_state_dict[key] /= len(device_manager.devices)
+                avg_state_dict[key] = avg_state_dict[key] / float(len(device_manager.devices))
             
             for device in device_manager.devices:
                 models[device].load_state_dict(avg_state_dict)
@@ -801,7 +801,7 @@ def main(main_dir):
     
     if train_losses is None or val_losses is None:
         print("Training failed due to invalid values")
-        return None
+        return None, None, None, None
     
     torch.save(trained_model.state_dict(), "model.pt")
     print("Model saved to model.pt")
