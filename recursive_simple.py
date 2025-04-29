@@ -106,7 +106,7 @@ def process_tree_output_directory(main_dir):
     combined = list(zip(all_features, file_names))
     random.shuffle(combined)
     all_features, file_names = zip(*combined)
-    test_size = min(30, len(all_features))
+    test_size = min(60, len(all_features))
     train_features = all_features[:-test_size]
     test_features = all_features[-test_size:]
     train_file_names = file_names[:-test_size]
