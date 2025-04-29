@@ -230,7 +230,340 @@ def prepare_data_for_model(train_program_features, train_schedule_features, test
     y_train_raw = np.clip(y_train_raw, 0, np.percentile(y_train_raw, 99))
     y_test_raw = np.clip(y_test_raw, 0, np.percentile(y_test_raw, 99))
     
-    y_train = np.log1 # Modified main function to save the model
+    y_train = np.log1p(y_train_raw).reshape(-1, 1)
+    y_test = np.log1p(y_test_raw).reshape(-1, 1)
+    
+    # Scale features and targets
+    scaler_program = RobustScaler()
+    scaler_schedule = RobustScaler()
+    scaler_y = RobustScaler()
+    
+    train_program_scaled = scaler_program.fit_transform(train_program_df)
+    test_program_scaled = scaler_program.transform(test_program_df)
+    train_schedule_scaled = scaler_schedule.fit_transform(train_schedule_df)
+    test_schedule_scaled = scaler_schedule.transform(test_schedule_df)
+    y_train_scaled = scaler_y.fit_transform(y_train)
+    y_test_scaled = scaler_y.transform(y_test)
+    
+    train_program_scaled = np.nan_to_num(train_program_scaled, nan=0.0)
+    test_program_scaled = np.nan_to_num(test_program_scaled, nan=0.0)
+    train_schedule_scaled = np.nan_to_num(train_schedule_scaled, nan=0.0)
+    test_schedule_scaled = np.nan_to_num(test_schedule_scaled, nan=0.0)
+    y_train_scaled = np.nan_to_num(y_train_scaled, nan=0.0)
+    y_test_scaled = np.nan_to_num(y_test_scaled, nan=0.0)
+    
+    # Data augmentation for significant features
+    train_program_aug = []
+    train_schedule_aug = []
+    y_train_aug = []
+    for i in range(len(train_program_features)):
+        train_program_aug.append(train_program_scaled[i])
+        train_schedule_aug.append(train_schedule_scaled[i])
+        y_train_aug.append(y_train_scaled[i])
+        
+        cache_hits_idx = train_schedule_df.columns.get_loc('log_cache_hits') if 'log_cache_hits' in train_schedule_df.columns else -1
+        bytes_rate_idx = train_schedule_df.columns.get_loc('log_bytes_processing_rate') if 'log_bytes_processing_rate' in train_schedule_df.columns else -1
+        
+        is_significant = False
+        if cache_hits_idx != -1 and train_schedule_scaled[i, cache_hits_idx] > np.percentile(train_schedule_scaled[:, cache_hits_idx], 75):
+            is_significant = True
+        if bytes_rate_idx != -1 and train_schedule_scaled[i, bytes_rate_idx] > np.percentile(train_schedule_scaled[:, bytes_rate_idx], 75):
+            is_significant = True
+        
+        augment_count = 3 if is_significant else 1
+        for _ in range(augment_count):
+            noise_program = np.random.normal(0, 0.05, train_program_scaled[i].shape)
+            noise_schedule = np.random.normal(0, 0.05, train_schedule_scaled[i].shape)
+            noise_y = np.random.normal(0, 0.05, y_train_scaled[i].shape)
+            train_program_aug.append(train_program_scaled[i] + noise_program)
+            train_schedule_aug.append(train_schedule_scaled[i] + noise_schedule)
+            y_train_aug.append(y_train_scaled[i] + noise_y)
+    
+    train_program_tensor = torch.FloatTensor(np.array(train_program_aug))
+    train_schedule_tensor = torch.FloatTensor(np.array(train_schedule_aug))
+    y_train_tensor = torch.FloatTensor(np.array(y_train_aug))
+    test_program_tensor = torch.FloatTensor(test_program_scaled)
+    test_schedule_tensor = torch.FloatTensor(test_schedule_scaled)
+    y_test_tensor = torch.FloatTensor(y_test_scaled)
+    
+    print(f"Program input size: {train_program_tensor.shape[1]}")
+    print(f"Schedule input size: {train_schedule_tensor.shape[1]}")
+    
+    return (train_program_tensor, train_schedule_tensor, y_train_tensor,
+            test_program_tensor, test_schedule_tensor, y_test_tensor,
+            scaler_y, train_program_tensor.shape[1], train_schedule_tensor.shape[1],
+            train_program_df.columns, train_schedule_df.columns)
+
+# Multi-Head Attention mechanism
+class MultiHeadAttention(nn.Module):
+    def __init__(self, hidden_size, num_heads, dropout_rate=0.1):
+        super(MultiHeadAttention, self).__init__()
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+        
+        self.query = nn.Linear(hidden_size, hidden_size)
+        self.key = nn.Linear(hidden_size, hidden_size)
+        self.value = nn.Linear(hidden_size, hidden_size)
+        self.fc_out = nn.Linear(hidden_size, hidden_size)
+        self.dropout = nn.Dropout(dropout_rate)
+        self.scale = torch.sqrt(torch.FloatTensor([self.head_dim]))
+    
+    def forward(self, x):
+        batch_size = x.shape[0]
+        Q = self.query(x).view(batch_size, -1, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        K = self.key(x).view(batch_size, -1, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        V = self.value(x).view(batch_size, -1, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        energy = torch.matmul(Q, K.transpose(-1, -2)) / self.scale.to(x.device)
+        attention = torch.softmax(energy, dim=-1)
+        attention = self.dropout(attention)
+        out = torch.matmul(attention, V).permute(0, 2, 1, 3).contiguous()
+        out = out.view(batch_size, -1, self.hidden_size)
+        out = self.fc_out(out)
+        return out
+
+# Modified LSTM Model
+class SimpleLSTMModel(nn.Module):
+    def __init__(self, program_input_size, schedule_input_size, hidden_sizes=[512, 256, 128], output_size=1, dropout_rate=0.2, num_heads=8):
+        super(SimpleLSTMModel, self).__init__()
+        self.program_fc = nn.Linear(program_input_size, hidden_sizes[0])
+        self.schedule_fc = nn.Linear(schedule_input_size, hidden_sizes[0])
+        self.program_bn = nn.BatchNorm1d(hidden_sizes[0])
+        self.schedule_bn = nn.BatchNorm1d(hidden_sizes[0])
+        
+        self.attention = MultiHeadAttention(hidden_sizes[0] * 2, num_heads, dropout_rate)
+        
+        combined_size = hidden_sizes[0] * 2
+        self.fc1 = nn.Linear(combined_size, 256)
+        self.bn1 = nn.BatchNorm1d(256)
+        self.ln1 = nn.LayerNorm(256)
+        self.fc2 = nn.Linear(256, 128)
+        self.bn2 = nn.BatchNorm1d(128)
+        self.ln2 = nn.LayerNorm(128)
+        self.fc3 = nn.Linear(128, 64)
+        self.bn3 = nn.BatchNorm1d(64)
+        self.ln3 = nn.LayerNorm(64)
+        self.output_layer = nn.Linear(64, output_size)
+        
+        self.gelu = nn.GELU()
+        self.dropout = nn.Dropout(dropout_rate)
+        self.residual_proj = nn.Linear(combined_size, 64) if combined_size != 64 else None
+    
+    def forward(self, program_input, schedule_input):
+        program_out = self.program_fc(program_input)
+        program_out = self.program_bn(program_out)
+        program_out = self.gelu(program_out)
+        program_out = self.dropout(program_out)
+        
+        schedule_out = self.schedule_fc(schedule_input)
+        schedule_out = self.schedule_bn(schedule_out)
+        schedule_out = self.gelu(schedule_out)
+        schedule_out = self.dropout(schedule_out)
+        
+        combined = torch.cat((program_out, schedule_out), dim=1)
+        combined = self.attention(combined.unsqueeze(1)).squeeze(1)
+        
+        x = self.fc1(combined)
+        x = self.bn1(x)
+        x = self.ln1(x)
+        x = self.gelu(x)
+        x = self.dropout(x)
+        x = self.fc2(x)
+        x = self.bn2(x)
+        x = self.ln2(x)
+        x = self.gelu(x)
+        x = self.dropout(x)
+        x = self.fc3(x)
+        x = self.bn3(x)
+        x = self.ln3(x)
+        x = self.gelu(x)
+        
+        residual = combined if self.residual_proj is None else self.residual_proj(combined)
+        x = x + residual
+        x = self.dropout(x)
+        output = self.output_layer(x)
+        return output
+
+# Custom loss function
+def custom_loss(outputs, targets, schedule_inputs, feature_indices, feature_importances, huber_delta=0.5, mae_weight=0.3, l1_lambda=1e-5):
+    huber = nn.HuberLoss(delta=huber_delta)(outputs, targets)
+    mae = torch.mean(torch.abs(outputs - targets))
+    l1_reg = sum(param.abs().sum() for param in model.parameters()) * l1_lambda
+    
+    weights = torch.ones_like(targets)
+    for feature, idx in feature_indices.items():
+        if idx != -1 and feature in feature_importances:
+            feature_vals = schedule_inputs[:, idx]
+            importance = feature_importances[feature]
+            weights = torch.where(
+                feature_vals > 1.0,
+                weights * (1.0 + importance * 2.0),
+                weights
+            )
+    
+    weighted_huber = (huber * weights).mean()
+    weighted_mae = (mae * weights).mean()
+    return weighted_huber + mae_weight * weighted_mae + l1_reg
+
+# Create data loaders
+def create_data_loaders(train_program, train_schedule, y_train, test_program, test_schedule, y_test, batch_size=64):
+    train_dataset = TensorDataset(train_program, train_schedule, y_train)
+    test_dataset = TensorDataset(test_program, test_schedule, y_test)
+    
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    return train_loader, test_loader
+
+# Train the model
+def train_model(model, train_loader, test_loader, criterion, optimizer, feature_indices, feature_importances, num_epochs=1000, patience=50, accumulation_steps=2):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    
+    try:
+        model.to(device)
+    except RuntimeError as e:
+        print(f"Error moving model to CUDA: {e}. Falling back to CPU.")
+        device = torch.device('cpu')
+        model.to(device)
+    
+    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=50, T_mult=2, eta_min=1e-6)
+    
+    best_val_loss = float('inf')
+    epochs_no_improve = 0
+    best_model_state = None
+    train_losses = []
+    val_losses = []
+    
+    for epoch in range(num_epochs):
+        model.train()
+        running_loss = 0.0
+        optimizer.zero_grad()
+        
+        for i, (program_inputs, schedule_inputs, targets) in enumerate(train_loader):
+            program_inputs, schedule_inputs, targets = program_inputs.to(device), schedule_inputs.to(device), targets.to(device)
+            outputs = model(program_inputs, schedule_inputs)
+            loss = criterion(outputs, targets, schedule_inputs, feature_indices, feature_importances)
+            
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"Invalid loss detected at epoch {epoch+1}, batch {i+1}")
+                return None, None
+            
+            loss = loss / accumulation_steps
+            loss.backward()
+            
+            if (i + 1) % accumulation_steps == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                optimizer.zero_grad()
+            
+            running_loss += loss.item() * accumulation_steps * program_inputs.size(0)
+        
+        if len(train_loader) % accumulation_steps != 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            optimizer.zero_grad()
+        
+        train_loss = running_loss / len(train_loader.dataset)
+        train_losses.append(train_loss)
+        
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for program_inputs, schedule_inputs, targets in test_loader:
+                program_inputs, schedule_inputs, targets = program_inputs.to(device), schedule_inputs.to(device), targets.to(device)
+                outputs = model(program_inputs, schedule_inputs)
+                loss = criterion(outputs, targets, schedule_inputs, feature_indices, feature_importances)
+                val_loss += loss.item() * program_inputs.size(0)
+        
+        val_loss /= len(test_loader.dataset)
+        val_losses.append(val_loss)
+        
+        scheduler.step()
+        print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
+        
+        if val_loss < best_val_loss and not np.isnan(val_loss) and not np.isinf(val_loss):
+            best_val_loss = val_loss
+            epochs_no_improve = 0
+            best_model_state = model.state_dict().copy()
+        else:
+            epochs_no_improve += 1
+        
+        if epochs_no_improve >= patience:
+            print(f'Early stopping after {epoch+1} epochs')
+            model.load_state_dict(best_model_state)
+            break
+    
+    if best_model_state is not None and epochs_no_improve > 0:
+        model.load_state_dict(best_model_state)
+    
+    plt.figure(figsize=(10, 6))
+    plt.plot(range(1, len(train_losses) + 1), train_losses, label='Training Loss')
+    plt.plot(range(1, len(val_losses) + 1), val_losses, label='Validation Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('Training and Validation Loss Over Epochs')
+    plt.legend()
+    plt.grid(True)
+    plt.savefig('loss_plot.png')
+    plt.close()
+    
+    return train_losses, val_losses
+
+# Evaluate the model
+def evaluate_model(model, X_test_program, X_test_schedule, y_test, y_scaler, file_names_test):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model.to(device)
+    model.eval()
+    
+    X_test_program, X_test_schedule = X_test_program.to(device), X_test_schedule.to(device)
+    with torch.no_grad():
+        y_pred_scaled = model(X_test_program, X_test_schedule)
+    
+    y_pred_scaled = y_pred_scaled.cpu().numpy()
+    y_test = y_test.cpu().numpy()
+    
+    y_test_transformed = y_scaler.inverse_transform(y_test)
+    y_pred_transformed = y_scaler.inverse_transform(y_pred_scaled)
+    
+    y_test_actual = np.expm1(y_test_transformed)
+    y_pred_actual = np.expm1(y_pred_transformed)
+    
+    results_by_subfolder = {}
+    for i, file_path in enumerate(file_names_test):
+        subfolder = '/'.join(file_path.split('/')[:-1])
+        if subfolder not in results_by_subfolder:
+            results_by_subfolder[subfolder] = []
+        
+        pred = max(y_pred_actual[i][0], 0)
+        results_by_subfolder[subfolder].append({
+            'file': file_path,
+            'actual': y_test_actual[i][0],
+            'predicted': pred,
+            'error_percentage': abs(y_test_actual[i][0] - pred) / y_test_actual[i][0] * 100 if y_test_actual[i][0] > 0 else 0
+        })
+    
+    for subfolder, results in results_by_subfolder.items():
+        print(f"\nResults for {subfolder}:")
+        for result in results:
+            print(f"File: {result['file']}")
+            print(f"  Actual execution time: {result['actual']:.2f} ms")
+            print(f"  Predicted execution time: {result['predicted']:.2f} ms")
+            print(f"  Error percentage: {result['error_percentage']:.2f}%")
+    
+    mse = np.mean((y_test_actual - y_pred_actual) ** 2)
+    rmse = np.sqrt(mse)
+    mae = np.mean(np.abs(y_test_actual - y_pred_actual))
+    mape = np.mean(np.abs((y_test_actual - y_pred_actual) / (y_test_actual + 1e-8))) * 100
+    
+    print("\nOverall Model Performance:")
+    print(f"MSE: {mse:.2f}")
+    print(f"RMSE: {rmse:.2f}")
+    print(f"MAE: {mae:.2f}")
+    print(f"MAPE: {mape:.2f}%")
+    
+    return y_test_actual, y_pred_actual
+
+# Main function to save the model
 def main(main_dir):
     if torch.cuda.is_available():
         torch.cuda.init()
