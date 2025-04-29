@@ -1,226 +1,256 @@
 import os
 import json
 import numpy as np
+import pandas as pd
+from sklearn.preprocessing import RobustScaler
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
-from sklearn.preprocessing import RobustScaler
+from torch.utils.data import TensorDataset, DataLoader
 import random
 
-# ---- Fixed feature keys (should match your dataset) ----
+# ---- Fixed set of features ----
 FIXED_FEATURES = [
-    # Add all features you want to extract from each node
     'cache_hits', 'cache_misses', 'execution_time_ms',
-    'sched_num_realizations', 'sched_num_productions',
-    'sched_points_computed_total', 'sched_innermost_loop_extent',
-    'sched_inner_parallelism', 'sched_outer_parallelism',
-    'sched_bytes_at_realization', 'sched_bytes_at_production',
-    'sched_bytes_at_root', 'sched_unique_bytes_read_per_realization',
-    'sched_working_set', 'sched_vector_size', 'sched_num_vectors',
-    'sched_num_scalars', 'sched_bytes_at_task', 'sched_working_set_at_task',
-    'sched_working_set_at_production', 'sched_working_set_at_realization',
-    'sched_working_set_at_root', 'total_parallelism', 'scheduling_count',
-    'total_bytes_at_production', 'total_vectors', 'computation_efficiency',
-    'memory_pressure', 'memory_utilization_ratio', 'bytes_processing_rate',
-    'bytes_per_parallelism', 'bytes_per_vector', 'nodes_count', 'edges_count',
-    'node_edge_ratio', 'nodes_per_schedule', 'op_diversity',
-    # Example operation features (add more as needed)
-    'op_add', 'op_mul', 'op_sub', 'op_div'
+    'sched_num_realizations', 'sched_num_productions', 'sched_points_computed_total',
+    'sched_innermost_loop_extent', 'sched_inner_parallelism', 'sched_outer_parallelism',
+    'sched_bytes_at_realization', 'sched_bytes_at_production', 'sched_bytes_at_root',
+    'sched_unique_bytes_read_per_realization', 'sched_working_set', 'sched_vector_size',
+    'sched_num_vectors', 'sched_num_scalars', 'sched_bytes_at_task', 'sched_working_set_at_task',
+    'sched_working_set_at_production', 'sched_working_set_at_realization', 'sched_working_set_at_root',
+    'total_parallelism', 'scheduling_count', 'total_bytes_at_production', 'total_vectors',
+    'computation_efficiency', 'memory_pressure', 'memory_utilization_ratio', 'bytes_processing_rate',
+    'bytes_per_parallelism', 'bytes_per_vector', 'nodes_count', 'edges_count', 'node_edge_ratio',
+    'nodes_per_schedule', 'op_diversity', 'op_add', 'op_sub', 'op_mul', 'op_div'
+    # Add more as needed
 ]
 
-# ---- Tree feature extraction ----
-def extract_tree_features(node):
-    # Extract features for this node
-    features = {k: node.get(k, 0.0) for k in FIXED_FEATURES}
-    # Recursively extract children
-    children = node.get('children', [])
-    child_features = [extract_tree_features(child) for child in children]
-    return {'features': features, 'children': child_features}
+def extract_features(json_data):
+    features = {}
+    global_node = next((child for child in json_data['children'] if child['name'] == 'Global Features'), None)
+    if global_node:
+        features['cache_hits'] = global_node.get('cache_hits', 0)
+        features['cache_misses'] = global_node.get('cache_misses', 0)
+        features['execution_time_ms'] = global_node.get('execution_time_ms', 0)
+    op_histogram = {}
+    for node in json_data['children']:
+        if 'op_histogram' in node:
+            for op, count in node['op_histogram'].items():
+                features[f'op_{op.lower()}'] = features.get(f'op_{op.lower()}', 0) + count
+    # Scheduling features
+    scheduling_keys = [
+        'num_realizations', 'num_productions', 'points_computed_total', 'innermost_loop_extent',
+        'inner_parallelism', 'outer_parallelism', 'bytes_at_realization', 'bytes_at_production',
+        'bytes_at_root', 'unique_bytes_read_per_realization', 'working_set', 'vector_size',
+        'num_vectors', 'num_scalars', 'bytes_at_task', 'working_set_at_task', 'working_set_at_production',
+        'working_set_at_realization', 'working_set_at_root'
+    ]
+    scheduling_sums = {}
+    node_count = 0
+    for node in json_data['children']:
+        if 'scheduling' in node:
+            node_count += 1
+            for key in scheduling_keys:
+                scheduling_sums[key] = scheduling_sums.get(key, 0) + node['scheduling'].get(key, 0)
+    for key in scheduling_keys:
+        features[f'sched_{key}'] = scheduling_sums.get(key, 0)
+    features['total_parallelism'] = features.get('sched_inner_parallelism', 0) + features.get('sched_outer_parallelism', 0)
+    features['scheduling_count'] = features.get('sched_num_realizations', 0) + features.get('sched_num_productions', 0)
+    features['total_bytes_at_production'] = features.get('sched_bytes_at_production', 0)
+    features['total_vectors'] = features.get('sched_num_vectors', 0)
+    features['computation_efficiency'] = features.get('sched_points_computed_total', 0) / (features.get('sched_bytes_at_realization', 1) or 1)
+    features['memory_pressure'] = features.get('sched_working_set', 0) / (features.get('sched_bytes_at_root', 1) or 1)
+    features['memory_utilization_ratio'] = features.get('sched_unique_bytes_read_per_realization', 0) / (features.get('sched_bytes_at_task', 1) or 1)
+    features['bytes_processing_rate'] = features.get('sched_bytes_at_realization', 0) / (features.get('execution_time_ms', 1) or 1)
+    features['bytes_per_parallelism'] = features.get('sched_bytes_at_task', 0) / (features.get('total_parallelism', 1) or 1)
+    features['bytes_per_vector'] = features.get('sched_bytes_at_realization', 0) / (features.get('sched_num_vectors', 1) or 1)
+    nodes_count = len(json_data['children'])
+    edges_count = sum(len(node.get('children', [])) for node in json_data['children'])
+    features['nodes_count'] = nodes_count
+    features['edges_count'] = edges_count
+    features['node_edge_ratio'] = nodes_count / (edges_count + 1)
+    features['nodes_per_schedule'] = nodes_count / (features.get('scheduling_count', 1) or 1)
+    features['op_diversity'] = len([k for k, v in features.items() if k.startswith('op_') and v > 0])
+    # Fill missing features with 0
+    fixed_features = {key: features.get(key, 0.0) for key in FIXED_FEATURES}
+    return fixed_features
 
-# ---- Dataset for tree-structured data ----
-class HalideTreeDataset(Dataset):
-    def __init__(self, file_list):
-        self.trees = []
-        self.targets = []
-        for file_path in file_list:
-            with open(file_path, 'r') as f:
-                data = json.load(f)
-            # Root node must have valid execution time
-            if 'children' not in data:
-                continue
-            root = extract_tree_features(data)
-            exec_time = root['features'].get('execution_time_ms', 0)
-            if exec_time > 0 and np.isfinite(exec_time):
-                self.trees.append(root)
-                self.targets.append(exec_time)
-        print(f"Loaded {len(self.trees)} valid trees.")
-
-    def __len__(self):
-        return len(self.trees)
-
-    def __getitem__(self, idx):
-        return self.trees[idx], self.targets[idx]
-
-# ---- Recursive TreeLSTM ----
-class TreeLSTMCell(nn.Module):
-    def __init__(self, feature_size, hidden_size):
-        super().__init__()
-        self.feature_size = feature_size
-        self.hidden_size = hidden_size
-        self.W_iou = nn.Linear(feature_size, 3 * hidden_size)
-        self.U_iou = nn.Linear(hidden_size, 3 * hidden_size, bias=False)
-        self.W_f = nn.Linear(feature_size, hidden_size)
-        self.U_f = nn.Linear(hidden_size, hidden_size, bias=False)
-
-    def forward(self, features, child_states):
-        # child_states: list of (h, c) tuples
-        if child_states:
-            h_sum = torch.sum(torch.stack([h for h, c in child_states]), dim=0, keepdim=True)
-        else:
-            h_sum = torch.zeros(1, self.hidden_size, device=features.device)
-        iou = self.W_iou(features) + self.U_iou(h_sum)
-        i, o, u = torch.chunk(iou, 3, dim=1)
-        i, o, u = torch.sigmoid(i), torch.sigmoid(o), torch.tanh(u)
-        if child_states:
-            f = torch.stack([torch.sigmoid(self.W_f(features) + self.U_f(h)) for h, c in child_states])
-            fc = torch.sum(f * torch.stack([c for h, c in child_states]), dim=0)
-        else:
-            fc = torch.zeros(1, self.hidden_size, device=features.device)
-        c = i * u + fc
-        h = o * torch.tanh(c)
-        return h, c
-
-class RecursiveTreeLSTM(nn.Module):
-    def __init__(self, feature_size, hidden_size=128):
-        super().__init__()
-        self.cell = TreeLSTMCell(feature_size, hidden_size)
-        self.regressor = nn.Sequential(
-            nn.Linear(hidden_size, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1)
-        )
-
-    def forward(self, tree):
-        h, c = self._recurse(tree)
-        return self.regressor(h)
-
-    def _recurse(self, node):
-        device = next(self.parameters()).device
-        features = torch.tensor([list(node['features'].values())], dtype=torch.float32, device=device)
-        child_states = [self._recurse(child) for child in node['children']]
-        h, c = self.cell(features, child_states)
-        return h, c
-
-# ---- Data preparation utilities ----
-def list_all_tree_files(main_dir):
-    file_list = []
+def process_tree_output_directory(main_dir):
+    all_features, file_names, skipped_files = [], [], []
     for root, dirs, files in os.walk(main_dir):
-        for fname in files:
-            if fname == "tree_representation.json":
-                file_list.append(os.path.join(root, fname))
-    return file_list
+        if 'tree_representation.json' in files:
+            file_path = os.path.join(root, 'tree_representation.json')
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    json_data = json.load(f)
+                features = extract_features(json_data)
+                if features['execution_time_ms'] > 0 and np.isfinite(features['execution_time_ms']):
+                    all_features.append(features)
+                    file_names.append(file_path)
+                else:
+                    skipped_files.append(file_path)
+            except Exception as e:
+                skipped_files.append(file_path)
+    if not all_features:
+        raise ValueError("No valid JSON files with valid execution times found in Tree_Output directory.")
+    combined = list(zip(all_features, file_names))
+    random.shuffle(combined)
+    all_features, file_names = zip(*combined)
+    test_size = min(30, len(all_features))
+    train_features = all_features[:-test_size]
+    test_features = all_features[-test_size:]
+    train_file_names = file_names[:-test_size]
+    test_file_names = file_names[-test_size:]
+    print(f"Training files: {len(train_features)}")
+    print(f"Testing files: {len(test_features)}")
+    return train_features, test_features, list(test_file_names)
 
-def split_train_test(files, test_size=30, seed=42):
-    random.seed(seed)
-    files = [f for f in files]
-    random.shuffle(files)
-    return files[test_size:], files[:test_size]
+def prepare_data_for_model(train_features, test_features):
+    train_sequences = [np.array([[features.get(key, 0.0) for key in FIXED_FEATURES]]) for features in train_features]
+    test_sequences = [np.array([[features.get(key, 0.0) for key in FIXED_FEATURES]]) for features in test_features]
+    train_sequences_padded = torch.FloatTensor(np.array(train_sequences))
+    test_sequences_padded = torch.FloatTensor(np.array(test_sequences))
+    train_scalar_df = pd.DataFrame(train_features)
+    test_scalar_df = pd.DataFrame(test_features)
+    train_scalar_df = train_scalar_df.fillna(0)
+    test_scalar_df = test_scalar_df.fillna(0)
+    constant_columns = [col for col in train_scalar_df.columns if train_scalar_df[col].nunique() == 1]
+    train_scalar_df = train_scalar_df.drop(columns=constant_columns)
+    test_scalar_df = test_scalar_df.drop(columns=constant_columns)
+    y_train_raw = np.array([f['execution_time_ms'] for f in train_features])
+    y_test_raw = np.array([f['execution_time_ms'] for f in test_features])
+    y_train = np.log1p(y_train_raw).reshape(-1, 1)
+    y_test = np.log1p(y_test_raw).reshape(-1, 1)
+    scaler_X_scalar = RobustScaler()
+    scaler_y = RobustScaler()
+    train_scalar_scaled = scaler_X_scalar.fit_transform(train_scalar_df)
+    test_scalar_scaled = scaler_X_scalar.transform(test_scalar_df)
+    y_train_scaled = scaler_y.fit_transform(y_train)
+    y_test_scaled = scaler_y.transform(y_test)
+    train_scalar_tensor = torch.FloatTensor(train_scalar_scaled)
+    test_scalar_tensor = torch.FloatTensor(test_scalar_scaled)
+    y_train_tensor = torch.FloatTensor(y_train_scaled)
+    y_test_tensor = torch.FloatTensor(y_test_scaled)
+    return (train_sequences_padded, train_scalar_tensor, y_train_tensor,
+            test_sequences_padded, test_scalar_tensor, y_test_tensor,
+            scaler_y, train_sequences_padded.shape[2], train_scalar_tensor.shape[1], train_scalar_df.columns)
 
-# ---- Training and evaluation ----
-def train_model(model, train_dataset, val_dataset, scaler, epochs=100, lr=1e-3, batch_size=1):
+class EnhancedRecursiveLSTMModel(nn.Module):
+    def __init__(self, seq_input_size, scalar_input_size, hidden_sizes=[128, 64], output_size=1, dropout_rate=0.2):
+        super(EnhancedRecursiveLSTMModel, self).__init__()
+        self.lstm_layers = nn.ModuleList()
+        self.lstm_layers.append(nn.LSTM(seq_input_size, hidden_sizes[0], batch_first=True, bidirectional=True))
+        for i in range(1, len(hidden_sizes)):
+            self.lstm_layers.append(nn.LSTM(hidden_sizes[i-1]*2, hidden_sizes[i], batch_first=True, bidirectional=True))
+        combined_size = hidden_sizes[-1]*2 + scalar_input_size
+        self.fc1 = nn.Linear(combined_size, 64)
+        self.fc2 = nn.Linear(64, output_size)
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(dropout_rate)
+    def forward(self, seq_input, scalar_input):
+        lstm_out = seq_input
+        for lstm in self.lstm_layers:
+            lstm_out, _ = lstm(lstm_out)
+            lstm_out = self.dropout(lstm_out)
+        context = lstm_out.mean(dim=1)
+        combined = torch.cat((context, scalar_input), dim=1)
+        x = self.relu(self.fc1(combined))
+        x = self.dropout(x)
+        output = self.fc2(x)
+        return output
+
+def train_model(model, train_loader, test_loader, optimizer, num_epochs=100, patience=10):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = model.to(device)
-    optimizer = optim.Adam(model.parameters(), lr=lr)
+    model.to(device)
     criterion = nn.MSELoss()
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=1)
     best_val_loss = float('inf')
-    patience = 10
     patience_counter = 0
-    for epoch in range(epochs):
+    for epoch in range(num_epochs):
         model.train()
-        train_losses = []
-        for trees, targets in train_loader:
+        for seq_inputs, scalar_inputs, targets in train_loader:
+            seq_inputs, scalar_inputs, targets = seq_inputs.to(device), scalar_inputs.to(device), targets.to(device)
             optimizer.zero_grad()
-            preds = []
-            for i in range(len(trees)):
-                pred = model(trees[i])
-                preds.append(pred)
-            preds = torch.cat(preds, dim=0)
-            targets = torch.tensor(targets, dtype=torch.float32, device=device).view(-1, 1)
-            targets_scaled = scaler.transform(targets.cpu().numpy())
-            targets_scaled = torch.tensor(targets_scaled, dtype=torch.float32, device=device)
-            loss = criterion(preds, targets_scaled)
+            outputs = model(seq_inputs, scalar_inputs)
+            loss = criterion(outputs, targets)
             loss.backward()
             optimizer.step()
-            train_losses.append(loss.item())
-        # Validation
         model.eval()
-        val_losses = []
+        val_loss = 0.0
         with torch.no_grad():
-            for trees, targets in val_loader:
-                preds = []
-                for i in range(len(trees)):
-                    pred = model(trees[i])
-                    preds.append(pred)
-                preds = torch.cat(preds, dim=0)
-                targets = torch.tensor(targets, dtype=torch.float32, device=device).view(-1, 1)
-                targets_scaled = scaler.transform(targets.cpu().numpy())
-                targets_scaled = torch.tensor(targets_scaled, dtype=torch.float32, device=device)
-                loss = criterion(preds, targets_scaled)
-                val_losses.append(loss.item())
-        avg_train = np.mean(train_losses)
-        avg_val = np.mean(val_losses)
-        print(f"Epoch {epoch+1}: Train Loss {avg_train:.4f}, Val Loss {avg_val:.4f}")
-        if avg_val < best_val_loss:
-            best_val_loss = avg_val
+            for seq_inputs, scalar_inputs, targets in test_loader:
+                seq_inputs, scalar_inputs, targets = seq_inputs.to(device), scalar_inputs.to(device), targets.to(device)
+                outputs = model(seq_inputs, scalar_inputs)
+                loss = criterion(outputs, targets)
+                val_loss += loss.item() * seq_inputs.size(0)
+        val_loss /= len(test_loader.dataset)
+        print(f"Epoch {epoch+1}: Val Loss: {val_loss:.4f}")
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
             patience_counter = 0
-            torch.save(model.state_dict(), "best_tree_lstm.pth")
+            torch.save(model.state_dict(), "best_lstm.pth")
         else:
             patience_counter += 1
         if patience_counter > patience:
             print("Early stopping.")
             break
-    model.load_state_dict(torch.load("best_tree_lstm.pth"))
+    model.load_state_dict(torch.load("best_lstm.pth"))
     return model
 
-def evaluate_model(model, dataset, scaler, file_list):
-    device = next(model.parameters()).device
-    loader = DataLoader(dataset, batch_size=1)
+def evaluate_model(model, X_test_seq, X_test_scalar, y_test, y_scaler, file_names_test):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model.to(device)
     model.eval()
-    all_preds = []
-    all_targets = []
-    for i, (trees, targets) in enumerate(loader):
-        with torch.no_grad():
-            pred = model(trees[0])
-            pred = pred.cpu().numpy().flatten()
-            pred_unscaled = scaler.inverse_transform(pred.reshape(-1, 1)).flatten()
-            all_preds.append(pred_unscaled[0])
-            all_targets.append(targets[0].item())
-    errors = [abs(p-t)/t*100 if t > 0 else 0 for p, t in zip(all_preds, all_targets)]
-    for fname, t, p, e in zip(file_list, all_targets, all_preds, errors):
-        print(f"{fname}: Actual={t:.2f} ms, Predicted={p:.2f} ms, Error={e:.2f}%")
-    print(f"MAE: {np.mean(np.abs(np.array(all_preds)-np.array(all_targets))):.2f} ms")
-    print(f"MAPE: {np.mean(errors):.2f}%")
+    X_test_seq, X_test_scalar = X_test_seq.to(device), X_test_scalar.to(device)
+    with torch.no_grad():
+        y_pred_scaled = model(X_test_seq, X_test_scalar)
+    y_pred_scaled = y_pred_scaled.cpu().numpy()
+    y_test = y_test.cpu().numpy()
+    y_test_transformed = y_scaler.inverse_transform(y_test)
+    y_pred_transformed = y_scaler.inverse_transform(y_pred_scaled)
+    y_test_actual = np.expm1(y_test_transformed)
+    y_pred_actual = np.expm1(y_pred_transformed)
+    for i, file_path in enumerate(file_names_test):
+        pred = max(y_pred_actual[i][0], 0)
+        actual = y_test_actual[i][0]
+        error_pct = abs(actual - pred) / actual * 100 if actual > 0 else 0
+        print(f"{file_path}: Actual={actual:.2f} ms, Predicted={pred:.2f} ms, Error={error_pct:.2f}%")
+    mse = np.mean((y_test_actual - y_pred_actual) ** 2)
+    rmse = np.sqrt(mse)
+    mae = np.mean(np.abs(y_test_actual - y_pred_actual))
+    mape = np.mean(np.abs((y_test_actual - y_pred_actual) / (y_test_actual + 1e-8))) * 100
+    print("\nOverall Model Performance:")
+    print(f"MSE: {mse:.2f}")
+    print(f"RMSE: {rmse:.2f}")
+    print(f"MAE: {mae:.2f}")
+    print(f"MAPE: {mape:.2f}%")
+    return y_test_actual, y_pred_actual
 
-# ---- Main script ----
-def main():
-    main_dir = "Tree_Output"
-    all_files = list_all_tree_files(main_dir)
-    train_files, test_files = split_train_test(all_files, test_size=30)
-    print(f"Train files: {len(train_files)}, Test files: {len(test_files)}")
-    train_dataset = HalideTreeDataset(train_files)
-    test_dataset = HalideTreeDataset(test_files)
-    # Use execution times for scaling
-    y_train = np.array(train_dataset.targets).reshape(-1, 1)
-    scaler = RobustScaler().fit(y_train)
-    # Model
-    feature_size = len(FIXED_FEATURES)
-    model = RecursiveTreeLSTM(feature_size, hidden_size=128)
-    model = train_model(model, train_dataset, test_dataset, scaler, epochs=100, lr=1e-3)
-    print("\nEvaluation on test set:")
-    evaluate_model(model, test_dataset, scaler, test_files)
+def main(main_dir):
+    print(f"Processing main directory: {main_dir}")
+    train_features, test_features, test_file_names = process_tree_output_directory(main_dir)
+    if len(train_features) == 0 or len(test_features) == 0:
+        print("Error: No valid training or test data found")
+        return None
+    (train_sequences, train_scalar, y_train,
+     test_sequences, test_scalar, y_test,
+     y_scaler, seq_input_size, scalar_input_size, feature_columns) = prepare_data_for_model(train_features, test_features)
+    train_loader = DataLoader(TensorDataset(train_sequences, train_scalar, y_train), batch_size=64, shuffle=True)
+    test_loader = DataLoader(TensorDataset(test_sequences, test_scalar, y_test), batch_size=64)
+    model = EnhancedRecursiveLSTMModel(seq_input_size=seq_input_size, scalar_input_size=scalar_input_size)
+    optimizer = optim.AdamW(model.parameters(), lr=0.0005, weight_decay=1e-4)
+    model = train_model(model, train_loader, test_loader, optimizer, num_epochs=100, patience=10)
+    print("\nEvaluating model:")
+    y_test_actual, y_pred_actual = evaluate_model(
+        model, test_sequences, test_scalar, y_test,
+        y_scaler, test_file_names
+    )
+    print(f"\nSummary for Comparison:")
+    print(f"Model: EnhancedRecursiveLSTM")
+    return model, y_scaler, y_test_actual, y_pred_actual
 
 if __name__ == "__main__":
-    main()
+    main_dir = "Tree_Output"
+    random.seed(42)
+    torch.manual_seed(42)
+    np.random.seed(42)
+    main(main_dir)
