@@ -76,128 +76,133 @@ std::map<std::string, double> extract_features(const json& json_data, const std:
         return features; // Return empty features to skip this file
     }
 
-    // Extract global features
-    auto global_node = std::find_if(json_data["children"].begin(), json_data["children"].end(),
-        [](const json& child) { return child.contains("name") && child["name"] == "Global Features"; });
-    if (global_node != json_data["children"].end()) {
-        features["cache_hits"] = global_node->value("cache_hits", 0.0);
-        features["cache_misses"] = global_node->value("cache_misses", 0.0);
-        features["execution_time_ms"] = global_node->value("execution_time_ms", 0.0);
-    } else {
-        std::cout << "Warning: No 'Global Features' node found in " << file_path << std::endl;
-    }
-
-    // Extract op_histogram features
-    std::map<std::string, int> op_histogram;
-    for (const auto& node : json_data["children"]) {
-        if (node.contains("op_histogram") && node["op_histogram"].is_object()) {
-            for (const auto& [op, count] : node["op_histogram"].items()) {
-                if (!count.is_number()) continue; // Skip invalid counts
-                std::string op_lower = op;
-                std::transform(op_lower.begin(), op_lower.end(), op_lower.begin(), ::tolower);
-                op_histogram[op_lower] += count.get<int>();
-            }
-        }
-    }
-    for (const auto& [op, count] : op_histogram) {
-        features["op_" + op] = static_cast<double>(count);
-    }
-
-    // Extract memory patterns
-    std::map<std::string, std::vector<double>> memory_patterns;
-    for (const auto& node : json_data["children"]) {
-        if (node.contains("memory_patterns") && node["memory_patterns"].is_object()) {
-            for (const auto& [pattern, values] : node["memory_patterns"].items()) {
-                if (!values.is_array()) continue; // Skip invalid values
-                std::string pattern_lower = pattern;
-                std::transform(pattern_lower.begin(), pattern_lower.end(), pattern_lower.begin(), ::tolower);
-                if (memory_patterns.find(pattern_lower) == memory_patterns.end()) {
-                    memory_patterns[pattern_lower] = {0.0, 0.0, 0.0, 0.0};
-                }
-                auto curr_values = memory_patterns[pattern_lower];
-                auto json_values = values.get<std::vector<double>>();
-                for (size_t i = 0; i < json_values.size() && i < 4; ++i) {
-                    curr_values[i] += json_values[i];
-                }
-                memory_patterns[pattern_lower] = curr_values;
-            }
-        }
-    }
-    for (const auto& [pattern, values] : memory_patterns) {
-        for (size_t i = 0; i < 4; ++i) {
-            features["memory_" + pattern + "_" + std::to_string(i)] = values[i];
-        }
-    }
-
-    // Extract scheduling features
-    std::vector<std::string> scheduling_keys = {
-        "num_realizations", "num_productions", "points_computed_total", "innermost_loop_extent",
-        "inner_parallelism", "outer_parallelism", "bytes_at_realization", "bytes_at_production",
-        "bytes_at_root", "unique_bytes_read_per_realization", "working_set", "vector_size",
-        "num_vectors", "num_scalars", "bytes_at_task", "working_set_at_task", "working_set_at_production",
-        "working_set_at_realization", "working_set_at_root"
-    };
-    std::map<std::string, double> scheduling_sums;
-    int node_count = 0;
-    for (const auto& node : json_data["children"]) {
-        if (node.contains("scheduling") && node["scheduling"].is_object()) {
-            node_count++;
-            for (const auto& key : scheduling_keys) {
-                if (node["scheduling"].contains(key) && node["scheduling"][key].is_number()) {
-                    scheduling_sums[key] += node["scheduling"][key].get<double>();
-                }
-            }
-        }
-    }
-    for (const auto& key : scheduling_keys) {
-        if (key == "inner_parallelism" || key == "outer_parallelism") {
-            features["sched_" + key] = node_count > 0 ? scheduling_sums[key] / node_count : 0.0;
+    try {
+        // Extract global features
+        auto global_node = std::find_if(json_data["children"].begin(), json_data["children"].end(),
+            [](const json& child) { return child.contains("name") && child["name"] == "Global Features"; });
+        if (global_node != json_data["children"].end()) {
+            features["cache_hits"] = global_node->value("cache_hits", 0.0);
+            features["cache_misses"] = global_node->value("cache_misses", 0.0);
+            features["execution_time_ms"] = global_node->value("execution_time_ms", 0.0);
         } else {
-            features["sched_" + key] = scheduling_sums[key];
+            std::cout << "Warning: No 'Global Features' node found in " << file_path << std::endl;
         }
-    }
 
-    // Derived features
-    features["total_parallelism"] = features["sched_inner_parallelism"] + features["sched_outer_parallelism"];
-    features["scheduling_count"] = features["sched_num_realizations"] + features["sched_num_productions"];
-    features["total_bytes_at_production"] = features["sched_bytes_at_production"];
-    features["total_vectors"] = features["sched_num_vectors"];
-    double bytes_at_realization = features["sched_bytes_at_realization"];
-    features["computation_efficiency"] = (bytes_at_realization > 0) ? features["sched_points_computed_total"] / bytes_at_realization : 0.0;
-    double bytes_at_root = features["sched_bytes_at_root"];
-    features["memory_pressure"] = (bytes_at_root > 0) ? features["sched_working_set"] / bytes_at_root : 0.0;
-    double bytes_at_task = features["sched_bytes_at_task"];
-    features["memory_utilization_ratio"] = (bytes_at_task > 0) ? features["sched_unique_bytes_read_per_realization"] / bytes_at_task : 0.0;
-    double execution_time_ms = features["execution_time_ms"];
-    features["bytes_processing_rate"] = (execution_time_ms > 0) ? features["sched_bytes_at_realization"] / execution_time_ms : 0.0;
-    double total_parallelism = features["total_parallelism"];
-    features["bytes_per_parallelism"] = (total_parallelism > 0) ? features["sched_bytes_at_task"] / total_parallelism : 0.0;
-    double num_vectors = features["sched_num_vectors"];
-    features["bytes_per_vector"] = (num_vectors > 0) ? features["sched_bytes_at_realization"] / num_vectors : 0.0;
-    int nodes_count = json_data["children"].size();
-    int edges_count = 0;
-    for (const auto& node : json_data["children"]) {
-        if (node.contains("children") && node["children"].is_array()) {
-            edges_count += node["children"].size();
+        // Extract op_histogram features
+        std::map<std::string, int> op_histogram;
+        for (const auto& node : json_data["children"]) {
+            if (node.contains("op_histogram") && node["op_histogram"].is_object() && !node["op_histogram"].is_null()) {
+                for (const auto& [op, count] : node["op_histogram"].items()) {
+                    if (!count.is_number()) continue; // Skip invalid counts
+                    std::string op_lower = op;
+                    std::transform(op_lower.begin(), op_lower.end(), op_lower.begin(), ::tolower);
+                    op_histogram[op_lower] += count.get<int>();
+                }
+            }
         }
-    }
-    features["nodes_count"] = nodes_count;
-    features["edges_count"] = edges_count;
-    features["node_edge_ratio"] = (edges_count + 1 > 0) ? static_cast<double>(nodes_count) / (edges_count + 1) : static_cast<double>(nodes_count);
-    double scheduling_count = features["scheduling_count"];
-    features["nodes_per_schedule"] = (scheduling_count > 0) ? nodes_count / scheduling_count : 0.0;
-    int op_diversity = 0;
-    for (const auto& [key, value] : features) {
-        if (key.find("op_") == 0 && value > 0) {
-            op_diversity++;
+        for (const auto& [op, count] : op_histogram) {
+            features["op_" + op] = static_cast<double>(count);
         }
-    }
-    features["op_diversity"] = op_diversity;
 
-    // Interaction features
-    features["cache_hits_bytes_rate"] = features["cache_hits"] * features["bytes_processing_rate"];
-    features["bytes_task_parallelism"] = features["sched_bytes_at_task"] * features["total_parallelism"];
-    features["op_diversity_nodes"] = features["op_diversity"] * features["nodes_count"];
+        // Extract memory patterns
+        std::map<std::string, std::vector<double>> memory_patterns;
+        for (const auto& node : json_data["children"]) {
+            if (node.contains("memory_patterns") && node["memory_patterns"].is_object() && !node["memory_patterns"].is_null()) {
+                for (const auto& [pattern, values] : node["memory_patterns"].items()) {
+                    if (!values.is_array() || values.is_null()) continue; // Skip invalid or null values
+                    std::string pattern_lower = pattern;
+                    std::transform(pattern_lower.begin(), pattern_lower.end(), pattern_lower.begin(), ::tolower);
+                    if (memory_patterns.find(pattern_lower) == memory_patterns.end()) {
+                        memory_patterns[pattern_lower] = {0.0, 0.0, 0.0, 0.0};
+                    }
+                    auto curr_values = memory_patterns[pattern_lower];
+                    auto json_values = values.get<std::vector<double>>();
+                    for (size_t i = 0; i < json_values.size() && i < 4; ++i) {
+                        curr_values[i] += json_values[i];
+                    }
+                    memory_patterns[pattern_lower] = curr_values;
+                }
+            }
+        }
+        for (const auto& [pattern, values] : memory_patterns) {
+            for (size_t i = 0; i < 4; ++i) {
+                features["memory_" + pattern + "_" + std::to_string(i)] = values[i];
+            }
+        }
+
+        // Extract scheduling features
+        std::vector<std::string> scheduling_keys = {
+            "num_realizations", "num_productions", "points_computed_total", "innermost_loop_extent",
+            "inner_parallelism", "outer_parallelism", "bytes_at_realization", "bytes_at_production",
+            "bytes_at_root", "unique_bytes_read_per_realization", "working_set", "vector_size",
+            "num_vectors", "num_scalars", "bytes_at_task", "working_set_at_task", "working_set_at_production",
+            "working_set_at_realization", "working_set_at_root"
+        };
+        std::map<std::string, double> scheduling_sums;
+        int node_count = 0;
+        for (const auto& node : json_data["children"]) {
+            if (node.contains("scheduling") && node["scheduling"].is_object() && !node["scheduling"].is_null()) {
+                node_count++;
+                for (const auto& key : scheduling_keys) {
+                    if (node["scheduling"].contains(key) && node["scheduling"][key].is_number() && !node["scheduling"][key].is_null()) {
+                        scheduling_sums[key] += node["scheduling"][key].get<double>();
+                    }
+                }
+            }
+        }
+        for (const auto& key : scheduling_keys) {
+            if (key == "inner_parallelism" || key == "outer_parallelism") {
+                features["sched_" + key] = node_count > 0 ? scheduling_sums[key] / node_count : 0.0;
+            } else {
+                features["sched_" + key] = scheduling_sums[key];
+            }
+        }
+
+        // Derived features
+        features["total_parallelism"] = features["sched_inner_parallelism"] + features["sched_outer_parallelism"];
+        features["scheduling_count"] = features["sched_num_realizations"] + features["sched_num_productions"];
+        features["total_bytes_at_production"] = features["sched_bytes_at_production"];
+        features["total_vectors"] = features["sched_num_vectors"];
+        double bytes_at_realization = features["sched_bytes_at_realization"];
+        features["computation_efficiency"] = (bytes_at_realization > 0) ? features["sched_points_computed_total"] / bytes_at_realization : 0.0;
+        double bytes_at_root = features["sched_bytes_at_root"];
+        features["memory_pressure"] = (bytes_at_root > 0) ? features["sched_working_set"] / bytes_at_root : 0.0;
+        double bytes_at_task = features["sched_bytes_at_task"];
+        features["memory_utilization_ratio"] = (bytes_at_task > 0) ? features["sched_unique_bytes_read_per_realization"] / bytes_at_task : 0.0;
+        double execution_time_ms = features["execution_time_ms"];
+        features["bytes_processing_rate"] = (execution_time_ms > 0) ? features["sched_bytes_at_realization"] / execution_time_ms : 0.0;
+        double total_parallelism = features["total_parallelism"];
+        features["bytes_per_parallelism"] = (total_parallelism > 0) ? features["sched_bytes_at_task"] / total_parallelism : 0.0;
+        double num_vectors = features["sched_num_vectors"];
+        features["bytes_per_vector"] = (num_vectors > 0) ? features["sched_bytes_at_realization"] / num_vectors : 0.0;
+        int nodes_count = json_data["children"].size();
+        int edges_count = 0;
+        for (const auto& node : json_data["children"]) {
+            if (node.contains("children") && !node["children"].is_null() && node["children"].is_array()) {
+                edges_count += node["children"].size();
+            }
+        }
+        features["nodes_count"] = nodes_count;
+        features["edges_count"] = edges_count;
+        features["node_edge_ratio"] = (edges_count + 1 > 0) ? static_cast<double>(nodes_count) / (edges_count + 1) : static_cast<double>(nodes_count);
+        double scheduling_count = features["scheduling_count"];
+        features["nodes_per_schedule"] = (scheduling_count > 0) ? nodes_count / scheduling_count : 0.0;
+        int op_diversity = 0;
+        for (const auto& [key, value] : features) {
+            if (key.find("op_") == 0 && value > 0) {
+                op_diversity++;
+            }
+        }
+        features["op_diversity"] = op_diversity;
+
+        // Interaction features
+        features["cache_hits_bytes_rate"] = features["cache_hits"] * features["bytes_processing_rate"];
+        features["bytes_task_parallelism"] = features["sched_bytes_at_task"] * features["total_parallelism"];
+        features["op_diversity_nodes"] = features["op_diversity"] * features["nodes_count"];
+    } catch (const json::exception& e) {
+        std::cerr << "Error processing JSON in " << file_path << ": " << e.what() << std::endl;
+        return features; // Return empty features to skip this file
+    }
 
     return features;
 }
@@ -559,7 +564,7 @@ bool is_unknown_structure(const std::string& file_path) {
 
 int main(int argc, char* argv[]) {
     std::cout << "=== Enhanced Execution Time Predictor ===" << std::endl;
-    std::cout << "Version 3.1 - Robust JSON Handling" << std::endl;
+    std::cout << "Version 3.2 - Enhanced JSON Error Handling" << std::endl;
     
     bool is_gpu_available = torch::cuda::is_available();
     torch::Device device = is_gpu_available ? torch::Device(torch::kCUDA, 0) : torch::kCPU;
@@ -660,6 +665,7 @@ int main(int argc, char* argv[]) {
                     feature_map[feature_name] = value / count;
                 }
             }
+       
         }
     }
     
