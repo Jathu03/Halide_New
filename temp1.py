@@ -37,7 +37,7 @@ SCHEDULE_FEATURES = [
     'bytes_per_vector', 'nodes_per_schedule'
 ]
 
-# Feature extraction function
+# Feature extraction function with interaction features
 def extract_features(json_data):
     program_features = {}
     schedule_features = {}
@@ -114,9 +114,14 @@ def extract_features(json_data):
     schedule_features['nodes_per_schedule'] = nodes_count / (schedule_features.get('scheduling_count', 1)) if schedule_features.get('scheduling_count', 0) != 0 else 0
     program_features['op_diversity'] = len([k for k, v in program_features.items() if k.startswith('op_') and v > 0])
     
+    # Interaction features
+    schedule_features['cache_hits_bytes_rate'] = schedule_features.get('cache_hits', 0) * schedule_features.get('bytes_processing_rate', 0)
+    schedule_features['bytes_task_parallelism'] = schedule_features.get('sched_bytes_at_task', 0) * schedule_features.get('total_parallelism', 0)
+    program_features['op_diversity_nodes'] = program_features.get('op_diversity', 0) * program_features.get('nodes_count', 0)
+    
     # Create fixed-length feature vectors
-    fixed_program_features = {key: program_features.get(key, 0.0) for key in PROGRAM_FEATURES}
-    fixed_schedule_features = {key: schedule_features.get(key, 0.0) for key in SCHEDULE_FEATURES}
+    fixed_program_features = {key: program_features.get(key, 0.0) for key in PROGRAM_FEATURES + ['op_diversity_nodes']}
+    fixed_schedule_features = {key: schedule_features.get(key, 0.0) for key in SCHEDULE_FEATURES + ['cache_hits_bytes_rate', 'bytes_task_parallelism']}
     return fixed_program_features, fixed_schedule_features
 
 # Process Tree_Output directory
@@ -180,7 +185,8 @@ def process_tree_output_directory(main_dir):
 def prepare_data_for_model(train_program_features, train_schedule_features, test_program_features, test_schedule_features):
     important_features = [
         'cache_hits', 'bytes_processing_rate', 'sched_bytes_at_task', 'sched_working_set_at_root',
-        'sched_bytes_at_realization', 'sched_unique_bytes_read_per_realization'
+        'sched_bytes_at_realization', 'sched_unique_bytes_read_per_realization',
+        'cache_hits_bytes_rate', 'bytes_task_parallelism'
     ]
     
     # Create DataFrames
@@ -202,8 +208,17 @@ def prepare_data_for_model(train_program_features, train_schedule_features, test
     test_schedule_df = test_schedule_df.drop(columns=[col for col in low_importance_features if col in test_schedule_df.columns])
     
     # Log transform skewed features
-    skewed_features = ['cache_hits', 'bytes_processing_rate', 'sched_bytes_at_task', 'computation_efficiency']
-    for feature in skewed_features:
+    skewed_program_features = ['nodes_count', 'edges_count', 'op_diversity']
+    skewed_schedule_features = ['cache_hits', 'bytes_processing_rate', 'sched_bytes_at_task', 'computation_efficiency', 'cache_hits_bytes_rate', 'bytes_task_parallelism']
+    
+    for feature in skewed_program_features:
+        if feature in train_program_df.columns:
+            train_program_df[f'log_{feature}'] = np.log1p(train_program_df[feature])
+            test_program_df[f'log_{feature}'] = np.log1p(test_program_df[feature])
+            train_program_df = train_program_df.drop(columns=[feature])
+            test_program_df = test_program_df.drop(columns=[feature])
+    
+    for feature in skewed_schedule_features:
         if feature in train_schedule_df.columns:
             train_schedule_df[f'log_{feature}'] = np.log1p(train_schedule_df[feature])
             test_schedule_df[f'log_{feature}'] = np.log1p(test_schedule_df[feature])
@@ -227,8 +242,8 @@ def prepare_data_for_model(train_program_features, train_schedule_features, test
     # Extract execution times
     y_train_raw = np.array([f['execution_time_ms'] for f in train_schedule_features])
     y_test_raw = np.array([f['execution_time_ms'] for f in test_schedule_features])
-    y_train_raw = np.clip(y_train_raw, 0, np.percentile(y_train_raw, 99))
-    y_test_raw = np.clip(y_test_raw, 0, np.percentile(y_test_raw, 99))
+    y_train_raw = np.clip(y_train_raw, 0, np.percentile(y_train_raw, 95))  # More aggressive clipping
+    y_test_raw = np.clip(y_test_raw, 0, np.percentile(y_test_raw, 95))
     
     y_train = np.log1p(y_train_raw).reshape(-1, 1)
     y_test = np.log1p(y_test_raw).reshape(-1, 1)
@@ -265,15 +280,15 @@ def prepare_data_for_model(train_program_features, train_schedule_features, test
         bytes_rate_idx = train_schedule_df.columns.get_loc('log_bytes_processing_rate') if 'log_bytes_processing_rate' in train_schedule_df.columns else -1
         
         is_significant = False
-        if cache_hits_idx != -1 and train_schedule_scaled[i, cache_hits_idx] > np.percentile(train_schedule_scaled[:, cache_hits_idx], 75):
+        if cache_hits_idx != -1 and train_schedule_scaled[i, cache_hits_idx] > np.percentile(train_schedule_scaled[:, cache_hits_idx], 80):  # Higher threshold
             is_significant = True
-        if bytes_rate_idx != -1 and train_schedule_scaled[i, bytes_rate_idx] > np.percentile(train_schedule_scaled[:, bytes_rate_idx], 75):
+        if bytes_rate_idx != -1 and train_schedule_scaled[i, bytes_rate_idx] > np.percentile(train_schedule_scaled[:, bytes_rate_idx], 80):
             is_significant = True
         
-        augment_count = 3 if is_significant else 1
+        augment_count = 5 if is_significant else 2  # Increased augmentation
         for _ in range(augment_count):
-            noise_program = np.random.normal(0, 0.05, train_program_scaled[i].shape)
-            noise_schedule = np.random.normal(0, 0.05, train_schedule_scaled[i].shape)
+            noise_program = np.random.normal(0, 0.1, train_program_scaled[i].shape)  # Increased noise
+            noise_schedule = np.random.normal(0, 0.1, train_schedule_scaled[i].shape)
             noise_y = np.random.normal(0, 0.05, y_train_scaled[i].shape)
             train_program_aug.append(train_program_scaled[i] + noise_program)
             train_schedule_aug.append(train_schedule_scaled[i] + noise_schedule)
@@ -322,27 +337,35 @@ class MultiHeadAttention(nn.Module):
         out = self.fc_out(out)
         return out
 
-# Modified LSTM Model
+# Enhanced Model
 class SimpleLSTMModel(nn.Module):
-    def __init__(self, program_input_size, schedule_input_size, hidden_sizes=[512, 256, 128], output_size=1, dropout_rate=0.2, num_heads=8):
+    def __init__(self, program_input_size, schedule_input_size, hidden_sizes=[768, 384, 192], output_size=1, dropout_rate=0.3, num_heads=12):
         super(SimpleLSTMModel, self).__init__()
-        self.program_fc = nn.Linear(program_input_size, hidden_sizes[0])
-        self.schedule_fc = nn.Linear(schedule_input_size, hidden_sizes[0])
-        self.program_bn = nn.BatchNorm1d(hidden_sizes[0])
-        self.schedule_bn = nn.BatchNorm1d(hidden_sizes[0])
+        self.program_fc1 = nn.Linear(program_input_size, hidden_sizes[0])
+        self.program_bn1 = nn.BatchNorm1d(hidden_sizes[0])
+        self.program_fc2 = nn.Linear(hidden_sizes[0], hidden_sizes[1])
+        self.program_bn2 = nn.BatchNorm1d(hidden_sizes[1])
+        self.program_attention = MultiHeadAttention(hidden_sizes[1], num_heads, dropout_rate)
         
-        self.attention = MultiHeadAttention(hidden_sizes[0] * 2, num_heads, dropout_rate)
+        self.schedule_fc1 = nn.Linear(schedule_input_size, hidden_sizes[0])
+        self.schedule_bn1 = nn.BatchNorm1d(hidden_sizes[0])
+        self.schedule_fc2 = nn.Linear(hidden_sizes[0], hidden_sizes[1])
+        self.schedule_bn2 = nn.BatchNorm1d(hidden_sizes[1])
+        self.schedule_attention = MultiHeadAttention(hidden_sizes[1], num_heads, dropout_rate)
         
-        combined_size = hidden_sizes[0] * 2
-        self.fc1 = nn.Linear(combined_size, 256)
-        self.bn1 = nn.BatchNorm1d(256)
-        self.ln1 = nn.LayerNorm(256)
-        self.fc2 = nn.Linear(256, 128)
-        self.bn2 = nn.BatchNorm1d(128)
-        self.ln2 = nn.LayerNorm(128)
-        self.fc3 = nn.Linear(128, 64)
-        self.bn3 = nn.BatchNorm1d(64)
-        self.ln3 = nn.LayerNorm(64)
+        combined_size = hidden_sizes[1] * 2
+        self.fc1 = nn.Linear(combined_size, 512)
+        self.bn1 = nn.BatchNorm1d(512)
+        self.ln1 = nn.LayerNorm(512)
+        self.fc2 = nn.Linear(512, 256)
+        self.bn2 = nn.BatchNorm1d(256)
+        self.ln2 = nn.LayerNorm(256)
+        self.fc3 = nn.Linear(256, 128)
+        self.bn3 = nn.BatchNorm1d(128)
+        self.ln3 = nn.LayerNorm(128)
+        self.fc4 = nn.Linear(128, 64)
+        self.bn4 = nn.BatchNorm1d(64)
+        self.ln4 = nn.LayerNorm(64)
         self.output_layer = nn.Linear(64, output_size)
         
         self.gelu = nn.GELU()
@@ -350,19 +373,32 @@ class SimpleLSTMModel(nn.Module):
         self.residual_proj = nn.Linear(combined_size, 64) if combined_size != 64 else None
     
     def forward(self, program_input, schedule_input):
-        program_out = self.program_fc(program_input)
-        program_out = self.program_bn(program_out)
+        # Process program features
+        program_out = self.program_fc1(program_input)
+        program_out = self.program_bn1(program_out)
         program_out = self.gelu(program_out)
         program_out = self.dropout(program_out)
+        program_out = self.program_fc2(program_out)
+        program_out = self.program_bn2(program_out)
+        program_out = self.gelu(program_out)
+        program_out = self.program_attention(program_out.unsqueeze(1)).squeeze(1)
+        program_out = self.dropout(program_out)
         
-        schedule_out = self.schedule_fc(schedule_input)
-        schedule_out = self.schedule_bn(schedule_out)
+        # Process schedule features
+        schedule_out = self.schedule_fc1(schedule_input)
+        schedule_out = self.schedule_bn1(schedule_out)
         schedule_out = self.gelu(schedule_out)
         schedule_out = self.dropout(schedule_out)
+        schedule_out = self.schedule_fc2(schedule_out)
+        schedule_out = self.schedule_bn2(schedule_out)
+        schedule_out = self.gelu(schedule_out)
+        schedule_out = self.schedule_attention(schedule_out.unsqueeze(1)).squeeze(1)
+        schedule_out = self.dropout(schedule_out)
         
+        # Combine features
         combined = torch.cat((program_out, schedule_out), dim=1)
-        combined = self.attention(combined.unsqueeze(1)).squeeze(1)
         
+        # Final layers
         x = self.fc1(combined)
         x = self.bn1(x)
         x = self.ln1(x)
@@ -377,6 +413,11 @@ class SimpleLSTMModel(nn.Module):
         x = self.bn3(x)
         x = self.ln3(x)
         x = self.gelu(x)
+        x = self.dropout(x)
+        x = self.fc4(x)
+        x = self.bn4(x)
+        x = self.ln4(x)
+        x = self.gelu(x)
         
         residual = combined if self.residual_proj is None else self.residual_proj(combined)
         x = x + residual
@@ -384,17 +425,22 @@ class SimpleLSTMModel(nn.Module):
         output = self.output_layer(x)
         return output
 
-# Custom loss function
-def custom_loss(outputs, targets, schedule_inputs, feature_indices, feature_importances, huber_delta=0.5, mae_weight=0.3, l1_lambda=1e-5):
+# Custom loss function with outlier penalty
+def custom_loss(outputs, targets, schedule_inputs, feature_indices, feature_importances, huber_delta=1.0, mae_weight=0.5, l1_lambda=1e-4, outlier_weight=2.0):
     huber = nn.HuberLoss(delta=huber_delta)(outputs, targets)
     mae = torch.mean(torch.abs(outputs - targets))
     l1_reg = sum(param.abs().sum() for param in model.parameters()) * l1_lambda
+    
+    # Outlier penalty
+    errors = torch.abs(outputs - targets)
+    outlier_mask = errors > torch.quantile(errors, 0.95)
+    outlier_penalty = torch.mean(outlier_mask.float() * errors) * outlier_weight
     
     weights = torch.ones_like(targets)
     for feature, idx in feature_indices.items():
         if idx != -1 and feature in feature_importances:
             feature_vals = schedule_inputs[:, idx]
-            importance = feature_importances[feature]
+            importance = feature_importances[feature] * 1.5  # Increased importance
             weights = torch.where(
                 feature_vals > 1.0,
                 weights * (1.0 + importance * 2.0),
@@ -403,7 +449,7 @@ def custom_loss(outputs, targets, schedule_inputs, feature_indices, feature_impo
     
     weighted_huber = (huber * weights).mean()
     weighted_mae = (mae * weights).mean()
-    return weighted_huber + mae_weight * weighted_mae + l1_reg
+    return weighted_huber + mae_weight * weighted_mae + l1_reg + outlier_penalty
 
 # Create data loaders
 def create_data_loaders(train_program, train_schedule, y_train, test_program, test_schedule, y_test, batch_size=64):
@@ -426,7 +472,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, feature_
         device = torch.device('cpu')
         model.to(device)
     
-    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=50, T_mult=2, eta_min=1e-6)
+    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=30, T_mult=2, eta_min=1e-7)  # More aggressive schedule
     
     best_val_loss = float('inf')
     epochs_no_improve = 0
@@ -594,13 +640,13 @@ def main(main_dir):
     model = SimpleLSTMModel(
         program_input_size=program_input_size,
         schedule_input_size=schedule_input_size,
-        hidden_sizes=[512, 256, 128],
+        hidden_sizes=[768, 384, 192],
         output_size=1,
-        dropout_rate=0.2,
-        num_heads=8
+        dropout_rate=0.3,
+        num_heads=12
     )
     
-    optimizer = optim.AdamW(model.parameters(), lr=0.00005, weight_decay=1e-4)
+    optimizer = optim.AdamW(model.parameters(), lr=0.0001, weight_decay=1e-4)  # Slightly higher learning rate
     
     feature_importances = {
         'cache_hits': 0.5860,
@@ -608,18 +654,20 @@ def main(main_dir):
         'sched_bytes_at_task': 0.0422,
         'sched_working_set_at_root': 0.0248,
         'sched_bytes_at_realization': 0.0055,
-        'sched_unique_bytes_read_per_realization': 0.0049
+        'sched_unique_bytes_read_per_realization': 0.0049,
+        'cache_hits_bytes_rate': 0.0100,
+        'bytes_task_parallelism': 0.0080
     }
     
     feature_indices = {}
     for feature in feature_importances.keys():
-        log_feature = f'log_{feature}' if feature in ['cache_hits', 'bytes_processing_rate'] else feature
+        log_feature = f'log_{feature}' if feature in ['cache_hits', 'bytes_processing_rate', 'cache_hits_bytes_rate'] else feature
         if log_feature in schedule_columns:
             feature_indices[feature] = schedule_columns.get_loc(log_feature)
         else:
             feature_indices[feature] = schedule_columns.get_loc(feature) if feature in schedule_columns else -1
     
-    print("Building and training Simple LSTM model...")
+    print("Building and training enhanced model...")
     train_losses, val_losses = train_model(
         model, train_loader, test_loader,
         custom_loss, optimizer, feature_indices, feature_importances,
@@ -640,7 +688,7 @@ def main(main_dir):
     )
     
     print(f"\nSummary for Comparison:")
-    print(f"Model: SimpleLSTM")
+    print(f"Model: EnhancedLSTM")
     
     return model, y_scaler, y_test_actual, y_pred_actual
 
