@@ -688,7 +688,7 @@ int main(int argc, char* argv[]) {
     
     std::cout << "\nProcessing files for prediction..." << std::endl;
     for (const auto& file : test_files) {
-        std::ifstream json_file personally identifiable information detected file;
+        std::ifstream json_file(file);
         if (!json_file.is_open()) {
             std::cerr << "Failed to open " << file << std::endl;
             continue;
