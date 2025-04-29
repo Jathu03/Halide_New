@@ -25,14 +25,24 @@ FIXED_FEATURES = [
     # Add more as needed
 ]
 
+def set_random_seed(seed=42):
+    """Set random seed for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
 def extract_features(json_data):
+    """Extracts a fixed set of features from a JSON structure."""
     features = {}
     global_node = next((child for child in json_data['children'] if child['name'] == 'Global Features'), None)
     if global_node:
         features['cache_hits'] = global_node.get('cache_hits', 0)
         features['cache_misses'] = global_node.get('cache_misses', 0)
         features['execution_time_ms'] = global_node.get('execution_time_ms', 0)
-    op_histogram = {}
+    # Op histogram
     for node in json_data['children']:
         if 'op_histogram' in node:
             for op, count in node['op_histogram'].items():
@@ -46,14 +56,13 @@ def extract_features(json_data):
         'working_set_at_realization', 'working_set_at_root'
     ]
     scheduling_sums = {}
-    node_count = 0
     for node in json_data['children']:
         if 'scheduling' in node:
-            node_count += 1
             for key in scheduling_keys:
                 scheduling_sums[key] = scheduling_sums.get(key, 0) + node['scheduling'].get(key, 0)
     for key in scheduling_keys:
         features[f'sched_{key}'] = scheduling_sums.get(key, 0)
+    # Derived features
     features['total_parallelism'] = features.get('sched_inner_parallelism', 0) + features.get('sched_outer_parallelism', 0)
     features['scheduling_count'] = features.get('sched_num_realizations', 0) + features.get('sched_num_productions', 0)
     features['total_bytes_at_production'] = features.get('sched_bytes_at_production', 0)
@@ -76,6 +85,7 @@ def extract_features(json_data):
     return fixed_features
 
 def process_tree_output_directory(main_dir):
+    """Walks the directory, extracts features from all valid JSON files."""
     all_features, file_names, skipped_files = [], [], []
     for root, dirs, files in os.walk(main_dir):
         if 'tree_representation.json' in files:
@@ -89,7 +99,7 @@ def process_tree_output_directory(main_dir):
                     file_names.append(file_path)
                 else:
                     skipped_files.append(file_path)
-            except Exception as e:
+            except Exception:
                 skipped_files.append(file_path)
     if not all_features:
         raise ValueError("No valid JSON files with valid execution times found in Tree_Output directory.")
@@ -106,14 +116,13 @@ def process_tree_output_directory(main_dir):
     return train_features, test_features, list(test_file_names)
 
 def prepare_data_for_model(train_features, test_features):
+    """Prepares PyTorch tensors and scalers for model input."""
     train_sequences = [np.array([[features.get(key, 0.0) for key in FIXED_FEATURES]]) for features in train_features]
     test_sequences = [np.array([[features.get(key, 0.0) for key in FIXED_FEATURES]]) for features in test_features]
     train_sequences_padded = torch.FloatTensor(np.array(train_sequences))
     test_sequences_padded = torch.FloatTensor(np.array(test_sequences))
-    train_scalar_df = pd.DataFrame(train_features)
-    test_scalar_df = pd.DataFrame(test_features)
-    train_scalar_df = train_scalar_df.fillna(0)
-    test_scalar_df = test_scalar_df.fillna(0)
+    train_scalar_df = pd.DataFrame(train_features).fillna(0)
+    test_scalar_df = pd.DataFrame(test_features).fillna(0)
     constant_columns = [col for col in train_scalar_df.columns if train_scalar_df[col].nunique() == 1]
     train_scalar_df = train_scalar_df.drop(columns=constant_columns)
     test_scalar_df = test_scalar_df.drop(columns=constant_columns)
@@ -136,8 +145,9 @@ def prepare_data_for_model(train_features, test_features):
             scaler_y, train_sequences_padded.shape[2], train_scalar_tensor.shape[1], train_scalar_df.columns)
 
 class EnhancedRecursiveLSTMModel(nn.Module):
+    """Bidirectional multi-layer LSTM with scalar feature concatenation."""
     def __init__(self, seq_input_size, scalar_input_size, hidden_sizes=[128, 64], output_size=1, dropout_rate=0.2):
-        super(EnhancedRecursiveLSTMModel, self).__init__()
+        super().__init__()
         self.lstm_layers = nn.ModuleList()
         self.lstm_layers.append(nn.LSTM(seq_input_size, hidden_sizes[0], batch_first=True, bidirectional=True))
         for i in range(1, len(hidden_sizes)):
@@ -159,21 +169,32 @@ class EnhancedRecursiveLSTMModel(nn.Module):
         output = self.fc2(x)
         return output
 
-def train_model(model, train_loader, test_loader, optimizer, num_epochs=100, patience=10):
+def train_model(model, train_loader, test_loader, optimizer, num_epochs=100, patience=10, use_amp=False):
+    """Trains the model with early stopping and optional mixed precision."""
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.to(device)
     criterion = nn.MSELoss()
     best_val_loss = float('inf')
     patience_counter = 0
+    scaler = torch.cuda.amp.GradScaler() if use_amp and torch.cuda.is_available() else None
     for epoch in range(num_epochs):
         model.train()
         for seq_inputs, scalar_inputs, targets in train_loader:
             seq_inputs, scalar_inputs, targets = seq_inputs.to(device), scalar_inputs.to(device), targets.to(device)
             optimizer.zero_grad()
-            outputs = model(seq_inputs, scalar_inputs)
-            loss = criterion(outputs, targets)
-            loss.backward()
-            optimizer.step()
+            if scaler:
+                with torch.cuda.amp.autocast():
+                    outputs = model(seq_inputs, scalar_inputs)
+                    loss = criterion(outputs, targets)
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                outputs = model(seq_inputs, scalar_inputs)
+                loss = criterion(outputs, targets)
+                loss.backward()
+                optimizer.step()
+        # Validation
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
@@ -197,6 +218,8 @@ def train_model(model, train_loader, test_loader, optimizer, num_epochs=100, pat
     return model
 
 def evaluate_model(model, X_test_seq, X_test_scalar, y_test, y_scaler, file_names_test):
+    """Evaluates model and prints detailed metrics."""
+    from sklearn.metrics import r2_score
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.to(device)
     model.eval()
@@ -218,15 +241,26 @@ def evaluate_model(model, X_test_seq, X_test_scalar, y_test, y_scaler, file_name
     rmse = np.sqrt(mse)
     mae = np.mean(np.abs(y_test_actual - y_pred_actual))
     mape = np.mean(np.abs((y_test_actual - y_pred_actual) / (y_test_actual + 1e-8))) * 100
+    r2 = r2_score(y_test_actual, y_pred_actual)
     print("\nOverall Model Performance:")
     print(f"MSE: {mse:.2f}")
     print(f"RMSE: {rmse:.2f}")
     print(f"MAE: {mae:.2f}")
     print(f"MAPE: {mape:.2f}%")
+    print(f"R2 Score: {r2:.4f}")
     return y_test_actual, y_pred_actual
 
-def main(main_dir):
+def main(main_dir,
+         batch_size=64,
+         learning_rate=0.0005,
+         weight_decay=1e-4,
+         num_epochs=100,
+         patience=10,
+         use_amp=False,
+         seed=42):
+    """Main pipeline for data extraction, training, and evaluation."""
     print(f"Processing main directory: {main_dir}")
+    set_random_seed(seed)
     train_features, test_features, test_file_names = process_tree_output_directory(main_dir)
     if len(train_features) == 0 or len(test_features) == 0:
         print("Error: No valid training or test data found")
@@ -234,11 +268,11 @@ def main(main_dir):
     (train_sequences, train_scalar, y_train,
      test_sequences, test_scalar, y_test,
      y_scaler, seq_input_size, scalar_input_size, feature_columns) = prepare_data_for_model(train_features, test_features)
-    train_loader = DataLoader(TensorDataset(train_sequences, train_scalar, y_train), batch_size=64, shuffle=True)
-    test_loader = DataLoader(TensorDataset(test_sequences, test_scalar, y_test), batch_size=64)
+    train_loader = DataLoader(TensorDataset(train_sequences, train_scalar, y_train), batch_size=batch_size, shuffle=True)
+    test_loader = DataLoader(TensorDataset(test_sequences, test_scalar, y_test), batch_size=batch_size)
     model = EnhancedRecursiveLSTMModel(seq_input_size=seq_input_size, scalar_input_size=scalar_input_size)
-    optimizer = optim.AdamW(model.parameters(), lr=0.0005, weight_decay=1e-4)
-    model = train_model(model, train_loader, test_loader, optimizer, num_epochs=100, patience=10)
+    optimizer = optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    model = train_model(model, train_loader, test_loader, optimizer, num_epochs=num_epochs, patience=patience, use_amp=use_amp)
     print("\nEvaluating model:")
     y_test_actual, y_pred_actual = evaluate_model(
         model, test_sequences, test_scalar, y_test,
@@ -250,7 +284,4 @@ def main(main_dir):
 
 if __name__ == "__main__":
     main_dir = "Tree_Output"
-    random.seed(42)
-    torch.manual_seed(42)
-    np.random.seed(42)
     main(main_dir)
