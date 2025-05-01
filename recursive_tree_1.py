@@ -11,30 +11,26 @@ class HalideTreeDataset(Dataset):
     def __init__(self, root_dir, scaler=None):
         self.root_dir = root_dir
         self.samples = []
-        self.scaler = scaler or StandardScaler()
+        self.scaler = scaler if scaler else StandardScaler()
         self._preprocess_data()
         
     def _load_tree(self, file_path):
         with open(file_path, 'r') as f:
             data = json.load(f)
         
-        # Extract execution time (skip invalid entries)
         exec_time = data.get("Global Features", {}).get("execution_time_ms", -1)
-        if exec_time <= 0 or exec_time > 1e6:  # Filter invalid times
+        if exec_time <= 0 or exec_time > 1e6:
             return None, None
             
-        # Recursive tree parsing
         def parse_node(node):
             features = []
-            # Extract important features from different sections
+            # Feature extraction
             features += list(node.get("op_histogram", {}).values())
             features += list(node.get("memory_patterns", {}).values())
             features += list(node.get("scheduling", {}).values())
             
-            # Convert to floats and handle missing values
             features = [float(x) for x in features if x is not None]
             
-            # Process children recursively
             children = [parse_node(child) for child in node.get("children", [])]
             return {"features": features, "children": children}
         
@@ -60,8 +56,8 @@ class HalideTreeDataset(Dataset):
                     self._collect_features(tree, all_features)
                     valid_samples.append((tree, exec_time))
         
-        # Fit scaler on collected features
-        if not self.scaler.fit_:
+        # Check if scaler needs fitting
+        if len(all_features) > 0 and not hasattr(self.scaler, 'mean_'):
             self.scaler.fit(np.array(all_features))
         
         self.samples = valid_samples
@@ -99,7 +95,6 @@ class RecursiveLSTM(nn.Module):
         )
         
     def forward(self, tree):
-        # Process children recursively
         child_embeddings = [self.forward(child) for child in tree["children"]]
         
         if len(child_embeddings) > 0:
@@ -108,31 +103,24 @@ class RecursiveLSTM(nn.Module):
         else:
             hidden = torch.zeros(1, 1, self.hidden_size)
         
-        # Combine node features with children embeddings
         node_features = tree["features"].unsqueeze(0)
         combined = torch.cat([node_features, hidden], dim=-1)
-        
-        # Final prediction layers
         return self.fc(combined).squeeze()
 
 def train_model():
-    # Configuration
     root_dir = "Tree_Output"
     batch_size = 32
     hidden_size = 128
     epochs = 100
     
-    # Load dataset
     dataset = HalideTreeDataset(root_dir)
     train_data, val_data = train_test_split(dataset, test_size=0.2)
     
-    # Create model
     input_size = len(dataset.scaler.scale_)
     model = RecursiveLSTM(input_size, hidden_size)
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
     
-    # Training loop
     for epoch in range(epochs):
         model.train()
         for tree, target in DataLoader(train_data, batch_size=batch_size):
@@ -142,7 +130,6 @@ def train_model():
             loss.backward()
             optimizer.step()
         
-        # Validation
         model.eval()
         with torch.no_grad():
             val_loss = 0
@@ -151,7 +138,6 @@ def train_model():
                 val_loss += criterion(output, target).item()
             print(f"Epoch {epoch+1}, Val Loss: {val_loss/len(val_data):.4f}")
 
-    # Save artifacts
     torch.save(model.state_dict(), "halide_lstm.pth")
     torch.save(dataset.scaler, "scaler.pth")
 
