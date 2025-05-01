@@ -9,9 +9,7 @@ import joblib
 
 # ----------- Feature Extraction Utilities -----------
 FEATURE_NAMES = [
-    # Top features from feature_importance_report.txt
     "cache_hits", "cache_misses",
-    # Scheduling features (prefix with 'sched_')
     "num_realizations", "num_productions", "points_computed_per_realization",
     "points_computed_per_production", "points_computed_total",
     "points_computed_minimum", "innermost_loop_extent", "innermost_pure_loop_extent",
@@ -25,10 +23,8 @@ FEATURE_NAMES = [
     "unique_bytes_read_per_vector", "unique_lines_read_per_vector", "unique_bytes_read_per_task",
     "unique_lines_read_per_task", "working_set_at_task", "working_set_at_production",
     "working_set_at_realization", "working_set_at_root"
-    # Add more as needed
 ]
 
-# Flatten op_histogram and memory_patterns keys
 OP_NAMES = [
     "Constant", "Cast", "Variable", "Param", "Add", "Sub", "Mod", "Mul", "Div", "Min", "Max",
     "EQ", "NE", "LT", "LE", "And", "Or", "Not", "Select", "ImageCall", "FuncCall", "SelfCall",
@@ -38,31 +34,25 @@ MEMORY_PATTERN_NAMES = ["Pointwise", "Transpose", "Broadcast", "Slice"]
 
 def extract_node_features(node):
     features = []
-    # cache_hits, cache_misses
     features.append(node.get("cache_hits", 0))
     features.append(node.get("cache_misses", 0))
-    # scheduling
     sched = node.get("scheduling", {})
     for fname in FEATURE_NAMES[2:]:
         features.append(sched.get(fname, 0))
-    # op_histogram
     op_hist = node.get("op_histogram", {})
     for op in OP_NAMES:
         features.append(op_hist.get(op, 0))
-    # memory_patterns
     mem_patterns = node.get("memory_patterns", {})
     for mp in MEMORY_PATTERN_NAMES:
         pattern = mem_patterns.get(mp, [0, 0, 0, 0])
         features.extend(pattern)
     return np.array(features, dtype=np.float32)
 
-# ----------- Tree Parsing -----------
 def build_tree(node):
     features = extract_node_features(node)
     children = [build_tree(child) for child in node.get("children", [])]
     return {"features": features, "children": children}
 
-# ----------- Dataset -----------
 class HalideTreeDataset(Dataset):
     def __init__(self, root_dir, scaler=None, fit_scaler=False):
         self.samples = []
@@ -77,14 +67,12 @@ class HalideTreeDataset(Dataset):
                 if not os.path.isfile(json_file): continue
                 with open(json_file) as f:
                     data = json.load(f)
-                # Check for valid execution time
                 exec_time = None
                 for child in data.get("children", []):
                     if child.get("name") == "Global Features":
                         exec_time = child.get("execution_time_ms", None)
                 if exec_time is None or exec_time <= 0:
                     continue
-                # Build tree and collect features for scaler
                 tree = build_tree(data)
                 self.samples.append((tree, exec_time))
                 if fit_scaler:
@@ -96,7 +84,6 @@ class HalideTreeDataset(Dataset):
                     feature_list.extend(collect_feats(tree))
         if fit_scaler:
             self.scaler = StandardScaler().fit(np.vstack(feature_list))
-        # Normalize features
         for i, (tree, exec_time) in enumerate(self.samples):
             def norm_tree(node):
                 node["features"] = self.scaler.transform([node["features"]])[0]
@@ -126,32 +113,33 @@ class RecursiveLSTM(nn.Module):
         )
 
     def forward(self, tree):
-        # Returns (embedding, output)
         def recur(node):
-            # Embed node features
             node_emb = self.node_embed(torch.tensor(node["features"], dtype=torch.float32))
             if node["children"]:
-                # Aggregate children embeddings (mean)
                 child_embs = [recur(c)[0] for c in node["children"]]
                 child_emb = torch.mean(torch.stack(child_embs), dim=0)
             else:
                 child_emb = torch.zeros_like(node_emb)
-            # LSTM cell: input is node_emb, hidden is child_emb
             h, c = self.lstm_cell(node_emb, (child_emb, torch.zeros_like(child_emb)))
             return h, c
         root_emb, _ = recur(tree)
         return self.out_net(root_emb).squeeze(-1)
 
+# ----------- Custom Collate Function -----------
+def tree_collate_fn(batch):
+    # batch is a list of (tree, exec_time) tuples
+    # For batch_size=1, just return the first element
+    return batch[0]
+
 # ----------- Training Loop -----------
-def train_model(root_dir, model_save_path, scaler_save_path, epochs=20, batch_size=8, hidden_dim=128, lr=1e-3):
+def train_model(root_dir, model_save_path, scaler_save_path, epochs=20, hidden_dim=128, lr=1e-3):
     # First pass: fit scaler
     dataset = HalideTreeDataset(root_dir, fit_scaler=True)
     scaler = dataset.scaler
     joblib.dump(scaler, scaler_save_path)
     # Second pass: normalized dataset
     dataset = HalideTreeDataset(root_dir, scaler=scaler)
-    dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
-    # Model
+    dataloader = DataLoader(dataset, batch_size=1, shuffle=True, collate_fn=tree_collate_fn)
     feature_dim = len(extract_node_features({}))
     model = RecursiveLSTM(feature_dim, hidden_dim)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
@@ -159,9 +147,9 @@ def train_model(root_dir, model_save_path, scaler_save_path, epochs=20, batch_si
     model.train()
     for epoch in range(epochs):
         total_loss = 0
-        for (tree, exec_time) in dataloader:
+        for tree, exec_time in dataloader:
             optimizer.zero_grad()
-            pred = model(tree[0])
+            pred = model(tree)
             loss = loss_fn(pred, torch.tensor(exec_time, dtype=torch.float32))
             loss.backward()
             optimizer.step()
@@ -177,7 +165,6 @@ if __name__ == "__main__":
         model_save_path="halide_recursive_lstm.pt",
         scaler_save_path="halide_scaler.pkl",
         epochs=20,
-        batch_size=1,
         hidden_dim=128,
         lr=1e-3
     )
