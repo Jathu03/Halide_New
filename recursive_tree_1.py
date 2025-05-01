@@ -127,12 +127,51 @@ class RecursiveLSTM(nn.Module):
 
 # ----------- Custom Collate Function -----------
 def tree_collate_fn(batch):
-    # batch is a list of (tree, exec_time) tuples
-    # For batch_size=1, just return the first element
     return batch[0]
 
+# ----------- Checkpointing Utilities -----------
+def save_checkpoint(model, optimizer, epoch, loss, checkpoint_path):
+    state = {
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'loss': loss
+    }
+    torch.save(state, checkpoint_path)
+    print(f"Checkpoint saved at epoch {epoch} to {checkpoint_path}")
+
+def load_checkpoint(model, optimizer, checkpoint_path):
+    if os.path.isfile(checkpoint_path):
+        state = torch.load(checkpoint_path)
+        model.load_state_dict(state['model_state_dict'])
+        optimizer.load_state_dict(state['optimizer_state_dict'])
+        epoch = state['epoch']
+        loss = state['loss']
+        print(f"Checkpoint loaded from {checkpoint_path} at epoch {epoch}")
+        return epoch, loss
+    else:
+        print(f"No checkpoint found at {checkpoint_path}")
+        return 0, None
+
+# ----------- Prediction and Error Percentage -----------
+def predict_and_evaluate(model, dataset, scaler, num_schedules=30):
+    model.eval()
+    errors = []
+    with torch.no_grad():
+        for i in range(min(num_schedules, len(dataset))):
+            tree, true_time = dataset[i]
+            pred_time = model(tree).item()
+            error_percentage = abs(pred_time - true_time) / true_time * 100 if true_time != 0 else 0
+            errors.append(error_percentage)
+            print(f"Schedule {i+1}: True={true_time:.4f}, Predicted={pred_time:.4f}, Error%={error_percentage:.2f}")
+    mean_error = np.mean(errors) if errors else 0
+    print(f"Mean Error Percentage over {len(errors)} schedules: {mean_error:.2f}%")
+    return mean_error
+
 # ----------- Training Loop -----------
-def train_model(root_dir, model_save_path, scaler_save_path, epochs=20, hidden_dim=128, lr=1e-3):
+def train_model(root_dir, model_save_path, scaler_save_path, checkpoint_path,
+                epochs=20, hidden_dim=128, lr=1e-3, resume=False):
+
     # First pass: fit scaler
     dataset = HalideTreeDataset(root_dir, fit_scaler=True)
     scaler = dataset.scaler
@@ -144,8 +183,14 @@ def train_model(root_dir, model_save_path, scaler_save_path, epochs=20, hidden_d
     model = RecursiveLSTM(feature_dim, hidden_dim)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     loss_fn = nn.MSELoss()
+
+    start_epoch = 0
+    last_loss = None
+    if resume:
+        start_epoch, last_loss = load_checkpoint(model, optimizer, checkpoint_path)
+
     model.train()
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, epochs):
         total_loss = 0
         for tree, exec_time in dataloader:
             optimizer.zero_grad()
@@ -154,9 +199,15 @@ def train_model(root_dir, model_save_path, scaler_save_path, epochs=20, hidden_d
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
-        print(f"Epoch {epoch+1}/{epochs} - Loss: {total_loss/len(dataset):.4f}")
+        avg_loss = total_loss / len(dataset)
+        print(f"Epoch {epoch+1}/{epochs} - Loss: {avg_loss:.4f}")
+        save_checkpoint(model, optimizer, epoch+1, avg_loss, checkpoint_path)
     torch.save(model.state_dict(), model_save_path)
     print("Training complete. Model and scaler saved.")
+
+    # Prediction and error percentage for 30 schedules
+    print("\n--- Prediction and Error Percentage for 30 Schedules ---")
+    predict_and_evaluate(model, dataset, scaler, num_schedules=30)
 
 # ----------- Usage -----------
 if __name__ == "__main__":
@@ -164,7 +215,9 @@ if __name__ == "__main__":
         root_dir="Tree_Output",
         model_save_path="halide_recursive_lstm.pt",
         scaler_save_path="halide_scaler.pkl",
+        checkpoint_path="halide_checkpoint.pt",
         epochs=20,
         hidden_dim=128,
-        lr=1e-3
+        lr=1e-3,
+        resume=True  # Set to True to resume from checkpoint if available
     )
