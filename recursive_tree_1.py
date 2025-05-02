@@ -170,7 +170,7 @@ def predict_and_evaluate(model, dataset, scaler, num_schedules=30):
 
 # ----------- Training Loop -----------
 def train_model(root_dir, model_save_path, scaler_save_path, checkpoint_path,
-                epochs=20, hidden_dim=128, lr=1e-3, resume=False):
+                epochs=30, hidden_dim=128, lr=1e-3, resume=False):
 
     # First pass: fit scaler
     dataset = HalideTreeDataset(root_dir, fit_scaler=True)
@@ -216,7 +216,7 @@ if __name__ == "__main__":
         model_save_path="halide_recursive_lstm.pt",
         scaler_save_path="halide_scaler.pkl",
         checkpoint_path="halide_checkpoint.pt",
-        epochs=20,
+        epochs=30,
         hidden_dim=128,
         lr=1e-3,
         resume=True  # Set to True to resume from checkpoint if available
