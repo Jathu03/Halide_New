@@ -93,6 +93,7 @@ def extract_features(json_data):
     features['total_vectors'] = features.get('sched_num_vectors', 0)
     features['computation_efficiency'] = safe_div(features.get('sched_points_computed_total', 0), features.get('sched_bytes_at_realization', 1))
     features['memory_pressure'] = safe_div(features.get('sched_working_set', 0), features.get('sched_bytes_at_root', 1))
+ae
     features['memory_utilization_ratio'] = safe_div(features.get('sched_unique_bytes_read_per_realization', 0), features.get('sched_bytes_at_task', 1))
     features['bytes_processing_rate'] = safe_div(features.get('sched_bytes_at_realization', 0), features.get('execution_time_ms', 1))
     features['bytes_per_parallelism'] = safe_div(features.get('sched_bytes_at_task', 0), features.get('total_parallelism', 1))
@@ -179,7 +180,9 @@ def prepare_data_for_model(train_features, test_features):
     test_sequences = [np.array([[features.get(key, 0.0) for key in FIXED_FEATURES_EXTENDED]]) for features in test_features]
     
     train_sequences_padded = torch.FloatTensor(np.array(train_sequences))
-    test_sequences_padded = torch.FloatTensor(np.array(test_sequences))
+   
+
+ test_sequences_padded = torch.FloatTensor(np.array(test_sequences))
     
     train_scalar_df = pd.DataFrame(train_features)
     test_scalar_df = pd.DataFrame(test_features)
@@ -251,7 +254,7 @@ def prepare_data_for_model(train_features, test_features):
         is_significant = False
         if cache_hits_idx != -1 and train_scalar_scaled[i, cache_hits_idx] > np.percentile(train_scalar_scaled[:, cache_hits_idx], 75):
             is_significant = True
-        if bytes_rate_idx != -1 and train_scalar_scaled[i, bytes_rate_idx] > np.percentile(train_scalar_scaled[:, cache_hits_idx], 75):
+        if bytes_rate_idx != -1 and train_scalar_scaled[i, bytes_rate_idx] > np.percentile(train_scalar_scaled[:, bytes_rate_idx], 75):
             is_significant = True
         
         augment_count = 4 if is_significant else 2
@@ -275,7 +278,7 @@ def prepare_data_for_model(train_features, test_features):
     
     train_sequences_padded = torch.stack(train_sequences_aug)
     train_scalar_scaled = np.array(train_scalar_aug)
-    y_train_scaled = np.array(y_train_aug)
+    y_train_scaled = np.array(train_scalar_aug)
     
     train_scalar_tensor = torch.FloatTensor(train_scalar_scaled)
     test_scalar_tensor = torch.FloatTensor(test_scalar_scaled)
@@ -304,7 +307,9 @@ class MultiHeadAttention(nn.Module):
         self.head_dim = hidden_size // num_heads
         
         self.query = nn.Linear(hidden_size, hidden_size)
-        self.key = nn.Linear(hidden_size, hidden_size)
+        self.key
+
+ = nn.Linear(hidden_size, hidden_size)
         self.value = nn.Linear(hidden_size, hidden_size)
         self.fc_out = nn.Linear(hidden_size, hidden_size)
         self.dropout = nn.Dropout(dropout_rate)
@@ -324,7 +329,7 @@ class MultiHeadAttention(nn.Module):
         return out
 
 class EnhancedRecursiveLSTMModel(nn.Module):
-    def __init__(self, seq_input_size, scalar_input_size, hidden_sizes=[768, 384, 192], output_size=1, dropout_rate=0.15, num_heads=12):
+    def __init__(self, seq_input_size, scalar_input_size, hidden_sizes=[512, 256, 128], output_size=1, dropout_rate=0.2, num_heads=8):
         super(EnhancedRecursiveLSTMModel, self).__init__()
         self.lstm_layers = nn.ModuleList()
         self.ln_layers = nn.ModuleList()
@@ -337,20 +342,20 @@ class EnhancedRecursiveLSTMModel(nn.Module):
         self.attention = MultiHeadAttention(hidden_sizes[-1] * 2, num_heads, dropout_rate)
         
         combined_size = hidden_sizes[-1] * 2 + scalar_input_size
-        self.fc1 = nn.Linear(combined_size, 384)
-        self.bn1 = nn.BatchNorm1d(384)
-        self.ln1 = nn.LayerNorm(384)
-        self.fc2 = nn.Linear(384, 192)
-        self.bn2 = nn.BatchNorm1d(192)
-        self.ln2 = nn.LayerNorm(192)
-        self.fc3 = nn.Linear(192, 96)
-        self.bn3 = nn.BatchNorm1d(96)
-        self.ln3 = nn.LayerNorm(96)
-        self.output_layer = nn.Linear(96, output_size)
+        self.fc1 = nn.Linear(combined_size, 256)
+        self.bn1 = nn.BatchNorm1d(256)
+        self.ln1 = nn.LayerNorm(256)
+        self.fc2 = nn.Linear(256, 128)
+        self.bn2 = nn.BatchNorm1d(128)
+        self.ln2 = nn.LayerNorm(128)
+        self.fc3 = nn.Linear(128, 64)
+        self.bn3 = nn.BatchNorm1d(64)
+        self.ln3 = nn.LayerNorm(64)
+        self.output_layer = nn.Linear(64, output_size)
         
         self.gelu = nn.GELU()
         self.dropout = nn.Dropout(dropout_rate)
-        self.residual_proj = nn.Linear(combined_size, 96) if combined_size != 96 else None
+        self.residual_proj = nn.Linear(combined_size, 64) if combined_size != 64 else None
     
     def forward(self, seq_input, scalar_input):
         lstm_out = seq_input
@@ -414,7 +419,7 @@ def create_data_loaders(train_sequences, train_scalar, y_train, test_sequences, 
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
     return train_loader, test_loader
 
-# Enhanced training function
+# Enhanced training function with checkpoint compatibility
 def train_model(model, train_loader, test_loader, criterion, optimizer, feature_indices, feature_importances, num_epochs=1500, patience=75, accumulation_steps=4, checkpoint_path='recursive.pth'):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
@@ -439,17 +444,22 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, feature_
     
     # Load checkpoint if exists
     if os.path.exists(checkpoint_path):
-        checkpoint = torch.load(checkpoint_path, map_location=device)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        start_epoch = checkpoint['epoch'] + 1
-        best_val_loss = checkpoint['best_val_loss']
-        train_losses = checkpoint['train_losses']
-        val_losses = checkpoint['val_losses']
-        epochs_no_improve = checkpoint['epochs_no_improve']
-        best_model_state = checkpoint['best_model_state']
-        print(f"Resuming training from epoch {start_epoch}")
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location=device)
+            model.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            start_epoch = checkpoint['epoch'] + 1
+            best_val_loss = checkpoint['best_val_loss']
+            train_losses = checkpoint['train_losses']
+            val_losses = checkpoint['val_losses']
+            epochs_no_improve = checkpoint['epochs_no_improve']
+            best_model_state = checkpoint['best_model_state']
+            print(f"Resuming training from epoch {start_epoch}")
+        except RuntimeError as e:
+            print(f"Checkpoint incompatible: {e}. Starting training from scratch.")
+            os.rename(checkpoint_path, checkpoint_path + '.backup')
+            print(f"Renamed incompatible checkpoint to {checkpoint_path}.backup")
     
     for epoch in range(start_epoch, num_epochs):
         model.train()
@@ -520,7 +530,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, feature_
             
             # Save model for LibTorch
             model.eval()
-            example_seq = torch.randn(1, 1, FIXED_FEATURES_EXTENDED.__len__()).to(device)
+            example_seq = torch.randn(1, 1, seq_input_size).to(device)
             example_scalar = torch.randn(1, scalar_input_size).to(device)
             traced_model = torch.jit.trace(model, (example_seq, example_scalar))
             traced_model.save('recursive_model.pt')
@@ -552,10 +562,6 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, feature_
 # Resume training function
 def resume_training(model, train_loader, test_loader, criterion, optimizer, feature_indices, feature_importances, num_epochs=1500, patience=75, accumulation_steps=4, checkpoint_path='recursive.pth'):
     print(f"Attempting to resume training from checkpoint: {checkpoint_path}")
-    if not os.path.exists(checkpoint_path):
-        print(f"No checkpoint found at {checkpoint_path}. Starting training from scratch.")
-        return train_model(model, train_loader, test_loader, criterion, optimizer, feature_indices, feature_importances, num_epochs, patience, accumulation_steps, checkpoint_path)
-    
     return train_model(model, train_loader, test_loader, criterion, optimizer, feature_indices, feature_importances, num_epochs, patience, accumulation_steps, checkpoint_path)
 
 # Enhanced evaluation function
@@ -627,7 +633,7 @@ def main(main_dir):
         print("Error: No valid training or test data found")
         return None
     
-    global scalar_input_size
+    global seq_input_size, scalar_input_size
     (train_sequences, train_scalar, y_train,
      test_sequences, test_scalar, y_test,
      y_scaler, seq_input_size, scalar_input_size, feature_columns) = prepare_data_for_model(train_features, test_features)
@@ -642,10 +648,10 @@ def main(main_dir):
     model = EnhancedRecursiveLSTMModel(
         seq_input_size=seq_input_size,
         scalar_input_size=scalar_input_size,
-        hidden_sizes=[768, 384, 192],
+        hidden_sizes=[512, 256, 128],
         output_size=1,
-        dropout_rate=0.15,
-        num_heads=12
+        dropout_rate=0.2,
+        num_heads=8
     )
     
     optimizer = optim.AdamW(model.parameters(), lr=0.00003, weight_decay=5e-5)
