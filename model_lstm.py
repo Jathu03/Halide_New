@@ -11,6 +11,7 @@ from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 import random
 from collections import defaultdict
 import matplotlib.pyplot as plt
+import joblib
 
 # Define fixed set of features for sequences
 FIXED_FEATURES = [
@@ -177,7 +178,6 @@ def prepare_data_for_model(train_features, test_features):
     ]
     
     # Create sequences with fixed features
-    # Simulate sequence data by repeating feature vector (sequence_length=3 for simplicity)
     sequence_length = 3
     train_sequences = [np.array([[features.get(key, 0.0) for key in FIXED_FEATURES]] * sequence_length) for features in train_features]
     test_sequences = [np.array([[features.get(key, 0.0) for key in FIXED_FEATURES]] * sequence_length) for features in test_features]
@@ -269,7 +269,7 @@ def prepare_data_for_model(train_features, test_features):
     
     train_sequences_padded = torch.stack(train_sequences_aug)
     train_scalar_scaled = np.array(train_scalar_aug)
-    y_train_scaled = np.array(y_train_aug)
+    y_train_scaled = np.array(train_aug)
     
     train_scalar_tensor = torch.FloatTensor(train_scalar_scaled)
     test_scalar_tensor = torch.FloatTensor(test_scalar_scaled)
@@ -281,7 +281,7 @@ def prepare_data_for_model(train_features, test_features):
     
     return (train_sequences_padded, train_scalar_tensor, y_train_tensor,
             test_sequences_padded, test_scalar_tensor, y_test_tensor,
-            scaler_y, train_sequences_padded.shape[2], train_scalar_tensor.shape[1], train_scalar_df.columns)
+            scaler_y, scaler_X_scalar, train_sequences_padded.shape[2], train_scalar_tensor.shape[1], train_scalar_df.columns)
 
 # Multi-Head Attention mechanism
 class MultiHeadAttention(nn.Module):
@@ -583,7 +583,7 @@ def main(main_dir):
     
     (train_sequences, train_scalar, y_train,
      test_sequences, test_scalar, y_test,
-     y_scaler, seq_input_size, scalar_input_size, feature_columns) = prepare_data_for_model(train_features, test_features)
+     y_scaler, scaler_X_scalar, seq_input_size, scalar_input_size, feature_columns) = prepare_data_for_model(train_features, test_features)
     
     # Save scaler parameters
     scaler_node_params = {
@@ -624,6 +624,7 @@ def main(main_dir):
     }
     with open('model_metadata.json', 'w') as f:
         json.dump(metadata, f)
+    
     train_loader, test_loader = create_data_loaders(
         train_sequences, train_scalar, y_train,
         test_sequences, test_scalar, y_test,
