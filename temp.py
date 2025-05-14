@@ -294,7 +294,7 @@ def prepare_data_for_model(train_node_sequences, test_node_sequences, train_scal
     y_train_scaled = np.nan_to_num(y_train_scaled, nan=0.0)
     y_test_scaled = np.nan_to_num(y_test_scaled, nan=0.0)
     
-    # Data augmentation
+    # Data augmentation (unchanged)
     train_sequences_aug = []
     train_scalar_aug = []
     y_train_aug = []
@@ -341,13 +341,46 @@ def prepare_data_for_model(train_node_sequences, test_node_sequences, train_scal
     with open('scaler_y.pkl', 'wb') as f:
         pickle.dump(scaler_y, f)
     
+    # Save scaler parameters as JSON for C++ compatibility
+    scaler_node_params = {
+        "center": scaler_node.center_.tolist(),
+        "scale": scaler_node.scale_.tolist()
+    }
+    scaler_scalar_params = {
+        "center": scaler_scalar.center_.tolist(),
+        "scale": scaler_scalar.scale_.tolist()
+    }
+    scaler_y_params = {
+        "center": scaler_y.center_.tolist(),
+        "scale": scaler_y.scale_.tolist()
+    }
+    with open('scaler_node_params.json', 'w') as f:
+        json.dump(scaler_node_params, f)
+    with open('scaler_scalar_params.json', 'w') as f:
+        json.dump(scaler_scalar_params, f)
+    with open('scaler_y_params.json', 'w') as f:
+        json.dump(scaler_y_params, f)
+    
+    # Save metadata
+    metadata = {
+        "max_sequence_length": int(train_sequences_padded.shape[1]),
+        "seq_input_size": int(train_sequences_padded.shape[2]),
+        "scalar_input_size": int(train_scalar_tensor.shape[1]),
+        "node_features": NODE_FEATURES,
+        "scalar_features": train_scalar_df.columns.tolist(),
+        "dropped_features": low_importance_features + constant_columns,
+        "skewed_features": skewed_features
+    }
+    with open('model_metadata.json', 'w') as f:
+        json.dump(metadata, f)
+    
     print(f"Sequence input size: {train_sequences_padded.shape[2]}")
     print(f"Max sequence length: {train_sequences_padded.shape[1]}")
     print(f"Scalar input size: {train_scalar_tensor.shape[1]}")
     
     return (train_sequences_padded, train_scalar_tensor, y_train_tensor,
             test_sequences_padded, test_scalar_tensor, y_test_tensor,
-            scaler_y, train_sequences_padded.shape[2], train_scalar_tensor.shape[1], train_scalar_df.columns)
+            y_scaler, train_sequences_padded.shape[2], train_scalar_tensor.shape[1], train_scalar_df.columns)
 
 # Model definition
 class MultiHeadAttention(nn.Module):
@@ -583,6 +616,14 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, feature_
             traced_model = torch.jit.trace(model, (example_seq, example_scalar))
             traced_model.save('recursive_model.pt')
             print("Model saved for LibTorch as recursive_model.pt")
+            
+            # Save example input shapes for reference
+            input_shapes = {
+                "seq_input_shape": [1, int(train_sequences_padded.shape[1]), int(seq_input_size)],
+                "scalar_input_shape": [1, int(scalar_input_size)]
+            }
+            with open('input_shapes.json', 'w') as f:
+                json.dump(input_shapes, f)
         else:
             epochs_no_improve += 1
         
