@@ -81,14 +81,18 @@ struct NodeFeatures {
         std::unordered_map<std::string, float> op_histogram;
         if (node.contains("op_histogram")) {
             for (const auto& [op, count] : node["op_histogram"].items()) {
-                op_histogram[op] = count.get<float>();
+                try {
+                    op_histogram[op] = count.get<float>();
+                } catch (const std::exception& e) {
+                    std::cout << "Warning: Invalid op_histogram value for " << op << ": " << e.what() << std::endl;
+                }
             }
         }
         for (const auto& op : {
             "add", "sub", "mul", "div", "mod", "eq", "ne", "lt", "le", "or", "and", "not",
             "min", "max", "constant", "variable", "funccall", "imagecall", "externcall", "let", "param"
         }) {
-            features["op_" + std::string(op)] = op_histogram[op];
+            features["op_" + std::string(op)] = op_histogram.count(op) ? op_histogram[op] : 0.0f;
         }
 
         // Memory patterns
@@ -96,34 +100,39 @@ struct NodeFeatures {
         for (const auto& pattern : {"pointwise", "transpose", "broadcast", "slice"}) {
             memory_patterns[pattern] = {0.0f, 0.0f, 0.0f, 0.0f};
         }
-        if (node.contains("memory_patterns")) {
+        if (node.contains("memory_patterns") && node["memory_patterns"].is_object()) {
             std::cout << "Processing memory_patterns: " << node["memory_patterns"].dump() << std::endl;
             for (const auto& [pattern, values] : node["memory_patterns"].items()) {
                 std::string pattern_lower = pattern;
                 std::transform(pattern_lower.begin(), pattern_lower.end(), pattern_lower.begin(), ::tolower);
-                std::vector<float> vals(4, 0.0f);
-                if (values.is_array()) {
-                    for (size_t i = 0; i < std::min<size_t>(values.size(), 4); ++i) {
-                        try {
-                            vals[i] = values[i].get<float>();
-                        } catch (const std::exception& e) {
-                            std::cout << "Warning: Invalid value in memory_patterns[" << pattern << "][" << i << "]: " << e.what() << std::endl;
+                if (memory_patterns.count(pattern_lower)) {
+                    std::vector<float> vals(4, 0.0f);
+                    if (values.is_array()) {
+                        std::cout << "memory_patterns[" << pattern_lower << "] has " << values.size() << " elements" << std::endl;
+                        for (size_t i = 0; i < std::min<size_t>(values.size(), 4); ++i) {
+                            try {
+                                if (values[i].is_number()) {
+                                    vals[i] = values[i].get<float>();
+                                } else {
+                                    std::cout << "Warning: Non-numeric value in memory_patterns[" << pattern_lower << "][" << i << "]" << std::endl;
+                                }
+                            } catch (const std::exception& e) {
+                                std::cout << "Warning: Invalid value in memory_patterns[" << pattern_lower << "][" << i << "]: " << e.what() << std::endl;
+                            }
                         }
+                    } else {
+                        std::cout << "Warning: memory_patterns[" << pattern_lower << "] is not an array: " << values.dump() << std::endl;
                     }
+                    memory_patterns[pattern_lower] = vals;
                 } else {
-                    std::cout << "Warning: memory_patterns[" << pattern << "] is not an array" << std::endl;
+                    std::cout << "Warning: Unknown memory pattern key: " << pattern_lower << std::endl;
                 }
-                memory_patterns[pattern_lower] = vals;
             }
         } else {
-            std::cout << "Warning: Node missing memory_patterns field" << std::endl;
+            std::cout << "Warning: Node missing memory_patterns field or not an object" << std::endl;
         }
         for (const auto& pattern : {"pointwise", "transpose", "broadcast", "slice"}) {
             auto values = memory_patterns[pattern];
-            if (values.size() < 4) {
-                std::cout << "Warning: memory_patterns[" << pattern << "] has only " << values.size() << " elements, padding with zeros" << std::endl;
-                values.resize(4, 0.0f);
-            }
             for (size_t i = 0; i < 4; ++i) {
                 features["memory_" + std::string(pattern) + "_" + std::to_string(i)] = values[i];
             }
@@ -132,13 +141,14 @@ struct NodeFeatures {
         // Create fixed-length feature vector
         std::unordered_map<std::string, float> ordered_features;
         for (const auto& key : feature_names) {
-            ordered_features[key] = features[key];
+            ordered_features[key] = features.count(key) ? features[key] : 0.0f;
         }
+        std::cout << "Extracted " << ordered_features.size() << " features for node" << std::endl;
         return ordered_features;
     }
 };
 
-// Scalar feature extraction
+// Scalar feature extraction (unchanged)
 struct ScalarFeatures {
     std::vector<std::string> feature_names;
     std::vector<std::string> skewed_features;
@@ -148,7 +158,6 @@ struct ScalarFeatures {
         std::cout << "Extracting scalar features" << std::endl;
         std::unordered_map<std::string, float> features;
 
-        // Global features
         bool found_global = false;
         for (const auto& child : json_data["children"]) {
             if (child["name"] == "Global Features") {
@@ -161,7 +170,6 @@ struct ScalarFeatures {
             std::cout << "Warning: Global Features node not found" << std::endl;
         }
 
-        // Collect nodes (excluding Global Features)
         std::vector<json> nodes;
         for (const auto& child : json_data["children"]) {
             if (child["name"] != "Global Features") {
@@ -170,7 +178,6 @@ struct ScalarFeatures {
         }
         std::cout << "Number of nodes: " << nodes.size() << std::endl;
 
-        // Derived features
         float node_count = nodes.size();
         float scheduling_count = 0, total_parallelism = 0, total_bytes_at_production = 0, total_vectors = 0;
         float points_computed_total = 0, bytes_at_realization = 0, working_set = 0, bytes_at_root = 0;
@@ -211,7 +218,6 @@ struct ScalarFeatures {
         features["node_edge_ratio"] = edges_count > 0 ? node_count / (edges_count + 1) : node_count;
         features["nodes_per_schedule"] = scheduling_count > 0 ? node_count / scheduling_count : node_count;
 
-        // Op diversity
         std::set<std::string> ops;
         for (const auto& node : nodes) {
             if (node.contains("op_histogram")) {
@@ -224,7 +230,6 @@ struct ScalarFeatures {
         }
         features["op_diversity"] = ops.size();
 
-        // Apply log transformation for skewed features
         for (const auto& feature : skewed_features) {
             if (features.count(feature)) {
                 features["log_" + feature] = std::log1p(features[feature]);
@@ -232,28 +237,25 @@ struct ScalarFeatures {
             }
         }
 
-        // Filter out dropped features and create ordered feature vector
         std::unordered_map<std::string, float> ordered_features;
         for (const auto& key : feature_names) {
             if (std::find(dropped_features.begin(), dropped_features.end(), key) == dropped_features.end()) {
-                ordered_features[key] = features[key];
+                ordered_features[key] = features.count(key) ? features[key] : 0.0f;
             }
         }
         return ordered_features;
     }
 };
 
-// Main function (unchanged from previous debug version)
+// Main function (unchanged)
 int main(int argc, char* argv[]) {
     try {
-        // Handle command-line argument
         std::string input_file_path = "tree_representation.json";
         if (argc > 1) {
             input_file_path = argv[1];
         }
         std::cout << "Input file: " << input_file_path << std::endl;
 
-        // Load metadata
         std::ifstream metadata_file("model_metadata.json");
         if (!metadata_file.is_open()) {
             throw std::runtime_error("Failed to open model_metadata.json");
@@ -270,20 +272,17 @@ int main(int argc, char* argv[]) {
         std::vector<std::string> dropped_features = metadata["dropped_features"].get<std::vector<std::string>>();
         std::cout << "Metadata loaded: seq_input_size=" << seq_input_size << ", scalar_input_size=" << scalar_input_size << std::endl;
 
-        // Load scalers
         RobustScaler scaler_node, scaler_scalar, scaler_y;
         scaler_node.load("scaler_node_params.json");
         scaler_scalar.load("scaler_scalar_params.json");
         scaler_y.load("scaler_y_params.json");
 
-        // Verify scaler dimensions
         if (scaler_node.center.size() != seq_input_size || scaler_scalar.center.size() != scalar_input_size) {
             throw std::runtime_error("Scaler dimensions do not match input sizes: node_center=" + 
                                      std::to_string(scaler_node.center.size()) + ", scalar_center=" + 
                                      std::to_string(scaler_scalar.center.size()));
         }
 
-        // Load input JSON
         std::ifstream input_file(input_file_path);
         if (!input_file.is_open()) {
             throw std::runtime_error("Failed to open " + input_file_path);
@@ -292,7 +291,6 @@ int main(int argc, char* argv[]) {
         input_file >> json_data;
         std::cout << "Input JSON loaded" << std::endl;
 
-        // Extract node features
         NodeFeatures node_extractor;
         node_extractor.feature_names = node_features;
         std::vector<std::vector<float>> node_sequences;
@@ -311,14 +309,12 @@ int main(int argc, char* argv[]) {
         traverse_nodes(json_data, traverse_nodes);
         std::cout << "Extracted " << node_sequences.size() << " node sequences" << std::endl;
 
-        // Scale node features
         std::vector<std::vector<float>> scaled_node_sequences;
         for (const auto& node : node_sequences) {
             auto scaled = scaler_node.transform(node);
             scaled_node_sequences.push_back(scaled);
         }
 
-        // Pad sequences
         torch::Tensor seq_tensor;
         if (scaled_node_sequences.empty()) {
             throw std::runtime_error("No nodes extracted from JSON");
@@ -337,7 +333,6 @@ int main(int argc, char* argv[]) {
         );
         std::cout << "Sequence tensor created: shape=[1, " << max_sequence_length << ", " << seq_input_size << "]" << std::endl;
 
-        // Extract and scale scalar features
         ScalarFeatures scalar_extractor;
         scalar_extractor.feature_names = scalar_features;
         scalar_extractor.skewed_features = skewed_features;
@@ -356,19 +351,16 @@ int main(int argc, char* argv[]) {
         );
         std::cout << "Scalar tensor created: shape=[1, " << scalar_input_size << "]" << std::endl;
 
-        // Load model
         torch::jit::script::Module model;
         model = torch::jit::load("recursive_model.pt");
         model.eval();
         std::cout << "Model loaded" << std::endl;
 
-        // Perform inference
         std::vector<torch::jit::IValue> inputs = {seq_tensor, scalar_tensor};
         auto output = model.forward(inputs).toTensor();
         float scaled_output = output.item<float>();
         std::cout << "Inference completed: scaled_output=" << scaled_output << std::endl;
 
-        // Postprocess output
         float log_output = scaler_y.inverse_transform(scaled_output, 0);
         float execution_time_ms = std::expm1(log_output);
         execution_time_ms = std::max(0.0f, execution_time_ms);
