@@ -585,6 +585,45 @@ def main(main_dir):
      test_sequences, test_scalar, y_test,
      y_scaler, seq_input_size, scalar_input_size, feature_columns) = prepare_data_for_model(train_features, test_features)
     
+    # Save scaler parameters
+    scaler_node_params = {
+        'center': scaler_X_scalar.center_.tolist(),
+        'scale': scaler_X_scalar.scale_.tolist()
+    }
+    with open('scaler_node_params.json', 'w') as f:
+        json.dump(scaler_node_params, f)
+    
+    scaler_scalar_params = {
+        'center': scaler_X_scalar.center_.tolist(),
+        'scale': scaler_X_scalar.scale_.tolist()
+    }
+    with open('scaler_scalar_params.json', 'w') as f:
+        json.dump(scaler_scalar_params, f)
+    
+    scaler_y_params = {
+        'center': y_scaler.center_.tolist(),
+        'scale': y_scaler.scale_.tolist()
+    }
+    with open('scaler_y_params.json', 'w') as f:
+        json.dump(scaler_y_params, f)
+    
+    # Save model metadata
+    metadata = {
+        'max_sequence_length': 3,
+        'seq_input_size': seq_input_size,
+        'scalar_input_size': scalar_input_size,
+        'node_features': FIXED_FEATURES,
+        'scalar_features': list(feature_columns),
+        'skewed_features': ['cache_hits', 'bytes_processing_rate', 'sched_bytes_at_task', 'computation_efficiency'],
+        'dropped_features': [
+            'op_cast', 'op_selfcall', 'memory_pointwise_1', 'memory_transpose_1', 'memory_broadcast_1',
+            'memory_slice_1', 'op_select', 'op_not', 'op_and', 'op_ne', 'op_mod', 'memory_pointwise_2',
+            'memory_broadcast_2', 'memory_slice_2', 'memory_transpose_2', 'op_externcall', 'op_imagecall',
+            'op_param', 'memory_pointwise_3', 'memory_transpose_3', 'op_sub', 'memory_pointwise_0', 'op_let'
+        ]
+    }
+    with open('model_metadata.json', 'w') as f:
+        json.dump(metadata, f)
     train_loader, test_loader = create_data_loaders(
         train_sequences, train_scalar, y_train,
         test_sequences, test_scalar, y_test,
