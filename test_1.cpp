@@ -327,10 +327,29 @@ int main(int argc, char* argv[]) {
             scaled_node_sequences.push_back(scaled);
         }
 
+        // Determine if CUDA is available and set device
+        torch::Device device = torch::kCPU;
+        if (torch::cuda::is_available()) {
+            device = torch::kCUDA;
+            std::cout << "CUDA is available, using GPU" << std::endl;
+        } else {
+            std::cout << "CUDA is not available, using CPU" << std::endl;
+        }
+
+        // Load the model first so we can move it to the right device
+        torch::jit::script::Module model;
+        model = torch::jit::load("recursive_model.pt");
+        model.eval();
+        // Move model to the selected device
+        model.to(device);
+        std::cout << "Model loaded and moved to " << (device.is_cuda() ? "CUDA" : "CPU") << " device" << std::endl;
+
+        // Create tensors directly on the correct device
         torch::Tensor seq_tensor;
         if (scaled_node_sequences.empty()) {
             throw std::runtime_error("No nodes extracted from JSON");
         }
+        
         std::vector<float> padded_data(max_sequence_length * seq_input_size, 0.0f);
         size_t nodes_to_copy = std::min(scaled_node_sequences.size(), static_cast<size_t>(max_sequence_length));
         for (size_t i = 0; i < nodes_to_copy; ++i) {
@@ -338,13 +357,16 @@ int main(int argc, char* argv[]) {
                 padded_data[i * seq_input_size + j] = scaled_node_sequences[i][j];
             }
         }
+        
+        // Create tensors directly on the correct device
         seq_tensor = torch::from_blob(
             padded_data.data(),
             {1, max_sequence_length, seq_input_size},
             torch::kFloat
-        ).clone();
+        ).clone().to(device);
 
-        std::cout << "Sequence tensor created: shape=[1, " << max_sequence_length << ", " << seq_input_size << "]" << std::endl;
+        std::cout << "Sequence tensor created on " << (device.is_cuda() ? "CUDA" : "CPU") 
+                  << " device: shape=[1, " << max_sequence_length << ", " << seq_input_size << "]" << std::endl;
 
         ScalarFeatures scalar_extractor;
         scalar_extractor.feature_names = scalar_features;
@@ -359,32 +381,18 @@ int main(int argc, char* argv[]) {
             }
         }
         auto scaled_scalar = scaler_scalar.transform(scalar_vec);
+        
+        // Create scalar tensor directly on the correct device
         torch::Tensor scalar_tensor = torch::from_blob(
             scaled_scalar.data(),
             {1, scalar_input_size},
             torch::kFloat
-        ).clone();
+        ).clone().to(device);
         
-        std::cout << "Scalar tensor created: shape=[1, " << scalar_input_size << "]" << std::endl;
+        std::cout << "Scalar tensor created on " << (device.is_cuda() ? "CUDA" : "CPU") 
+                  << " device: shape=[1, " << scalar_input_size << "]" << std::endl;
 
-        // Load the model and ensure it's on the same device as the inputs
-        torch::jit::script::Module model;
-        model = torch::jit::load("recursive_model.pt");
-        model.eval();
-        std::cout << "Model loaded" << std::endl;
-
-        // Determine if CUDA is available and move tensors and model to the same device
-        torch::Device device = torch::kCPU;
-        if (torch::cuda::is_available()) {
-            device = torch::kCUDA;
-            model.to(device);
-            std::cout << "Model moved to CUDA device" << std::endl;
-        }
-
-        // Move input tensors to the same device as the model
-        seq_tensor = seq_tensor.to(device);
-        scalar_tensor = scalar_tensor.to(device);
-
+        // Run inference with both inputs on the same device as the model
         std::vector<torch::jit::IValue> inputs = {seq_tensor, scalar_tensor};
         auto output = model.forward(inputs).toTensor();
         float scaled_output = output.item<float>();
