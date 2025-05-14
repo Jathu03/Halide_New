@@ -9,7 +9,6 @@
 #include <cmath>
 #include <algorithm>
 #include <iostream>
-#include <sstream>
 
 using json = nlohmann::json;
 
@@ -110,11 +109,9 @@ struct NodeFeatures {
                 
                 if (memory_patterns.count(pattern_lower)) {
                     std::vector<float> vals(4, 0.0f);
-                    
                     if (values.is_array()) {
                         size_t array_size = values.size();
                         std::cout << "memory_patterns[" << pattern_lower << "] has " << array_size << " elements" << std::endl;
-                        
                         for (size_t i = 0; i < std::min<size_t>(array_size, 4); ++i) {
                             try {
                                 if (i < array_size && values[i].is_number()) {
@@ -129,7 +126,6 @@ struct NodeFeatures {
                     } else {
                         std::cout << "Warning: memory_patterns[" << pattern_lower << "] is not an array" << std::endl;
                     }
-                    
                     memory_patterns[pattern_lower] = vals;
                 } else {
                     std::cout << "Warning: Unknown memory pattern key: " << pattern_lower << std::endl;
@@ -255,17 +251,21 @@ struct ScalarFeatures {
     }
 };
 
-// Function to predict execution time from JSON string
-float predict_execution_time(const std::string& json_input) {
+// Function to predict execution time from JSON file
+float predict_execution_time(const std::string& json_file_path) {
     try {
-        // Parse JSON input
+        // Read JSON file
+        std::ifstream input_file(json_file_path);
+        if (!input_file.is_open()) {
+            throw std::runtime_error("Failed to open " + json_file_path);
+        }
         json json_data;
         try {
-            json_data = json::parse(json_input);
+            input_file >> json_data;
         } catch (const json::parse_error& e) {
-            throw std::runtime_error("Failed to parse JSON input: " + std::string(e.what()));
+            throw std::runtime_error("Failed to parse JSON from " + json_file_path + ": " + e.what());
         }
-        std::cout << "Input JSON parsed successfully" << std::endl;
+        std::cout << "Input JSON loaded from " << json_file_path << std::endl;
 
         // Load metadata
         std::ifstream metadata_file("model_metadata.json");
@@ -406,27 +406,14 @@ float predict_execution_time(const std::string& json_input) {
     }
 }
 
-// Main function for testing
+// Main function
 int main(int argc, char* argv[]) {
     try {
-        std::string json_input;
-        if (argc > 1) {
-            // Read JSON from command-line argument
-            json_input = argv[1];
-        } else {
-            // Read JSON from standard input
-            std::cout << "Reading JSON from standard input (press Ctrl+D or Ctrl+Z to finish):" << std::endl;
-            std::stringstream buffer;
-            buffer << std::cin.rdbuf();
-            json_input = buffer.str();
-        }
-
-        if (json_input.empty()) {
-            throw std::runtime_error("Empty JSON input provided");
-        }
+        // Default input file
+        std::string json_file_path = "tree_representation.json";
 
         // Predict execution time
-        float execution_time_ms = predict_execution_time(json_input);
+        float execution_time_ms = predict_execution_time(json_file_path);
 
         // Output result as JSON
         json output;
