@@ -229,7 +229,7 @@ int main(int argc, char* argv[]) {
         scaler_node.load("scaler_node_params.json");
         scaler_scalar.load("scaler_scalar_params.json");
         scaler_y.load("scaler_y_params.json");
-        if (scaler_node.center.size() != seq_input_size || scaler_scalar.center.size() != scalar_input_size) {
+        if (scaler_node.center.size() != scalar_input_size || scaler_scalar.center.size() != scalar_input_size) {
             throw std::runtime_error("Scaler dimensions do not match input sizes");
         }
 
@@ -249,16 +249,16 @@ int main(int argc, char* argv[]) {
         extractor.dropped_features = dropped_features;
         auto features = extractor.extract(json_data);
 
-        // Create sequence input
+        // Create sequence input (filter to scalar features to match scaler)
         std::vector<float> feature_vec;
-        for (const auto& key : node_features) {
+        for (const auto& key : scalar_features) {
             feature_vec.push_back(features[key]);
         }
         auto scaled_features = scaler_node.transform(feature_vec);
-        std::vector<float> seq_data(max_sequence_length * seq_input_size, 0.0f);
+        std::vector<float> seq_data(max_sequence_length * scalar_input_size, 0.0f);
         for (int i = 0; i < max_sequence_length; ++i) {
-            for (int j = 0; j < seq_input_size; ++j) {
-                seq_data[i * seq_input_size + j] = scaled_features[j];
+            for (int j = 0; j < scalar_input_size; ++j) {
+                seq_data[i * scalar_input_size + j] = scaled_features[j];
             }
         }
 
@@ -294,7 +294,7 @@ int main(int argc, char* argv[]) {
         // Create tensors
         torch::Tensor seq_tensor = torch::from_blob(
             seq_data.data(),
-            {1, max_sequence_length, seq_input_size},
+            {1, max_sequence_length, scalar_input_size},
             torch::kFloat
         ).clone().to(device);
         torch::Tensor scalar_tensor = torch::from_blob(
