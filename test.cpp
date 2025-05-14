@@ -1,5 +1,3 @@
-#pragma once
-
 #include <torch/script.h>
 #include <torch/torch.h>
 #include <nlohmann/json.hpp>
