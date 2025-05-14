@@ -19,8 +19,8 @@ struct RobustScaler {
     std::vector<double> center;
     std::vector<double> scale;
 
-    void load(const std::string& params_file) {
-        std::cout << "Loading scaler from " << params_file << std::endl;
+    void load(const std::string& params_file, bool debug = false) {
+        if (debug) std::cout << "Loading scaler from " << params_file << std::endl;
         std::ifstream file(params_file);
         if (!file.is_open()) {
             throw std::runtime_error("Failed to open " + params_file);
@@ -40,7 +40,7 @@ struct RobustScaler {
             scale[i] = static_cast<double>(scale_float[i]);
         }
         
-        std::cout << "Scaler loaded: center size=" << center.size() << ", scale size=" << scale.size() << std::endl;
+        if (debug) std::cout << "Scaler loaded: center size=" << center.size() << ", scale size=" << scale.size() << std::endl;
     }
 
     std::vector<double> transform(const std::vector<double>& input) {
@@ -141,8 +141,8 @@ struct NodeFeatures {
         return score;
     }
 
-    std::unordered_map<std::string, double> extract(const json& node) {
-        std::cout << "Extracting features for node: " << (node.contains("name") ? node["name"].get<std::string>() : "unnamed") << std::endl;
+    std::unordered_map<std::string, double> extract(const json& node, bool debug = false) {
+        if (debug) std::cout << "Extracting features for node: " << (node.contains("name") ? node["name"].get<std::string>() : "unnamed") << std::endl;
         std::unordered_map<std::string, double> features;
 
         // Cache features
@@ -175,7 +175,7 @@ struct NodeFeatures {
                                                   sched["bytes_at_realization"].get<double>() / 
                                                   sched["points_computed_total"].get<double>() : 0.0;
             }
-        } else {
+        } else if (debug) {
             std::cout << "Warning: Node missing scheduling field" << std::endl;
         }
 
@@ -186,7 +186,7 @@ struct NodeFeatures {
                 try {
                     op_histogram[op] = count.get<double>();
                 } catch (const std::exception& e) {
-                    std::cout << "Warning: Invalid op_histogram value for " << op << ": " << e.what() << std::endl;
+                    if (debug) std::cout << "Warning: Invalid op_histogram value for " << op << ": " << e.what() << std::endl;
                 }
             }
         }
@@ -217,7 +217,7 @@ struct NodeFeatures {
         }
         
         if (node.contains("memory_patterns") && node["memory_patterns"].is_object()) {
-            std::cout << "Processing memory_patterns" << std::endl;
+            if (debug) std::cout << "Processing memory_patterns" << std::endl;
             for (const auto& [pattern, values] : node["memory_patterns"].items()) {
                 std::string pattern_lower = pattern;
                 std::transform(pattern_lower.begin(), pattern_lower.end(), pattern_lower.begin(), ::tolower);
@@ -225,32 +225,31 @@ struct NodeFeatures {
                 if (memory_patterns.count(pattern_lower)) {
                     std::vector<double> vals(4, 0.0);
                     
-                    // Safely check if values is an array and has elements
                     if (values.is_array()) {
                         size_t array_size = values.size();
-                        std::cout << "memory_patterns[" << pattern_lower << "] has " << array_size << " elements" << std::endl;
+                        if (debug) std::cout << "memory_patterns[" << pattern_lower << "] has " << array_size << " elements" << std::endl;
                         
                         for (size_t i = 0; i < std::min<size_t>(array_size, 4); ++i) {
                             try {
                                 if (i < array_size && values[i].is_number()) {
                                     vals[i] = values[i].get<double>();
-                                } else {
+                                } else if (debug) {
                                     std::cout << "Warning: Non-numeric or missing value in memory_patterns[" << pattern_lower << "][" << i << "]" << std::endl;
                                 }
                             } catch (const std::exception& e) {
-                                std::cout << "Warning: Invalid value in memory_patterns[" << pattern_lower << "][" << i << "]: " << e.what() << std::endl;
+                                if (debug) std::cout << "Warning: Invalid value in memory_patterns[" << pattern_lower << "][" << i << "]: " << e.what() << std::endl;
                             }
                         }
-                    } else {
+                    } else if (debug) {
                         std::cout << "Warning: memory_patterns[" << pattern_lower << "] is not an array" << std::endl;
                     }
                     
                     memory_patterns[pattern_lower] = vals;
-                } else {
+                } else if (debug) {
                     std::cout << "Warning: Unknown memory pattern key: " << pattern_lower << std::endl;
                 }
             }
-        } else {
+        } else if (debug) {
             std::cout << "Warning: Node missing memory_patterns field or not an object" << std::endl;
         }
         
@@ -271,7 +270,7 @@ struct NodeFeatures {
         for (const auto& key : feature_names) {
             ordered_features[key] = features.count(key) ? features[key] : 0.0;
         }
-        std::cout << "Extracted " << ordered_features.size() << " features for node" << std::endl;
+        if (debug) std::cout << "Extracted " << ordered_features.size() << " features for node" << std::endl;
         return ordered_features;
     }
 };
@@ -282,8 +281,8 @@ struct ScalarFeatures {
     std::vector<std::string> skewed_features;
     std::vector<std::string> dropped_features;
 
-    std::unordered_map<std::string, double> extract(const json& json_data) {
-        std::cout << "Extracting scalar features" << std::endl;
+    std::unordered_map<std::string, double> extract(const json& json_data, bool debug = false) {
+        if (debug) std::cout << "Extracting scalar features" << std::endl;
         std::unordered_map<std::string, double> features;
 
         bool found_global = false;
@@ -294,7 +293,7 @@ struct ScalarFeatures {
                 break;
             }
         }
-        if (!found_global) {
+        if (!found_global && debug) {
             std::cout << "Warning: Global Features node not found" << std::endl;
         }
 
@@ -304,7 +303,7 @@ struct ScalarFeatures {
                 nodes.push_back(child);
             }
         }
-        std::cout << "Number of nodes: " << nodes.size() << std::endl;
+        if (debug) std::cout << "Number of nodes: " << nodes.size() << std::endl;
 
         double node_count = nodes.size();
         double scheduling_count = 0, total_parallelism = 0, total_bytes_at_production = 0, total_vectors = 0;
@@ -449,16 +448,16 @@ private:
     torch::Device device;
     
 public:
-    ModelEnsemble(const std::vector<std::string>& model_paths, torch::Device device) : device(device) {
+    ModelEnsemble(const std::vector<std::string>& model_paths, torch::Device device, bool debug = false) : device(device) {
         for (const auto& path : model_paths) {
             try {
                 torch::jit::script::Module model = torch::jit::load(path);
                 model.eval();
                 model.to(device);
                 models.push_back(model);
-                std::cout << "Loaded model: " << path << std::endl;
+                if (debug) std::cout << "Loaded model: " << path << std::endl;
             } catch (const std::exception& e) {
-                std::cerr << "Error loading model " << path << ": " << e.what() << std::endl;
+                if (debug) std::cerr << "Error loading model " << path << ": " << e.what() << std::endl;
             }
         }
         
@@ -466,10 +465,10 @@ public:
             throw std::runtime_error("No models were successfully loaded");
         }
         
-        std::cout << "Ensemble created with " << models.size() << " models" << std::endl;
+        if (debug) std::cout << "Ensemble created with " << models.size() << " models" << std::endl;
     }
     
-    double predict(const torch::Tensor& seq_tensor, const torch::Tensor& scalar_tensor) {
+    double predict(const torch::Tensor& seq_tensor, const torch::Tensor& scalar_tensor, bool debug = false) {
         if (models.empty()) {
             throw std::runtime_error("No models available for prediction");
         }
@@ -488,7 +487,7 @@ public:
         double sq_sum = std::inner_product(predictions.begin(), predictions.end(), predictions.begin(), 0.0);
         double stdev = std::sqrt(sq_sum / predictions.size() - mean * mean);
         
-        std::cout << "Ensemble predictions: mean=" << mean << ", stdev=" << stdev << std::endl;
+        if (debug) std::cout << "Ensemble predictions: mean=" << mean << ", stdev=" << stdev << std::endl;
         
         // Remove outliers (optional)
         if (predictions.size() > 3) {
@@ -502,8 +501,8 @@ public:
             if (!filtered_predictions.empty()) {
                 double filtered_sum = std::accumulate(filtered_predictions.begin(), filtered_predictions.end(), 0.0);
                 mean = filtered_sum / filtered_predictions.size();
-                std::cout << "Filtered ensemble prediction: " << mean << " (removed " 
-                          << predictions.size() - filtered_predictions.size() << " outliers)" << std::endl;
+                if (debug) std::cout << "Filtered ensemble prediction: " << mean << " (removed " 
+                                     << predictions.size() - filtered_predictions.size() << " outliers)" << std::endl;
             }
         }
         
@@ -515,17 +514,21 @@ public:
     }
 };
 
-// Main function
-int main(int argc, char* argv[]) {
+// Inference function that takes JSON string and returns execution time
+double predict_execution_time(const std::string& json_input, bool debug = false) {
+    auto start_time = std::chrono::high_resolution_clock::now();
+    
     try {
-        auto start_time = std::chrono::high_resolution_clock::now();
-        
-        std::string input_file_path = "tree_representation.json";
-        if (argc > 1) {
-            input_file_path = argv[1];
+        // Parse JSON string
+        json json_data;
+        try {
+            json_data = json::parse(json_input);
+            if (debug) std::cout << "Input JSON parsed successfully" << std::endl;
+        } catch (const json::parse_error& e) {
+            throw std::runtime_error("Failed to parse JSON input: " + std::string(e.what()));
         }
-        std::cout << "Input file: " << input_file_path << std::endl;
 
+        // Load metadata
         std::ifstream metadata_file("model_metadata.json");
         if (!metadata_file.is_open()) {
             throw std::runtime_error("Failed to open model_metadata.json");
@@ -540,12 +543,13 @@ int main(int argc, char* argv[]) {
         std::vector<std::string> scalar_features = metadata["scalar_features"].get<std::vector<std::string>>();
         std::vector<std::string> skewed_features = metadata["skewed_features"].get<std::vector<std::string>>();
         std::vector<std::string> dropped_features = metadata["dropped_features"].get<std::vector<std::string>>();
-        std::cout << "Metadata loaded: seq_input_size=" << seq_input_size << ", scalar_input_size=" << scalar_input_size << std::endl;
+        if (debug) std::cout << "Metadata loaded: seq_input_size=" << seq_input_size << ", scalar_input_size=" << scalar_input_size << std::endl;
 
+        // Load scalers
         RobustScaler scaler_node, scaler_scalar, scaler_y;
-        scaler_node.load("scaler_node_params.json");
-        scaler_scalar.load("scaler_scalar_params.json");
-        scaler_y.load("scaler_y_params.json");
+        scaler_node.load("scaler_node_params.json", debug);
+        scaler_scalar.load("scaler_scalar_params.json", debug);
+        scaler_y.load("scaler_y_params.json", debug);
 
         if (scaler_node.center.size() != seq_input_size || scaler_scalar.center.size() != scalar_input_size) {
             throw std::runtime_error("Scaler dimensions do not match input sizes: node_center=" + 
@@ -553,20 +557,13 @@ int main(int argc, char* argv[]) {
                                      std::to_string(scaler_scalar.center.size()));
         }
 
-        std::ifstream input_file(input_file_path);
-        if (!input_file.is_open()) {
-            throw std::runtime_error("Failed to open " + input_file_path);
-        }
-        json json_data;
-        input_file >> json_data;
-        std::cout << "Input JSON loaded" << std::endl;
-
+        // Extract node features
         NodeFeatures node_extractor;
         node_extractor.feature_names = node_features;
         std::vector<std::vector<double>> node_sequences;
 
         auto traverse_nodes = [&](const json& node, auto&& traverse_nodes) -> void {
-            auto features = node_extractor.extract(node);
+            auto features = node_extractor.extract(node, debug);
             std::vector<double> feature_vec;
             for (const auto& key : node_features) {
                 feature_vec.push_back(features[key]);
@@ -581,24 +578,24 @@ int main(int argc, char* argv[]) {
             }
         };
         traverse_nodes(json_data, traverse_nodes);
-        std::cout << "Extracted " << node_sequences.size() << " node sequences" << std::endl;
+        if (debug) std::cout << "Extracted " << node_sequences.size() << " node sequences" << std::endl;
 
+        // Scale node sequences
         std::vector<std::vector<double>> scaled_node_sequences;
         for (const auto& node : node_sequences) {
             auto scaled = scaler_node.transform(node);
             scaled_node_sequences.push_back(scaled);
         }
 
-        // Determine if CUDA is available and set device
+        // Create sequence tensor
         torch::Device device = torch::kCPU;
         if (torch::cuda::is_available()) {
             device = torch::kCUDA;
-            std::cout << "CUDA is available, using GPU" << std::endl;
-        } else {
+            if (debug) std::cout << "CUDA is available, using GPU" << std::endl;
+        } else if (debug) {
             std::cout << "CUDA is not available, using CPU" << std::endl;
         }
 
-        // Create tensors with double precision
         torch::Tensor seq_tensor;
         if (scaled_node_sequences.empty()) {
             throw std::runtime_error("No nodes extracted from JSON");
@@ -612,22 +609,22 @@ int main(int argc, char* argv[]) {
             }
         }
         
-        // Create tensors with double precision directly on the correct device
         seq_tensor = torch::from_blob(
             padded_data.data(),
             {1, max_sequence_length, seq_input_size},
             torch::kDouble
         ).clone().to(device);
 
-        std::cout << "Sequence tensor created on " << (device.is_cuda() ? "CUDA" : "CPU") 
-                  << " device: shape=[1, " << max_sequence_length << ", " << seq_input_size << "]" << std::endl;
+        if (debug) std::cout << "Sequence tensor created on " << (device.is_cuda() ? "CUDA" : "CPU") 
+                             << " device: shape=[1, " << max_sequence_length << ", " << seq_input_size << "]" << std::endl;
 
+        // Extract and scale scalar features
         ScalarFeatures scalar_extractor;
         scalar_extractor.feature_names = scalar_features;
         scalar_extractor.skewed_features = skewed_features;
         scalar_extractor.dropped_features = dropped_features;
 
-        auto scalar_features_map = scalar_extractor.extract(json_data);
+        auto scalar_features_map = scalar_extractor.extract(json_data, debug);
         std::vector<double> scalar_vec;
         for (const auto& key : scalar_features) {
             if (std::find(dropped_features.begin(), dropped_features.end(), key) == dropped_features.end()) {
@@ -636,20 +633,17 @@ int main(int argc, char* argv[]) {
         }
         auto scaled_scalar = scaler_scalar.transform(scalar_vec);
         
-        // Create scalar tensor with double precision
         torch::Tensor scalar_tensor = torch::from_blob(
             scaled_scalar.data(),
             {1, scalar_input_size},
             torch::kDouble
         ).clone().to(device);
         
-        std::cout << "Scalar tensor created on " << (device.is_cuda() ? "CUDA" : "CPU") 
-                  << " device: shape=[1, " << scalar_input_size << "]" << std::endl;
+        if (debug) std::cout << "Scalar tensor created on " << (device.is_cuda() ? "CUDA" : "CPU") 
+                             << " device: shape=[1, " << scalar_input_size << "]" << std::endl;
 
-        // Load ensemble of models for better prediction
+        // Load ensemble of models
         std::vector<std::string> model_paths;
-        
-        // Check if ensemble models exist, otherwise fall back to single model
         std::vector<std::string> potential_models = {
             "recursive_model.pt",
             "recursive_model_v2.pt",
@@ -665,26 +659,25 @@ int main(int argc, char* argv[]) {
         
         double scaled_output;
         if (model_paths.size() > 1) {
-            // Use ensemble prediction
-            ModelEnsemble ensemble(model_paths, device);
-            scaled_output = ensemble.predict(seq_tensor, scalar_tensor);
-            std::cout << "Ensemble inference completed with " << ensemble.size() << " models" << std::endl;
+            ModelEnsemble ensemble(model_paths, device, debug);
+            scaled_output = ensemble.predict(seq_tensor, scalar_tensor, debug);
+            if (debug) std::cout << "Ensemble inference completed with " << ensemble.size() << " models" << std::endl;
         } else {
-            // Fall back to single model
             torch::jit::script::Module model;
             model = torch::jit::load("recursive_model.pt");
             model.eval();
             model.to(device);
-            std::cout << "Single model loaded" << std::endl;
+            if (debug) std::cout << "Single model loaded" << std::endl;
             
             std::vector<torch::jit::IValue> inputs = {seq_tensor, scalar_tensor};
             auto output = model.forward(inputs).toTensor();
             scaled_output = output.item<double>();
-            std::cout << "Single model inference completed" << std::endl;
+            if (debug) std::cout << "Single model inference completed" << std::endl;
         }
         
-        std::cout << "Scaled output: " << scaled_output << std::endl;
+        if (debug) std::cout << "Scaled output: " << scaled_output << std::endl;
 
+        // Inverse transform output
         double log_output = scaler_y.inverse_transform(scaled_output, 0);
         double execution_time_ms = std::expm1(log_output);
         execution_time_ms = std::max(0.0, execution_time_ms);
@@ -692,8 +685,104 @@ int main(int argc, char* argv[]) {
         auto end_time = std::chrono::high_resolution_clock::now();
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
         
-        std::cout << "Predicted execution time: " << execution_time_ms << " ms" << std::endl;
-        std::cout << "Prediction completed in " << duration << " ms" << std::endl;
+        if (debug) {
+            std::cout << "Predicted execution time: " << execution_time_ms << " ms" << std::endl;
+            std::cout << "Prediction completed in " << duration << " ms" << std::endl;
+        }
+
+        return execution_time_ms;
+
+    } catch (const std::exception& e) {
+        throw std::runtime_error("Inference error: " + std::string(e.what()));
+    }
+}
+
+// Main function for testing
+int main(int argc, char* argv[]) {
+    try {
+        // Sample JSON input for testing
+        std::string sample_json = R"({
+            "name": "root",
+            "cache_hits": 1000,
+            "cache_misses": 200,
+            "scheduling": {
+                "num_realizations": 10,
+                "num_productions": 5,
+                "points_computed_total": 10000,
+                "innermost_loop_extent": 128,
+                "inner_parallelism": 4,
+                "outer_parallelism": 2,
+                "bytes_at_realization": 1024,
+                "bytes_at_production": 512,
+                "bytes_at_root": 2048,
+                "unique_bytes_read_per_realization": 256,
+                "working_set": 4096,
+                "vector_size": 16,
+                "num_vectors": 64,
+                "num_scalars": 32,
+                "bytes_at_task": 1024,
+                "working_set_at_task": 2048,
+                "working_set_at_production": 1024,
+                "working_set_at_realization": 512,
+                "working_set_at_root": 4096
+            },
+            "op_histogram": {
+                "add": 100,
+                "mul": 50,
+                "variable": 20,
+                "constant": 30
+            },
+            "memory_patterns": {
+                "pointwise": [1.0, 0.0, 0.0, 0.0],
+                "transpose": [0.0, 0.0, 0.0, 0.0]
+            },
+            "children": [
+                {
+                    "name": "Global Features",
+                    "execution_time_ms": 50.0
+                },
+                {
+                    "name": "child1",
+                    "cache_hits": 500,
+                    "cache_misses": 100,
+                    "scheduling": {
+                        "num_realizations": 5,
+                        "num_productions": 3,
+                        "points_computed_total": 5000,
+                        "innermost_loop_extent": 64,
+                        "inner_parallelism": 2,
+                        "outer_parallelism": 1,
+                        "bytes_at_realization": 512,
+                        "bytes_at_production": 256,
+                        "bytes_at_root": 1024,
+                        "unique_bytes_read_per_realization": 128,
+                        "working_set": 2048,
+                        "vector_size": 8,
+                        "num_vectors": 32,
+                        "num_scalars": 16,
+                        "bytes_at_task": 512,
+                        "working_set_at_task": 1024,
+                        "working_set_at_production": 512,
+                        "working_set_at_realization": 256,
+                        "working_set_at_root": 2048
+                    },
+                    "op_histogram": {
+                        "add": 50,
+                        "mul": 25,
+                        "variable": 10,
+                        "constant": 15
+                    },
+                    "memory_patterns": {
+                        "pointwise": [0.5, 0.0, 0.0, 0.0],
+                        "transpose": [0.0, 0.0, 0.0, 0.0]
+                    }
+                }
+            ]
+        })";
+
+        // Call inference function
+        double execution_time = predict_execution_time(sample_json, true);
+        std::cout << "Predicted execution time: " << execution_time << " ms" << std::endl;
 
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;
