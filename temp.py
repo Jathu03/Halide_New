@@ -288,13 +288,13 @@ def prepare_data_for_model(train_node_sequences, test_node_sequences, train_scal
     y_train = np.log1p(y_train_raw).reshape(-1, 1)
     y_test = np.log1p(y_test_raw).reshape(-1, 1)
     
-    scaler_y = RobustScaler()
-    y_train_scaled = scaler_y.fit_transform(y_train)
-    y_test_scaled = scaler_y.transform(y_test)
+    y_scaler = RobustScaler()
+    y_train_scaled = y_scaler.fit_transform(y_train)
+    y_test_scaled = y_scaler.transform(y_test)
     y_train_scaled = np.nan_to_num(y_train_scaled, nan=0.0)
     y_test_scaled = np.nan_to_num(y_test_scaled, nan=0.0)
     
-    # Data augmentation (unchanged)
+    # Data augmentation
     train_sequences_aug = []
     train_scalar_aug = []
     y_train_aug = []
@@ -339,7 +339,7 @@ def prepare_data_for_model(train_node_sequences, test_node_sequences, train_scal
     with open('scaler_scalar.pkl', 'wb') as f:
         pickle.dump(scaler_scalar, f)
     with open('scaler_y.pkl', 'wb') as f:
-        pickle.dump(scaler_y, f)
+        pickle.dump(y_scaler, f)
     
     # Save scaler parameters as JSON for C++ compatibility
     scaler_node_params = {
@@ -351,8 +351,8 @@ def prepare_data_for_model(train_node_sequences, test_node_sequences, train_scal
         "scale": scaler_scalar.scale_.tolist()
     }
     scaler_y_params = {
-        "center": scaler_y.center_.tolist(),
-        "scale": scaler_y.scale_.tolist()
+        "center": y_scaler.center_.tolist(),
+        "scale": y_scaler.scale_.tolist()
     }
     with open('scaler_node_params.json', 'w') as f:
         json.dump(scaler_node_params, f)
@@ -381,7 +381,6 @@ def prepare_data_for_model(train_node_sequences, test_node_sequences, train_scal
     return (train_sequences_padded, train_scalar_tensor, y_train_tensor,
             test_sequences_padded, test_scalar_tensor, y_test_tensor,
             y_scaler, train_sequences_padded.shape[2], train_scalar_tensor.shape[1], train_scalar_df.columns)
-
 # Model definition
 class MultiHeadAttention(nn.Module):
     def __init__(self, hidden_size, num_heads, dropout_rate=0.1):
