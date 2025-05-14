@@ -95,34 +95,41 @@ struct NodeFeatures {
             features["op_" + std::string(op)] = op_histogram.count(op) ? op_histogram[op] : 0.0f;
         }
 
-        // Memory patterns
+        // Memory patterns - FIXED THIS SECTION
         std::unordered_map<std::string, std::vector<float>> memory_patterns;
         for (const auto& pattern : {"pointwise", "transpose", "broadcast", "slice"}) {
             memory_patterns[pattern] = {0.0f, 0.0f, 0.0f, 0.0f};
         }
+        
         if (node.contains("memory_patterns") && node["memory_patterns"].is_object()) {
-            std::cout << "Processing memory_patterns: " << node["memory_patterns"].dump() << std::endl;
+            std::cout << "Processing memory_patterns" << std::endl;
             for (const auto& [pattern, values] : node["memory_patterns"].items()) {
                 std::string pattern_lower = pattern;
                 std::transform(pattern_lower.begin(), pattern_lower.end(), pattern_lower.begin(), ::tolower);
+                
                 if (memory_patterns.count(pattern_lower)) {
                     std::vector<float> vals(4, 0.0f);
+                    
+                    // Safely check if values is an array and has elements
                     if (values.is_array()) {
-                        std::cout << "memory_patterns[" << pattern_lower << "] has " << values.size() << " elements" << std::endl;
-                        for (size_t i = 0; i < std::min<size_t>(values.size(), 4); ++i) {
+                        size_t array_size = values.size();
+                        std::cout << "memory_patterns[" << pattern_lower << "] has " << array_size << " elements" << std::endl;
+                        
+                        for (size_t i = 0; i < std::min<size_t>(array_size, 4); ++i) {
                             try {
-                                if (values[i].is_number()) {
+                                if (i < array_size && values[i].is_number()) {
                                     vals[i] = values[i].get<float>();
                                 } else {
-                                    std::cout << "Warning: Non-numeric value in memory_patterns[" << pattern_lower << "][" << i << "]" << std::endl;
+                                    std::cout << "Warning: Non-numeric or missing value in memory_patterns[" << pattern_lower << "][" << i << "]" << std::endl;
                                 }
                             } catch (const std::exception& e) {
                                 std::cout << "Warning: Invalid value in memory_patterns[" << pattern_lower << "][" << i << "]: " << e.what() << std::endl;
                             }
                         }
                     } else {
-                        std::cout << "Warning: memory_patterns[" << pattern_lower << "] is not an array: " << values.dump() << std::endl;
+                        std::cout << "Warning: memory_patterns[" << pattern_lower << "] is not an array" << std::endl;
                     }
+                    
                     memory_patterns[pattern_lower] = vals;
                 } else {
                     std::cout << "Warning: Unknown memory pattern key: " << pattern_lower << std::endl;
@@ -131,6 +138,7 @@ struct NodeFeatures {
         } else {
             std::cout << "Warning: Node missing memory_patterns field or not an object" << std::endl;
         }
+        
         for (const auto& pattern : {"pointwise", "transpose", "broadcast", "slice"}) {
             auto values = memory_patterns[pattern];
             for (size_t i = 0; i < 4; ++i) {
@@ -148,7 +156,7 @@ struct NodeFeatures {
     }
 };
 
-// Scalar feature extraction (unchanged)
+// Scalar feature extraction
 struct ScalarFeatures {
     std::vector<std::string> feature_names;
     std::vector<std::string> skewed_features;
@@ -247,7 +255,7 @@ struct ScalarFeatures {
     }
 };
 
-// Main function (unchanged)
+// Main function
 int main(int argc, char* argv[]) {
     try {
         std::string input_file_path = "tree_representation.json";
@@ -302,8 +310,12 @@ int main(int argc, char* argv[]) {
                 feature_vec.push_back(features[key]);
             }
             node_sequences.push_back(feature_vec);
-            for (const auto& child : node["children"]) {
-                traverse_nodes(child, traverse_nodes);
+            
+            // Safely traverse children
+            if (node.contains("children") && node["children"].is_array()) {
+                for (const auto& child : node["children"]) {
+                    traverse_nodes(child, traverse_nodes);
+                }
             }
         };
         traverse_nodes(json_data, traverse_nodes);
@@ -330,7 +342,8 @@ int main(int argc, char* argv[]) {
             padded_data.data(),
             {1, max_sequence_length, seq_input_size},
             torch::kFloat
-        );
+        ).clone(); // Added clone() to ensure data is copied
+
         std::cout << "Sequence tensor created: shape=[1, " << max_sequence_length << ", " << seq_input_size << "]" << std::endl;
 
         ScalarFeatures scalar_extractor;
@@ -341,14 +354,17 @@ int main(int argc, char* argv[]) {
         auto scalar_features_map = scalar_extractor.extract(json_data);
         std::vector<float> scalar_vec;
         for (const auto& key : scalar_features) {
-            scalar_vec.push_back(scalar_features_map[key]);
+            if (std::find(dropped_features.begin(), dropped_features.end(), key) == dropped_features.end()) {
+                scalar_vec.push_back(scalar_features_map[key]);
+            }
         }
         auto scaled_scalar = scaler_scalar.transform(scalar_vec);
         torch::Tensor scalar_tensor = torch::from_blob(
             scaled_scalar.data(),
             {1, scalar_input_size},
             torch::kFloat
-        );
+        ).clone(); // Added clone() to ensure data is copied
+        
         std::cout << "Scalar tensor created: shape=[1, " << scalar_input_size << "]" << std::endl;
 
         torch::jit::script::Module model;
@@ -364,7 +380,6 @@ int main(int argc, char* argv[]) {
         float log_output = scaler_y.inverse_transform(scaled_output, 0);
         float execution_time_ms = std::expm1(log_output);
         execution_time_ms = std::max(0.0f, execution_time_ms);
-
         std::cout << "Predicted execution time: " << execution_time_ms << " ms" << std::endl;
 
     } catch (const std::exception& e) {
