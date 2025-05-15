@@ -11,6 +11,7 @@ from sklearn.metrics import mean_squared_error, r2_score
 import scipy.stats as stats
 from pathlib import Path
 import warnings
+import random
 warnings.filterwarnings('ignore')
 
 def extract_features_from_file(file_path):
@@ -18,11 +19,9 @@ def extract_features_from_file(file_path):
         with open(file_path, 'r') as f:
             data = json.load(f)
         
-        # Access the without_extern section
         without_extern = data.get('without_extern', {})
         global_features = without_extern.get('global_features', {})
         
-        # Extract execution time
         execution_time = global_features.get('execution_time_ms', None)
         if execution_time is None:
             print(f"No execution time found in {file_path}")
@@ -31,7 +30,6 @@ def extract_features_from_file(file_path):
         nodes = without_extern.get('nodes', [])
         edges = without_extern.get('edges', [])
         
-        # Initialize feature dictionary
         features = {
             'execution_time': float(execution_time),
             'nodes_count': len(nodes),
@@ -43,10 +41,8 @@ def extract_features_from_file(file_path):
             'total_parallelism': 0.0
         }
         
-        # Node-edge ratio
         features['node_edge_ratio'] = features['nodes_count'] / (features['edges_count'] + 1e-8)
         
-        # Aggregate operation histogram and memory access patterns
         op_counts = {}
         memory_patterns = {'Broadcast': 0, 'Pointwise': 0, 'Slice': 0, 'Transpose': 0}
         
@@ -62,12 +58,10 @@ def extract_features_from_file(file_path):
                 for pattern, values in mem_access.items():
                     memory_patterns[pattern] = memory_patterns.get(pattern, 0) + sum(values)
         
-        # Add operation counts and memory patterns to features
         features.update(op_counts)
         for pattern, value in memory_patterns.items():
             features[f'mem_{pattern.lower()}'] = value
         
-        # Aggregate scheduling features
         scheduling_features = []
         for node in nodes:
             stages = node.get('stages', [])
@@ -78,7 +72,6 @@ def extract_features_from_file(file_path):
         features['scheduling_count'] = len(scheduling_features)
         
         if scheduling_features:
-            # Sum key metrics across all scheduling features
             important_metrics = [
                 'bytes_at_production', 'bytes_at_realization', 'bytes_at_root', 'bytes_at_task',
                 'inner_parallelism', 'outer_parallelism', 'num_productions', 'num_realizations',
@@ -93,7 +86,6 @@ def extract_features_from_file(file_path):
             features['total_parallelism'] = sum(sf.get('inner_parallelism', 0) * sf.get('outer_parallelism', 1) 
                                               for sf in scheduling_features)
             
-            # Derived scheduling features
             features['bytes_per_vector'] = (features['total_bytes_at_production'] / 
                                           (features['total_vectors'] + 1e-8))
             features['memory_pressure'] = (features['sched_working_set'] / 
@@ -103,7 +95,6 @@ def extract_features_from_file(file_path):
             features['nodes_per_schedule'] = (features['nodes_count'] / 
                                             (features['scheduling_count'] + 1e-8))
         
-        # Operation diversity and averages
         op_types = sum(1 for k in op_counts.keys())
         features['avg_ops_per_node'] = sum(op_counts.values()) / (features['nodes_count'] + 1e-8)
         features['op_diversity'] = op_types / (features['nodes_count'] + 1e-8)
@@ -202,7 +193,61 @@ def analyze_feature_importance(features_list):
     pearson_correlations = pd.Series(pearson_correlations).sort_values(ascending=False, key=abs)
     spearman_correlations = pd.Series(spearman_correlations).sort_values(ascending=False, key=abs)
     
-    return feature_importances, pearson_correlations, spearman_correlations, y, df, X
+    return feature_importances, pearson_correlations, spearman_correlations, y, df, X, rf, scaler
+
+def predict_execution_times(model, scaler, file_paths, main_dir):
+    predictions = []
+    main_dir_path = Path(main_dir)
+    
+    print("\nPredicting execution times for selected files:")
+    for file_path in file_paths:
+        full_path = main_dir_path / file_path
+        if not full_path.exists():
+            print(f"File not found: {full_path}")
+            continue
+        
+        features = extract_features_from_file(full_path)
+        if features is None:
+            print(f"Failed to extract features from {full_path}")
+            continue
+        
+        actual_time = features['execution_time']
+        feature_df = pd.DataFrame([features])
+        feature_df = create_additional_features(feature_df)
+        
+        X = feature_df.drop(['execution_time', 'log_execution_time'] if 'log_execution_time' in feature_df.columns else ['execution_time'], axis=1)
+        X = X.fillna(0)
+        
+        # Ensure X has the same columns as the training data
+        for col in model.feature_names_in_:
+            if col not in X.columns:
+                X[col] = 0
+        X = X[model.feature_names_in_]
+        
+        X_scaled = scaler.transform(X)
+        predicted_time = model.predict(X_scaled)[0]
+        
+        error = abs(actual_time - predicted_time)
+        error_percentage = (error / actual_time) * 100 if actual_time != 0 else float('inf')
+        
+        predictions.append({
+            'file': str(file_path),
+            'actual_time_ms': actual_time,
+            'predicted_time_ms': predicted_time,
+            'error_percentage': error_percentage
+        })
+        
+        print(f"File: {file_path}")
+        print(f"Actual Time: {actual_time:.2f} ms")
+        print(f"Predicted Time: {predicted_time:.2f} ms")
+        print(f"Error Percentage: {error_percentage:.2f}%")
+        print()
+    
+    if predictions:
+        mean_error_percentage = np.mean([p['error_percentage'] for p in predictions if p['error_percentage'] != float('inf')])
+        print(f"Mean Absolute Percentage Error (MAPE): {mean_error_percentage:.2f}%")
+    
+    return predictions
 
 def plot_feature_importance(feature_importances, correlations, output_dir):
     os.makedirs(output_dir, exist_ok=True)
@@ -268,6 +313,9 @@ def generate_report(feature_importances, pearson_correlations, spearman_correlat
     plot_execution_time_distribution(execution_times, output_dir)
     plot_feature_importance(feature_importances, pearson_correlations, output_dir)
     plot_scatter_for_top_features(df, feature_importances, output_dir)
+    
+    # Define top_feature_names at the start of the function
+    top_feature_names = list(feature_importances.index[:10])
     
     html_report = f"""
     <!DOCTYPE html>
@@ -451,12 +499,34 @@ def main(main_dir="Graph_Output", output_dir="analysis_results"):
     print(f"Extracted features from {len(features_list)} files.")
     
     print("Analyzing feature importance...")
-    feature_importances, pearson_correlations, spearman_correlations, execution_times, df, X = analyze_feature_importance(features_list)
+    feature_importances, pearson_correlations, spearman_correlations, execution_times, df, X, rf, scaler = analyze_feature_importance(features_list)
     
     print("Generating comprehensive report...")
     generate_report(feature_importances, pearson_correlations, spearman_correlations, execution_times, file_paths, df, output_dir)
     
-    print("Analysis complete.")
+    # Predict execution times for 5 random files
+    if len(file_paths) >= 5:
+        selected_files = random.sample(file_paths, 5)
+    else:
+        selected_files = file_paths
+        print(f"Only {len(file_paths)} files available, using all for prediction.")
+    
+    predictions = predict_execution_times(rf, scaler, selected_files, main_dir)
+    
+    # Add predictions to the text report
+    with open(f"{output_dir}/feature_importance_report.txt", 'a') as f:
+        f.write("\nExecution Time Predictions:\n")
+        f.write("--------------------------\n")
+        for pred in predictions:
+            f.write(f"File: {pred['file']}\n")
+            f.write(f"Actual Time: {pred['actual_time_ms']:.2f} ms\n")
+            f.write(f"Predicted Time: {pred['predicted_time_ms']:.2f} ms\n")
+            f.write(f"Error Percentage: {pred['error_percentage']:.2f}%\n\n")
+        if predictions:
+            mean_mape = np.mean([p['error_percentage'] for p in predictions if p['error_percentage'] != float('inf')])
+            f.write(f"Mean Absolute Percentage Error (MAPE): {mean_mape:.2f}%\n")
+    
+    print("Analysis and predictions complete.")
 
 if __name__ == "__main__":
     main()
