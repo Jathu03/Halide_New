@@ -193,9 +193,9 @@ def analyze_feature_importance(features_list):
     pearson_correlations = pd.Series(pearson_correlations).sort_values(ascending=False, key=abs)
     spearman_correlations = pd.Series(spearman_correlations).sort_values(ascending=False, key=abs)
     
-    return feature_importances, pearson_correlations, spearman_correlations, y, df, X, rf, scaler
+    return feature_importances, pearson_correlations, spearman_correlations, y, df, X, rf, scaler, X.columns
 
-def predict_execution_times(model, scaler, file_paths, main_dir):
+def predict_execution_times(model, scaler, file_paths, main_dir, feature_names):
     predictions = []
     main_dir_path = Path(main_dir)
     
@@ -219,10 +219,10 @@ def predict_execution_times(model, scaler, file_paths, main_dir):
         X = X.fillna(0)
         
         # Ensure X has the same columns as the training data
-        for col in model.feature_names_in_:
+        for col in feature_names:
             if col not in X.columns:
                 X[col] = 0
-        X = X[model.feature_names_in_]
+        X = X[feature_names]
         
         X_scaled = scaler.transform(X)
         predicted_time = model.predict(X_scaled)[0]
@@ -314,7 +314,6 @@ def generate_report(feature_importances, pearson_correlations, spearman_correlat
     plot_feature_importance(feature_importances, pearson_correlations, output_dir)
     plot_scatter_for_top_features(df, feature_importances, output_dir)
     
-    # Define top_feature_names at the start of the function
     top_feature_names = list(feature_importances.index[:10])
     
     html_report = f"""
@@ -499,21 +498,19 @@ def main(main_dir="Graph_Output", output_dir="analysis_results"):
     print(f"Extracted features from {len(features_list)} files.")
     
     print("Analyzing feature importance...")
-    feature_importances, pearson_correlations, spearman_correlations, execution_times, df, X, rf, scaler = analyze_feature_importance(features_list)
+    feature_importances, pearson_correlations, spearman_correlations, execution_times, df, X, rf, scaler, feature_names = analyze_feature_importance(features_list)
     
     print("Generating comprehensive report...")
     generate_report(feature_importances, pearson_correlations, spearman_correlations, execution_times, file_paths, df, output_dir)
     
-    # Predict execution times for 5 random files
     if len(file_paths) >= 5:
         selected_files = random.sample(file_paths, 5)
     else:
         selected_files = file_paths
         print(f"Only {len(file_paths)} files available, using all for prediction.")
     
-    predictions = predict_execution_times(rf, scaler, selected_files, main_dir)
+    predictions = predict_execution_times(rf, scaler, selected_files, main_dir, feature_names)
     
-    # Add predictions to the text report
     with open(f"{output_dir}/feature_importance_report.txt", 'a') as f:
         f.write("\nExecution Time Predictions:\n")
         f.write("--------------------------\n")
