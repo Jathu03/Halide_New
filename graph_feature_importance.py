@@ -2,8 +2,6 @@ import os
 import json
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import train_test_split, cross_val_score
 from sklearn.preprocessing import StandardScaler
@@ -12,6 +10,8 @@ import scipy.stats as stats
 from pathlib import Path
 import warnings
 import random
+import pickle
+import argparse
 warnings.filterwarnings('ignore')
 
 def extract_features_from_file(file_path):
@@ -22,16 +22,19 @@ def extract_features_from_file(file_path):
         without_extern = data.get('without_extern', {})
         global_features = without_extern.get('global_features', {})
         
-        execution_time = global_features.get('execution_time_ms', None)
-        if execution_time is None:
+        execution_time_ms = global_features.get('execution_time_ms', None)
+        if execution_time_ms is None:
             print(f"No execution time found in {file_path}")
             return None
+        
+        # Convert execution time from milliseconds to seconds
+        execution_time = float(execution_time_ms) / 1000.0
         
         nodes = without_extern.get('nodes', [])
         edges = without_extern.get('edges', [])
         
         features = {
-            'execution_time': float(execution_time),
+            'execution_time': execution_time,
             'nodes_count': len(nodes),
             'edges_count': len(edges),
             'cache_hits': global_features.get('cache_hits', 0),
@@ -138,16 +141,16 @@ def create_additional_features(df):
     
     return df
 
-def analyze_feature_importance(features_list):
+def analyze_feature_importance(features_list, output_dir):
     df = pd.DataFrame(features_list)
     df = create_additional_features(df)
     
-    print(f"\nExecution time statistics:")
-    print(f"Min: {df['execution_time'].min():.2f} ms")
-    print(f"Max: {df['execution_time'].max():.2f} ms")
-    print(f"Mean: {df['execution_time'].mean():.2f} ms")
-    print(f"Median: {df['execution_time'].median():.2f} ms")
-    print(f"Std Dev: {df['execution_time'].std():.2f} ms")
+    print(f"\nExecution time statistics (in seconds):")
+    print(f"Min: {df['execution_time'].min():.5f} s")
+    print(f"Max: {df['execution_time'].max():.5f} s")
+    print(f"Mean: {df['execution_time'].mean():.5f} s")
+    print(f"Median: {df['execution_time'].median():.5f} s")
+    print(f"Std Dev: {df['execution_time'].std():.5f} s")
     
     y = df['execution_time']
     X = df.drop(['execution_time', 'log_execution_time'] if 'log_execution_time' in df.columns else ['execution_time'], axis=1)
@@ -171,7 +174,7 @@ def analyze_feature_importance(features_list):
     r2 = r2_score(y_test, y_pred)
     
     print(f"\nModel Evaluation:")
-    print(f"Mean Squared Error: {mse:.2f}")
+    print(f"Mean Squared Error: {mse:.5f}")
     print(f"R² Score: {r2:.4f}")
     
     cv_scores = cross_val_score(rf, X_scaled, y, cv=5, scoring='r2')
@@ -193,13 +196,26 @@ def analyze_feature_importance(features_list):
     pearson_correlations = pd.Series(pearson_correlations).sort_values(ascending=False, key=abs)
     spearman_correlations = pd.Series(spearman_correlations).sort_values(ascending=False, key=abs)
     
+    # Save the model, scaler, and feature names as .pkl files
+    os.makedirs(output_dir, exist_ok=True)
+    with open(f"{output_dir}/random_forest_model.pkl", 'wb') as f:
+        pickle.dump(rf, f)
+    with open(f"{output_dir}/scaler.pkl", 'wb') as f:
+        pickle.dump(scaler, f)
+    with open(f"{output_dir}/feature_names.pkl", 'wb') as f:
+        pickle.dump(list(X.columns), f)
+    
+    print(f"Model saved to {output_dir}/random_forest_model.pkl")
+    print(f"Scaler saved to {output_dir}/scaler.pkl")
+    print(f"Feature names saved to {output_dir}/feature_names.pkl")
+    
     return feature_importances, pearson_correlations, spearman_correlations, y, df, X, rf, scaler, X.columns
 
 def predict_execution_times(model, scaler, file_paths, main_dir, feature_names):
     predictions = []
     main_dir_path = Path(main_dir)
     
-    print("\nPredicting execution times for selected files:")
+    print("\nPredicting execution times for selected files (in seconds):")
     for file_path in file_paths:
         full_path = main_dir_path / file_path
         if not full_path.exists():
@@ -218,7 +234,6 @@ def predict_execution_times(model, scaler, file_paths, main_dir, feature_names):
         X = feature_df.drop(['execution_time', 'log_execution_time'] if 'log_execution_time' in feature_df.columns else ['execution_time'], axis=1)
         X = X.fillna(0)
         
-        # Ensure X has the same columns as the training data
         for col in feature_names:
             if col not in X.columns:
                 X[col] = 0
@@ -232,14 +247,14 @@ def predict_execution_times(model, scaler, file_paths, main_dir, feature_names):
         
         predictions.append({
             'file': str(file_path),
-            'actual_time_ms': actual_time,
-            'predicted_time_ms': predicted_time,
+            'actual_time_s': actual_time,
+            'predicted_time_s': predicted_time,
             'error_percentage': error_percentage
         })
         
         print(f"File: {file_path}")
-        print(f"Actual Time: {actual_time:.2f} ms")
-        print(f"Predicted Time: {predicted_time:.2f} ms")
+        print(f"Actual Time: {actual_time:.5f} s")
+        print(f"Predicted Time: {predicted_time:.5f} s")
         print(f"Error Percentage: {error_percentage:.2f}%")
         print()
     
@@ -249,245 +264,45 @@ def predict_execution_times(model, scaler, file_paths, main_dir, feature_names):
     
     return predictions
 
-def plot_feature_importance(feature_importances, correlations, output_dir):
-    os.makedirs(output_dir, exist_ok=True)
+def predict_custom_input(model, scaler, feature_names, input_file=None, input_features=None):
+    if input_file is None and input_features is None:
+        raise ValueError("Either input_file or input_features must be provided")
     
-    plt.figure(figsize=(12, 8))
-    top_features = feature_importances.head(15)
-    sns.barplot(x=top_features.values, y=top_features.index)
-    plt.title('Top 15 Features by Importance (Random Forest)')
-    plt.tight_layout()
-    plt.savefig(f"{output_dir}/top_features_importance.png")
+    if input_file:
+        features = extract_features_from_file(input_file)
+        if features is None:
+            raise ValueError(f"Failed to extract features from {input_file}")
+    else:
+        features = input_features.copy()
     
-    plt.figure(figsize=(12, 8))
-    top_correlations = correlations.head(15)
-    sns.barplot(x=top_correlations.values, y=top_correlations.index)
-    plt.title('Top 15 Features by Correlation with Execution Time')
-    plt.tight_layout()
-    plt.savefig(f"{output_dir}/top_features_correlation.png")
+    actual_time = features.get('execution_time', None)
+    feature_df = pd.DataFrame([features])
+    feature_df = create_additional_features(feature_df)
     
-    plt.close('all')
+    X = feature_df.drop(['execution_time', 'log_execution_time'] if 'log_execution_time' in feature_df.columns else ['execution_time'], axis=1)
+    X = X.fillna(0)
+    
+    for col in feature_names:
+        if col not in X.columns:
+            X[col] = 0
+    X = X[feature_names]
+    
+    X_scaled = scaler.transform(X)
+    predicted_time = model.predict(X_scaled)[0]
+    
+    result = {
+        'predicted_time_s': predicted_time
+    }
+    
+    if actual_time is not None:
+        error = abs(actual_time - predicted_time)
+        error_percentage = (error / actual_time) * 100 if actual_time != 0 else float('inf')
+        result['actual_time_s'] = actual_time
+        result['error_percentage'] = error_percentage
+    
+    return result
 
-def plot_execution_time_distribution(execution_times, output_dir):
-    os.makedirs(output_dir, exist_ok=True)
-    
-    plt.figure(figsize=(10, 6))
-    sns.histplot(execution_times, kde=True)
-    plt.title('Distribution of Execution Times')
-    plt.xlabel('Execution Time (ms)')
-    plt.ylabel('Frequency')
-    plt.tight_layout()
-    plt.savefig(f"{output_dir}/execution_time_distribution.png")
-    
-    plt.figure(figsize=(10, 6))
-    sns.boxplot(x=execution_times)
-    plt.title('Execution Time Box Plot')
-    plt.xlabel('Execution Time (ms)')
-    plt.tight_layout()
-    plt.savefig(f"{output_dir}/execution_time_boxplot.png")
-    
-    plt.close('all')
-
-def plot_scatter_for_top_features(df, top_features, output_dir):
-    os.makedirs(output_dir, exist_ok=True)
-    
-    top_feature_names = list(top_features.index[:10])
-    
-    for feature in top_feature_names:
-        if feature in df.columns:
-            plt.figure(figsize=(8, 6))
-            sns.scatterplot(x=df[feature], y=df['execution_time'])
-            plt.title(f'{feature} vs Execution Time')
-            plt.xlabel(feature)
-            plt.ylabel('Execution Time (ms)')
-            plt.tight_layout()
-            safe_feature = feature.replace('/', '_').replace('\\', '_')
-            plt.savefig(f"{output_dir}/scatter_{safe_feature}.png")
-            plt.close()
-
-def generate_report(feature_importances, pearson_correlations, spearman_correlations, 
-                    execution_times, file_paths, df, output_dir='analysis_results'):
-    
-    os.makedirs(output_dir, exist_ok=True)
-    
-    plot_execution_time_distribution(execution_times, output_dir)
-    plot_feature_importance(feature_importances, pearson_correlations, output_dir)
-    plot_scatter_for_top_features(df, feature_importances, output_dir)
-    
-    top_feature_names = list(feature_importances.index[:10])
-    
-    html_report = f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Feature Importance Analysis Report</title>
-        <style>
-            body {{ font-family: Arial, sans-serif; margin: 20px; }}
-            h1, h2, h3 {{ color: #333; }}
-            table {{ border-collapse: collapse; width: 100%; margin-bottom: 20px; }}
-            th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
-            th {{ background-color: #f2f2f2; }}
-            tr:nth-child(even) {{ background-color: #f9f9f9; }}
-            .section {{ margin-bottom: 30px; }}
-            img {{ max-width: 100%; height: auto; }}
-        </style>
-    </head>
-    <body>
-        <h1>Feature Importance Analysis Report</h1>
-        
-        <div class="section">
-            <h2>Summary Statistics</h2>
-            <p>Total files processed: {len(file_paths)}</p>
-            <p>Execution time range: {execution_times.min():.2f} ms to {execution_times.max():.2f} ms</p>
-            <p>Mean execution time: {execution_times.mean():.2f} ms</p>
-            <p>Median execution time: {execution_times.median():.2f} ms</p>
-            <p>Standard deviation: {execution_times.std():.2f} ms</p>
-            
-            <h3>Execution Time Distribution</h3>
-            <img src="execution_time_distribution.png" alt="Execution Time Distribution">
-            <img src="execution_time_boxplot.png" alt="Execution Time Box Plot">
-        </div>
-        
-        <div class="section">
-            <h2>Feature Importance Analysis</h2>
-            
-            <h3>Top Features by Importance (Random Forest Model)</h3>
-            <img src="top_features_importance.png" alt="Top Features by Importance">
-            
-            <table>
-                <tr>
-                    <th>Rank</th>
-                    <th>Feature</th>
-                    <th>Importance Score</th>
-                </tr>
-    """
-    
-    for i, (feature, importance) in enumerate(feature_importances.items(), start=1):
-        if i > 20:
-            break
-        html_report += f"""
-                <tr>
-                    <td>{i}</td>
-                    <td>{feature}</td>
-                    <td>{importance:.4f}</td>
-                </tr>
-        """
-    
-    html_report += """
-            </table>
-            
-            <h3>Top Features by Correlation (Pearson)</h3>
-            <img src="top_features_correlation.png" alt="Top Features by Correlation">
-            
-            <table>
-                <tr>
-                    <th>Rank</th>
-                    <th>Feature</th>
-                    <th>Pearson Correlation</th>
-                    <th>Spearman Correlation</th>
-                </tr>
-    """
-    
-    for i, (feature, corr) in enumerate(pearson_correlations.items(), start=1):
-        if i > 20:
-            break
-        spearman_corr = spearman_correlations.get(feature, 0)
-        html_report += f"""
-                <tr>
-                    <td>{i}</td>
-                    <td>{feature}</td>
-                    <td>{corr:.4f}</td>
-                    <td>{spearman_corr:.4f}</td>
-                </tr>
-        """
-    
-    html_report += """
-            </table>
-        </div>
-        
-        <div class="section">
-            <h2>Scatter Plots of Top Features vs Execution Time</h2>
-    """
-    
-    for feature in top_feature_names:
-        safe_feature = feature.replace('/', '_').replace('\\', '_')
-        html_report += f"""
-            <h3>{feature} vs Execution Time</h3>
-            <img src="scatter_{safe_feature}.png" alt="Scatter plot of {feature}">
-        """
-    
-    html_report += """
-        </div>
-        
-        <div class="section">
-            <h2>Files Processed</h2>
-            <table>
-                <tr>
-                    <th>#</th>
-                    <th>File Path</th>
-                </tr>
-    """
-    
-    display_files = file_paths[:100]
-    for i, file_path in enumerate(display_files, start=1):
-        html_report += f"""
-                <tr>
-                    <td>{i}</td>
-                    <td>{file_path}</td>
-                </tr>
-        """
-    
-    if len(file_paths) > 100:
-        html_report += f"""
-                <tr>
-                    <td colspan="2">... and {len(file_paths) - 100} more files</td>
-                </tr>
-        """
-    
-    html_report += """
-            </table>
-        </div>
-    </body>
-    </html>
-    """
-    
-    with open(f"{output_dir}/feature_importance_report.html", 'w') as f:
-        f.write(html_report)
-    
-    with open(f"{output_dir}/feature_importance_report.txt", 'w') as f:
-        f.write("Feature Importance Analysis Report\n")
-        f.write("=================================\n\n")
-        
-        f.write("Summary Statistics:\n")
-        f.write(f"Total files processed: {len(file_paths)}\n")
-        f.write(f"Execution time range: {execution_times.min():.2f} ms to {execution_times.max():.2f} ms\n")
-        f.write(f"Mean execution time: {execution_times.mean():.2f} ms\n")
-        f.write(f"Median execution time: {execution_times.median():.2f} ms\n")
-        f.write(f"Standard deviation: {execution_times.std():.2f} ms\n\n")
-        
-        f.write("Feature Importance (Random Forest):\n")
-        f.write("----------------------------------\n")
-        for feature, importance in list(feature_importances.items())[:30]:
-            f.write(f"{feature}: {importance:.4f}\n")
-        f.write("\n")
-        
-        f.write("Correlation with Execution Time (Pearson):\n")
-        f.write("-----------------------------------------\n")
-        for feature, corr in list(pearson_correlations.items())[:30]:
-            f.write(f"{feature}: {corr:.4f}\n")
-        f.write("\n")
-        
-        f.write("Correlation with Execution Time (Spearman):\n")
-        f.write("------------------------------------------\n")
-        for feature, corr in list(spearman_correlations.items())[:30]:
-            f.write(f"{feature}: {corr:.4f}\n")
-        f.write("\n")
-    
-    print(f"Reports generated in the '{output_dir}' directory")
-    print(f"- HTML report: {output_dir}/feature_importance_report.html")
-    print(f"- Text report: {output_dir}/feature_importance_report.txt")
-
-def main(main_dir="Graph_Output", output_dir="analysis_results"):
+def main(main_dir="Graph_Output", output_dir="analysis_results", custom_input_file=None, custom_input_features=None):
     print(f"Processing files in {main_dir}...")
     features_list, file_paths = process_all_files(main_dir)
     
@@ -498,11 +313,9 @@ def main(main_dir="Graph_Output", output_dir="analysis_results"):
     print(f"Extracted features from {len(features_list)} files.")
     
     print("Analyzing feature importance...")
-    feature_importances, pearson_correlations, spearman_correlations, execution_times, df, X, rf, scaler, feature_names = analyze_feature_importance(features_list)
+    feature_importances, pearson_correlations, spearman_correlations, execution_times, df, X, rf, scaler, feature_names = analyze_feature_importance(features_list, output_dir)
     
-    print("Generating comprehensive report...")
-    generate_report(feature_importances, pearson_correlations, spearman_correlations, execution_times, file_paths, df, output_dir)
-    
+    # Predict for 5 random files
     if len(file_paths) >= 5:
         selected_files = random.sample(file_paths, 5)
     else:
@@ -511,19 +324,51 @@ def main(main_dir="Graph_Output", output_dir="analysis_results"):
     
     predictions = predict_execution_times(rf, scaler, selected_files, main_dir, feature_names)
     
-    with open(f"{output_dir}/feature_importance_report.txt", 'a') as f:
-        f.write("\nExecution Time Predictions:\n")
-        f.write("--------------------------\n")
+    # Save prediction results to a text file
+    os.makedirs(output_dir, exist_ok=True)
+    with open(f"{output_dir}/prediction_results.txt", 'w') as f:
+        f.write("Execution Time Predictions (in seconds)\n")
+        f.write("=====================================\n\n")
         for pred in predictions:
             f.write(f"File: {pred['file']}\n")
-            f.write(f"Actual Time: {pred['actual_time_ms']:.2f} ms\n")
-            f.write(f"Predicted Time: {pred['predicted_time_ms']:.2f} ms\n")
+            f.write(f"Actual Time: {pred['actual_time_s']:.5f} s\n")
+            f.write(f"Predicted Time: {pred['predicted_time_s']:.5f} s\n")
             f.write(f"Error Percentage: {pred['error_percentage']:.2f}%\n\n")
         if predictions:
             mean_mape = np.mean([p['error_percentage'] for p in predictions if p['error_percentage'] != float('inf')])
             f.write(f"Mean Absolute Percentage Error (MAPE): {mean_mape:.2f}%\n")
     
+    print(f"Prediction results saved to {output_dir}/prediction_results.txt")
+    
+    # Handle custom input prediction
+    if custom_input_file or custom_input_features:
+        print("\nPredicting for custom input (in seconds)...")
+        try:
+            result = predict_custom_input(rf, scaler, feature_names, input_file=custom_input_file, input_features=custom_input_features)
+            print(f"Predicted Execution Time: {result['predicted_time_s']:.5f} s")
+            if 'actual_time_s' in result:
+                print(f"Actual Execution Time: {result['actual_time_s']:.5f} s")
+                print(f"Error Percentage: {result['error_percentage']:.2f}%")
+            
+            with open(f"{output_dir}/prediction_results.txt", 'a') as f:
+                f.write("\nCustom Input Prediction (in seconds)\n")
+                f.write("==================================\n")
+                f.write(f"Input: {custom_input_file if custom_input_file else 'Feature Dictionary'}\n")
+                f.write(f"Predicted Execution Time: {result['predicted_time_s']:.5f} s\n")
+                if 'actual_time_s' in result:
+                    f.write(f"Actual Execution Time: {result['actual_time_s']:.5f} s\n")
+                    f.write(f"Error Percentage: {result['error_percentage']:.2f}%\n")
+        
+        except Exception as e:
+            print(f"Error predicting custom input: {str(e)}")
+    
     print("Analysis and predictions complete.")
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Analyze feature importance and predict execution times.")
+    parser.add_argument('--input-dir', default='Graph_Output', help='Input directory containing converted_function_graph.json files')
+    parser.add_argument('--output-dir', default='analysis_results', help='Output directory for predictions and models')
+    parser.add_argument('--custom-input-file', help='Path to a custom converted_function_graph.json file for prediction')
+    args = parser.parse_args()
+    
+    main(main_dir=args.input_dir, output_dir=args.output_dir, custom_input_file=args.custom_input_file)
