@@ -115,6 +115,7 @@ def process_tree_output_directory(main_dir):
     all_scalar_features = []
     file_names = []
     skipped_files = []
+    zero_time_files = []
     
     for root, dirs, files in os.walk(main_dir):
         if 'tree_representation.json' in files:
@@ -123,32 +124,39 @@ def process_tree_output_directory(main_dir):
                 with open(file_path, 'r', encoding='utf-8') as f:
                     json_data = json.load(f)
                 node_sequences, scalar_features = extract_features(json_data)
-                if scalar_features['execution_time_ms'] > 0 and np.isfinite(scalar_features['execution_time_ms']):
+                if np.isfinite(scalar_features['execution_time_ms']):
+                    if scalar_features['execution_time_ms'] == 0:
+                        zero_time_files.append(file_path)
+                        print(f"Warning: {file_path} has execution_time_ms = 0, but including it")
                     all_node_sequences.append(node_sequences)
                     all_scalar_features.append(scalar_features)
                     file_names.append(file_path)
                 else:
                     skipped_files.append(file_path)
-                    print(f"Skipped {file_path} due to invalid execution time: {scalar_features['execution_time_ms']}")
+                    print(f"Skipped {file_path} due to non-finite execution time: {scalar_features['execution_time_ms']}")
             except Exception as e:
                 print(f"Error processing {file_path}: {e}")
                 skipped_files.append(file_path)
     
     if not all_node_sequences:
-        raise ValueError("No valid JSON files with valid execution times found in directory.")
+        raise ValueError("No valid JSON files with finite execution times found in directory.")
     
     log_path = os.path.join(main_dir, 'skipped_files_log.txt')
     with open(log_path, 'w', encoding='utf-8') as f:
-        f.write("Files skipped due to invalid execution times or errors:\n")
+        f.write("Files skipped due to non-finite execution times or errors:\n")
         for file_path in skipped_files:
+            f.write(f"{file_path}\n")
+        f.write("\nFiles with execution_time_ms = 0 (included but potentially problematic):\n")
+        for file_path in zero_time_files:
             f.write(f"{file_path}\n")
     
     total_files = len(all_node_sequences) + len(skipped_files)
     print(f"Total files found: {total_files}")
     print(f"Files skipped: {len(skipped_files)}")
+    print(f"Files with zero execution time: {len(zero_time_files)}")
     print(f"Valid files retained: {len(all_node_sequences)}")
-    if len(all_node_sequences) < 50:
-        raise ValueError(f"Expected at least 50 valid files, found {len(all_node_sequences)}")
+    if len(all_node_sequences) < 10:
+        raise ValueError(f"Expected at least 10 valid files, found {len(all_node_sequences)}")
     
     combined = list(zip(all_node_sequences, all_scalar_features, file_names))
     random.shuffle(combined)
