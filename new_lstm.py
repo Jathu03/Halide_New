@@ -134,15 +134,22 @@ def process_graph_output_directory(main_dir):
     invalid_files = []
     max_file_size = 100 * 1024 * 1024  # 100 MB limit
     processed_files = 0
+    total_files_found = 0
     start_time = time.time()
     
     main_dir_path = os.path.join(main_dir)
-    with open(os.path.join(main_dir, 'invalid_files_log.txt'), 'w', encoding='utf-8') as log_file:
+    if not os.path.exists(main_dir_path):
+        print(f"Directory {main_dir_path} does not exist.")
+        return [], [], []
+    
+    log_file_path = os.path.join(main_dir, 'invalid_files_log.txt')
+    with open(log_file_path, 'w', encoding='utf-8') as log_file:
         log_file.write("Files with invalid execution times or errors (skipped):\n")
         
         for root, dirs, files in os.walk(main_dir_path):
             for file in files:
                 if file == 'converted_function_graph.json':
+                    total_files_found += 1
                     file_path = os.path.join(root, file)
                     try:
                         # Check file size
@@ -172,21 +179,26 @@ def process_graph_output_directory(main_dir):
                         invalid_files.append(file_path)
                         log_file.write(f"{file_path}: {str(e)}\n")
     
-    total_files = len(all_features)
-    print(f"Total valid files found: {total_files}")
+    print(f"Total files found: {total_files_found}")
+    print(f"Total valid files found: {len(all_features)}")
     print(f"Files skipped due to invalid execution times or errors: {len(invalid_files)}")
     
-    if not all_features:
-        raise ValueError("No valid JSON files with valid execution times found in Graph_Output directory.")
+    if not total_files_found:
+        print(f"No converted_function_graph.json files found in {main_dir_path}")
+        return [], [], []
     
-    if total_files < 50:
-        raise ValueError(f"Expected at least 50 valid files, found {total_files}")
+    if not all_features:
+        print(f"No valid JSON files with valid execution times found in {main_dir_path}. Check {log_file_path} for details.")
+        return [], [], []
+    
+    if len(all_features) < 50:
+        print(f"Warning: Expected at least 50 valid files, found {len(all_features)}. Proceeding with available data.")
     
     combined = list(zip(all_features, file_names))
     random.shuffle(combined)
     all_features, file_names = zip(*combined)
     
-    test_size = min(50, total_files)
+    test_size = min(50, len(all_features))
     train_features = all_features[:-test_size]
     test_features = all_features[-test_size:]
     train_file_names = file_names[:-test_size]
@@ -199,6 +211,10 @@ def process_graph_output_directory(main_dir):
 
 # Prepare data for model
 def prepare_data_for_model(train_features, test_features):
+    if not train_features or not test_features:
+        print("No valid features provided for model preparation.")
+        return None
+    
     important_features = [
         'cache_hits', 'bytes_processing_rate', 'sched_bytes_at_task',
         'sched_bytes_at_realization', 'total_bytes_at_production', 'sched_bytes_at_production'
@@ -611,13 +627,18 @@ def main(main_dir):
     print(f"Processing main directory: {main_dir}")
     train_features, test_features, test_file_names = process_graph_output_directory(main_dir)
     
-    if len(train_features) == 0 or len(test_features) == 0:
-        print("Error: No valid training or test data found")
+    if not train_features or not test_file_names:
+        print("Error: No valid training or test data found. Exiting.")
+        return None
+    
+    data = prepare_data_for_model(train_features, test_features)
+    if data is None:
+        print("Error: Failed to prepare data for model. Exiting.")
         return None
     
     (train_sequences, train_scalar, y_train,
      test_sequences, test_scalar, y_test,
-     y_scaler, scaler_X_seq, scaler_X_scalar, seq_input_size, scalar_input_size, feature_columns) = prepare_data_for_model(train_features, test_features)
+     y_scaler, scaler_X_seq, scaler_X_scalar, seq_input_size, scalar_input_size, feature_columns) = data
     
     # Save scaler parameters
     scaler_node_params = {
@@ -732,4 +753,6 @@ if __name__ == "__main__":
     random.seed(42)
     torch.manual_seed(42)
     np.random.seed(42)
-    model, y_scaler, y_test_actual, y_pred_actual = main(main_dir)
+    result = main(main_dir)
+    if result is None:
+        print("Script failed to complete. Check logs and data directory.")
