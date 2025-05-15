@@ -45,166 +45,71 @@ def extract_features(json_data):
     node_sequences = []
     scalar_features = {}
     
-    # Use only without_extern section
-    data = json_data['without_extern']
-    nodes = data['nodes']
-    edges = data['edges']
-    global_features = data['global_features']
-    
-    # Helper function to combine op_histogram from multiple stages
-    def combine_op_histogram(stages):
-        op_histogram = defaultdict(int)
-        for stage in stages:
-            for dtype in ['Float', 'UInt32']:
-                for op, count in stage['pipeline_features']['op_histogram'][dtype].items():
-                    op_histogram[op.lower()] += count
-        return op_histogram
-    
-    # Helper function to combine memory_access_patterns from multiple stages
-    def combine_memory_patterns(stages):
-        memory_patterns = {
-            'Pointwise': [0, 0, 0, 0],
-            'Transpose': [0, 0, 0, 0],
-            'Broadcast': [0, 0, 0, 0],
-            'Slice': [0, 0, 0, 0]
-        }
-        for stage in stages:
-            for dtype in ['Float', 'UInt32']:
-                for pattern, values in stage['pipeline_features']['memory_access_patterns'][dtype].items():
-                    for i in range(4):
-                        memory_patterns[pattern][i] = max(memory_patterns[pattern][i], values[i])
-        return memory_patterns
-    
     # Helper function to extract node features
     def extract_node_features(node, is_global=False):
         features = {}
-        # Extract cache_hits and cache_misses for global features node
         if is_global:
-            features['cache_hits'] = global_features.get('cache_hits', 0)
-            features['cache_misses'] = global_features.get('cache_misses', 0)
+            features['cache_hits'] = json_data.get('Global Features', {}).get('cache_hits', 0)
+            features['cache_misses'] = json_data.get('Global Features', {}).get('cache_misses', 0)
         else:
-            features['cache_hits'] = 0
-            features['cache_misses'] = 0
+            features['cache_hits'] = node.get('cache_hits', 0)
+            features['cache_misses'] = node.get('cache_misses', 0)
         
-        # Extract scheduling features (use last stage)
-        if not is_global and 'stages' in node and node['stages']:
-            schedule_features = node['stages'][-1]['schedule_features']
-            for key in [
-                'num_realizations', 'num_productions', 'points_computed_total', 'innermost_loop_extent',
-                'inner_parallelism', 'outer_parallelism', 'bytes_at_realization', 'bytes_at_production',
-                'bytes_at_root', 'unique_bytes_read_per_realization', 'working_set', 'vector_size',
-                'num_vectors', 'num_scalars', 'bytes_at_task', 'working_set_at_task',
-                'working_set_at_production', 'working_set_at_realization', 'working_set_at_root'
-            ]:
-                features[f'sched_{key}'] = schedule_features.get(key, 0)
-        else:
-            for key in [
-                'num_realizations', 'num_productions', 'points_computed_total', 'innermost_loop_extent',
-                'inner_parallelism', 'outer_parallelism', 'bytes_at_realization', 'bytes_at_production',
-                'bytes_at_root', 'unique_bytes_read_per_realization', 'working_set', 'vector_size',
-                'num_vectors', 'num_scalars', 'bytes_at_task', 'working_set_at_task',
-                'working_set_at_production', 'working_set_at_realization', 'working_set_at_root'
-            ]:
-                features[f'sched_{key}'] = 0
+        # Extract scheduling features
+        scheduling = node.get('scheduling', {}) if not is_global else {}
+        for key in [
+            'num_realizations', 'num_productions', 'points_computed_total', 'innermost_loop_extent',
+            'inner_parallelism', 'outer_parallelism', 'bytes_at_realization', 'bytes_at_production',
+            'bytes_at_root', 'unique_bytes_read_per_realization', 'working_set', 'vector_size',
+            'num_vectors', 'num_scalars', 'bytes_at_task', 'working_set_at_task',
+            'working_set_at_production', 'working_set_at_realization', 'working_set_at_root'
+        ]:
+            features[f'sched_{key}'] = scheduling.get(key, 0)
         
         # Extract op_histogram
-        op_histogram = combine_op_histogram(node['stages']) if not is_global and 'stages' in node else defaultdict(int)
+        op_histogram = node.get('op_histogram', {}) if not is_global else {}
         for op in ['add', 'sub', 'mul', 'div', 'mod', 'eq', 'ne', 'lt', 'le', 'or', 'and', 'not', 'min', 'max',
-                   'constant', 'variable', 'funccall', 'imagecall', 'externcall', 'let', 'param', 'cast', 'select']:
+                   'constant', 'variable', 'funccall', 'imagecall', 'externcall', 'let', 'param']:
             features[f'op_{op}'] = op_histogram.get(op, 0)
         
         # Extract memory patterns
-        memory_patterns = combine_memory_patterns(node['stages']) if not is_global and 'stages' in node else {
-            'Pointwise': [0, 0, 0, 0], 'Transpose': [0, 0, 0, 0], 'Broadcast': [0, 0, 0, 0], 'Slice': [0, 0, 0, 0]
-        }
-        for pattern, values in memory_patterns.items():
-            for i, val in enumerate(values):
-                features[f'memory_{pattern.lower()}_{i}'] = val
+        memory_patterns = node.get('memory_patterns', {}) if not is_global else {}
+        for pattern in ['transpose', 'slice', 'broadcast', 'pointwise']:
+            for i in range(4):
+                features[f'memory_{pattern}_{i}'] = memory_patterns.get(f'{pattern}_{i}', 0)
         
-        # Create fixed-length feature vector for the node
         return {key: features.get(key, 0.0) for key in NODE_FEATURES}
     
-    # Build a pseudo-tree structure
-    node_by_id = {node['id']: node for node in nodes}
-    children_by_target = defaultdict(list)
-    for edge in edges:
-        children_by_target[edge['target_id']].append(edge['source_id'])
-    
-    # Start with nodes that have no incoming edges (leaves) or the output node
-    visited = set()
-    def traverse_node(node_id):
-        if node_id in visited:
+    # Recursive function to traverse tree
+    def traverse_tree(node):
+        if not node:
             return
-        visited.add(node_id)
-        node = node_by_id[node_id]
         node_features = extract_node_features(node)
         node_sequences.append(node_features)
-        # Traverse dependencies (children)
-        for child_id in children_by_target[node_id]:
-            traverse_node(child_id)
+        for child in node.get('children', []):
+            traverse_tree(child)
     
-    # Create a global features node
-    global_node = {'name': 'Global Features', 'stages': []}
+    # Start with global features
+    global_node = {}
     node_sequences.append(extract_node_features(global_node, is_global=True))
     
-    # Traverse all nodes, starting with the output node (h$1, id=0)
-    if 0 in node_by_id:
-        traverse_node(0)
-    # Ensure all nodes are included (in case some are disconnected)
-    for node_id in node_by_id:
-        traverse_node(node_id)
+    # Traverse the tree starting from root
+    traverse_tree(json_data.get('root', {}))
     
-    # Extract global scalar features
-    scalar_features['execution_time_ms'] = global_features.get('execution_time_ms', 0)
+    # Extract scalar features
+    scalar_data = json_data.get('Scalar Features', {})
+    for feature in SCALAR_FEATURES:
+        scalar_features[feature] = scalar_data.get(feature, 0)
     
-    # Compute derived scalar features
-    scheduling_sums = defaultdict(float)
-    node_count = len(nodes)
-    op_histogram = defaultdict(int)
-    
-    for node in nodes:
-        if 'stages' in node and node['stages']:
-            schedule_features = node['stages'][-1]['schedule_features']
-            for key in ['inner_parallelism', 'outer_parallelism', 'num_realizations', 'num_productions',
-                        'points_computed_total', 'bytes_at_realization', 'bytes_at_production',
-                        'bytes_at_root', 'unique_bytes_read_per_realization', 'working_set',
-                        'num_vectors', 'bytes_at_task']:
-                scheduling_sums[key] += schedule_features.get(key, 0)
-            node_op_histogram = combine_op_histogram(node['stages'])
-            for op, count in node_op_histogram.items():
-                op_histogram[op] += count
-    
-    scalar_features['total_parallelism'] = (scheduling_sums.get('inner_parallelism', 0) +
-                                           scheduling_sums.get('outer_parallelism', 0)) / max(node_count, 1)
-    scalar_features['scheduling_count'] = (scheduling_sums.get('num_realizations', 0) +
-                                          scheduling_sums.get('num_productions', 0))
-    scalar_features['total_bytes_at_production'] = scheduling_sums.get('bytes_at_production', 0)
-    scalar_features['total_vectors'] = scheduling_sums.get('num_vectors', 0)
-    scalar_features['computation_efficiency'] = safe_div(
-        scheduling_sums.get('points_computed_total', 0), scheduling_sums.get('bytes_at_realization', 1))
-    scalar_features['memory_pressure'] = safe_div(
-        scheduling_sums.get('working_set', 0), scheduling_sums.get('bytes_at_root', 1))
-    scalar_features['memory_utilization_ratio'] = safe_div(
-        scheduling_sums.get('unique_bytes_read_per_realization', 0), scheduling_sums.get('bytes_at_task', 1))
-    scalar_features['bytes_processing_rate'] = safe_div(
-        scheduling_sums.get('bytes_at_realization', 0), scalar_features.get('execution_time_ms', 1))
-    scalar_features['bytes_per_parallelism'] = safe_div(
-        scheduling_sums.get('bytes_at_task', 0), scalar_features.get('total_parallelism', 1))
-    scalar_features['bytes_per_vector'] = safe_div(
-        scheduling_sums.get('bytes_at_realization', 0), scalar_features.get('total_vectors', 1))
-    
-    scalar_features['nodes_count'] = node_count
-    scalar_features['edges_count'] = len(edges)
-    scalar_features['node_edge_ratio'] = safe_div(node_count, len(edges) + 1)
-    scalar_features['nodes_per_schedule'] = safe_div(node_count, scalar_features.get('scheduling_count', 1))
-    scalar_features['op_diversity'] = len([op for op, count in op_histogram.items() if count > 0])
+    # Ensure execution_time_ms is set
+    scalar_features['execution_time_ms'] = json_data.get('Global Features', {}).get('execution_time_ms', 0)
     
     return node_sequences, scalar_features
 
 def safe_div(a, b):
     return a / b if b != 0 else 0
 
-# Process directory containing function_graph_output.json files
+# Process directory containing tree_representation.json files
 def process_tree_output_directory(main_dir):
     all_node_sequences = []
     all_scalar_features = []
@@ -212,8 +117,8 @@ def process_tree_output_directory(main_dir):
     skipped_files = []
     
     for root, dirs, files in os.walk(main_dir):
-        if 'function_graph_output.json' in files:
-            file_path = os.path.join(root, 'function_graph_output.json')
+        if 'tree_representation.json' in files:
+            file_path = os.path.join(root, 'tree_representation.json')
             try:
                 with open(file_path, 'r', encoding='utf-8') as f:
                     json_data = json.load(f)
