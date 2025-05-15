@@ -704,7 +704,7 @@ def main(main_dir):
     return model, y_scaler, y_test_actual, y_pred_actual
 
 if __name__ == "__main__":
-    main_dir = "Tree_Output"
+    main_dir = "/home/kowrisaan/jathu/Halide_New/Tree_Output"
     random.seed(42)
     torch.manual_seed(42)
     np.random.seed(42)
