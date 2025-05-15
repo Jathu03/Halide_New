@@ -12,7 +12,7 @@
 
 using json = nlohmann::json;
 
-// RobustScaler implementation (reused from reference)
+// RobustScaler implementation
 struct RobustScaler {
     std::vector<float> center;
     std::vector<float> scale;
@@ -49,6 +49,13 @@ struct RobustScaler {
     }
 };
 
+// Struct to hold feature extraction results
+struct FeatureResult {
+    std::unordered_map<std::string, float> features;
+    std::vector<float> node_vector;
+    std::vector<float> scalar_vector;
+};
+
 // Feature extraction (adapted from Python extract_features for Graph_Output)
 struct GraphFeatures {
     std::vector<std::string> node_feature_names;
@@ -56,9 +63,10 @@ struct GraphFeatures {
     std::vector<std::string> skewed_features;
     std::vector<std::string> dropped_features;
 
-    std::unordered_map<std::string, float> extract(const json& json_data) {
+    FeatureResult extract(const json& json_data) {
         std::cout << "Extracting features from JSON" << std::endl;
-        std::unordered_map<std::string, float> features;
+        FeatureResult result;
+        auto& features = result.features;
 
         // Validate JSON structure
         if (!json_data.contains("without_extern") || !json_data["without_extern"].contains("global_features")) {
@@ -196,11 +204,11 @@ struct GraphFeatures {
             }
         }
 
-        // Store results
-        features["node_vector"] = node_vec;
-        features["scalar_vector"] = scalar_vec;
+        // Store vectors in result
+        result.node_vector = node_vec;
+        result.scalar_vector = scalar_vec;
         std::cout << "Extracted node features: " << node_vec.size() << ", scalar features: " << scalar_vec.size() << std::endl;
-        return features;
+        return result;
     }
 };
 
@@ -256,9 +264,9 @@ float predict_execution_time(const std::string& json_file_path) {
         extractor.skewed_features = skewed_features;
         extractor.dropped_features = dropped_features;
 
-        auto features = extractor.extract(json_data);
-        auto node_vec = features["node_vector"].get<std::vector<float>>();
-        auto scalar_vec = features["scalar_vector"].get<std::vector<float>>();
+        auto feature_result = extractor.extract(json_data);
+        auto node_vec = feature_result.node_vector;
+        auto scalar_vec = feature_result.scalar_vector;
 
         // Scale features
         auto scaled_node = scaler_node.transform(node_vec);
@@ -319,11 +327,11 @@ float predict_execution_time(const std::string& json_file_path) {
 
         return execution_time_ms;
 
-    } catch (const std::exception& e) {
-        std::cerr << "Error: " << e.what() << std::endl;
-        throw;
     } catch (const c10::Error& e) {
         std::cerr << "PyTorch Error: " << e.what() << std::endl;
+        throw;
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
         throw;
     }
 }
@@ -350,11 +358,11 @@ int main(int argc, char* argv[]) {
 
         return 0;
 
-    } catch (const std::exception& e) {
-        std::cerr << "Error: " << e.what() << std::endl;
-        return 1;
     } catch (const c10::Error& e) {
         std::cerr << "PyTorch Error: " << e.what() << std::endl;
+        return 1;
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
         return 1;
     }
 }
