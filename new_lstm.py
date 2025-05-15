@@ -13,19 +13,16 @@ from collections import defaultdict
 import matplotlib.pyplot as plt
 import time
 
-# Define fixed set of features for sequences
+# Define fixed set of features (adapted from Tree_Output, compatible with Graph_Output)
 FIXED_FEATURES = [
     'cache_hits', 'cache_misses', 'execution_time_ms', 'sched_num_realizations',
-    'sched_num_productions', 'sched_points_computed_total', 'sched_innermost_loop_extent',
-    'sched_inner_parallelism', 'sched_outer_parallelism', 'sched_bytes_at_realization',
-    'sched_bytes_at_production', 'sched_bytes_at_root', 'sched_unique_bytes_read_per_realization',
-    'sched_working_set', 'sched_vector_size', 'sched_num_vectors', 'sched_num_scalars',
-    'sched_bytes_at_task', 'sched_working_set_at_task', 'sched_working_set_at_production',
-    'sched_working_set_at_realization', 'sched_working_set_at_root', 'total_parallelism',
-    'scheduling_count', 'total_bytes_at_production', 'total_vectors', 'computation_efficiency',
-    'memory_pressure', 'memory_utilization_ratio', 'bytes_processing_rate', 'bytes_per_parallelism',
-    'bytes_per_vector', 'nodes_count', 'edges_count', 'node_edge_ratio', 'nodes_per_schedule',
-    'op_diversity',
+    'sched_num_productions', 'sched_points_computed_total', 'sched_inner_parallelism',
+    'sched_outer_parallelism', 'sched_bytes_at_realization', 'sched_bytes_at_production',
+    'sched_bytes_at_root', 'sched_bytes_at_task', 'sched_working_set', 'sched_num_vectors',
+    'sched_num_scalars', 'total_parallelism', 'scheduling_count', 'total_bytes_at_production',
+    'total_vectors', 'computation_efficiency', 'memory_pressure', 'memory_utilization_ratio',
+    'bytes_processing_rate', 'bytes_per_parallelism', 'bytes_per_vector', 'nodes_count',
+    'edges_count', 'node_edge_ratio', 'nodes_per_schedule', 'op_diversity',
     'op_add', 'op_sub', 'op_mul', 'op_div', 'op_mod', 'op_eq', 'op_ne', 'op_lt', 'op_le',
     'op_or', 'op_and', 'op_not', 'op_min', 'op_max', 'op_constant', 'op_variable',
     'op_funccall', 'op_imagecall', 'op_externcall', 'op_let', 'op_param',
@@ -35,101 +32,109 @@ FIXED_FEATURES = [
     'memory_pointwise_0', 'memory_pointwise_1', 'memory_pointwise_2', 'memory_pointwise_3'
 ]
 
-# Feature extraction function
+# Feature extraction function for converted_function_graph.json
 def extract_features(json_data):
     try:
         # Validate JSON structure
-        if not isinstance(json_data, dict) or 'children' not in json_data:
+        if not isinstance(json_data, dict) or 'without_extern' not in json_data:
+            return None
+        without_extern = json_data['without_extern']
+        if 'global_features' not in without_extern:
+            return None
+        global_features = without_extern['global_features']
+        
+        # Extract and validate execution time
+        execution_time_ms = global_features.get('execution_time_ms', None)
+        if execution_time_ms is None or not isinstance(execution_time_ms, (int, float)) or execution_time_ms <= 0:
             return None
         
         features = {}
+        features['execution_time_ms'] = float(execution_time_ms)  # Keep in milliseconds
+        features['cache_hits'] = global_features.get('cache_hits', 0)
+        features['cache_misses'] = global_features.get('cache_misses', 0)
         
-        # Extract global features
-        global_node = next((child for child in json_data['children'] if child['name'] == 'Global Features'), None)
-        if not global_node:
-            return None
-        features['cache_hits'] = global_node.get('cache_hits', 0)
-        features['cache_misses'] = global_node.get('cache_misses', 0)
-        execution_time_ms = global_node.get('execution_time_ms', None)
-        if execution_time_ms is None or not isinstance(execution_time_ms, (int, float)) or execution_time_ms <= 0:
-            return None
-        features['execution_time_ms'] = float(execution_time_ms)
+        # Extract node and edge counts
+        nodes = without_extern.get('nodes', [])
+        edges = without_extern.get('edges', [])
+        features['nodes_count'] = len(nodes)
+        features['edges_count'] = len(edges)
+        features['node_edge_ratio'] = features['nodes_count'] / (features['edges_count'] + 1e-8)
         
-        # Extract op_histogram features
-        op_histogram = defaultdict(int)
-        for node in json_data['children']:
-            if 'op_histogram' in node:
-                for op, count in node['op_histogram'].items():
-                    op_histogram[op.lower()] += count
-        for op, count in op_histogram.items():
-            features[f'op_{op.lower()}'] = count
-        
-        # Extract memory patterns
+        # Extract operation counts
+        op_counts = defaultdict(int)
         memory_patterns = defaultdict(lambda: [0, 0, 0, 0])
-        for node in json_data['children']:
-            if 'memory_patterns' in node:
-                for pattern, values in node['memory_patterns'].items():
-                    if isinstance(values, list) and len(values) == 4:
-                        memory_patterns[pattern] = [sum(x) for x in zip(memory_patterns[pattern], values)]
+        
+        for node in nodes:
+            stages = node.get('stages', [])
+            for stage in stages:
+                pipeline_features = stage.get('pipeline_features', {})
+                op_hist = pipeline_features.get('op_histogram', {}).get('Float', {})
+                for op, count in op_hist.items():
+                    op_counts[f'op_{op.lower()}'] += count
+                
+                mem_access = pipeline_features.get('memory_access_patterns', {}).get('Float', {})
+                for pattern, values in mem_access.items():
+                    for i, val in enumerate(values[:4]):  # Ensure max 4 dimensions
+                        memory_patterns[pattern][i] += val
+        
+        features.update(op_counts)
         for pattern, values in memory_patterns.items():
             for i, val in enumerate(values):
                 features[f'memory_{pattern.lower()}_{i}'] = val
         
         # Extract scheduling features
-        scheduling_keys = [
-            'num_realizations', 'num_productions', 'points_computed_total', 'innermost_loop_extent',
-            'inner_parallelism', 'outer_parallelism', 'bytes_at_realization', 'bytes_at_production',
-            'bytes_at_root', 'unique_bytes_read_per_realization', 'working_set', 'vector_size',
-            'num_vectors', 'num_scalars', 'bytes_at_task', 'working_set_at_task', 'working_set_at_production',
-            'working_set_at_realization', 'working_set_at_root'
-        ]
-        scheduling_sums = defaultdict(float)
-        node_count = 0
-        for node in json_data['children']:
-            if 'scheduling' in node:
-                node_count += 1
-                for key in scheduling_keys:
-                    scheduling_sums[key] += node['scheduling'].get(key, 0)
-        for key in scheduling_keys:
-            if key in ['inner_parallelism', 'outer_parallelism'] and node_count > 0:
-                features[f'sched_{key}'] = scheduling_sums[key] / node_count
-            else:
-                features[f'sched_{key}'] = scheduling_sums[key]
+        scheduling_features = []
+        for node in nodes:
+            stages = node.get('stages', [])
+            for stage in stages:
+                sched = stage.get('schedule_features', {})
+                scheduling_features.append(sched)
         
-        # Derived features with division-by-zero protection
-        features['total_parallelism'] = features.get('sched_inner_parallelism', 0) + features.get('sched_outer_parallelism', 0)
-        features['scheduling_count'] = features.get('sched_num_realizations', 0) + features.get('sched_num_productions', 0)
-        features['total_bytes_at_production'] = features.get('sched_bytes_at_production', 0)
-        features['total_vectors'] = features.get('sched_num_vectors', 0)
-        features['computation_efficiency'] = (features.get('sched_points_computed_total', 0) /
-                                             (features.get('sched_bytes_at_realization', 1) or 1))
-        features['memory_pressure'] = (features.get('sched_working_set', 0) /
-                                      (features.get('sched_bytes_at_root', 1) or 1))
-        features['memory_utilization_ratio'] = (features.get('sched_unique_bytes_read_per_realization', 0) /
-                                               (features.get('sched_bytes_at_task', 1) or 1))
-        features['bytes_processing_rate'] = (features.get('sched_bytes_at_realization', 0) /
-                                            (features.get('execution_time_ms', 1) or 1))
-        features['bytes_per_parallelism'] = (features.get('sched_bytes_at_task', 0) /
-                                            (features.get('total_parallelism', 1) or 1))
-        features['bytes_per_vector'] = (features.get('sched_bytes_at_realization', 0) /
-                                       (features.get('sched_num_vectors', 1) or 1))
-        nodes_count = len(json_data['children'])
-        edges_count = sum(len(node.get('children', [])) for node in json_data['children'])
-        features['nodes_count'] = nodes_count
-        features['edges_count'] = edges_count
-        features['node_edge_ratio'] = nodes_count / (edges_count + 1)
-        features['nodes_per_schedule'] = nodes_count / (features.get('scheduling_count', 1) or 1)
-        features['op_diversity'] = len([k for k, v in features.items() if k.startswith('op_') and v > 0])
+        features['scheduling_count'] = len(scheduling_features)
+        
+        if scheduling_features:
+            important_metrics = [
+                'bytes_at_production', 'bytes_at_realization', 'bytes_at_root', 'bytes_at_task',
+                'inner_parallelism', 'outer_parallelism', 'num_productions', 'num_realizations',
+                'num_scalars', 'num_vectors', 'points_computed_total', 'working_set'
+            ]
+            
+            for metric in important_metrics:
+                features[f'sched_{metric}'] = sum(sf.get(metric, 0) for sf in scheduling_features)
+            
+            features['total_bytes_at_production'] = features['sched_bytes_at_production']
+            features['total_vectors'] = features['sched_num_vectors']
+            features['total_parallelism'] = sum(sf.get('inner_parallelism', 0) * sf.get('outer_parallelism', 1) 
+                                              for sf in scheduling_features)
+            
+            features['bytes_per_vector'] = (features['total_bytes_at_production'] / 
+                                          (features['total_vectors'] + 1e-8))
+            features['memory_pressure'] = (features['sched_working_set'] / 
+                                         (features['sched_bytes_at_production'] + 1e-8))
+            features['bytes_per_parallelism'] = (features['total_bytes_at_production'] / 
+                                               (features['total_parallelism'] + 1e-8))
+            features['nodes_per_schedule'] = (features['nodes_count'] / 
+                                            (features['scheduling_count'] + 1e-8))
+        
+        features['op_diversity'] = len([k for k, v in op_counts.items() if v > 0])
+        
+        # Create additional derived features
+        features['computation_efficiency'] = (features['sched_points_computed_total'] / 
+                                            (features['execution_time_ms'] + 1e-8))
+        features['bytes_processing_rate'] = (features['total_bytes_at_production'] / 
+                                            (features['execution_time_ms'] + 1e-8))
+        features['memory_utilization_ratio'] = (features['sched_working_set'] / 
+                                              (features['sched_bytes_at_production'] + 1e-8))
         
         # Create fixed-length feature vector
         fixed_features = {key: features.get(key, 0.0) for key in FIXED_FEATURES}
         return fixed_features
     
     except Exception:
-        return None
+        return None  # Skip files that cause any errors
 
-# Process Tree_Output directory
-def process_tree_output_directory(main_dir):
+# Process Graph_Output directory
+def process_graph_output_directory(main_dir):
     all_features = []
     file_names = []
     invalid_files = []
@@ -148,42 +153,44 @@ def process_tree_output_directory(main_dir):
         log_file.write("Files with invalid execution times or errors (skipped):\n")
         
         for root, dirs, files in os.walk(main_dir_path):
-            if 'tree_representation.json' in files:
-                total_files_found += 1
-                file_path = os.path.join(root, 'tree_representation.json')
-                try:
-                    file_size = os.path.getsize(file_path)
-                    if file_size > max_file_size:
-                        invalid_files.append(file_path)
-                        log_file.write(f"{file_path}: File too large ({file_size} bytes)\n")
-                        continue
+            for file in files:
+                if file == 'converted_function_graph.json':
+                    total_files_found += 1
+                    file_path = os.path.join(root, file)
+                    try:
+                        # Check file size
+                        file_size = os.path.getsize(file_path)
+                        if file_size > max_file_size:
+                            invalid_files.append(file_path)
+                            log_file.write(f"{file_path}: File too large ({file_size} bytes)\n")
+                            continue
+                        
+                        with open(file_path, 'r', encoding='utf-8') as f:
+                            json_data = json.load(f)
+                        features = extract_features(json_data)
+                        if features is None or 'execution_time_ms' not in features or features['execution_time_ms'] <= 0 or not np.isfinite(features['execution_time_ms']):
+                            invalid_files.append(file_path)
+                            log_file.write(f"{file_path}: Invalid execution time or features\n")
+                            continue
+                        all_features.append(features)
+                        relative_path = os.path.relpath(file_path, main_dir_path)
+                        file_names.append(relative_path)
+                        
+                        processed_files += 1
+                        if processed_files % 1000 == 0:
+                            elapsed = time.time() - start_time
+                            print(f"Processed {processed_files} files in {elapsed:.2f} seconds")
                     
-                    with open(file_path, 'r', encoding='utf-8') as f:
-                        json_data = json.load(f)
-                    features = extract_features(json_data)
-                    if features is None or 'execution_time_ms' not in features or features['execution_time_ms'] <= 0 or not np.isfinite(features['execution_time_ms']):
+                    except Exception as e:
                         invalid_files.append(file_path)
-                        log_file.write(f"{file_path}: Invalid execution time or features\n")
-                        continue
-                    all_features.append(features)
-                    relative_path = os.path.relpath(file_path, main_dir_path)
-                    file_names.append(relative_path)
-                    
-                    processed_files += 1
-                    if processed_files % 1000 == 0:
-                        elapsed = time.time() - start_time
-                        print(f"Processed {processed_files} files in {elapsed:.2f} seconds")
-                
-                except Exception as e:
-                    invalid_files.append(file_path)
-                    log_file.write(f"{file_path}: {str(e)}\n")
+                        log_file.write(f"{file_path}: {str(e)}\n")
     
     print(f"Total files found: {total_files_found}")
     print(f"Total valid files found: {len(all_features)}")
     print(f"Files skipped due to invalid execution times or errors: {len(invalid_files)}")
     
     if not total_files_found:
-        print(f"No tree_representation.json files found in {main_dir_path}")
+        print(f"No converted_function_graph.json files found in {main_dir_path}")
         return [], [], []
     
     if not all_features:
@@ -215,8 +222,8 @@ def prepare_data_for_model(train_features, test_features):
         return None
     
     important_features = [
-        'cache_hits', 'bytes_processing_rate', 'sched_bytes_at_task', 'sched_working_set_at_root',
-        'sched_bytes_at_realization', 'sched_unique_bytes_read_per_realization'
+        'cache_hits', 'bytes_processing_rate', 'sched_bytes_at_task',
+        'sched_bytes_at_realization', 'total_bytes_at_production', 'sched_bytes_at_production'
     ]
     
     # Create sequences with fixed features
@@ -245,10 +252,10 @@ def prepare_data_for_model(train_features, test_features):
     
     # Drop low-importance features
     low_importance_features = [
-        'op_cast', 'op_selfcall', 'memory_pointwise_1', 'memory_transpose_1', 'memory_broadcast_1',
-        'memory_slice_1', 'op_select', 'op_not', 'op_and', 'op_ne', 'op_mod', 'memory_pointwise_2',
-        'memory_broadcast_2', 'memory_slice_2', 'memory_transpose_2', 'op_externcall', 'op_imagecall',
-        'op_param', 'memory_pointwise_3', 'memory_transpose_3', 'op_sub', 'memory_pointwise_0', 'op_let'
+        'op_eq', 'nodes_count', 'sched_outer_parallelism', 'op_le', 'node_edge_ratio',
+        'memory_pressure', 'op_let', 'bytes_per_vector', 'sched_working_set', 'sched_num_realizations',
+        'computation_efficiency', 'avg_ops_per_node', 'memory_utilization_ratio', 'sched_num_scalars',
+        'cache_misses', 'bytes_per_parallelism', 'op_mul'
     ]
     train_scalar_df = train_scalar_df.drop(columns=[col for col in low_importance_features if col in train_scalar_df.columns])
     test_scalar_df = test_scalar_df.drop(columns=[col for col in low_importance_features if col in test_scalar_df.columns])
@@ -270,14 +277,14 @@ def prepare_data_for_model(train_features, test_features):
     train_scalar_df = train_scalar_df.drop(columns=constant_columns)
     test_scalar_df = test_scalar_df.drop(columns=constant_columns)
     
-    # Extract execution times
+    # Extract execution times (in milliseconds)
     y_train_raw = np.array([f['execution_time_ms'] for f in train_features])
     y_test_raw = np.array([f['execution_time_ms'] for f in test_features])
     y_train_raw = np.clip(y_train_raw, 0, np.percentile(y_train_raw, 99))
     y_test_raw = np.clip(y_test_raw, 0, np.percentile(y_test_raw, 99))
     
     y_train = np.log1p(y_train_raw).reshape(-1, 1)
-    y_test = np.log1p(y_train_raw).reshape(-1, 1)
+    y_test = np.log1p(y_test_raw).reshape(-1, 1)
     
     # Scale scalar features and targets
     scaler_X_scalar = RobustScaler()
@@ -624,7 +631,7 @@ def main(main_dir):
         print("CUDA not available. Using CPU.")
     
     print(f"Processing main directory: {main_dir}")
-    train_features, test_features, test_file_names = process_tree_output_directory(main_dir)
+    train_features, test_features, test_file_names = process_graph_output_directory(main_dir)
     
     if not train_features or not test_file_names:
         print("Error: No valid training or test data found. Exiting.")
@@ -670,10 +677,10 @@ def main(main_dir):
         'scalar_features': list(feature_columns),
         'skewed_features': ['cache_hits', 'bytes_processing_rate', 'sched_bytes_at_task', 'computation_efficiency'],
         'dropped_features': [
-            'op_cast', 'op_selfcall', 'memory_pointwise_1', 'memory_transpose_1', 'memory_broadcast_1',
-            'memory_slice_1', 'op_select', 'op_not', 'op_and', 'op_ne', 'op_mod', 'memory_pointwise_2',
-            'memory_broadcast_2', 'memory_slice_2', 'memory_transpose_2', 'op_externcall', 'op_imagecall',
-            'op_param', 'memory_pointwise_3', 'memory_transpose_3', 'op_sub', 'memory_pointwise_0', 'op_let'
+            'op_eq', 'nodes_count', 'sched_outer_parallelism', 'op_le', 'node_edge_ratio',
+            'memory_pressure', 'op_let', 'bytes_per_vector', 'sched_working_set', 'sched_num_realizations',
+            'computation_efficiency', 'avg_ops_per_node', 'memory_utilization_ratio', 'sched_num_scalars',
+            'cache_misses', 'bytes_per_parallelism', 'op_mul'
         ]
     }
     with open('model_metadata.json', 'w') as f:
@@ -698,13 +705,14 @@ def main(main_dir):
     
     optimizer = optim.AdamW(model.parameters(), lr=0.00005, weight_decay=1e-4)
     
+    # Feature importances (aligned with Tree_Output)
     feature_importances = {
         'cache_hits': 0.5860,
         'bytes_processing_rate': 0.2893,
         'sched_bytes_at_task': 0.0422,
-        'sched_working_set_at_root': 0.0248,
         'sched_bytes_at_realization': 0.0055,
-        'sched_unique_bytes_read_per_realization': 0.0049
+        'total_bytes_at_production': 0.0049,
+        'sched_bytes_at_production': 0.0030
     }
     
     feature_indices = {}
