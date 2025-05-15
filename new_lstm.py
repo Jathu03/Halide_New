@@ -2,62 +2,49 @@ import os
 import json
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import RobustScaler
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import TensorDataset, DataLoader
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
-import random
-from collections import defaultdict
 import matplotlib.pyplot as plt
-import time
+import seaborn as sns
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, r2_score
+import scipy.stats as stats
+from pathlib import Path
+import warnings
+import random
+warnings.filterwarnings('ignore')
 
-# Define fixed set of features based on feature_importance_report.txt
-FIXED_FEATURES = [
-    'cache_hits', 'cache_misses', 'nodes_count', 'edges_count', 'node_edge_ratio',
-    'sched_num_realizations', 'sched_num_productions', 'sched_points_computed_total',
-    'sched_inner_parallelism', 'sched_outer_parallelism', 'sched_bytes_at_realization',
-    'sched_bytes_at_production', 'sched_bytes_at_root', 'sched_bytes_at_task',
-    'sched_working_set', 'sched_num_vectors', 'sched_num_scalars', 'total_parallelism',
-    'scheduling_count', 'total_bytes_at_production', 'total_vectors', 'computation_efficiency',
-    'memory_pressure', 'memory_utilization_ratio', 'bytes_processing_rate', 'bytes_per_parallelism',
-    'bytes_per_vector', 'nodes_per_schedule', 'op_diversity', 'avg_ops_per_node',
-    'op_add', 'op_sub', 'op_mul', 'op_div', 'op_mod', 'op_eq', 'op_ne', 'op_lt', 'op_le',
-    'op_or', 'op_and', 'op_not', 'op_min', 'op_max', 'op_constant', 'op_variable',
-    'op_funccall', 'op_imagecall', 'op_externcall', 'op_let', 'op_param',
-    'mem_transpose', 'mem_slice', 'mem_broadcast', 'mem_pointwise'
-]
-
-# Feature extraction function for converted_function_graph.json
-def extract_features(json_data):
+def extract_features_from_file(file_path):
     try:
-        # Validate JSON structure
-        if not isinstance(json_data, dict) or 'without_extern' not in json_data:
-            return None
-        without_extern = json_data['without_extern']
-        if 'global_features' not in without_extern:
-            return None
-        global_features = without_extern['global_features']
+        with open(file_path, 'r') as f:
+            data = json.load(f)
         
-        # Extract and validate execution time
-        execution_time_ms = global_features.get('execution_time_ms', None)
-        if execution_time_ms is None or not isinstance(execution_time_ms, (int, float)) or execution_time_ms <= 0:
-            return None
+        without_extern = data.get('without_extern', {})
+        global_features = without_extern.get('global_features', {})
         
-        features = {}
-        features['execution_time'] = float(execution_time_ms) / 1000.0  # Convert to seconds
-        features['cache_hits'] = global_features.get('cache_hits', 0)
-        features['cache_misses'] = global_features.get('cache_misses', 0)
+        execution_time = global_features.get('execution_time_ms', None)
+        if execution_time is None or not np.isfinite(execution_time) or execution_time < 0:
+            print(f"Invalid or missing execution time in {file_path}, using fallback value 0.001 ms")
+            execution_time = 0.001
+        elif execution_time == 0:
+            print(f"Warning: {file_path} has execution_time_ms = 0, proceeding with value")
         
-        # Extract node and edge counts
         nodes = without_extern.get('nodes', [])
         edges = without_extern.get('edges', [])
-        features['nodes_count'] = len(nodes)
-        features['edges_count'] = len(edges)
+        
+        features = {
+            'execution_time': float(execution_time),
+            'nodes_count': len(nodes),
+            'edges_count': len(edges),
+            'cache_hits': global_features.get('cache_hits', 0),
+            'cache_misses': global_features.get('cache_misses', 0),
+            'total_bytes_at_production': 0.0,
+            'total_vectors': 0.0,
+            'total_parallelism': 0.0
+        }
+        
         features['node_edge_ratio'] = features['nodes_count'] / (features['edges_count'] + 1e-8)
         
-        # Extract operation counts
         op_counts = {}
         memory_patterns = {'Broadcast': 0, 'Pointwise': 0, 'Slice': 0, 'Transpose': 0}
         
@@ -77,7 +64,6 @@ def extract_features(json_data):
         for pattern, value in memory_patterns.items():
             features[f'mem_{pattern.lower()}'] = value
         
-        # Extract scheduling features
         scheduling_features = []
         for node in nodes:
             stages = node.get('stages', [])
@@ -115,644 +101,452 @@ def extract_features(json_data):
         features['avg_ops_per_node'] = sum(op_counts.values()) / (features['nodes_count'] + 1e-8)
         features['op_diversity'] = op_types / (features['nodes_count'] + 1e-8)
         
-        # Create additional derived features
-        features['computation_efficiency'] = features['sched_points_computed_total'] / (features['execution_time'] + 1e-8)
-        features['bytes_processing_rate'] = features['total_bytes_at_production'] / (features['execution_time'] + 1e-8)
-        features['memory_utilization_ratio'] = features['sched_working_set'] / (features['sched_bytes_at_production'] + 1e-8)
-        
-        # Create fixed-length feature vector
-        fixed_features = {key: features.get(key, 0.0) for key in FIXED_FEATURES}
-        return fixed_features
+        return features
     
-    except Exception:
-        return None  # Skip files that cause any errors
-
-# Process Graph_Output directory
-def process_graph_output_directory(main_dir):
-    all_features = []
-    file_names = []
-    invalid_files = []
-    max_file_size = 100 * 1024 * 1024  # 100 MB limit
-    processed_files = 0
-    total_files_found = 0
-    start_time = time.time()
-    
-    main_dir_path = os.path.join(main_dir)
-    if not os.path.exists(main_dir_path):
-        print(f"Directory {main_dir_path} does not exist.")
-        return [], [], []
-    
-    log_file_path = os.path.join(main_dir, 'invalid_files_log.txt')
-    with open(log_file_path, 'w', encoding='utf-8') as log_file:
-        log_file.write("Files with invalid execution times or errors (skipped):\n")
-        
-        for root, dirs, files in os.walk(main_dir_path):
-            for file in files:
-                if file == 'converted_function_graph.json':
-                    total_files_found += 1
-                    file_path = os.path.join(root, file)
-                    try:
-                        # Check file size
-                        file_size = os.path.getsize(file_path)
-                        if file_size > max_file_size:
-                            invalid_files.append(file_path)
-                            log_file.write(f"{file_path}: File too large ({file_size} bytes)\n")
-                            continue
-                        
-                        with open(file_path, 'r', encoding='utf-8') as f:
-                            json_data = json.load(f)
-                        features = extract_features(json_data)
-                        if features is None or 'execution_time' not in features or features['execution_time'] <= 0 or not np.isfinite(features['execution_time']):
-                            invalid_files.append(file_path)
-                            log_file.write(f"{file_path}: Invalid execution time or features\n")
-                            continue
-                        all_features.append(features)
-                        relative_path = os.path.relpath(file_path, main_dir_path)
-                        file_names.append(relative_path)
-                        
-                        processed_files += 1
-                        if processed_files % 1000 == 0:
-                            elapsed = time.time() - start_time
-                            print(f"Processed {processed_files} files in {elapsed:.2f} seconds")
-                    
-                    except Exception as e:
-                        invalid_files.append(file_path)
-                        log_file.write(f"{file_path}: {str(e)}\n")
-    
-    print(f"Total files found: {total_files_found}")
-    print(f"Total valid files found: {len(all_features)}")
-    print(f"Files skipped due to invalid execution times or errors: {len(invalid_files)}")
-    
-    if not total_files_found:
-        print(f"No converted_function_graph.json files found in {main_dir_path}")
-        return [], [], []
-    
-    if not all_features:
-        print(f"No valid JSON files with valid execution times found in {main_dir_path}. Check {log_file_path} for details.")
-        return [], [], []
-    
-    if len(all_features) < 50:
-        print(f"Warning: Expected at least 50 valid files, found {len(all_features)}. Proceeding with available data.")
-    
-    combined = list(zip(all_features, file_names))
-    random.shuffle(combined)
-    all_features, file_names = zip(*combined)
-    
-    test_size = min(50, len(all_features))
-    train_features = all_features[:-test_size]
-    test_features = all_features[-test_size:]
-    train_file_names = file_names[:-test_size]
-    test_file_names = file_names[-test_size:]
-    
-    print(f"Training files: {len(train_features)}")
-    print(f"Testing files: {len(test_features)}")
-    
-    return train_features, test_features, list(test_file_names)
-
-# Prepare data for model
-def prepare_data_for_model(train_features, test_features):
-    if not train_features or not test_features:
-        print("No valid features provided for model preparation.")
+    except Exception as e:
+        print(f"Error extracting features from {file_path}: {str(e)}")
         return None
-    
-    important_features = [
-        'cache_hits', 'bytes_processing_rate', 'sched_bytes_at_task',
-        'sched_bytes_at_realization', 'total_bytes_at_production', 'sched_bytes_at_production'
-    ]
-    
-    # Create sequences with fixed features
-    sequence_length = 3
-    train_sequences = [np.array([[features.get(key, 0.0) for key in FIXED_FEATURES]] * sequence_length) for features in train_features]
-    test_sequences = [np.array([[features.get(key, 0.0) for key in FIXED_FEATURES]] * sequence_length) for features in test_features]
-    
-    # Convert to numpy for scaling
-    train_sequences_np = np.array(train_sequences)
-    test_sequences_np = np.array(test_sequences)
-    train_sequences_flat = train_sequences_np.reshape(-1, len(FIXED_FEATURES))
-    test_sequences_flat = test_sequences_np.reshape(-1, len(FIXED_FEATURES))
-    
-    # Scale sequence features
-    scaler_X_seq = RobustScaler()
-    train_sequences_scaled = scaler_X_seq.fit_transform(train_sequences_flat)
-    test_sequences_scaled = scaler_X_seq.transform(test_sequences_flat)
-    
-    # Reshape back to tensor
-    train_sequences_padded = torch.FloatTensor(train_sequences_scaled).view(len(train_features), sequence_length, -1)
-    test_sequences_padded = torch.FloatTensor(test_sequences_scaled).view(len(test_features), sequence_length, -1)
-    
-    # Create scalar features DataFrame
-    train_scalar_df = pd.DataFrame(train_features)
-    test_scalar_df = pd.DataFrame(test_features)
-    
-    # Drop low-importance features based on report
-    low_importance_features = [
-        'op_eq', 'nodes_count', 'sched_outer_parallelism', 'op_le', 'node_edge_ratio',
-        'memory_pressure', 'op_let', 'bytes_per_vector', 'sched_working_set', 'sched_num_realizations',
-        'computation_efficiency', 'avg_ops_per_node', 'memory_utilization_ratio', 'sched_num_scalars',
-        'cache_misses', 'bytes_per_parallelism', 'op_mul'
-    ]
-    train_scalar_df = train_scalar_df.drop(columns=[col for col in low_importance_features if col in train_scalar_df.columns])
-    test_scalar_df = test_scalar_df.drop(columns=[col for col in low_importance_features if col in test_scalar_df.columns])
-    
-    # Log transform skewed features
-    skewed_features = ['cache_hits', 'bytes_processing_rate', 'sched_bytes_at_task', 'computation_efficiency']
-    for feature in skewed_features:
-        if feature in train_scalar_df.columns:
-            train_scalar_df[f'log_{feature}'] = np.log1p(train_scalar_df[feature])
-            test_scalar_df[f'log_{feature}'] = np.log1p(test_scalar_df[feature])
-            train_scalar_df = train_scalar_df.drop(columns=[feature])
-            test_scalar_df = test_scalar_df.drop(columns=[feature])
-    
-    train_scalar_df = train_scalar_df.fillna(0)
-    test_scalar_df = test_scalar_df.fillna(0)
-    
-    # Remove constant columns
-    constant_columns = [col for col in train_scalar_df.columns if train_scalar_df[col].nunique() == 1]
-    train_scalar_df = train_scalar_df.drop(columns=constant_columns)
-    test_scalar_df = test_scalar_df.drop(columns=constant_columns)
-    
-    # Extract execution times (in seconds)
-    y_train_raw = np.array([f['execution_time'] for f in train_features])
-    y_test_raw = np.array([f['execution_time'] for f in test_features])
-    y_train_raw = np.clip(y_train_raw, 0, np.percentile(y_train_raw, 99))
-    y_test_raw = np.clip(y_test_raw, 0, np.percentile(y_test_raw, 99))
-    
-    y_train = np.log1p(y_train_raw).reshape(-1, 1)
-    y_test = np.log1p(y_test_raw).reshape(-1, 1)
-    
-    # Scale scalar features and targets
-    scaler_X_scalar = RobustScaler()
-    scaler_y = RobustScaler()
-    
-    train_scalar_scaled = scaler_X_scalar.fit_transform(train_scalar_df)
-    test_scalar_scaled = scaler_X_scalar.transform(test_scalar_df)
-    y_train_scaled = scaler_y.fit_transform(y_train)
-    y_test_scaled = scaler_y.transform(y_test)
-    
-    train_scalar_scaled = np.nan_to_num(train_scalar_scaled, nan=0.0)
-    test_scalar_scaled = np.nan_to_num(test_scalar_scaled, nan=0.0)
-    y_train_scaled = np.nan_to_num(y_train_scaled, nan=0.0)
-    y_test_scaled = np.nan_to_num(y_test_scaled, nan=0.0)
-    
-    # Data augmentation for significant features
-    train_sequences_aug = []
-    train_scalar_aug = []
-    y_train_aug = []
-    for i in range(len(train_features)):
-        train_sequences_aug.append(train_sequences_padded[i])
-        train_scalar_aug.append(train_scalar_scaled[i])
-        y_train_aug.append(y_train_scaled[i])
-        
-        cache_hits_idx = train_scalar_df.columns.get_loc('log_cache_hits') if 'log_cache_hits' in train_scalar_df.columns else -1
-        bytes_rate_idx = train_scalar_df.columns.get_loc('log_bytes_processing_rate') if 'log_bytes_processing_rate' in train_scalar_df.columns else -1
-        
-        is_significant = False
-        if cache_hits_idx != -1 and train_scalar_scaled[i, cache_hits_idx] > np.percentile(train_scalar_scaled[:, cache_hits_idx], 75):
-            is_significant = True
-        if bytes_rate_idx != -1 and train_scalar_scaled[i, bytes_rate_idx] > np.percentile(train_scalar_scaled[:, bytes_rate_idx], 75):
-            is_significant = True
-        
-        augment_count = 3 if is_significant else 1
-        for _ in range(augment_count):
-            noise_seq = torch.normal(mean=0.0, std=0.05, size=train_sequences_padded[i].shape)
-            noise_scalar = np.random.normal(0, 0.05, train_scalar_scaled[i].shape)
-            noise_y = np.random.normal(0, 0.05, y_train_scaled[i].shape)
-            train_sequences_aug.append(train_sequences_padded[i] + noise_seq)
-            train_scalar_aug.append(train_scalar_scaled[i] + noise_scalar)
-            y_train_aug.append(y_train_scaled[i] + noise_y)
-    
-    train_sequences_padded = torch.stack(train_sequences_aug)
-    train_scalar_scaled = np.array(train_scalar_aug)
-    y_train_scaled = np.array(y_train_aug)
-    
-    train_scalar_tensor = torch.FloatTensor(train_scalar_scaled)
-    test_scalar_tensor = torch.FloatTensor(test_scalar_scaled)
-    y_train_tensor = torch.FloatTensor(y_train_scaled)
-    y_test_tensor = torch.FloatTensor(y_test_scaled)
-    
-    print(f"Sequence input size: {train_sequences_padded.shape[2]}")
-    print(f"Scalar input size: {train_scalar_tensor.shape[1]}")
-    
-    return (train_sequences_padded, train_scalar_tensor, y_train_tensor,
-            test_sequences_padded, test_scalar_tensor, y_test_tensor,
-            scaler_y, scaler_X_seq, scaler_X_scalar, train_sequences_padded.shape[2], train_scalar_tensor.shape[1], train_scalar_df.columns)
 
-# Multi-Head Attention mechanism
-class MultiHeadAttention(nn.Module):
-    def __init__(self, hidden_size, num_heads, dropout_rate=0.1):
-        super(MultiHeadAttention, self).__init__()
-        self.hidden_size = hidden_size
-        self.num_heads = num_heads
-        self.head_dim = hidden_size // num_heads
-        
-        self.query = nn.Linear(hidden_size, hidden_size)
-        self.key = nn.Linear(hidden_size, hidden_size)
-        self.value = nn.Linear(hidden_size, hidden_size)
-        self.fc_out = nn.Linear(hidden_size, hidden_size)
-        self.dropout = nn.Dropout(dropout_rate)
-        self.scale = torch.sqrt(torch.FloatTensor([self.head_dim]))
+def process_all_files(main_dir):
+    all_features = []
+    file_paths = []
+    invalid_files = []
+    zero_time_files = []
     
-    def forward(self, x):
-        batch_size = x.shape[0]
-        Q = self.query(x).view(batch_size, -1, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
-        K = self.key(x).view(batch_size, -1, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
-        V = self.value(x).view(batch_size, -1, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
-        energy = torch.matmul(Q, K.transpose(-1, -2)) / self.scale.to(x.device)
-        attention = torch.softmax(energy, dim=-1)
-        attention = self.dropout(attention)
-        out = torch.matmul(attention, V).permute(0, 2, 1, 3).contiguous()
-        out = out.view(batch_size, -1, self.hidden_size)
-        out = self.fc_out(out)
-        return out
-
-# Simple LSTM Model with Attention
-class SimpleLSTMModel(nn.Module):
-    def __init__(self, seq_input_size, scalar_input_size, hidden_sizes=[512, 256, 128], output_size=1, dropout_rate=0.2, num_heads=8, use_attention=True):
-        super(SimpleLSTMModel, self).__init__()
-        self.use_attention = use_attention
-        self.lstm_layers = nn.ModuleList()
-        self.ln_layers = nn.ModuleList()
-        
-        # Define LSTM layers
-        self.lstm_layers.append(nn.LSTM(seq_input_size, hidden_sizes[0], batch_first=True, bidirectional=True))
-        self.ln_layers.append(nn.LayerNorm(hidden_sizes[0] * 2))
-        for i in range(1, len(hidden_sizes)):
-            self.lstm_layers.append(nn.LSTM(hidden_sizes[i-1] * 2, hidden_sizes[i], batch_first=True, bidirectional=True))
-            self.ln_layers.append(nn.LayerNorm(hidden_sizes[i] * 2))
-        
-        # Attention layer
-        if self.use_attention:
-            self.attention = MultiHeadAttention(hidden_sizes[-1] * 2, num_heads, dropout_rate)
-        
-        # Fully connected layers
-        combined_size = hidden_sizes[-1] * 2 + scalar_input_size
-        self.fc1 = nn.Linear(combined_size, 256)
-        self.bn1 = nn.BatchNorm1d(256)
-        self.ln1 = nn.LayerNorm(256)
-        self.fc2 = nn.Linear(256, 128)
-        self.bn2 = nn.BatchNorm1d(128)
-        self.ln2 = nn.LayerNorm(128)
-        self.fc3 = nn.Linear(128, 64)
-        self.bn3 = nn.BatchNorm1d(64)
-        self.ln3 = nn.LayerNorm(64)
-        self.output_layer = nn.Linear(64, output_size)
-        
-        self.gelu = nn.GELU()
-        self.dropout = nn.Dropout(dropout_rate)
-        self.residual_proj = nn.Linear(combined_size, 64) if combined_size != 64 else None
+    main_dir_path = Path(main_dir)
+    if not main_dir_path.exists():
+        print(f"Directory '{main_dir}' does not exist.")
+        return all_features, file_paths
     
-    def forward(self, seq_input, scalar_input):
-        lstm_out = seq_input
-        for lstm, ln in zip(self.lstm_layers, self.ln_layers):
-            lstm_out, _ = lstm(lstm_out)
-            lstm_out = ln(lstm_out)
-            lstm_out = self.dropout(lstm_out)
-        
-        if self.use_attention:
-            context = self.attention(lstm_out).mean(dim=1)
+    for file_path in main_dir_path.rglob('converted_function_graph.json'):
+        print(f"Processing {file_path}...", end='\r')
+        features = extract_features_from_file(file_path)
+        if features is not None:
+            all_features.append(features)
+            file_paths.append(str(file_path.relative_to(main_dir_path)))
+            if features['execution_time'] == 0 or features['execution_time'] == 0.001:
+                zero_time_files.append(str(file_path))
         else:
-            context = lstm_out.mean(dim=1)
-        
-        combined = torch.cat((context, scalar_input), dim=1)
-        x = self.fc1(combined)
-        x = self.bn1(x)
-        x = self.ln1(x)
-        x = self.gelu(x)
-        x = self.dropout(x)
-        x = self.fc2(x)
-        x = self.bn2(x)
-        x = self.ln2(x)
-        x = self.gelu(x)
-        x = self.dropout(x)
-        x = self.fc3(x)
-        x = self.bn3(x)
-        x = self.ln3(x)
-        x = self.gelu(x)
-        
-        residual = combined if self.residual_proj is None else self.residual_proj(combined)
-        x = x + residual
-        x = self.dropout(x)
-        output = self.output_layer(x)
-        return output
+            invalid_files.append(str(file_path))
+    
+    print(f"Processed {len(all_features)} files successfully.           ")
+    
+    log_path = main_dir_path / 'invalid_files_log.txt'
+    with open(log_path, 'w', encoding='utf-8') as f:
+        f.write("Files skipped due to invalid execution times or errors:\n")
+        for file_path in invalid_files:
+            f.write(f"{file_path}\n")
+        f.write("\nFiles with execution_time_ms = 0 or fallback value (included but potentially problematic):\n")
+        for file_path in zero_time_files:
+            f.write(f"{file_path}\n")
+    
+    print(f"Total files found: {len(all_features) + len(invalid_files)}")
+    print(f"Files skipped: {len(invalid_files)}")
+    print(f"Files with zero or fallback execution time: {len(zero_time_files)}")
+    print(f"Valid files retained: {len(all_features)}")
+    
+    return all_features, file_paths
 
-# Custom loss function
-def custom_loss(outputs, targets, scalar_inputs, feature_indices, feature_importances, huber_delta=0.5, mae_weight=0.3, l1_lambda=1e-5):
-    huber = nn.HuberLoss(delta=huber_delta)(outputs, targets)
-    mae = torch.mean(torch.abs(outputs - targets))
-    l1_reg = sum(param.abs().sum() for param in model.parameters()) * l1_lambda
+def create_additional_features(df):
+    df['log_execution_time'] = np.log1p(df['execution_time'])
     
-    weights = torch.ones_like(targets)
-    for feature, idx in feature_indices.items():
-        if idx != -1 and feature in feature_importances:
-            feature_vals = scalar_inputs[:, idx]
-            importance = feature_importances[feature]
-            weights = torch.where(
-                feature_vals > 1.0,
-                weights * (1.0 + importance * 2.0),
-                weights
-            )
+    if 'sched_points_computed_total' in df.columns:
+        df['computation_efficiency'] = df['sched_points_computed_total'] / (df['execution_time'] + 1e-8)
     
-    weighted_huber = (huber * weights).mean()
-    weighted_mae = (mae * weights).mean()
-    return weighted_huber + mae_weight * weighted_mae + l1_reg
+    if 'total_bytes_at_production' in df.columns:
+        df['bytes_processing_rate'] = df['total_bytes_at_production'] / (df['execution_time'] + 1e-8)
+    
+    if 'sched_working_set' in df.columns and 'sched_bytes_at_production' in df.columns:
+        df['memory_utilization_ratio'] = df['sched_working_set'] / (df['sched_bytes_at_production'] + 1e-8)
+    
+    return df
 
-# Create data loaders
-def create_data_loaders(train_sequences, train_scalar, y_train, test_sequences, test_scalar, y_test, batch_size=64):
-    train_dataset = TensorDataset(train_sequences, train_scalar, y_train)
-    test_dataset = TensorDataset(test_sequences, test_scalar, y_test)
+def analyze_feature_importance(features_list):
+    df = pd.DataFrame(features_list)
+    df = create_additional_features(df)
     
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-    return train_loader, test_loader
+    print(f"\nExecution time statistics:")
+    print(f"Min: {df['execution_time'].min():.2f} ms")
+    print(f"Max: {df['execution_time'].max():.2f} ms")
+    print(f"Mean: {df['execution_time'].mean():.2f} ms")
+    print(f"Median: {df['execution_time'].median():.2f} ms")
+    print(f"Std Dev: {df['execution_time'].std():.2f} ms")
+    
+    y = df['execution_time']
+    X = df.drop(['execution_time', 'log_execution_time'] if 'log_execution_time' in df.columns else ['execution_time'], axis=1)
+    
+    X = X.fillna(0)
+    constant_features = [col for col in X.columns if X[col].nunique() <= 1]
+    if constant_features:
+        print(f"\nRemoving {len(constant_features)} constant features")
+        X = X.drop(constant_features, axis=1)
+    
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    
+    X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2, random_state=42)
+    
+    rf = RandomForestRegressor(n_estimators=100, random_state=42)
+    rf.fit(X_train, y_train)
+    
+    y_pred = rf.predict(X_test)
+    mse = mean_squared_error(y_test, y_pred)
+    r2 = r2_score(y_test, y_pred)
+    
+    print(f"\nModel Evaluation:")
+    print(f"Mean Squared Error: {mse:.2f}")
+    print(f"R² Score: {r2:.4f}")
+    
+    cv_scores = cross_val_score(rf, X_scaled, y, cv=5, scoring='r2')
+    print(f"Cross-validation R² scores: {cv_scores}")
+    print(f"Mean CV R²: {cv_scores.mean():.4f}")
+    
+    feature_importances = pd.Series(rf.feature_importances_, index=X.columns)
+    feature_importances = feature_importances.sort_values(ascending=False)
+    
+    pearson_correlations = {}
+    spearman_correlations = {}
+    
+    for column in X.columns:
+        p_corr, _ = stats.pearsonr(X[column], y)
+        s_corr, _ = stats.spearmanr(X[column], y)
+        pearson_correlations[column] = p_corr
+        spearman_correlations[column] = s_corr
+    
+    pearson_correlations = pd.Series(pearson_correlations).sort_values(ascending=False, key=abs)
+    spearman_correlations = pd.Series(spearman_correlations).sort_values(ascending=False, key=abs)
+    
+    return feature_importances, pearson_correlations, spearman_correlations, y, df, X, rf, scaler, X.columns
 
-# Train the model
-def train_model(model, train_loader, test_loader, criterion, optimizer, feature_indices, feature_importances, num_epochs=1000, patience=50, accumulation_steps=2):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
+def predict_execution_times(model, scaler, file_paths, main_dir, feature_names):
+    predictions = []
+    main_dir_path = Path(main_dir)
     
-    try:
-        model.to(device)
-        for lstm in model.lstm_layers:
-            lstm.flatten_parameters()
-    except RuntimeError as e:
-        print(f"Error moving model to CUDA: {e}. Falling back to CPU.")
-        device = torch.device('cpu')
-        model.to(device)
+    print("\nPredicting execution times for selected files:")
+    for file_path in file_paths:
+        full_path = main_dir_path / file_path
+        if not full_path.exists():
+            print(f"File not found: {full_path}")
+            continue
+        
+        features = extract_features_from_file(full_path)
+        if features is None:
+            print(f"Failed to extract features from {full_path}")
+            continue
+        
+        actual_time = features['execution_time']
+        feature_df = pd.DataFrame([features])
+        feature_df = create_additional_features(feature_df)
+        
+        X = feature_df.drop(['execution_time', 'log_execution_time'] if 'log_execution_time' in feature_df.columns else ['execution_time'], axis=1)
+        X = X.fillna(0)
+        
+        # Ensure X has the same columns as the training data
+        for col in feature_names:
+            if col not in X.columns:
+                X[col] = 0
+        X = X[feature_names]
+        
+        X_scaled = scaler.transform(X)
+        predicted_time = model.predict(X_scaled)[0]
+        
+        error = abs(actual_time - predicted_time)
+        error_percentage = (error / actual_time) * 100 if actual_time != 0 else float('inf')
+        
+        predictions.append({
+            'file': str(file_path),
+            'actual_time_ms': actual_time,
+            'predicted_time_ms': predicted_time,
+            'error_percentage': error_percentage
+        })
+        
+        print(f"File: {file_path}")
+        print(f"Actual Time: {actual_time:.2f} ms")
+        print(f"Predicted Time: {predicted_time:.2f} ms")
+        print(f"Error Percentage: {error_percentage:.2f}%")
+        print()
     
-    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=50, T_mult=2, eta_min=1e-6)
+    if predictions:
+        mean_error_percentage = np.mean([p['error_percentage'] for p in predictions if p['error_percentage'] != float('inf')])
+        print(f"Mean Absolute Percentage Error (MAPE): {mean_error_percentage:.2f}%")
     
-    best_val_loss = float('inf')
-    epochs_no_improve = 0
-    best_model_state = None
-    train_losses = []
-    val_losses = []
+    return predictions
+
+def plot_feature_importance(feature_importances, correlations, output_dir):
+    os.makedirs(output_dir, exist_ok=True)
     
-    for epoch in range(num_epochs):
-        model.train()
-        running_loss = 0.0
-        optimizer.zero_grad()
-        
-        for i, (seq_inputs, scalar_inputs, targets) in enumerate(train_loader):
-            seq_inputs, scalar_inputs, targets = seq_inputs.to(device), scalar_inputs.to(device), targets.to(device)
-            outputs = model(seq_inputs, scalar_inputs)
-            loss = criterion(outputs, targets, scalar_inputs, feature_indices, feature_importances)
-            
-            if torch.isnan(loss) or torch.isinf(loss):
-                print(f"Invalid loss detected at epoch {epoch+1}, batch {i+1}")
-                return None, None
-            
-            loss = loss / accumulation_steps
-            loss.backward()
-            
-            if (i + 1) % accumulation_steps == 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
-                optimizer.zero_grad()
-            
-            running_loss += loss.item() * accumulation_steps * seq_inputs.size(0)
-        
-        if len(train_loader) % accumulation_steps != 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-            optimizer.zero_grad()
-        
-        train_loss = running_loss / len(train_loader.dataset)
-        train_losses.append(train_loss)
-        
-        model.eval()
-        val_loss = 0.0
-        with torch.no_grad():
-            for seq_inputs, scalar_inputs, targets in test_loader:
-                seq_inputs, scalar_inputs, targets = seq_inputs.to(device), scalar_inputs.to(device), targets.to(device)
-                outputs = model(seq_inputs, scalar_inputs)
-                loss = criterion(outputs, targets, scalar_inputs, feature_indices, feature_importances)
-                val_loss += loss.item() * seq_inputs.size(0)
-        
-        val_loss /= len(test_loader.dataset)
-        val_losses.append(val_loss)
-        
-        scheduler.step()
-        print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
-        
-        if val_loss < best_val_loss and not np.isnan(val_loss) and not np.isinf(val_loss):
-            best_val_loss = val_loss
-            epochs_no_improve = 0
-            best_model_state = model.state_dict().copy()
-        else:
-            epochs_no_improve += 1
-        
-        if epochs_no_improve >= patience:
-            print(f'Early stopping after {epoch+1} epochs')
-            model.load_state_dict(best_model_state)
-            break
+    plt.figure(figsize=(12, 8))
+    top_features = feature_importances.head(15)
+    sns.barplot(x=top_features.values, y=top_features.index)
+    plt.title('Top 15 Features by Importance (Random Forest)')
+    plt.tight_layout()
+    plt.savefig(f"{output_dir}/top_features_importance.png")
     
-    if best_model_state is not None and epochs_no_improve > 0:
-        model.load_state_dict(best_model_state)
+    plt.figure(figsize=(12, 8))
+    top_correlations = correlations.head(15)
+    sns.barplot(x=top_correlations.values, y=top_correlations.index)
+    plt.title('Top 15 Features by Correlation with Execution Time')
+    plt.tight_layout()
+    plt.savefig(f"{output_dir}/top_features_correlation.png")
+    
+    plt.close('all')
+
+def plot_execution_time_distribution(execution_times, output_dir):
+    os.makedirs(output_dir, exist_ok=True)
     
     plt.figure(figsize=(10, 6))
-    plt.plot(range(1, len(train_losses) + 1), train_losses, label='Training Loss')
-    plt.plot(range(1, len(val_losses) + 1), val_losses, label='Validation Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.title('Training and Validation Loss Over Epochs')
-    plt.legend()
-    plt.grid(True)
-    plt.savefig('loss_plot.png')
-    plt.close()
+    sns.histplot(execution_times, kde=True)
+    plt.title('Distribution of Execution Times')
+    plt.xlabel('Execution Time (ms)')
+    plt.ylabel('Frequency')
+    plt.tight_layout()
+    plt.savefig(f"{output_dir}/execution_time_distribution.png")
     
-    return train_losses, val_losses
+    plt.figure(figsize=(10, 6))
+    sns.boxplot(x=execution_times)
+    plt.title('Execution Time Box Plot')
+    plt.xlabel('Execution Time (ms)')
+    plt.tight_layout()
+    plt.savefig(f"{output_dir}/execution_time_boxplot.png")
+    
+    plt.close('all')
 
-# Evaluate the model
-def evaluate_model(model, X_test_seq, X_test_scalar, y_test, y_scaler, file_names_test):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model.to(device)
-    model.eval()
+def plot_scatter_for_top_features(df, top_features, output_dir):
+    os.makedirs(output_dir, exist_ok=True)
     
-    X_test_seq, X_test_scalar = X_test_seq.to(device), X_test_scalar.to(device)
-    with torch.no_grad():
-        y_pred_scaled = model(X_test_seq, X_test_scalar)
+    top_feature_names = list(top_features.index[:10])
     
-    y_pred_scaled = y_pred_scaled.cpu().numpy()
-    y_test = y_test.cpu().numpy()
+    for feature in top_feature_names:
+        if feature in df.columns:
+            plt.figure(figsize=(8, 6))
+            sns.scatterplot(x=df[feature], y=df['execution_time'])
+            plt.title(f'{feature} vs Execution Time')
+            plt.xlabel(feature)
+            plt.ylabel('Execution Time (ms)')
+            plt.tight_layout()
+            safe_feature = feature.replace('/', '_').replace('\\', '_')
+            plt.savefig(f"{output_dir}/scatter_{safe_feature}.png")
+            plt.close()
+
+def generate_report(feature_importances, pearson_correlations, spearman_correlations, 
+                    execution_times, file_paths, df, output_dir='analysis_results'):
     
-    y_test_transformed = y_scaler.inverse_transform(y_test)
-    y_pred_transformed = y_scaler.inverse_transform(y_pred_scaled)
+    os.makedirs(output_dir, exist_ok=True)
     
-    y_test_actual = np.expm1(y_test_transformed)
-    y_pred_actual = np.expm1(y_pred_transformed)
+    plot_execution_time_distribution(execution_times, output_dir)
+    plot_feature_importance(feature_importances, pearson_correlations, output_dir)
+    plot_scatter_for_top_features(df, feature_importances, output_dir)
     
-    results_by_subfolder = {}
-    for i, file_path in enumerate(file_names_test):
-        subfolder = '/'.join(file_path.split('/')[:-1])
-        if subfolder not in results_by_subfolder:
-            results_by_subfolder[subfolder] = []
+    top_feature_names = list(feature_importances.index[:10])
+    
+    html_report = f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Feature Importance Analysis Report</title>
+        <style>
+            body {{ font-family: Arial, sans-serif; margin: 20px; }}
+            h1, h2, h3 {{ color: #333; }}
+            table {{ border-collapse: collapse; width: 100%; margin-bottom: 20px; }}
+            th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
+            th {{ background-color: #f2f2f2; }}
+            tr:nth-child(even) {{ background-color: #f9f9f9; }}
+            .section {{ margin-bottom: 30px; }}
+            img {{ max-width: 100%; height: auto; }}
+        </style>
+    </head>
+    <body>
+        <h1>Feature Importance Analysis Report</h1>
         
-        pred = max(y_pred_actual[i][0], 0)
-        results_by_subfolder[subfolder].append({
-            'file': file_path,
-            'actual': y_test_actual[i][0],
-            'predicted': pred,
-            'error_percentage': abs(y_test_actual[i][0] - pred) / y_test_actual[i][0] * 100 if y_test_actual[i][0] > 0 else 0
-        })
+        <div class="section">
+            <h2>Summary Statistics</h2>
+            <p>Total files processed: {len(file_paths)}</p>
+            <p>Execution time range: {execution_times.min():.2f} ms to {execution_times.max():.2f} ms</p>
+            <p>Mean execution time: {execution_times.mean():.2f} ms</p>
+            <p>Median execution time: {execution_times.median():.2f} ms</p>
+            <p>Standard deviation: {execution_times.std():.2f} ms</p>
+            
+            <h3>Execution Time Distribution</h3>
+            <img src="execution_time_distribution.png" alt="Execution Time Distribution">
+            <img src="execution_time_boxplot.png" alt="Execution Time Box Plot">
+        </div>
+        
+        <div class="section">
+            <h2>Feature Importance Analysis</h2>
+            
+            <h3>Top Features by Importance (Random Forest Model)</h3>
+            <img src="top_features_importance.png" alt="Top Features by Importance">
+            
+            <table>
+                <tr>
+                    <th>Rank</th>
+                    <th>Feature</th>
+                    <th>Importance Score</th>
+                </tr>
+    """
     
-    for subfolder, results in results_by_subfolder.items():
-        print(f"\nResults for {subfolder}:")
-        for result in results:
-            print(f"File: {result['file']}")
-            print(f"  Actual execution time: {result['actual']:.5f} s")
-            print(f"  Predicted execution time: {result['predicted']:.5f} s")
-            print(f"  Error percentage: {result['error_percentage']:.2f}%")
+    for i, (feature, importance) in enumerate(feature_importances.items(), start=1):
+        if i > 20:
+            break
+        html_report += f"""
+                <tr>
+                    <td>{i}</td>
+                    <td>{feature}</td>
+                    <td>{importance:.4f}</td>
+                </tr>
+        """
     
-    mse = np.mean((y_test_actual - y_pred_actual) ** 2)
-    rmse = np.sqrt(mse)
-    mae = np.mean(np.abs(y_test_actual - y_pred_actual))
-    mape = np.mean(np.abs((y_test_actual - y_pred_actual) / (y_test_actual + 1e-8))) * 100
+    html_report += """
+            </table>
+            
+            <h3>Top Features by Correlation (Pearson)</h3>
+            <img src="top_features_correlation.png" alt="Top Features by Correlation">
+            
+            <table>
+                <tr>
+                    <th>Rank</th>
+                    <th>Feature</th>
+                    <th>Pearson Correlation</th>
+                    <th>Spearman Correlation</th>
+                </tr>
+    """
     
-    print("\nOverall Model Performance:")
-    print(f"MSE: {mse:.5f}")
-    print(f"RMSE: {rmse:.5f}")
-    print(f"MAE: {mae:.5f}")
-    print(f"MAPE: {mape:.2f}%")
+    for i, (feature, corr) in enumerate(pearson_correlations.items(), start=1):
+        if i > 20:
+            break
+        spearman_corr = spearman_correlations.get(feature, 0)
+        html_report += f"""
+                <tr>
+                    <td>{i}</td>
+                    <td>{feature}</td>
+                    <td>{corr:.4f}</td>
+                    <td>{spearman_corr:.4f}</td>
+                </tr>
+        """
     
-    return y_test_actual, y_pred_actual
+    html_report += """
+            </table>
+        </div>
+        
+        <div class="section">
+            <h2>Scatter Plots of Top Features vs Execution Time</h2>
+    """
+    
+    for feature in top_feature_names:
+        safe_feature = feature.replace('/', '_').replace('\\', '_')
+        html_report += f"""
+            <h3>{feature} vs Execution Time</h3>
+            <img src="scatter_{safe_feature}.png" alt="Scatter plot of {feature}">
+        """
+    
+    html_report += """
+        </div>
+        
+        <div class="section">
+            <h2>Files Processed</h2>
+            <table>
+                <tr>
+                    <th>#</th>
+                    <th>File Path</th>
+                </tr>
+    """
+    
+    display_files = file_paths[:100]
+    for i, file_path in enumerate(display_files, start=1):
+        html_report += f"""
+                <tr>
+                    <td>{i}</td>
+                    <td>{file_path}</td>
+                </tr>
+        """
+    
+    if len(file_paths) > 100:
+        html_report += f"""
+                <tr>
+                    <td colspan="2">... and {len(file_paths) - 100} more files</td>
+                </tr>
+        """
+    
+    html_report += """
+            </table>
+        </div>
+    </body>
+    </html>
+    """
+    
+    with open(f"{output_dir}/feature_importance_report.html", 'w') as f:
+        f.write(html_report)
+    
+    with open(f"{output_dir}/feature_importance_report.txt", 'w') as f:
+        f.write("Feature Importance Analysis Report\n")
+        f.write("=================================\n\n")
+        
+        f.write("Summary Statistics:\n")
+        f.write(f"Total files processed: {len(file_paths)}\n")
+        f.write(f"Execution time range: {execution_times.min():.2f} ms to {execution_times.max():.2f} ms\n")
+        f.write(f"Mean execution time: {execution_times.mean():.2f} ms\n")
+        f.write(f"Median execution time: {execution_times.median():.2f} ms\n")
+        f.write(f"Standard deviation: {execution_times.std():.2f} ms\n\n")
+        
+        f.write("Feature Importance (Random Forest):\n")
+        f.write("----------------------------------\n")
+        for feature, importance in list(feature_importances.items())[:30]:
+            f.write(f"{feature}: {importance:.4f}\n")
+        f.write("\n")
+        
+        f.write("Correlation with Execution Time (Pearson):\n")
+        f.write("-----------------------------------------\n")
+        for feature, corr in list(pearson_correlations.items())[:30]:
+            f.write(f"{feature}: {corr:.4f}\n")
+        f.write("\n")
+        
+        f.write("Correlation with Execution Time (Spearman):\n")
+        f.write("------------------------------------------\n")
+        for feature, corr in list(spearman_correlations.items())[:30]:
+            f.write(f"{feature}: {corr:.4f}\n")
+        f.write("\n")
+    
+    print(f"Reports generated in the '{output_dir}' directory")
+    print(f"- HTML report: {output_dir}/feature_importance_report.html")
+    print(f"- Text report: {output_dir}/feature_importance_report.txt")
 
-# Main function
-def main(main_dir):
-    if torch.cuda.is_available():
-        torch.cuda.init()
-        print(f"CUDA initialized. Using GPU: {torch.cuda.get_device_name(0)}")
+def main(main_dir="Graph_Output", output_dir="analysis_results"):
+    print(f"Processing files in {main_dir}...")
+    features_list, file_paths = process_all_files(main_dir)
+    
+    if not features_list:
+        print("No valid data found in the files. Check Graph_Output/invalid_files_log.txt for details.")
+        return
+    
+    print(f"Extracted features from {len(features_list)} files.")
+    
+    print("Analyzing feature importance...")
+    feature_importances, pearson_correlations, spearman_correlations, execution_times, df, X, rf, scaler, feature_names = analyze_feature_importance(features_list)
+    
+    print("Generating comprehensive report...")
+    generate_report(feature_importances, pearson_correlations, spearman_correlations, execution_times, file_paths, df, output_dir)
+    
+    if len(file_paths) >= 5:
+        selected_files = random.sample(file_paths, 5)
     else:
-        print("CUDA not available. Using CPU.")
+        selected_files = file_paths
+        print(f"Only {len(file_paths)} files available, using all for prediction.")
     
-    print(f"Processing main directory: {main_dir}")
-    train_features, test_features, test_file_names = process_graph_output_directory(main_dir)
+    predictions = predict_execution_times(rf, scaler, selected_files, main_dir, feature_names)
     
-    if not train_features or not test_file_names:
-        print("Error: No valid training or test data found. Exiting.")
-        return None
+    with open(f"{output_dir}/feature_importance_report.txt", 'a') as f:
+        f.write("\nExecution Time Predictions:\n")
+        f.write("--------------------------\n")
+        for pred in predictions:
+            f.write(f"File: {pred['file']}\n")
+            f.write(f"Actual Time: {pred['actual_time_ms']:.2f} ms\n")
+            f.write(f"Predicted Time: {pred['predicted_time_ms']:.2f} ms\n")
+            f.write(f"Error Percentage: {pred['error_percentage']:.2f}%\n\n")
+        if predictions:
+            mean_mape = np.mean([p['error_percentage'] for p in predictions if p['error_percentage'] != float('inf')])
+            f.write(f"Mean Absolute Percentage Error (MAPE): {mean_mape:.2f}%\n")
     
-    data = prepare_data_for_model(train_features, test_features)
-    if data is None:
-        print("Error: Failed to prepare data for model. Exiting.")
-        return None
-    
-    (train_sequences, train_scalar, y_train,
-     test_sequences, test_scalar, y_test,
-     y_scaler, scaler_X_seq, scaler_X_scalar, seq_input_size, scalar_input_size, feature_columns) = data
-    
-    # Save scaler parameters
-    scaler_node_params = {
-        'center': scaler_X_seq.center_.tolist(),
-        'scale': scaler_X_seq.scale_.tolist()
-    }
-    with open('scaler_node_params.json', 'w') as f:
-        json.dump(scaler_node_params, f)
-    
-    scaler_scalar_params = {
-        'center': scaler_X_scalar.center_.tolist(),
-        'scale': scaler_X_scalar.scale_.tolist()
-    }
-    with open('scaler_scalar_params.json', 'w') as f:
-        json.dump(scaler_scalar_params, f)
-    
-    scaler_y_params = {
-        'center': y_scaler.center_.tolist(),
-        'scale': y_scaler.scale_.tolist()
-    }
-    with open('scaler_y_params.json', 'w') as f:
-        json.dump(scaler_y_params, f)
-    
-    # Save model metadata
-    metadata = {
-        'max_sequence_length': 3,
-        'seq_input_size': seq_input_size,
-        'scalar_input_size': scalar_input_size,
-        'node_features': FIXED_FEATURES,
-        'scalar_features': list(feature_columns),
-        'skewed_features': ['cache_hits', 'bytes_processing_rate', 'sched_bytes_at_task', 'computation_efficiency'],
-        'dropped_features': [
-            'op_eq', 'nodes_count', 'sched_outer_parallelism', 'op_le', 'node_edge_ratio',
-            'memory_pressure', 'op_let', 'bytes_per_vector', 'sched_working_set', 'sched_num_realizations',
-            'computation_efficiency', 'avg_ops_per_node', 'memory_utilization_ratio', 'sched_num_scalars',
-            'cache_misses', 'bytes_per_parallelism', 'op_mul'
-        ]
-    }
-    with open('model_metadata.json', 'w') as f:
-        json.dump(metadata, f)
-    
-    train_loader, test_loader = create_data_loaders(
-        train_sequences, train_scalar, y_train,
-        test_sequences, test_scalar, y_test,
-        batch_size=64
-    )
-    
-    global model
-    model = SimpleLSTMModel(
-        seq_input_size=seq_input_size,
-        scalar_input_size=scalar_input_size,
-        hidden_sizes=[512, 256, 128],
-        output_size=1,
-        dropout_rate=0.2,
-        num_heads=8,
-        use_attention=True
-    )
-    
-    optimizer = optim.AdamW(model.parameters(), lr=0.00005, weight_decay=1e-4)
-    
-    # Feature importances from feature_importance_report.txt
-    feature_importances = {
-        'cache_hits': 0.5956,
-        'bytes_processing_rate': 0.2912,
-        'sched_bytes_at_task': 0.0461,
-        'sched_bytes_at_realization': 0.0130,
-        'total_bytes_at_production': 0.0090,
-        'sched_bytes_at_production': 0.0068
-    }
-    
-    feature_indices = {}
-    for feature in feature_importances.keys():
-        log_feature = f'log_{feature}' if feature in ['cache_hits', 'bytes_processing_rate'] else feature
-        if log_feature in feature_columns:
-            feature_indices[feature] = feature_columns.get_loc(log_feature)
-        else:
-            feature_indices[feature] = feature_columns.get_loc(feature) if feature in feature_columns else -1
-    
-    print("Building and training Simple LSTM model...")
-    train_losses, val_losses = train_model(
-        model, train_loader, test_loader,
-        custom_loss, optimizer, feature_indices, feature_importances,
-        num_epochs=1000, patience=50, accumulation_steps=2
-    )
-    
-    if train_losses is None or val_losses is None:
-        print("Training failed due to invalid values")
-        return None
-    
-    # Save the trained model as TorchScript
-    model.eval()
-    model.to(torch.device('cpu'))
-    example_seq = torch.randn(1, 3, seq_input_size)
-    example_scalar = torch.randn(1, scalar_input_size)
-    scripted_model = torch.jit.trace(model, (example_seq, example_scalar))
-    scripted_model.save("model.pt")
-    print("Model saved to model.pt as TorchScript module")
-    
-    print("\nEvaluating model:")
-    y_test_actual, y_pred_actual = evaluate_model(
-        model, test_sequences, test_scalar, y_test,
-        y_scaler, test_file_names
-    )
-    
-    print(f"\nSummary for Comparison:")
-    print(f"Model: SimpleLSTM")
-    
-    return model, y_scaler, y_test_actual, y_pred_actual
+    print("Analysis and predictions complete.")
 
 if __name__ == "__main__":
-    main_dir = "Graph_Output"
-    random.seed(42)
-    torch.manual_seed(42)
-    np.random.seed(42)
-    result = main(main_dir)
-    if result is None:
-        print("Script failed to complete. Check logs and data directory.")
+    main()
