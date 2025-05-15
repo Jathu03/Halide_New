@@ -49,142 +49,166 @@ struct RobustScaler {
     }
 };
 
-// Struct to hold feature extraction results
-struct FeatureResult {
-    std::unordered_map<std::string, float> features;
-    std::vector<float> node_vector;
-    std::vector<float> scalar_vector;
-};
+// Node feature extraction
+struct NodeFeatures {
+    std::vector<std::string> feature_names;
 
-// Feature extraction (adapted from Python extract_features for Graph_Output)
-struct GraphFeatures {
-    std::vector<std::string> node_feature_names;
-    std::vector<std::string> scalar_feature_names;
-    std::vector<std::string> skewed_features;
-    std::vector<std::string> dropped_features;
+    std::unordered_map<std::string, float> extract(const json& node) {
+        std::cout << "Extracting features for node: " << (node.contains("name") ? node["name"].get<std::string>() : "unnamed") << std::endl;
+        std::unordered_map<std::string, float> features;
 
-    FeatureResult extract(const json& json_data) {
-        std::cout << "Extracting features from JSON" << std::endl;
-        FeatureResult result;
-        auto& features = result.features;
+        // Cache features
+        features["cache_hits"] = node.contains("cache_hits") ? node["cache_hits"].get<float>() : 0.0f;
+        features["cache_misses"] = node.contains("cache_misses") ? node["cache_misses"].get<float>() : 0.0f;
 
-        // Validate JSON structure
-        if (!json_data.contains("without_extern") || !json_data["without_extern"].contains("global_features")) {
-            throw std::runtime_error("JSON missing 'without_extern' or 'global_features'");
+        // Scheduling features
+        if (node.contains("scheduling")) {
+            auto sched = node["scheduling"];
+            for (const auto& key : {
+                "num_realizations", "num_productions", "points_computed_total", "innermost_loop_extent",
+                "inner_parallelism", "outer_parallelism", "bytes_at_realization", "bytes_at_production",
+                "bytes_at_root", "unique_bytes_read_per_realization", "working_set", "vector_size",
+                "num_vectors", "num_scalars", "bytes_at_task", "working_set_at_task",
+                "working_set_at_production", "working_set_at_realization", "working_set_at_root"
+            }) {
+                features["sched_" + std::string(key)] = sched.contains(key) ? sched[key].get<float>() : 0.0f;
+            }
         }
-        auto global_features = json_data["without_extern"]["global_features"];
-        if (!global_features.contains("execution_time_ms")) {
-            throw std::runtime_error("JSON missing 'execution_time_ms'");
+
+        // Operation histogram
+        std::unordered_map<std::string, float> op_histogram;
+        if (node.contains("op_histogram")) {
+            for (const auto& [op, count] : node["op_histogram"].items()) {
+                try {
+                    op_histogram[op] = count.get<float>();
+                } catch (const std::exception& e) {
+                    std::cout << "Warning: Invalid op_histogram value for " << op << ": " << e.what() << std::endl;
+                }
+            }
         }
-        features["execution_time_ms"] = global_features["execution_time_ms"].get<float>();
-        features["cache_hits"] = global_features.contains("cache_hits") ? global_features["cache_hits"].get<float>() : 0.0f;
-        features["cache_misses"] = global_features.contains("cache_misses") ? global_features["cache_misses"].get<float>() : 0.0f;
+        for (const auto& op : {
+            "add", "sub", "mul", "div", "mod", "eq", "ne", "lt", "le", "or", "and", "not",
+            "min", "max", "constant", "variable", "funccall", "imagecall", "externcall", "let", "param"
+        }) {
+            features["op_" + std::string(op)] = op_histogram.count(op) ? op_histogram[op] : 0.0f;
+        }
 
-        // Extract node and edge counts
-        auto nodes = json_data["without_extern"].contains("nodes") ? json_data["without_extern"]["nodes"] : json::array();
-        auto edges = json_data["without_extern"].contains("edges") ? json_data["without_extern"]["edges"] : json::array();
-        features["nodes_count"] = nodes.size();
-        features["edges_count"] = edges.size();
-        features["node_edge_ratio"] = features["nodes_count"] / (features["edges_count"] + 1e-8);
-
-        // Extract operation counts and memory patterns
-        std::unordered_map<std::string, float> op_counts;
+        // Memory patterns
         std::unordered_map<std::string, std::vector<float>> memory_patterns;
-        for (const auto& pattern : {"transpose", "slice", "broadcast", "pointwise"}) {
+        for (const auto& pattern : {"pointwise", "transpose", "broadcast", "slice"}) {
             memory_patterns[pattern] = {0.0f, 0.0f, 0.0f, 0.0f};
         }
-
-        for (const auto& node : nodes) {
-            if (!node.contains("stages") || !node["stages"].is_array()) {
-                continue;
-            }
-            for (const auto& stage : node["stages"]) {
-                if (!stage.contains("pipeline_features")) {
-                    continue;
-                }
-                auto pipeline = stage["pipeline_features"];
-                // Operation histogram (Float type)
-                if (pipeline.contains("op_histogram") && pipeline["op_histogram"].contains("Float")) {
-                    for (const auto& [op, count] : pipeline["op_histogram"]["Float"].items()) {
-                        std::string op_lower = op;
-                        std::transform(op_lower.begin(), op_lower.end(), op_lower.begin(), ::tolower);
-                        op_counts["op_" + op_lower] += count.get<float>();
-                    }
-                }
-                // Memory access patterns (Float type)
-                if (pipeline.contains("memory_access_patterns") && pipeline["memory_access_patterns"].contains("Float")) {
-                    for (const auto& [pattern, values] : pipeline["memory_access_patterns"]["Float"].items()) {
-                        std::string pattern_lower = pattern;
-                        std::transform(pattern_lower.begin(), pattern_lower.end(), pattern_lower.begin(), ::tolower);
-                        if (memory_patterns.count(pattern_lower) && values.is_array()) {
-                            auto& vals = memory_patterns[pattern_lower];
-                            for (size_t i = 0; i < std::min<size_t>(values.size(), 4); ++i) {
-                                vals[i] += values[i].is_number() ? values[i].get<float>() : 0.0f;
-                            }
-                        }
+        
+        if (node.contains("memory_patterns") && node["memory_patterns"].is_object()) {
+            for (const auto& [pattern, values] : node["memory_patterns"].items()) {
+                std::string pattern_lower = pattern;
+                std::transform(pattern_lower.begin(), pattern_lower.end(), pattern_lower.begin(), ::tolower);
+                if (memory_patterns.count(pattern_lower) && values.is_array()) {
+                    auto& vals = memory_patterns[pattern_lower];
+                    for (size_t i = 0; i < std::min<size_t>(values.size(), 4); ++i) {
+                        vals[i] = values[i].is_number() ? values[i].get<float>() : 0.0f;
                     }
                 }
             }
         }
-        features.insert(op_counts.begin(), op_counts.end());
+        
         for (const auto& [pattern, values] : memory_patterns) {
             for (size_t i = 0; i < 4; ++i) {
                 features["memory_" + pattern + "_" + std::to_string(i)] = values[i];
             }
         }
 
-        // Extract scheduling features
-        std::vector<json> scheduling_features;
+        // Create fixed-length feature vector
+        std::unordered_map<std::string, float> ordered_features;
+        for (const auto& key : feature_names) {
+            ordered_features[key] = features.count(key) ? features[key] : 0.0f;
+        }
+        return ordered_features;
+    }
+};
+
+// Scalar feature extraction
+struct ScalarFeatures {
+    std::vector<std::string> feature_names;
+    std::vector<std::string> skewed_features;
+    std::vector<std::string> dropped_features;
+
+    std::unordered_map<std::string, float> extract(const json& json_data) {
+        std::cout << "Extracting scalar features" << std::endl;
+        std::unordered_map<std::string, float> features;
+
+        bool found_global = false;
+        for (const auto& child : json_data["children"]) {
+            if (child["name"] == "Global Features") {
+                features["execution_time_ms"] = child["execution_time_ms"].get<float>();
+                found_global = true;
+                break;
+            }
+        }
+        if (!found_global) {
+            throw std::runtime_error("Global Features node not found");
+        }
+
+        std::vector<json> nodes;
+        for (const auto& child : json_data["children"]) {
+            if (child["name"] != "Global Features") {
+                nodes.push_back(child);
+            }
+        }
+        std::cout << "Number of nodes: " << nodes.size() << std::endl;
+
+        float node_count = nodes.size();
+        float scheduling_count = 0, total_parallelism = 0, total_bytes_at_production = 0, total_vectors = 0;
+        float points_computed_total = 0, bytes_at_realization = 0, working_set = 0, bytes_at_root = 0;
+        float unique_bytes_read_per_realization = 0, bytes_at_task = 0;
+
         for (const auto& node : nodes) {
-            if (node.contains("stages")) {
-                for (const auto& stage : node["stages"]) {
-                    if (stage.contains("schedule_features")) {
-                        scheduling_features.push_back(stage["schedule_features"]);
+            if (node.contains("scheduling")) {
+                auto sched = node["scheduling"];
+                scheduling_count += (sched["num_realizations"].get<float>() + sched["num_productions"].get<float>());
+                total_parallelism += (sched["inner_parallelism"].get<float>() * sched["outer_parallelism"].get<float>());
+                total_bytes_at_production += sched["bytes_at_production"].get<float>();
+                total_vectors += sched["num_vectors"].get<float>();
+                points_computed_total += sched["points_computed_total"].get<float>();
+                bytes_at_realization += sched["bytes_at_realization"].get<float>();
+                working_set += sched["working_set"].get<float>();
+                bytes_at_root += sched["bytes_at_root"].get<float>();
+                unique_bytes_read_per_realization += sched["unique_bytes_read_per_realization"].get<float>();
+                bytes_at_task += sched["bytes_at_task"].get<float>();
+            }
+        }
+
+        features["total_parallelism"] = total_parallelism;
+        features["scheduling_count"] = scheduling_count;
+        features["total_bytes_at_production"] = total_bytes_at_production;
+        features["total_vectors"] = total_vectors;
+        features["computation_efficiency"] = bytes_at_realization > 0 ? points_computed_total / bytes_at_realization : 0.0f;
+        features["memory_pressure"] = bytes_at_root > 0 ? working_set / bytes_at_root : 0.0f;
+        features["memory_utilization_ratio"] = bytes_at_task > 0 ? unique_bytes_read_per_realization / bytes_at_task : 0.0f;
+        features["bytes_processing_rate"] = features["execution_time_ms"] > 0 ? bytes_at_realization / features["execution_time_ms"] : 0.0f;
+        features["bytes_per_parallelism"] = total_parallelism > 0 ? bytes_at_task / total_parallelism : 0.0f;
+        features["bytes_per_vector"] = total_vectors > 0 ? bytes_at_realization / total_vectors : 0.0f;
+        features["nodes_count"] = node_count;
+        float edges_count = 0;
+        for (const auto& node : nodes) {
+            edges_count += node.contains("children") ? node["children"].size() : 0;
+        }
+        features["edges_count"] = edges_count;
+        features["node_edge_ratio"] = edges_count > 0 ? node_count / edges_count : node_count;
+        features["nodes_per_schedule"] = scheduling_count > 0 ? node_count / scheduling_count : node_count;
+
+        std::set<std::string> ops;
+        for (const auto& node : nodes) {
+            if (node.contains("op_histogram")) {
+                for (const auto& [op, count] : node["op_histogram"].items()) {
+                    if (count.get<float>() > 0) {
+                        ops.insert(op);
                     }
                 }
             }
         }
-        features["scheduling_count"] = scheduling_features.size();
+        features["op_diversity"] = ops.size();
 
-        if (!scheduling_features.empty()) {
-            std::vector<std::string> important_metrics = {
-                "bytes_at_production", "bytes_at_realization", "bytes_at_root", "bytes_at_task",
-                "inner_parallelism", "outer_parallelism", "num_productions", "num_realizations",
-                "num_scalars", "num_vectors", "points_computed_total", "working_set"
-            };
-            for (const auto& metric : important_metrics) {
-                float sum = 0.0f;
-                for (const auto& sf : scheduling_features) {
-                    sum += sf.contains(metric) ? sf[metric].get<float>() : 0.0f;
-                }
-                features["sched_" + metric] = sum;
-            }
-            features["total_bytes_at_production"] = features["sched_bytes_at_production"];
-            features["total_vectors"] = features["sched_num_vectors"];
-            float total_parallelism = 0.0f;
-            for (const auto& sf : scheduling_features) {
-                float inner = sf.contains("inner_parallelism") ? sf["inner_parallelism"].get<float>() : 0.0f;
-                float outer = sf.contains("outer_parallelism") ? sf["outer_parallelism"].get<float>() : 1.0f;
-                total_parallelism += inner * outer;
-            }
-            features["total_parallelism"] = total_parallelism;
-            features["bytes_per_vector"] = features["total_vectors"] > 0 ? features["total_bytes_at_production"] / features["total_vectors"] : 0.0f;
-            features["memory_pressure"] = features["sched_bytes_at_production"] > 0 ? features["sched_working_set"] / features["sched_bytes_at_production"] : 0.0f;
-            features["bytes_per_parallelism"] = total_parallelism > 0 ? features["total_bytes_at_production"] / total_parallelism : 0.0f;
-            features["nodes_per_schedule"] = features["scheduling_count"] > 0 ? features["nodes_count"] / features["scheduling_count"] : features["nodes_count"];
-        }
-
-        // Derived features
-        features["op_diversity"] = std::count_if(op_counts.begin(), op_counts.end(), 
-            [](const auto& p) { return p.second > 0; });
-        features["computation_efficiency"] = features["execution_time_ms"] > 0 ? 
-            features["sched_points_computed_total"] / features["execution_time_ms"] : 0.0f;
-        features["bytes_processing_rate"] = features["execution_time_ms"] > 0 ? 
-            features["total_bytes_at_production"] / features["execution_time_ms"] : 0.0f;
-        features["memory_utilization_ratio"] = features["sched_bytes_at_production"] > 0 ? 
-            features["sched_working_set"] / features["sched_bytes_at_production"] : 0.0f;
-
-        // Log transform skewed features
         for (const auto& feature : skewed_features) {
             if (features.count(feature)) {
                 features["log_" + feature] = std::log1p(features[feature]);
@@ -192,23 +216,13 @@ struct GraphFeatures {
             }
         }
 
-        // Create node and scalar feature vectors
-        std::vector<float> node_vec;
-        for (const auto& key : node_feature_names) {
-            node_vec.push_back(features.count(key) ? features[key] : 0.0f);
-        }
-        std::vector<float> scalar_vec;
-        for (const auto& key : scalar_feature_names) {
+        std::unordered_map<std::string, float> ordered_features;
+        for (const auto& key : feature_names) {
             if (std::find(dropped_features.begin(), dropped_features.end(), key) == dropped_features.end()) {
-                scalar_vec.push_back(features.count(key) ? features[key] : 0.0f);
+                ordered_features[key] = features.count(key) ? features[key] : 0.0f;
             }
         }
-
-        // Store vectors in result
-        result.node_vector = node_vec;
-        result.scalar_vector = scalar_vec;
-        std::cout << "Extracted node features: " << node_vec.size() << ", scalar features: " << scalar_vec.size() << std::endl;
-        return result;
+        return ordered_features;
     }
 };
 
@@ -257,22 +271,40 @@ float predict_execution_time(const std::string& json_file_path) {
                                      std::to_string(scaler_scalar.center.size()));
         }
 
-        // Extract features
-        GraphFeatures extractor;
-        extractor.node_feature_names = node_features;
-        extractor.scalar_feature_names = scalar_features;
-        extractor.skewed_features = skewed_features;
-        extractor.dropped_features = dropped_features;
+        // Extract node features (average across non-Global Feature nodes)
+        NodeFeatures node_extractor;
+        node_extractor.feature_names = node_features;
+        std::vector<std::vector<float>> node_sequences;
 
-        auto feature_result = extractor.extract(json_data);
-        auto node_vec = feature_result.node_vector;
-        auto scalar_vec = feature_result.scalar_vector;
+        for (const auto& child : json_data["children"]) {
+            if (child["name"] != "Global Features") {
+                auto features = node_extractor.extract(child);
+                std::vector<float> feature_vec;
+                for (const auto& key : node_features) {
+                    feature_vec.push_back(features[key]);
+                }
+                node_sequences.push_back(feature_vec);
+            }
+        }
+        std::cout << "Extracted " << node_sequences.size() << " node sequences" << std::endl;
 
-        // Scale features
-        auto scaled_node = scaler_node.transform(node_vec);
-        auto scaled_scalar = scaler_scalar.transform(scalar_vec);
+        // Average node features
+        std::vector<float> avg_node_features(seq_input_size, 0.0f);
+        if (!node_sequences.empty()) {
+            for (const auto& seq : node_sequences) {
+                for (size_t i = 0; i < seq_input_size; ++i) {
+                    avg_node_features[i] += seq[i];
+                }
+            }
+            for (size_t i = 0; i < seq_input_size; ++i) {
+                avg_node_features[i] /= node_sequences.size();
+            }
+        }
 
-        // Create sequence tensor (repeat node features for max_sequence_length)
+        // Scale node features
+        auto scaled_node = scaler_node.transform(avg_node_features);
+
+        // Create sequence tensor
         std::vector<float> seq_data(max_sequence_length * seq_input_size, 0.0f);
         for (int i = 0; i < max_sequence_length; ++i) {
             for (int j = 0; j < seq_input_size; ++j) {
@@ -285,6 +317,21 @@ float predict_execution_time(const std::string& json_file_path) {
             torch::kFloat
         ).clone();
 
+        // Extract and scale scalar features
+        ScalarFeatures scalar_extractor;
+        scalar_extractor.feature_names = scalar_features;
+        scalar_extractor.skewed_features = skewed_features;
+        scalar_extractor.dropped_features = dropped_features;
+
+        auto scalar_features_map = scalar_extractor.extract(json_data);
+        std::vector<float> scalar_vec;
+        for (const auto& key : scalar_features) {
+            if (std::find(dropped_features.begin(), dropped_features.end(), key) == dropped_features.end()) {
+                scalar_vec.push_back(scalar_features_map[key]);
+            }
+        }
+        auto scaled_scalar = scaler_scalar.transform(scalar_vec);
+        
         torch::Tensor scalar_tensor = torch::from_blob(
             scaled_scalar.data(),
             {1, scalar_input_size},
@@ -328,7 +375,7 @@ float predict_execution_time(const std::string& json_file_path) {
         return execution_time_ms;
 
     } catch (const c10::Error& e) {
-        std::cerr << "PyTorch Error: " << e.what() << std::endl;
+        std::cerr << "PyTorch Error: " << e.what() << std::-ren
         throw;
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;
@@ -344,7 +391,7 @@ int main(int argc, char* argv[]) {
         if (argc > 1) {
             json_file_path = argv[1];
         } else {
-            json_file_path = "converted_function_graph.json";
+            json_file_path = "tree_representation_mapped.json";
             std::cout << "No input file specified, using default: " << json_file_path << std::endl;
         }
 
