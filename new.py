@@ -1,16 +1,23 @@
 import os
 import json
 import numpy as np
-import pandas as pd
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset, random_split
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+import random
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
-import matplotlib.pyplot as plt
-import random
-from tqdm import tqdm
+
+# Try importing torch, with helpful error message if not available
+try:
+    import torch
+    import torch.nn as nn
+    import torch.optim as optim
+    from torch.utils.data import DataLoader, Dataset, random_split
+except ImportError:
+    print("PyTorch is not installed. Please install it using:")
+    print("pip install torch torchvision")
+    print("or visit https://pytorch.org/get-started/locally/ for installation instructions specific to your system.")
+    exit(1)
 
 # Set random seeds for reproducibility
 torch.manual_seed(42)
@@ -63,25 +70,79 @@ class LSTMExecutionTimePredictor(nn.Module):
         out = self.fc(out[:, -1, :])
         return out.squeeze()
 
-def extract_features_from_json(json_data):
+def examine_json_structure(file_path):
+    """
+    Examine the structure of a JSON file to help debug extraction issues
+    """
+    try:
+        with open(file_path, 'r') as f:
+            json_data = json.load(f)
+        
+        # Check for key structures
+        has_global_features = "global_features" in json_data
+        has_execution_time = "execution_time_ms" in json_data.get("global_features", {})
+        has_nodes = "nodes" in json_data
+        num_nodes = len(json_data.get("nodes", []))
+        
+        # Check node structure if nodes exist
+        node_structure = {}
+        if num_nodes > 0:
+            first_node = json_data["nodes"][0]
+            node_structure = {key: type(value).__name__ for key, value in first_node.items()}
+            
+            # Check stages structure
+            if "stages" in first_node:
+                if isinstance(first_node["stages"], list):
+                    node_structure["stages"] = f"list[{len(first_node['stages'])}]"
+                    if first_node["stages"]:
+                        node_structure["stages_keys"] = list(first_node["stages"][0].keys())
+                else:
+                    node_structure["stages"] = type(first_node["stages"]).__name__
+        
+        return {
+            "has_global_features": has_global_features,
+            "has_execution_time": has_execution_time,
+            "execution_time": json_data.get("global_features", {}).get("execution_time_ms", "N/A"),
+            "has_nodes": has_nodes,
+            "num_nodes": num_nodes,
+            "node_structure": node_structure
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+def extract_features_from_json(json_data, debug=False):
     """
     Extract relevant features from the JSON data
     """
-    features = []
+    # Debug: Print JSON structure
+    if debug:
+        print("JSON keys:", json_data.keys())
     
     # Extract global features if available
     global_features = json_data.get("global_features", {})
+    if debug and not global_features:
+        print("Warning: No global_features found in JSON")
+    
     execution_time = global_features.get("execution_time_ms", 0)
+    if debug:
+        print(f"Execution time: {execution_time}")
     
     # Skip files with invalid execution times
     if execution_time <= 0:
+        if debug:
+            print(f"Skipping file due to invalid execution time: {execution_time}")
         return None, None
     
     # Process nodes
     nodes = json_data.get("nodes", [])
+    if debug:
+        print(f"Number of nodes: {len(nodes)}")
+        if nodes:
+            print(f"First node keys: {nodes[0].keys()}")
+    
     node_features = []
     
-    for node in nodes:
+    for i, node in enumerate(nodes):
         node_feature_vector = []
         
         # Basic node properties
@@ -94,8 +155,21 @@ def extract_features_from_json(json_data):
         # Extract schedule features
         stages = node.get("stages", [])
         if stages:
-            pipeline_features = stages[0].get("pipeline_features", {})
+            # Check if stages is a list or dictionary
+            if isinstance(stages, list) and stages:
+                first_stage = stages[0]
+            elif isinstance(stages, dict):
+                first_stage = stages
+            else:
+                first_stage = {}
+                
+            pipeline_features = first_stage.get("pipeline_features", {})
             schedule_features = pipeline_features.get("schedule_features", {})
+            
+            if debug and i == 0:  # Only print for the first node to avoid clutter
+                print(f"Stage type: {type(stages)}")
+                print(f"Pipeline features keys: {pipeline_features.keys() if pipeline_features else 'None'}")
+                print(f"Schedule features keys: {schedule_features.keys() if schedule_features else 'None'}")
             
             # Select important numerical features
             important_features = [
@@ -117,25 +191,55 @@ def extract_features_from_json(json_data):
             ]
             
             for feature in important_features:
-                node_feature_vector.append(float(schedule_features.get(feature, 0.0)))
+                try:
+                    value = float(schedule_features.get(feature, 0.0))
+                    node_feature_vector.append(value)
+                except (ValueError, TypeError):
+                    if debug:
+                        print(f"Warning: Could not convert {feature} to float")
+                    node_feature_vector.append(0.0)
             
             # Extract operation histogram information
             op_histogram = pipeline_features.get("op_histogram", {})
             float_ops = op_histogram.get("Float", {})
             
+            if debug and i == 0:
+                print(f"Op histogram keys: {op_histogram.keys() if op_histogram else 'None'}")
+                print(f"Float ops keys: {float_ops.keys() if float_ops else 'None'}")
+            
             # Count total operations
-            total_ops = sum(float_ops.values())
-            node_feature_vector.append(total_ops)
+            try:
+                total_ops = sum(float_ops.values())
+                node_feature_vector.append(total_ops)
+            except:
+                node_feature_vector.append(0.0)
+                if debug:
+                    print("Warning: Could not calculate total_ops")
             
             # Count specific operation types
-            compute_ops = float_ops.get("Add", 0) + float_ops.get("Sub", 0) + float_ops.get("Mul", 0) + float_ops.get("Div", 0)
-            node_feature_vector.append(compute_ops)
+            try:
+                compute_ops = float_ops.get("Add", 0) + float_ops.get("Sub", 0) + float_ops.get("Mul", 0) + float_ops.get("Div", 0)
+                node_feature_vector.append(compute_ops)
+            except:
+                node_feature_vector.append(0.0)
+                if debug:
+                    print("Warning: Could not calculate compute_ops")
             
-            memory_ops = float_ops.get("Variable", 0) + float_ops.get("Param", 0) + float_ops.get("ImageCall", 0)
-            node_feature_vector.append(memory_ops)
+            try:
+                memory_ops = float_ops.get("Variable", 0) + float_ops.get("Param", 0) + float_ops.get("ImageCall", 0)
+                node_feature_vector.append(memory_ops)
+            except:
+                node_feature_vector.append(0.0)
+                if debug:
+                    print("Warning: Could not calculate memory_ops")
             
-            control_ops = float_ops.get("Select", 0) + float_ops.get("Let", 0) + float_ops.get("FuncCall", 0)
-            node_feature_vector.append(control_ops)
+            try:
+                control_ops = float_ops.get("Select", 0) + float_ops.get("Let", 0) + float_ops.get("FuncCall", 0)
+                node_feature_vector.append(control_ops)
+            except:
+                node_feature_vector.append(0.0)
+                if debug:
+                    print("Warning: Could not calculate control_ops")
         
         # If we don't have stages, add zeros
         else:
@@ -143,20 +247,30 @@ def extract_features_from_json(json_data):
         
         node_features.append(node_feature_vector)
     
-    # Ensure all nodes have the same feature length by padding with zeros if needed
-    max_features = max(len(features) for features in node_features) if node_features else 0
-    padded_features = [f + [0] * (max_features - len(f)) for f in node_features]
-    
     # If we have no valid nodes, return None
-    if not padded_features:
+    if not node_features:
+        if debug:
+            print("No valid nodes found in JSON data")
         return None, None
+    
+    # Ensure all nodes have the same feature length by padding with zeros if needed
+    max_feature_len = max(len(f) for f in node_features) if node_features else 0
+    if debug:
+        print(f"Max feature length: {max_feature_len}")
+        feature_lengths = [len(f) for f in node_features]
+        if len(set(feature_lengths)) > 1:
+            print(f"Warning: Inconsistent feature lengths: {feature_lengths}")
+    
+    padded_features = [f + [0] * (max_feature_len - len(f)) for f in node_features]
     
     # Convert to numpy array and ensure consistent shape
     features = np.array(padded_features, dtype=np.float32)
+    if debug:
+        print(f"Features shape: {features.shape}")
     
     return features, execution_time
 
-def process_data_directory(root_dir):
+def process_data_directory(root_dir, debug=False, max_files=None):
     """
     Process all JSON files in the directory structure
     """
@@ -164,32 +278,92 @@ def process_data_directory(root_dir):
     all_execution_times = []
     file_paths = []
     
-    # Walk through all subdirectories
-    for dirpath, dirnames, filenames in tqdm(os.walk(root_dir), desc="Scanning directories"):
+    skipped_format = 0
+    skipped_execution = 0
+    skipped_other = 0
+    processed = 0
+    
+    # First, find all JSON files
+    all_json_files = []
+    for dirpath, dirnames, filenames in os.walk(root_dir):
         for filename in filenames:
             if filename.endswith('.json'):
-                file_path = os.path.join(dirpath, filename)
+                all_json_files.append(os.path.join(dirpath, filename))
+                if max_files is not None and len(all_json_files) >= max_files:
+                    break
+        if max_files is not None and len(all_json_files) >= max_files:
+            break
+    
+    if debug:
+        print(f"Found {len(all_json_files)} JSON files")
+        if not all_json_files:
+            print(f"No JSON files found in {root_dir}")
+            # Check if the directory exists
+            if not os.path.exists(root_dir):
+                print(f"Directory {root_dir} does not exist!")
+            else:
+                # List contents of directory
+                print(f"Contents of {root_dir}:")
+                for item in os.listdir(root_dir):
+                    print(f"  {item}")
+    
+    # Process files with progress bar
+    for file_path in tqdm(all_json_files, desc="Processing JSON files"):
+        try:
+            with open(file_path, 'r') as f:
+                json_data = json.load(f)
+            
+            if debug and processed < 2:  # Only examine structure for first few files
+                print(f"\nExamining structure of {file_path}:")
+                structure = examine_json_structure(file_path)
+                for key, value in structure.items():
+                    print(f"  {key}: {value}")
+            
+            features, execution_time = extract_features_from_json(json_data, debug=(debug and processed < 2))
+            
+            if features is None:
+                if execution_time is None:
+                    # Check why it was skipped
+                    global_features = json_data.get("global_features", {})
+                    exec_time = global_features.get("execution_time_ms", 0)
+                    if exec_time <= 0:
+                        skipped_execution += 1
+                        if debug and skipped_execution < 5:
+                            print(f"Skipped due to zero/negative execution time: {file_path}")
+                    else:
+                        skipped_other += 1
+                        if debug and skipped_other < 5:
+                            print(f"Skipped due to other reasons: {file_path}")
+                else:
+                    skipped_other += 1
+            elif execution_time is not None and execution_time > 0:
+                all_features.append(features)
+                all_execution_times.append(execution_time)
                 file_paths.append(file_path)
-                
-                try:
-                    with open(file_path, 'r') as f:
-                        json_data = json.load(f)
-                    
-                    features, execution_time = extract_features_from_json(json_data)
-                    
-                    if features is not None and execution_time is not None and execution_time > 0:
-                        all_features.append(features)
-                        all_execution_times.append(execution_time)
-                except Exception as e:
-                    print(f"Error processing {file_path}: {e}")
+                processed += 1
+        except json.JSONDecodeError as e:
+            skipped_format += 1
+            if debug and skipped_format < 5:
+                print(f"JSON decode error in {file_path}: {e}")
+        except Exception as e:
+            skipped_format += 1
+            if debug and skipped_format < 5:
+                print(f"Error processing {file_path}: {e}")
     
     print(f"Processed {len(all_features)} valid JSON files")
+    print(f"Skipped {skipped_format} files with format errors")
+    print(f"Skipped {skipped_execution} files with zero/negative execution time")
+    print(f"Skipped {skipped_other} files for other reasons")
+    
     return all_features, all_execution_times, file_paths
 
 def pad_sequences(sequences, max_length=None):
     """
     Pad sequences to the same length
     """
+    if not sequences:
+        return np.array([])
+        
     if max_length is None:
         max_length = max(len(seq) for seq in sequences)
     
@@ -299,14 +473,14 @@ def evaluate_model(test_loader, model, device):
     
     return predictions, actuals, percentage_errors
 
-def main():
+def main(debug=True, max_files=None):
     # Set device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
     # Process data
     root_dir = "Graph_Output"
-    all_features, all_execution_times, file_paths = process_data_directory(root_dir)
+    all_features, all_execution_times, file_paths = process_data_directory(root_dir, debug=debug, max_files=max_files)
     
     if not all_features:
         print("No valid data found. Exiting.")
@@ -314,21 +488,30 @@ def main():
     
     # Pad sequences to the same length
     padded_features = pad_sequences(all_features)
+    print(f"Padded features shape: {padded_features.shape}")
     
     # Convert to numpy arrays
     execution_times = np.array(all_execution_times, dtype=np.float32)
+    print(f"Execution times shape: {execution_times.shape}")
+    print(f"Execution times range: {execution_times.min()} to {execution_times.max()}")
     
     # Log transform execution times (often helps with skewed distributions)
     log_execution_times = np.log1p(execution_times)
     
     # Split data into train, validation, and test sets
+    test_size = min(20, len(padded_features) // 5)  # Use at most 20 samples or 20% for testing
+    
     X_train_val, X_test, y_train_val, y_test, paths_train_val, paths_test = train_test_split(
-        padded_features, log_execution_times, file_paths, test_size=20, random_state=42
+        padded_features, log_execution_times, file_paths, test_size=test_size, random_state=42
     )
     
     X_train, X_val, y_train, y_val = train_test_split(
         X_train_val, y_train_val, test_size=0.2, random_state=42
     )
+    
+    print(f"Training set size: {X_train.shape}")
+    print(f"Validation set size: {X_val.shape}")
+    print(f"Test set size: {X_test.shape}")
     
     # Normalize features
     feature_dim = X_train.shape[2]
@@ -353,9 +536,11 @@ def main():
     val_dataset = GraphDataset(torch.FloatTensor(X_val), torch.FloatTensor(y_val))
     test_dataset = GraphDataset(torch.FloatTensor(X_test), torch.FloatTensor(y_test))
     
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=32)
-    test_loader = DataLoader(test_dataset, batch_size=32)
+    batch_size = min(32, len(train_dataset))  # Ensure batch size isn't larger than dataset
+    
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size)
     
     # Initialize model
     input_size = feature_dim
@@ -363,6 +548,8 @@ def main():
     num_layers = 2
     
     model = LSTMExecutionTimePredictor(input_size, hidden_size, num_layers)
+    print(f"Model input size: {input_size}")
+    print(model)
     
     # Define loss function and optimizer
     criterion = nn.MSELoss()
@@ -407,4 +594,5 @@ def main():
     plt.show()
 
 if __name__ == "__main__":
-    main()
+    # Run with debug mode and limit to 100 files for initial testing
+    main(debug=True, max_files=100)
