@@ -234,9 +234,10 @@ def prepare_data_for_model(train_features, test_features):
     y_train_scaled = scaler_y.fit_transform(y_train)
     y_test_scaled = scaler_y.transform(y_test)
     
+    # Fixed: Correctly handle nan_to_num for y_train_scaled and y_test_scaled separately
     train_scalar_scaled = np.nan_to_num(train_scalar_scaled, nan=0.0)
     test_scalar_scaled = np.nan_to_num(test_scalar_scaled, nan=0.0)
-    y_train_scaled = np.nan_to_num(y_test_scaled, nan=0.0)
+    y_train_scaled = np.nan_to_num(y_train_scaled, nan=0.0)
     y_test_scaled = np.nan_to_num(y_test_scaled, nan=0.0)
     
     train_sequences_aug = []
