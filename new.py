@@ -79,15 +79,30 @@ def examine_json_structure(file_path):
             json_data = json.load(f)
         
         # Check for key structures
-        has_global_features = "global_features" in json_data
-        has_execution_time = "execution_time_ms" in json_data.get("global_features", {})
-        has_nodes = "nodes" in json_data
-        num_nodes = len(json_data.get("nodes", []))
+        has_without_extern = "without_extern" in json_data
+        
+        if has_without_extern:
+            without_extern = json_data.get("without_extern", {})
+            has_global_features = "global_features" in without_extern
+            has_execution_time = "execution_time_ms" in without_extern.get("global_features", {})
+            execution_time = without_extern.get("global_features", {}).get("execution_time_ms", "N/A")
+            has_nodes = "nodes" in without_extern
+            num_nodes = len(without_extern.get("nodes", []))
+        else:
+            has_global_features = "global_features" in json_data
+            has_execution_time = "execution_time_ms" in json_data.get("global_features", {})
+            execution_time = json_data.get("global_features", {}).get("execution_time_ms", "N/A")
+            has_nodes = "nodes" in json_data
+            num_nodes = len(json_data.get("nodes", []))
         
         # Check node structure if nodes exist
         node_structure = {}
         if num_nodes > 0:
-            first_node = json_data["nodes"][0]
+            if has_without_extern:
+                first_node = without_extern["nodes"][0]
+            else:
+                first_node = json_data["nodes"][0]
+                
             node_structure = {key: type(value).__name__ for key, value in first_node.items()}
             
             # Check stages structure
@@ -100,9 +115,10 @@ def examine_json_structure(file_path):
                     node_structure["stages"] = type(first_node["stages"]).__name__
         
         return {
+            "has_without_extern": has_without_extern,
             "has_global_features": has_global_features,
             "has_execution_time": has_execution_time,
-            "execution_time": json_data.get("global_features", {}).get("execution_time_ms", "N/A"),
+            "execution_time": execution_time,
             "has_nodes": has_nodes,
             "num_nodes": num_nodes,
             "node_structure": node_structure
@@ -114,6 +130,10 @@ def extract_features_from_json(json_data, debug=False):
     """
     Extract relevant features from the JSON data
     """
+    # Check if the data is under 'without_extern' key
+    if "without_extern" in json_data:
+        json_data = json_data["without_extern"]
+    
     # Debug: Print JSON structure
     if debug:
         print("JSON keys:", json_data.keys())
@@ -138,11 +158,15 @@ def extract_features_from_json(json_data, debug=False):
     if debug:
         print(f"Number of nodes: {len(nodes)}")
         if nodes:
-            print(f"First node keys: {nodes[0].keys()}")
+            print(f"First node keys: {nodes[0].keys() if isinstance(nodes[0], dict) else 'Not a dict'}")
     
     node_features = []
     
     for i, node in enumerate(nodes):
+        # Skip if node is not a dictionary
+        if not isinstance(node, dict):
+            continue
+            
         node_feature_vector = []
         
         # Basic node properties
@@ -324,7 +348,11 @@ def process_data_directory(root_dir, debug=False, max_files=None):
             if features is None:
                 if execution_time is None:
                     # Check why it was skipped
-                    global_features = json_data.get("global_features", {})
+                    if "without_extern" in json_data:
+                        global_features = json_data["without_extern"].get("global_features", {})
+                    else:
+                        global_features = json_data.get("global_features", {})
+                    
                     exec_time = global_features.get("execution_time_ms", 0)
                     if exec_time <= 0:
                         skipped_execution += 1
