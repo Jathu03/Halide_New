@@ -8,7 +8,6 @@ from sklearn.preprocessing import RobustScaler
 from sklearn.model_selection import train_test_split
 import sys
 
-# Try importing PyTorch but don't attempt to install it automatically
 try:
     import torch
     import torch.nn as nn
@@ -24,6 +23,7 @@ np.random.seed(42)
 random.seed(42)
 if TORCH_AVAILABLE:
     torch.manual_seed(42)
+    torch.cuda.manual_seed_all(42)
 
 class GraphDataset(Dataset):
     def __init__(self, features, execution_times):
@@ -37,7 +37,7 @@ class GraphDataset(Dataset):
         return self.features[idx], self.execution_times[idx]
 
 class ImprovedLSTMExecutionTimePredictor(nn.Module):
-    def __init__(self, input_size, hidden_size=256, num_layers=3, dropout=0.3, bidirectional=True):
+    def __init__(self, input_size, hidden_size=512, num_layers=4, dropout=0.4, bidirectional=True):
         if not TORCH_AVAILABLE:
             raise ImportError("PyTorch is required for this model")
             
@@ -47,14 +47,17 @@ class ImprovedLSTMExecutionTimePredictor(nn.Module):
         self.bidirectional = bidirectional
         self.num_directions = 2 if bidirectional else 1
         
-        self.lstm = nn.LSTM(
-            input_size=input_size,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            batch_first=True,
-            dropout=dropout if num_layers > 1 else 0,
-            bidirectional=bidirectional
-        )
+        # LSTM layers with residual connections
+        self.lstm_layers = nn.ModuleList([
+            nn.LSTM(
+                input_size=input_size if i == 0 else hidden_size * self.num_directions,
+                hidden_size=hidden_size,
+                num_layers=1,
+                batch_first=True,
+                dropout=0,
+                bidirectional=bidirectional
+            ) for i in range(num_layers)
+        ])
         
         self.batch_norm = nn.BatchNorm1d(hidden_size * self.num_directions)
         
@@ -73,20 +76,37 @@ class ImprovedLSTMExecutionTimePredictor(nn.Module):
             nn.Linear(hidden_size, hidden_size // 2),
             nn.ReLU(),
             nn.Dropout(dropout/2),
-            nn.Linear(hidden_size // 2, 1)
+            nn.Linear(hidden_size // 2, hidden_size // 4),
+            nn.ReLU(),
+            nn.Linear(hidden_size // 4, 1)
         )
         
     def forward(self, x):
         batch_size = x.size(0)
-        h0 = torch.zeros(self.num_layers * self.num_directions, batch_size, self.hidden_size).to(x.device)
-        c0 = torch.zeros(self.num_layers * self.num_directions, batch_size, self.hidden_size).to(x.device)
+        out = x
         
-        lstm_out, _ = self.lstm(x, (h0, c0))
-        attention_weights = self.attention(lstm_out)
-        context_vector = torch.sum(attention_weights * lstm_out, dim=1)
+        for i, lstm in enumerate(self.lstm_layers):
+            h0 = torch.zeros(1 * self.num_directions, batch_size, self.hidden_size).to(x.device)
+            c0 = torch.zeros(1 * self.num_directions, batch_size, self.hidden_size).to(x.device)
+            lstm_out, _ = lstm(out, (h0, c0))
+            if i > 0:  # Add residual connection
+                out = lstm_out + out
+            else:
+                out = lstm_out
+        
+        attention_weights = self.attention(out)
+        context_vector = torch.sum(attention_weights * out, dim=1)
         context_vector = self.batch_norm(context_vector)
         out = self.fc(context_vector)
         return out.squeeze()
+
+def custom_loss(outputs, targets):
+    mse_loss = nn.MSELoss()(outputs, targets)
+    l1_loss = nn.L1Loss()(outputs, targets)
+    # Add percentage error term
+    percentage_error = torch.abs((outputs - targets) / (targets + 1e-6))
+    percentage_loss = torch.mean(percentage_error)
+    return 0.5 * mse_loss + 0.3 * l1_loss + 0.2 * percentage_loss
 
 def examine_json_structure(file_path):
     try:
@@ -166,6 +186,12 @@ def extract_features_from_json(json_data, debug=False):
             print(f"Nodes keys: {nodes.keys()}")
     
     node_features = []
+    global_feature_vector = [
+        global_features.get("total_bytes", 0.0),
+        global_features.get("total_ops", 0.0),
+        len(nodes)
+    ]
+    
     if isinstance(nodes, list):
         node_list = nodes
     elif isinstance(nodes, dict):
@@ -264,6 +290,8 @@ def extract_features_from_json(json_data, debug=False):
         else:
             node_feature_vector.extend([0.0] * (15 + 4))
         
+        # Append global features to each node
+        node_feature_vector.extend(global_feature_vector)
         node_features.append(node_feature_vector)
     
     if not node_features:
@@ -390,15 +418,19 @@ def augment_data(features, execution_times, file_paths):
     augmented_times = []
     augmented_paths = []
     
-    high_time_indices = np.where(execution_times > np.percentile(execution_times, 90))[0]
-    
-    for idx in high_time_indices:
-        for i in range(5):
-            noise_scale = 0.05
-            noise = np.random.normal(0, noise_scale, features[idx].shape)
-            augmented_features.append(features[idx] + noise)
-            augmented_times.append(execution_times[idx] * np.random.uniform(0.95, 1.05))
-            augmented_paths.append(file_paths[idx] + f"_augmented_{i}")
+    # Augment across different execution time ranges
+    percentiles = [50, 75, 90]
+    for perc in percentiles:
+        threshold = np.percentile(execution_times, perc)
+        indices = np.where((execution_times > threshold) if perc == 90 else (execution_times <= threshold))[0]
+        
+        for idx in indices:
+            for i in range(3):  # Reduced augmentation to prevent overfitting
+                noise_scale = 0.03
+                noise = np.random.normal(0, noise_scale, features[idx].shape)
+                augmented_features.append(features[idx] + noise)
+                augmented_times.append(execution_times[idx] * np.random.uniform(0.97, 1.03))
+                augmented_paths.append(file_paths[idx] + f"_augmented_{perc}_{i}")
     
     if augmented_features:
         return np.vstack([features, np.array(augmented_features)]), \
@@ -419,16 +451,16 @@ def train_pytorch_model(X_train, y_train, X_val, y_val, X_test, y_test, file_pat
     val_dataset = GraphDataset(torch.FloatTensor(X_val), torch.FloatTensor(y_val))
     test_dataset = GraphDataset(torch.FloatTensor(X_test), torch.FloatTensor(y_test))
     
-    batch_size = min(32, len(train_dataset))
+    batch_size = min(64, len(train_dataset))  # Increased batch size
     
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size)
     test_loader = DataLoader(test_dataset, batch_size=batch_size)
     
     input_size = feature_dim
-    hidden_size = 256
-    num_layers = 3
-    dropout = 0.3
+    hidden_size = 512
+    num_layers = 4
+    dropout = 0.4
     bidirectional = True
     
     model = ImprovedLSTMExecutionTimePredictor(input_size, hidden_size, num_layers, dropout, bidirectional)
@@ -436,17 +468,21 @@ def train_pytorch_model(X_train, y_train, X_val, y_val, X_test, y_test, file_pat
     print(f"Model input size: {input_size}")
     print(model)
     
-    criterion_mse = nn.MSELoss()
-    criterion_l1 = nn.L1Loss()
-    optimizer = optim.AdamW(model.parameters(), lr=0.0005, weight_decay=1e-5)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=10)
+    optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2)
     
     best_val_loss = float('inf')
     early_stop_counter = 0
-    num_epochs = 150
-    patience = 20
+    num_epochs = 200
+    patience = 30
     train_losses = []
     val_losses = []
+    
+    # Learning rate warmup
+    warmup_epochs = 5
+    initial_lr = 0.0001
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = initial_lr
     
     for epoch in range(num_epochs):
         model.train()
@@ -455,11 +491,9 @@ def train_pytorch_model(X_train, y_train, X_val, y_val, X_test, y_test, file_pat
             features, targets = features.to(device), targets.to(device)
             optimizer.zero_grad()
             outputs = model(features)
-            mse_loss = criterion_mse(outputs, targets)
-            l1_loss = criterion_l1(outputs, targets)
-            loss = 0.7 * mse_loss + 0.3 * l1_loss
+            loss = custom_loss(outputs, targets)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
             optimizer.step()
             train_loss += loss.item()
         train_loss /= len(train_loader)
@@ -471,16 +505,20 @@ def train_pytorch_model(X_train, y_train, X_val, y_val, X_test, y_test, file_pat
             for features, targets in val_loader:
                 features, targets = features.to(device), targets.to(device)
                 outputs = model(features)
-                mse_loss = criterion_mse(outputs, targets)
-                l1_loss = criterion_l1(outputs, targets)
-                loss = 0.7 * mse_loss + 0.3 * l1_loss
+                loss = custom_loss(outputs, targets)
                 val_loss += loss.item()
         val_loss /= len(val_loader)
         val_losses.append(val_loss)
         
-        scheduler.step(val_loss)
+        # Warmup learning rate
+        if epoch < warmup_epochs:
+            lr = initial_lr + (0.001 - initial_lr) * (epoch + 1) / warmup_epochs
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = lr
+        else:
+            scheduler.step()
         
-        print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
+        print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, LR: {optimizer.param_groups[0]["lr"]:.6f}')
         
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -531,7 +569,7 @@ def train_pytorch_model(X_train, y_train, X_val, y_val, X_test, y_test, file_pat
     plt.plot(train_losses, label='Train Loss')
     plt.plot(val_losses, label='Validation Loss')
     plt.xlabel('Epoch')
-    plt.ylabel('Loss (Combined MSE + L1)')
+    plt.ylabel('Loss')
     plt.legend()
     plt.title('Training and Validation Loss')
     
@@ -566,10 +604,17 @@ def main(debug=True, max_files=None):
         print("No valid data found. Exiting.")
         return
     
+    # Clip extreme execution times
+    execution_times = np.array(all_execution_times, dtype=np.float32)
+    upper_limit = np.percentile(execution_times, 99)
+    valid_indices = execution_times <= upper_limit
+    all_features = [f for f, v in zip(all_features, valid_indices) if v]
+    execution_times = execution_times[valid_indices]
+    file_paths = [p for p, v in zip(file_paths, valid_indices) if v]
+    
     padded_features = pad_sequences(all_features)
     print(f"Padded features shape: {padded_features.shape}")
     
-    execution_times = np.array(all_execution_times, dtype=np.float32)
     print(f"Execution times shape: {execution_times.shape}")
     print(f"Execution times range: {execution_times.min()} to {execution_times.max()}")
     
@@ -597,7 +642,7 @@ def main(debug=True, max_files=None):
     X_val_reshaped = X_val.reshape(-1, feature_dim)
     X_test_reshaped = X_test.reshape(-1, feature_dim)
     
-    scaler = RobustScaler()
+    scaler = RobustScaler(quantile_range=(10.0, 90.0))  # Wider quantile range
     X_train_reshaped = scaler.fit_transform(X_train_reshaped)
     X_val_reshaped = scaler.transform(X_val_reshaped)
     X_test_reshaped = scaler.transform(X_test_reshaped)
