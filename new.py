@@ -130,7 +130,7 @@ def examine_json_structure(file_path):
             "has_global_features": has_global_features,
             "has_execution_time": has_execution_time,
             "execution_time": execution_time,
-            "has_nodes": has_nodes інозем
+            "has_nodes": has_nodes,
             "num_nodes": num_nodes,
             "node_structure": node_structure
         }
