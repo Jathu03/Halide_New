@@ -76,8 +76,9 @@ def extract_edge_features(edge):
         # Flatten the matrix
         for row in matrix:
             features.extend(row)
-        # Pad if matrix is smaller than expected (e.g., max 5x5 for safety)
-        while len(features) % 25 != 0:
+        # Pad to a fixed size (assume max 5x5 matrix for consistency)
+        max_matrix_elements = 25
+        while len(features) % max_matrix_elements != 0:
             features.append(0.0)
     
     return features
@@ -100,17 +101,22 @@ def process_json_file(file_path):
         nodes = data.get('without_extern', {}).get('nodes', [])
         node_features = [extract_node_features(node) for node in nodes]
         
-        # Ensure all node feature vectors are of the same length
-        max_node_len = max(len(f) for f in node_features) if node_features else 0
-        node_features = [f + [0.0] * (max_node_len - len(f)) for f in node_features]
-        
         # Extract edge features
         edges = data.get('without_extern', {}).get('edges', [])
         edge_features = [extract_edge_features(edge) for edge in edges]
         
-        # Ensure all edge feature vectors are of the same length
-        max_edge_len = max(len(f) for f in edge_features) if edge_features else 0
-        edge_features = [f + [0.0] * (max_edge_len - len(f)) for f in edge_features]
+        # If no features, skip the file
+        if not node_features and not edge_features:
+            print(f"Skipping {file_path}: No nodes or edges found.")
+            return None
+        
+        # Combine all features to find the maximum length
+        all_features = node_features + edge_features
+        max_feature_len = max(len(f) for f in all_features) if all_features else 0
+        
+        # Pad all feature vectors to the maximum length
+        node_features = [f + [0.0] * (max_feature_len - len(f)) for f in node_features]
+        edge_features = [f + [0.0] * (max_feature_len - len(f)) for f in edge_features]
         
         # Combine node and edge features into a sequence
         sequence = node_features + edge_features
@@ -118,7 +124,7 @@ def process_json_file(file_path):
         # Pad sequence to a fixed length (e.g., max 100 steps)
         max_sequence_len = 100
         if len(sequence) < max_sequence_len:
-            sequence.extend([[0.0] * max_node_len] * (max_sequence_len - len(sequence)))
+            sequence.extend([[0.0] * max_feature_len] * (max_sequence_len - len(sequence)))
         elif len(sequence) > max_sequence_len:
             sequence = sequence[:max_sequence_len]
         
@@ -148,6 +154,10 @@ def create_dataset(graph_output_dir, output_file):
                     execution_times.append(exec_time)
     
     # Convert to NumPy arrays
+    if not sequences:
+        print("No valid data found. Dataset creation aborted.")
+        return
+    
     sequences = np.array(sequences)
     execution_times = np.array(execution_times)
     
