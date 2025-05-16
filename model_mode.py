@@ -1,4 +1,4 @@
-```python
+
 import os
 import json
 import numpy as np
@@ -763,56 +763,3 @@ if __name__ == "__main__":
     torch.manual_seed(42)
     np.random.seed(42)
     model, y_scaler, y_test_actual, y_pred_actual = main(main_dir)
-```
-
-### Key Changes and Verifications
-1. **Fixed Indentation in `SimpleLSTMModel`**:
-   - Ensured `self.fc1 = nn.Linear(combined_size, 256)` and all subsequent lines in `__init__` are indented with 8 spaces (2 levels).
-   - Verified consistent 4-space indentation throughout the class and other functions.
-
-2. **Comprehensive Indentation Check**:
-   - Reviewed all functions (`extract_features`, `process_tree_output_directory`, etc.) to ensure consistent 4-space indentation.
-   - Corrected any potential misalignments, especially in nested blocks like loops and conditionals.
-
-3. **Preserved Visualizations**:
-   - The `evaluate_model` function includes the 2x3 subplot grid with scatter plot, error distribution histogram, feature importance bar plot, residual plot, cumulative error plot, and time series plot.
-   - Visualizations are saved as `model_performance_banner.png` with high DPI for quality.
-
-4. **No Functional Changes**:
-   - The logic, model architecture, and visualization code remain unchanged except for indentation fixes.
-   - The `feature_importances` dictionary is passed to `evaluate_model` to support the feature importance plot.
-
-5. **Error Prevention**:
-   - Added checks for division by zero in feature extraction (already present).
-   - Ensured `y_test_actual` and `y_pred_actual` are flattened for plotting to avoid shape mismatches.
-
-### How to Run
-1. Save the code as `model_mode.py` in your working directory (`/home/kowrisaan/jathu/Halide_New/Graph`).
-2. Ensure all dependencies (`torch`, `numpy`, `pandas`, `sklearn`, `matplotlib`, `seaborn`) are installed:
-   ```bash
-   pip install torch numpy pandas scikit-learn matplotlib seaborn
-   ```
-3. Run the script:
-   ```bash
-   python model_mode.py
-   ```
-4. Check the output:
-   - The model will train and evaluate, producing console output with performance metrics.
-   - A file `model_performance_banner.png` will be created, containing the 2x3 grid of visualizations.
-   - Other outputs (e.g., `model.pt`, `scaler_*.json`, `loss_plot.png`) will be generated as before.
-
-### Expected Output
-- Console output will include training progress, evaluation results per subfolder, and overall metrics (MSE, RMSE, MAE, MAPE).
-- The `model_performance_banner.png` will display:
-  - **Top Row**: Scatter plot (actual vs. predicted), error distribution histogram, feature importance bar plot.
-  - **Bottom Row**: Residual plot, cumulative error plot, time series plot.
-  - Metrics (RMSE, MAE, MAPE) will be annotated in the bottom-left corner of the figure.
-
-### Troubleshooting
-If you encounter any issues:
-- **Indentation Errors**: Ensure your editor uses spaces (not tabs) and 4 spaces per indent level. Most editors (e.g., VS Code) can convert tabs to spaces or enforce consistent indentation.
-- **Module Not Found**: Verify all required libraries are installed.
-- **Data Issues**: Ensure the `Tree_Output` directory contains valid `tree_representation.json` files with positive `execution_time_ms` values.
-- **Runtime Errors**: Check for GPU compatibility or memory issues; the code automatically falls back to CPU if CUDA fails.
-
-If you encounter any other errors or need further assistance, please share the error message or specific issue, and I’ll help resolve it promptly.
