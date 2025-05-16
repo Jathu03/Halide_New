@@ -25,7 +25,7 @@ random.seed(42)
 if TORCH_AVAILABLE:
     torch.manual_seed(42)
 
-class GraphDataset:
+class GraphDataset(Dataset):
     def __init__(self, features, execution_times):
         self.features = features
         self.execution_times = execution_times
@@ -36,7 +36,7 @@ class GraphDataset:
     def __getitem__(self, idx):
         return self.features[idx], self.execution_times[idx]
 
-class ImprovedLSTMExecutionTimePredictor:
+class ImprovedLSTMExecutionTimePredictor(nn.Module):  # Correctly inherit from nn.Module
     def __init__(self, input_size, hidden_size=256, num_layers=3, dropout=0.3, bidirectional=True):
         if not TORCH_AVAILABLE:
             raise ImportError("PyTorch is required for this model")
@@ -507,6 +507,7 @@ def train_pytorch_model(X_train, y_train, X_val, y_val, X_test, y_test, file_pat
     bidirectional = True
     
     model = ImprovedLSTMExecutionTimePredictor(input_size, hidden_size, num_layers, dropout, bidirectional)
+    model = model.to(device)  # Move model to the device
     print(f"Model input size: {input_size}")
     print(model)
     
