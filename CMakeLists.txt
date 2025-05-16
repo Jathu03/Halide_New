@@ -16,7 +16,7 @@ find_package(nlohmann_json REQUIRED)
 include_directories(${TORCH_INCLUDE_DIRS})
 
 # Add executable
-add_executable(test test_2.cpp)
+add_executable(test graph.cpp)
 
 # Link libraries
 target_link_libraries(test "${TORCH_LIBRARIES}" nlohmann_json::nlohmann_json)
