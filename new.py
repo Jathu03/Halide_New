@@ -13,6 +13,7 @@ try:
     import torch.nn as nn
     import torch.optim as optim
     from torch.utils.data import DataLoader, Dataset
+    from torch.cuda.amp import GradScaler, autocast
     TORCH_AVAILABLE = True
 except ImportError:
     print("PyTorch is not available. Some functionality will be limited.")
@@ -37,19 +38,21 @@ class GraphDataset(Dataset):
         return self.features[idx], self.execution_times[idx]
 
 class TransformerLSTMExecutionTimePredictor(nn.Module):
-    def __init__(self, input_size, hidden_size=512, num_lstm_layers=3, num_transformer_layers=2, num_heads=8, dropout=0.3):
+    def __init__(self, input_size, hidden_size=512, num_lstm_layers=3, num_transformer_layers=2, num_heads=8, dropout=0.4):
         if not TORCH_AVAILABLE:
             raise ImportError("PyTorch is required for this model")
             
         super(TransformerLSTMExecutionTimePredictor, self).__init__()
         self.hidden_size = hidden_size
         self.num_lstm_layers = num_lstm_layers
-        self.num_directions = 2  # Bidirectional LSTM
+        self.num_directions = 2
         
-        # Input projection
         self.input_proj = nn.Linear(input_size, hidden_size)
+        self.layer_norm_input = nn.LayerNorm(hidden_size)
         
-        # LSTM layers
+        # Positional encoding
+        self.pos_encoder = nn.Parameter(torch.zeros(1, 100, hidden_size))  # Max sequence length 100
+        
         self.lstm_layers = nn.ModuleList([
             nn.LSTM(
                 input_size=hidden_size if i == 0 else hidden_size * self.num_directions,
@@ -61,7 +64,6 @@ class TransformerLSTMExecutionTimePredictor(nn.Module):
             ) for i in range(num_lstm_layers)
         ])
         
-        # Transformer encoder
         transformer_layer = nn.TransformerEncoderLayer(
             d_model=hidden_size * self.num_directions,
             nhead=num_heads,
@@ -70,6 +72,7 @@ class TransformerLSTMExecutionTimePredictor(nn.Module):
             batch_first=True
         )
         self.transformer = nn.TransformerEncoder(transformer_layer, num_layers=num_transformer_layers)
+        self.layer_norm_transformer = nn.LayerNorm(hidden_size * self.num_directions)
         
         self.batch_norm = nn.BatchNorm1d(hidden_size * self.num_directions)
         
@@ -94,12 +97,14 @@ class TransformerLSTMExecutionTimePredictor(nn.Module):
         )
         
     def forward(self, x):
-        batch_size = x.size(0)
+        batch_size, seq_len, _ = x.size()
         
-        # Input projection
         out = self.input_proj(x)
+        out = self.layer_norm_input(out)
         
-        # LSTM with residual connections
+        # Add positional encoding
+        out = out + self.pos_encoder[:, :seq_len, :].to(x.device)
+        
         for i, lstm in enumerate(self.lstm_layers):
             h0 = torch.zeros(1 * self.num_directions, batch_size, self.hidden_size).to(x.device)
             c0 = torch.zeros(1 * self.num_directions, batch_size, self.hidden_size).to(x.device)
@@ -109,26 +114,30 @@ class TransformerLSTMExecutionTimePredictor(nn.Module):
             else:
                 out = lstm_out
         
-        # Transformer encoder
         out = self.transformer(out)
+        out = self.layer_norm_transformer(out)
         
-        # Attention mechanism
         attention_weights = self.attention(out)
         context_vector = torch.sum(attention_weights * out, dim=1)
         context_vector = self.batch_norm(context_vector)
         
-        # Final prediction
         out = self.fc(context_vector)
         return out.squeeze()
+
+def focal_loss(outputs, targets, gamma=2.0, alpha=0.25):
+    mse_loss = nn.MSELoss(reduction='none')(outputs, targets)
+    pt = torch.exp(-mse_loss)
+    focal_loss = alpha * (1 - pt) ** gamma * mse_loss
+    return focal_loss.mean()
 
 def custom_loss(outputs, targets):
     mse_loss = nn.MSELoss()(outputs, targets)
     l1_loss = nn.L1Loss()(outputs, targets)
     percentage_error = torch.abs((outputs - targets) / (targets + 1e-6))
-    # Dynamic weighting based on target magnitude
-    weights = 1.0 / (torch.abs(targets) + 1e-2)  # Higher weight for smaller targets
+    weights = 1.0 / (torch.abs(targets) + 1e-2)
     weighted_percentage_loss = torch.mean(percentage_error * weights)
-    return 0.4 * mse_loss + 0.3 * l1_loss + 0.3 * weighted_percentage_loss
+    focal = focal_loss(outputs, targets)
+    return 0.3 * mse_loss + 0.2 * l1_loss + 0.3 * weighted_percentage_loss + 0.2 * focal
 
 def examine_json_structure(file_path):
     try:
@@ -208,12 +217,17 @@ def extract_features_from_json(json_data, debug=False):
             print(f"Nodes keys: {nodes.keys()}")
     
     node_features = []
+    num_nodes = len(nodes)
+    total_ops = global_features.get("total_ops", 0.0)
+    total_bytes = global_features.get("total_bytes", 0.0)
+    
     global_feature_vector = [
-        global_features.get("total_bytes", 0.0),
-        global_features.get("total_ops", 0.0),
-        len(nodes),
-        global_features.get("total_bytes", 0.0) / (len(nodes) + 1e-6),  # Bytes per node
-        global_features.get("total_ops", 0.0) / (global_features.get("total_bytes", 1.0) + 1e-6)  # Ops per byte
+        np.log1p(total_bytes) if total_bytes > 0 else 0.0,
+        np.log1p(total_ops) if total_ops > 0 else 0.0,
+        num_nodes,
+        np.log1p(total_bytes / (num_nodes + 1e-6)) if total_bytes > 0 else 0.0,
+        np.log1p(total_ops / (total_bytes + 1e-6)) if total_ops > 0 and total_bytes > 0 else 0.0,
+        num_nodes / (total_ops + 1e-6)  # Node density
     ]
     
     if isinstance(nodes, list):
@@ -222,6 +236,18 @@ def extract_features_from_json(json_data, debug=False):
         node_list = [value for key, value in nodes.items() if isinstance(value, dict)]
     else:
         node_list = []
+    
+    # Compute node centrality (approximated by number of connections)
+    centrality_scores = []
+    for node in node_list:
+        if not isinstance(node, dict):
+            centrality_scores.append(0.0)
+            continue
+        connections = sum([1 for key in ['input', 'output', 'boundary_condition', 'wrapper'] if node.get(key, False)])
+        centrality_scores.append(connections)
+    if centrality_scores:
+        max_centrality = max(centrality_scores) + 1e-6
+        centrality_scores = [score / max_centrality for score in centrality_scores]
     
     for i, node in enumerate(node_list):
         if not isinstance(node, dict):
@@ -233,6 +259,7 @@ def extract_features_from_json(json_data, debug=False):
         node_feature_vector.append(1 if node.get("pointwise", False) else 0)
         node_feature_vector.append(1 if node.get("boundary_condition", False) else 0)
         node_feature_vector.append(1 if node.get("wrapper", False) else 0)
+        node_feature_vector.append(centrality_scores[i] if i < len(centrality_scores) else 0.0)
         
         stages = node.get("stages", [])
         if stages:
@@ -256,7 +283,7 @@ def extract_features_from_json(json_data, debug=False):
                 "num_productions",
                 "num_realizations",
                 "num_scalars",
-                "num Wectors",
+                "num_vectors",
                 "outer_parallelism",
                 "points_computed_total",
                 "vector_size",
@@ -266,7 +293,7 @@ def extract_features_from_json(json_data, debug=False):
             for feature in important_features:
                 try:
                     value = float(schedule_features.get(feature, 0.0))
-                    node_feature_vector.append(np.log1p(value) if value > 0 else 0.0)  # Log-transform
+                    node_feature_vector.append(np.log1p(value) if value > 0 else 0.0)
                 except (ValueError, TypeError):
                     if debug:
                         print(f"Warning: Could not convert {feature} to float")
@@ -441,18 +468,18 @@ def augment_data(features, execution_times, file_paths):
     augmented_times = []
     augmented_paths = []
     
-    percentiles = [25, 50, 75, 90]
+    percentiles = [10, 30, 50, 70, 90]
     for perc in percentiles:
-        threshold_lower = np.percentile(execution_times, max(0, perc - 25))
+        threshold_lower = np.percentile(execution_times, max(0, perc - 10))
         threshold_upper = np.percentile(execution_times, perc)
         indices = np.where((execution_times > threshold_lower) & (execution_times <= threshold_upper))[0]
         
         for idx in indices:
-            for i in range(2):  # Further reduced augmentation
-                noise_scale = 0.02
+            for i in range(1):  # Minimal augmentation
+                noise_scale = 0.01
                 noise = np.random.normal(0, noise_scale, features[idx].shape)
                 augmented_features.append(features[idx] + noise)
-                augmented_times.append(execution_times[idx] * np.random.uniform(0.98, 1.02))
+                augmented_times.append(execution_times[idx] * np.random.uniform(0.99, 1.01))
                 augmented_paths.append(file_paths[idx] + f"_augmented_{perc}_{i}")
     
     if augmented_features:
@@ -461,6 +488,69 @@ def augment_data(features, execution_times, file_paths):
                file_paths + augmented_paths
     else:
         return features, execution_times, file_paths
+
+# Ranger optimizer (combination of RAdam and Lookahead)
+class Ranger(optim.Optimizer):
+    def __init__(self, params, lr=1e-3, alpha=0.5, k=6, betas=(0.95, 0.999), eps=1e-8, weight_decay=0):
+        defaults = dict(lr=lr, alpha=alpha, k=k, betas=betas, eps=eps, weight_decay=weight_decay)
+        super(Ranger, self).__init__(params, defaults)
+        
+        self.k = k
+        self.alpha = alpha
+        self.beta1, self.beta2 = betas
+        
+        for group in self.param_groups:
+            for p in group['params']:
+                state = self.state[p]
+                state['step'] = 0
+                state['exp_avg'] = torch.zeros_like(p.data)
+                state['exp_avg_sq'] = torch.zeros_like(p.data)
+                state['slow_buffer'] = torch.empty_like(p.data)
+                state['slow_buffer'].copy_(p.data)
+    
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            loss = closure()
+        
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                grad = p.grad.data
+                if grad.is_sparse:
+                    raise RuntimeError('Ranger does not support sparse gradients')
+                
+                state = self.state[p]
+                if len(state) == 0:
+                    state['step'] = 0
+                    state['exp_avg'] = torch.zeros_like(p.data)
+                    state['exp_avg_sq'] = torch.zeros_like(p.data)
+                    state['slow_buffer'] = torch.empty_like(p.data)
+                    state['slow_buffer'].copy_(p.data)
+                
+                exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
+                beta1, beta2 = group['betas']
+                
+                state['step'] += 1
+                
+                exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+                
+                denom = exp_avg_sq.sqrt().add_(group['eps'])
+                step_size = group['lr']
+                
+                p.data.addcdiv_(exp_avg, denom, value=-step_size)
+                
+                if state['step'] % group['k'] == 0:
+                    slow_p = state['slow_buffer']
+                    slow_p.add_(p.data - slow_p, alpha=group['alpha'])
+                    p.data.copy_(slow_p)
+                
+                if group['weight_decay'] != 0:
+                    p.data.add_(p.data, alpha=-group['lr'] * group['weight_decay'])
+        
+        return loss
 
 def train_pytorch_model(X_train, y_train, X_val, y_val, X_test, y_test, file_paths_test, feature_dim):
     if not TORCH_AVAILABLE:
@@ -474,8 +564,8 @@ def train_pytorch_model(X_train, y_train, X_val, y_val, X_test, y_test, file_pat
     val_dataset = GraphDataset(torch.FloatTensor(X_val), torch.FloatTensor(y_val))
     test_dataset = GraphDataset(torch.FloatTensor(X_test), torch.FloatTensor(y_test))
     
-    batch_size = 32  # Smaller batch size for gradient accumulation
-    accumulation_steps = 4  # Effective batch size = 32 * 4 = 128
+    batch_size = 16
+    accumulation_steps = 8  # Effective batch size = 16 * 8 = 128
     
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size)
@@ -486,7 +576,7 @@ def train_pytorch_model(X_train, y_train, X_val, y_val, X_test, y_test, file_pat
     num_lstm_layers = 3
     num_transformer_layers = 2
     num_heads = 8
-    dropout = 0.3
+    dropout = 0.4
     
     model = TransformerLSTMExecutionTimePredictor(
         input_size, hidden_size, num_lstm_layers, num_transformer_layers, num_heads, dropout
@@ -495,18 +585,20 @@ def train_pytorch_model(X_train, y_train, X_val, y_val, X_test, y_test, file_pat
     print(f"Model input size: {input_size}")
     print(model)
     
-    optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=5e-4)
-    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2, eta_min=1e-5)
+    optimizer = Ranger(model.parameters(), lr=0.001, weight_decay=1e-3)
+    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2, eta_min=5e-6)
+    
+    scaler = GradScaler() if device.type == 'cuda' else None
     
     best_val_loss = float('inf')
     early_stop_counter = 0
-    num_epochs = 300
-    patience = 50
+    num_epochs = 400
+    patience = 60
     train_losses = []
     val_losses = []
     
-    warmup_epochs = 10
-    initial_lr = 1e-4
+    warmup_epochs = 15
+    initial_lr = 5e-5
     for param_group in optimizer.param_groups:
         param_group['lr'] = initial_lr
     
@@ -516,15 +608,30 @@ def train_pytorch_model(X_train, y_train, X_val, y_val, X_test, y_test, file_pat
         optimizer.zero_grad()
         for i, (features, targets) in enumerate(train_loader):
             features, targets = features.to(device), targets.to(device)
-            outputs = model(features)
-            loss = custom_loss(outputs, targets)
-            loss = loss / accumulation_steps
-            loss.backward()
             
-            if (i + 1) % accumulation_steps == 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
-                optimizer.step()
-                optimizer.zero_grad()
+            if scaler:
+                with autocast():
+                    outputs = model(features)
+                    loss = custom_loss(outputs, targets)
+                    loss = loss / accumulation_steps
+                scaler.scale(loss).backward()
+                
+                if (i + 1) % accumulation_steps == 0:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad()
+            else:
+                outputs = model(features)
+                loss = custom_loss(outputs, targets)
+                loss = loss / accumulation_steps
+                loss.backward()
+                
+                if (i + 1) % accumulation_steps == 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+                    optimizer.step()
+                    optimizer.zero_grad()
             
             train_loss += loss.item() * accumulation_steps
         
@@ -636,8 +743,9 @@ def main(debug=True, max_files=None):
         return
     
     execution_times = np.array(all_execution_times, dtype=np.float32)
-    upper_limit = np.percentile(execution_times, 99.5)  # Tighter outlier clipping
-    valid_indices = execution_times <= upper_limit
+    upper_limit = np.percentile(execution_times, 99)
+    lower_limit = np.percentile(execution_times, 1)
+    valid_indices = (execution_times <= upper_limit) & (execution_times >= lower_limit)
     all_features = [f for f, v in zip(all_features, valid_indices) if v]
     execution_times = execution_times[valid_indices]
     file_paths = [p for p, v in zip(file_paths, valid_indices) if v]
@@ -672,7 +780,7 @@ def main(debug=True, max_files=None):
     X_val_reshaped = X_val.reshape(-1, feature_dim)
     X_test_reshaped = X_test.reshape(-1, feature_dim)
     
-    scaler = RobustScaler(quantile_range=(5.0, 95.0))  # Even wider quantile range
+    scaler = RobustScaler(quantile_range=(2.5, 97.5))
     X_train_reshaped = scaler.fit_transform(X_train_reshaped)
     X_val_reshaped = scaler.transform(X_val_reshaped)
     X_test_reshaped = scaler.transform(X_test_reshaped)
