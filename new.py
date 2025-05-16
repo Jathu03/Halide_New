@@ -4,31 +4,28 @@ import numpy as np
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 import random
-from sklearn.preprocessing import StandardScaler, RobustScaler
+from sklearn.preprocessing import RobustScaler
 from sklearn.model_selection import train_test_split
 import sys
 
-# First, ensure PyTorch is installed
+# Try importing PyTorch but don't attempt to install it automatically
 try:
     import torch
     import torch.nn as nn
     import torch.optim as optim
     from torch.utils.data import DataLoader, Dataset
+    TORCH_AVAILABLE = True
 except ImportError:
-    print("PyTorch is not installed. Installing now...")
-    import subprocess
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "torch"])
-    import torch
-    import torch.nn as nn
-    import torch.optim as optim
-    from torch.utils.data import DataLoader, Dataset
+    print("PyTorch is not available. Some functionality will be limited.")
+    TORCH_AVAILABLE = False
 
 # Set random seeds for reproducibility
-torch.manual_seed(42)
 np.random.seed(42)
 random.seed(42)
+if TORCH_AVAILABLE:
+    torch.manual_seed(42)
 
-class GraphDataset(Dataset):
+class GraphDataset:
     def __init__(self, features, execution_times):
         self.features = features
         self.execution_times = execution_times
@@ -39,8 +36,11 @@ class GraphDataset(Dataset):
     def __getitem__(self, idx):
         return self.features[idx], self.execution_times[idx]
 
-class ImprovedLSTMExecutionTimePredictor(nn.Module):
+class ImprovedLSTMExecutionTimePredictor:
     def __init__(self, input_size, hidden_size=256, num_layers=3, dropout=0.3, bidirectional=True):
+        if not TORCH_AVAILABLE:
+            raise ImportError("PyTorch is required for this model")
+            
         super(ImprovedLSTMExecutionTimePredictor, self).__init__()
         self.hidden_size = hidden_size
         self.num_layers = num_layers
@@ -127,20 +127,21 @@ def examine_json_structure(file_path):
         node_structure = {}
         if num_nodes > 0:
             if has_without_extern:
-                first_node = without_extern["nodes"][0] if isinstance(without_extern["nodes"], list) else without_extern["nodes"]
+                first_node = without_extern["nodes"][0] if isinstance(without_extern["nodes"], list) and len(without_extern["nodes"]) > 0 else {}
             else:
-                first_node = json_data["nodes"][0] if isinstance(json_data["nodes"], list) else json_data["nodes"]
+                first_node = json_data["nodes"][0] if isinstance(json_data["nodes"], list) and len(json_data["nodes"]) > 0 else {}
                 
-            node_structure = {key: type(value).__name__ for key, value in first_node.items()}
-            
-            # Check stages structure
-            if "stages" in first_node:
-                if isinstance(first_node["stages"], list):
-                    node_structure["stages"] = f"list[{len(first_node['stages'])}]"
-                    if first_node["stages"]:
-                        node_structure["stages_keys"] = list(first_node["stages"][0].keys()) if isinstance(first_node["stages"][0], dict) else "Not a dict"
-                else:
-                    node_structure["stages"] = type(first_node["stages"]).__name__
+            if isinstance(first_node, dict):
+                node_structure = {key: type(value).__name__ for key, value in first_node.items()}
+                
+                # Check stages structure
+                if "stages" in first_node:
+                    if isinstance(first_node["stages"], list):
+                        node_structure["stages"] = f"list[{len(first_node['stages'])}]"
+                        if first_node["stages"] and isinstance(first_node["stages"][0], dict):
+                            node_structure["stages_keys"] = list(first_node["stages"][0].keys())
+                    else:
+                        node_structure["stages"] = type(first_node["stages"]).__name__
         
         return {
             "has_without_extern": has_without_extern,
@@ -222,8 +223,8 @@ def extract_features_from_json(json_data, debug=False):
         stages = node.get("stages", [])
         if stages:
             # Check if stages is a list or dictionary
-            if isinstance(stages, list) and stages:
-                first_stage = stages[0] if isinstance(stages[0], dict) else stages
+            if isinstance(stages, list) and len(stages) > 0:
+                first_stage = stages[0]
             elif isinstance(stages, dict):
                 first_stage = stages
             else:
@@ -449,12 +450,13 @@ def pad_sequences(sequences, max_length=None):
     
     return np.array(padded_sequences)
 
-def augment_data(features, execution_times):
+def augment_data(features, execution_times, file_paths):
     """
     Generate synthetic samples for underrepresented execution time ranges
     """
     augmented_features = []
     augmented_times = []
+    augmented_paths = []
     
     # Find samples with high execution times (outliers)
     high_time_indices = np.where(execution_times > np.percentile(execution_times, 90))[0]
@@ -467,74 +469,24 @@ def augment_data(features, execution_times):
             noise = np.random.normal(0, noise_scale, features[idx].shape)
             augmented_features.append(features[idx] + noise)
             augmented_times.append(execution_times[idx] * np.random.uniform(0.95, 1.05))
+            augmented_paths.append(file_paths[idx] + f"_augmented_{i}")
     
     # Combine original and augmented data
     if augmented_features:
-        return np.vstack([features, np.array(augmented_features)]), np.concatenate([execution_times, np.array(augmented_times)])
+        return np.vstack([features, np.array(augmented_features)]), \
+               np.concatenate([execution_times, np.array(augmented_times)]), \
+               file_paths + augmented_paths
     else:
-        return features, execution_times
+        return features, execution_times, file_paths
 
-def main(debug=True, max_files=None):
+def train_pytorch_model(X_train, y_train, X_val, y_val, X_test, y_test, file_paths_test, feature_dim):
+    if not TORCH_AVAILABLE:
+        print("PyTorch is not available. Skipping model training.")
+        return
+    
     # Set device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
-    
-    # Process data
-    root_dir = "Graph_Output"
-    all_features, all_execution_times, file_paths = process_data_directory(root_dir, debug=debug, max_files=max_files)
-    
-    if not all_features:
-        print("No valid data found. Exiting.")
-        return
-    
-    # Pad sequences to the same length
-    padded_features = pad_sequences(all_features)
-    print(f"Padded features shape: {padded_features.shape}")
-    
-    # Convert to numpy arrays
-    execution_times = np.array(all_execution_times, dtype=np.float32)
-    print(f"Execution times shape: {execution_times.shape}")
-    print(f"Execution times range: {execution_times.min()} to {execution_times.max()}")
-    
-    # Augment data to handle outliers better
-    padded_features, execution_times = augment_data(padded_features, execution_times)
-    print(f"After augmentation - Features shape: {padded_features.shape}, Execution times shape: {execution_times.shape}")
-    
-    # Log transform execution times (often helps with skewed distributions)
-    log_execution_times = np.log1p(execution_times)
-    
-    # Split data into train, validation, and test sets
-    test_size = min(20, len(padded_features) // 5)  # Use at most 20 samples or 20% for testing
-    
-    X_train_val, X_test, y_train_val, y_test, paths_train_val, paths_test = train_test_split(
-        padded_features, log_execution_times, file_paths, test_size=test_size, random_state=42
-    )
-    
-    X_train, X_val, y_train, y_val = train_test_split(
-        X_train_val, y_train_val, test_size=0.2, random_state=42
-    )
-    
-    print(f"Training set size: {X_train.shape}")
-    print(f"Validation set size: {X_val.shape}")
-    print(f"Test set size: {X_test.shape}")
-    
-    # Use RobustScaler instead of StandardScaler to handle outliers better
-    feature_dim = X_train.shape[2]
-    
-    # Reshape for scaling
-    X_train_reshaped = X_train.reshape(-1, feature_dim)
-    X_val_reshaped = X_val.reshape(-1, feature_dim)
-    X_test_reshaped = X_test.reshape(-1, feature_dim)
-    
-    scaler = RobustScaler()
-    X_train_reshaped = scaler.fit_transform(X_train_reshaped)
-    X_val_reshaped = scaler.transform(X_val_reshaped)
-    X_test_reshaped = scaler.transform(X_test_reshaped)
-    
-    # Reshape back
-    X_train = X_train_reshaped.reshape(X_train.shape)
-    X_val = X_val_reshaped.reshape(X_val.shape)
-    X_test = X_test_reshaped.reshape(X_test.shape)
     
     # Create datasets and dataloaders
     train_dataset = GraphDataset(torch.FloatTensor(X_train), torch.FloatTensor(y_train))
@@ -653,7 +605,7 @@ def main(debug=True, max_files=None):
     
     # Print test file results
     print("\nTest File Predictions:")
-    for i, (pred, actual, error, path) in enumerate(zip(predictions_original, actuals_original, percentage_errors, paths_test)):
+    for i, (pred, actual, error, path) in enumerate(zip(predictions_original, actuals_original, percentage_errors, file_paths_test)):
         print(f"{i+1}. {os.path.basename(path)}: Predicted={pred:.2f}ms, Actual={actual:.2f}ms, Error={error:.2f}%")
     
     # Plot results
@@ -690,6 +642,74 @@ def main(debug=True, max_files=None):
     plt.tight_layout()
     plt.savefig('execution_time_prediction_results_improved.png')
     plt.show()
+    
+    return model, predictions_original, actuals_original
+
+def main(debug=True, max_files=None):
+    # Process data
+    root_dir = "Graph_Output"
+    all_features, all_execution_times, file_paths = process_data_directory(root_dir, debug=debug, max_files=max_files)
+    
+    if not all_features:
+        print("No valid data found. Exiting.")
+        return
+    
+    # Pad sequences to the same length
+    padded_features = pad_sequences(all_features)
+    print(f"Padded features shape: {padded_features.shape}")
+    
+    # Convert to numpy arrays
+    execution_times = np.array(all_execution_times, dtype=np.float32)
+    print(f"Execution times shape: {execution_times.shape}")
+    print(f"Execution times range: {execution_times.min()} to {execution_times.max()}")
+    
+    # Augment data to handle outliers better
+    padded_features, execution_times, file_paths = augment_data(padded_features, execution_times, file_paths)
+    print(f"After augmentation - Features shape: {padded_features.shape}, Execution times shape: {execution_times.shape}, Paths count: {len(file_paths)}")
+    
+    # Log transform execution times (often helps with skewed distributions)
+    log_execution_times = np.log1p(execution_times)
+    
+    # Split data into train, validation, and test sets
+    test_size = min(20, len(padded_features) // 5)  # Use at most 20 samples or 20% for testing
+    
+    X_train_val, X_test, y_train_val, y_test, paths_train_val, paths_test = train_test_split(
+        padded_features, log_execution_times, file_paths, test_size=test_size, random_state=42
+    )
+    
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_train_val, y_train_val, test_size=0.2, random_state=42
+    )
+    
+    print(f"Training set size: {X_train.shape}")
+    print(f"Validation set size: {X_val.shape}")
+    print(f"Test set size: {X_test.shape}")
+    
+    # Use RobustScaler instead of StandardScaler to handle outliers better
+    feature_dim = X_train.shape[2]
+    
+    # Reshape for scaling
+    X_train_reshaped = X_train.reshape(-1, feature_dim)
+    X_val_reshaped = X_val.reshape(-1, feature_dim)
+    X_test_reshaped = X_test.reshape(-1, feature_dim)
+    
+    scaler = RobustScaler()
+    X_train_reshaped = scaler.fit_transform(X_train_reshaped)
+    X_val_reshaped = scaler.transform(X_val_reshaped)
+    X_test_reshaped = scaler.transform(X_test_reshaped)
+    
+    # Reshape back
+    X_train = X_train_reshaped.reshape(X_train.shape)
+    X_val = X_val_reshaped.reshape(X_val.shape)
+    X_test = X_test_reshaped.reshape(X_test.shape)
+    
+    if TORCH_AVAILABLE:
+        # Train PyTorch model
+        train_pytorch_model(X_train, y_train, X_val, y_val, X_test, y_test, paths_test, feature_dim)
+    else:
+        print("PyTorch is not available. Skipping model training.")
+        # Here you could implement a fallback model using scikit-learn or another library
+        # For example, a random forest regressor or gradient boosting model
 
 if __name__ == "__main__":
     main(debug=True, max_files=500)  # Increase max_files for better training
