@@ -228,9 +228,13 @@ def prepare_data_for_model(train_features, test_features):
     train_sequences_flat = train_sequences_np.reshape(-1, len(FIXED_FEATURES))
     test_sequences_flat = test_sequences_np.reshape(-1, len(FIXED_FEATURES))
     
+    # Create DataFrame for sequences to retain feature names
+    train_sequences_df = pd.DataFrame(train_sequences_flat, columns=FIXED_FEATURES)
+    test_sequences_df = pd.DataFrame(test_sequences_flat, columns=FIXED_FEATURES)
+    
     scaler_X_seq = RobustScaler()
-    train_sequences_scaled = scaler_X_seq.fit_transform(train_sequences_flat)
-    test_sequences_scaled = scaler_X_seq.transform(test_sequences_flat)
+    train_sequences_scaled = scaler_X_seq.fit_transform(train_sequences_df)
+    test_sequences_scaled = scaler_X_seq.transform(test_sequences_df)
     
     train_sequences_padded = torch.FloatTensor(train_sequences_scaled).view(len(train_features), sequence_length, -1)
     test_sequences_padded = torch.FloatTensor(test_sequences_scaled).view(len(test_features), sequence_length, -1)
@@ -338,7 +342,9 @@ def prepare_single_file(file_path, scaler_X_seq, scaler_X_scalar, seq_input_size
         sequence_length = 3
         sequence = np.array([[features.get(key, 0.0) for key in FIXED_FEATURES]] * sequence_length)
         sequence_np = sequence.reshape(-1, len(FIXED_FEATURES))
-        sequence_scaled = scaler_X_seq.transform(sequence_np)
+        # Create DataFrame to retain feature names
+        sequence_df = pd.DataFrame(sequence_np, columns=FIXED_FEATURES)
+        sequence_scaled = scaler_X_seq.transform(sequence_df)
         sequence_padded = torch.FloatTensor(sequence_scaled).view(1, sequence_length, -1)
         
         scalar_df = pd.DataFrame([features])
@@ -704,14 +710,16 @@ def train(main_dir):
     
     scaler_node_params = {
         'center': scaler_X_seq.center_.tolist(),
-        'scale': scaler_X_seq.scale_.tolist()
+        'scale': scaler_X_seq.scale_.tolist(),
+        'feature_names': FIXED_FEATURES
     }
     with open('scaler_node_params.json', 'w') as f:
         json.dump(scaler_node_params, f)
     
     scaler_scalar_params = {
         'center': scaler_X_scalar.center_.tolist(),
-        'scale': scaler_X_scalar.scale_.tolist()
+        'scale': scaler_X_scalar.scale_.tolist(),
+        'feature_names': list(feature_columns)
     }
     with open('scaler_scalar_params.json', 'w') as f:
         json.dump(scaler_scalar_params, f)
@@ -787,10 +795,12 @@ def train(main_dir):
         print("Training failed due to invalid values")
         return None
     
+    # Trace model on the appropriate device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model.to(device)
     model.eval()
-    model.to(torch.device('cpu'))
-    example_seq = torch.randn(1, 3, seq_input_size)
-    example_scalar = torch.randn(1, scalar_input_size)
+    example_seq = torch.randn(1, 3, seq_input_size).to(device)
+    example_scalar = torch.randn(1, scalar_input_size).to(device)
     scripted_model = torch.jit.trace(model, (example_seq, example_scalar))
     scripted_model.save("model.pt")
     print("Model saved to model.pt as TorchScript module")
@@ -822,12 +832,14 @@ def inference(file_path, model_path='model.pt'):
         scaler_X_seq = RobustScaler()
         scaler_X_seq.center_ = np.array(scaler_node_params['center'])
         scaler_X_seq.scale_ = np.array(scaler_node_params['scale'])
+        scaler_X_seq.feature_names_in_ = np.array(scaler_node_params['feature_names'])
         
         with open('scaler_scalar_params.json', 'r') as f:
             scaler_scalar_params = json.load(f)
         scaler_X_scalar = RobustScaler()
         scaler_X_scalar.center_ = np.array(scaler_scalar_params['center'])
         scaler_X_scalar.scale_ = np.array(scaler_scalar_params['scale'])
+        scaler_X_scalar.feature_names_in_ = np.array(scaler_scalar_params['feature_names'])
         
         with open('scaler_y_params.json', 'r') as f:
             scaler_y_params = json.load(f)
@@ -836,7 +848,8 @@ def inference(file_path, model_path='model.pt'):
         y_scaler.scale_ = np.array(scaler_y_params['scale'])
         
         # Load model
-        model = torch.jit.load(model_path)
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        model = torch.jit.load(model_path, map_location=device)
         model.eval()
         
         # Perform inference
