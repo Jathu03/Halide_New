@@ -12,8 +12,9 @@ import random
 from collections import defaultdict
 import matplotlib.pyplot as plt
 import time
+import argparse
 
-# Define fixed set of features (adapted from Tree_Output, compatible with Graph_Output)
+# Define fixed set of features
 FIXED_FEATURES = [
     'cache_hits', 'cache_misses', 'execution_time_ms', 'sched_num_realizations',
     'sched_num_productions', 'sched_points_computed_total', 'sched_inner_parallelism',
@@ -32,10 +33,9 @@ FIXED_FEATURES = [
     'memory_pointwise_0', 'memory_pointwise_1', 'memory_pointwise_2', 'memory_pointwise_3'
 ]
 
-# Feature extraction function for converted_function_graph.json
+# Feature extraction function
 def extract_features(json_data):
     try:
-        # Validate JSON structure
         if not isinstance(json_data, dict) or 'without_extern' not in json_data:
             return None
         without_extern = json_data['without_extern']
@@ -43,24 +43,21 @@ def extract_features(json_data):
             return None
         global_features = without_extern['global_features']
         
-        # Extract and validate execution time
         execution_time_ms = global_features.get('execution_time_ms', None)
         if execution_time_ms is None or not isinstance(execution_time_ms, (int, float)) or execution_time_ms <= 0:
             return None
         
         features = {}
-        features['execution_time_ms'] = float(execution_time_ms)  # Keep in milliseconds
+        features['execution_time_ms'] = float(execution_time_ms)
         features['cache_hits'] = global_features.get('cache_hits', 0)
         features['cache_misses'] = global_features.get('cache_misses', 0)
         
-        # Extract node and edge counts
         nodes = without_extern.get('nodes', [])
         edges = without_extern.get('edges', [])
         features['nodes_count'] = len(nodes)
         features['edges_count'] = len(edges)
         features['node_edge_ratio'] = features['nodes_count'] / (features['edges_count'] + 1e-8)
         
-        # Extract operation counts
         op_counts = defaultdict(int)
         memory_patterns = defaultdict(lambda: [0, 0, 0, 0])
         
@@ -74,7 +71,7 @@ def extract_features(json_data):
                 
                 mem_access = pipeline_features.get('memory_access_patterns', {}).get('Float', {})
                 for pattern, values in mem_access.items():
-                    for i, val in enumerate(values[:4]):  # Ensure max 4 dimensions
+                    for i, val in enumerate(values[:4]):
                         memory_patterns[pattern][i] += val
         
         features.update(op_counts)
@@ -82,7 +79,6 @@ def extract_features(json_data):
             for i, val in enumerate(values):
                 features[f'memory_{pattern.lower()}_{i}'] = val
         
-        # Extract scheduling features
         scheduling_features = []
         for node in nodes:
             stages = node.get('stages', [])
@@ -118,7 +114,6 @@ def extract_features(json_data):
         
         features['op_diversity'] = len([k for k, v in op_counts.items() if v > 0])
         
-        # Create additional derived features
         features['computation_efficiency'] = (features['sched_points_computed_total'] / 
                                             (features['execution_time_ms'] + 1e-8))
         features['bytes_processing_rate'] = (features['total_bytes_at_production'] / 
@@ -126,19 +121,18 @@ def extract_features(json_data):
         features['memory_utilization_ratio'] = (features['sched_working_set'] / 
                                               (features['sched_bytes_at_production'] + 1e-8))
         
-        # Create fixed-length feature vector
         fixed_features = {key: features.get(key, 0.0) for key in FIXED_FEATURES}
         return fixed_features
     
     except Exception:
-        return None  # Skip files that cause any errors
+        return None
 
-# Process Graph_Output directory
+# Process directory
 def process_graph_output_directory(main_dir):
     all_features = []
     file_names = []
     invalid_files = []
-    max_file_size = 100 * 1024 * 1024  # 100 MB limit
+    max_file_size = 100 * 1024 * 1024
     total_files_found = 0
     processed_files = 0
     start_time = time.time()
@@ -158,7 +152,6 @@ def process_graph_output_directory(main_dir):
                     total_files_found += 1
                     file_path = os.path.join(root, file)
                     try:
-                        # Check file size
                         file_size = os.path.getsize(file_path)
                         if file_size > max_file_size:
                             invalid_files.append(file_path)
@@ -187,18 +180,11 @@ def process_graph_output_directory(main_dir):
     
     print(f"Total files found: {total_files_found}")
     print(f"Total valid files found: {len(all_features)}")
-    print(f"Files skipped due to invalid execution times or errors: {len(invalid_files)}")
-    
-    if not total_files_found:
-        print(f"No converted_function_graph.json files found in {main_dir_path}")
-        return [], [], []
+    print(f"Files skipped: {len(invalid_files)}")
     
     if not all_features:
-        print(f"No valid JSON files with valid execution times found in {main_dir_path}. Check {log_file_path} for details.")
+        print(f"No valid JSON files found. Check {log_file_path} for details.")
         return [], [], []
-    
-    if len(all_features) < 50:
-        print(f"Warning: Expected at least 50 valid files, found {len(all_features)}. Proceeding with available data.")
     
     combined = list(zip(all_features, file_names))
     random.shuffle(combined)
@@ -215,52 +201,40 @@ def process_graph_output_directory(main_dir):
     
     return train_features, test_features, list(test_file_names)
 
-# Prepare data for model
+# Prepare data
 def prepare_data_for_model(train_features, test_features):
     if not train_features or not test_features:
-        print("No valid features provided for model preparation.")
+        print("No valid features provided.")
         return None
     
-    important_features = [
-        'cache_hits', 'bytes_processing_rate', 'sched_bytes_at_task',
-        'sched_bytes_at_realization', 'total_bytes_at_production', 'sched_bytes_at_production'
-    ]
-    
-    # Create sequences with fixed features
     sequence_length = 3
     train_sequences = [np.array([[features.get(key, 0.0) for key in FIXED_FEATURES]] * sequence_length) for features in train_features]
     test_sequences = [np.array([[features.get(key, 0.0) for key in FIXED_FEATURES]] * sequence_length) for features in test_features]
     
-    # Convert to numpy for scaling
     train_sequences_np = np.array(train_sequences)
     test_sequences_np = np.array(test_sequences)
     train_sequences_flat = train_sequences_np.reshape(-1, len(FIXED_FEATURES))
     test_sequences_flat = test_sequences_np.reshape(-1, len(FIXED_FEATURES))
     
-    # Scale sequence features
     scaler_X_seq = RobustScaler()
     train_sequences_scaled = scaler_X_seq.fit_transform(train_sequences_flat)
     test_sequences_scaled = scaler_X_seq.transform(test_sequences_flat)
     
-    # Reshape back to tensor
     train_sequences_padded = torch.FloatTensor(train_sequences_scaled).view(len(train_features), sequence_length, -1)
     test_sequences_padded = torch.FloatTensor(test_sequences_scaled).view(len(test_features), sequence_length, -1)
     
-    # Create scalar features DataFrame
     train_scalar_df = pd.DataFrame(train_features)
     test_scalar_df = pd.DataFrame(test_features)
     
-    # Drop low-importance features
     low_importance_features = [
         'op_eq', 'nodes_count', 'sched_outer_parallelism', 'op_le', 'node_edge_ratio',
         'memory_pressure', 'op_let', 'bytes_per_vector', 'sched_working_set', 'sched_num_realizations',
-        'computation_efficiency', 'avg_ops_per_node', 'memory_utilization_ratio', 'sched_num_scalars',
+        'computation_efficiency', 'memory_utilization_ratio', 'sched_num_scalars',
         'cache_misses', 'bytes_per_parallelism', 'op_mul'
     ]
     train_scalar_df = train_scalar_df.drop(columns=[col for col in low_importance_features if col in train_scalar_df.columns])
     test_scalar_df = test_scalar_df.drop(columns=[col for col in low_importance_features if col in test_scalar_df.columns])
     
-    # Log transform skewed features
     skewed_features = ['cache_hits', 'bytes_processing_rate', 'sched_bytes_at_task', 'computation_efficiency']
     for feature in skewed_features:
         if feature in train_scalar_df.columns:
@@ -272,12 +246,10 @@ def prepare_data_for_model(train_features, test_features):
     train_scalar_df = train_scalar_df.fillna(0)
     test_scalar_df = test_scalar_df.fillna(0)
     
-    # Remove constant columns
     constant_columns = [col for col in train_scalar_df.columns if train_scalar_df[col].nunique() == 1]
     train_scalar_df = train_scalar_df.drop(columns=constant_columns)
     test_scalar_df = test_scalar_df.drop(columns=constant_columns)
     
-    # Extract execution times (in milliseconds)
     y_train_raw = np.array([f['execution_time_ms'] for f in train_features])
     y_test_raw = np.array([f['execution_time_ms'] for f in test_features])
     y_train_raw = np.clip(y_train_raw, 0, np.percentile(y_train_raw, 99))
@@ -286,7 +258,6 @@ def prepare_data_for_model(train_features, test_features):
     y_train = np.log1p(y_train_raw).reshape(-1, 1)
     y_test = np.log1p(y_test_raw).reshape(-1, 1)
     
-    # Scale scalar features and targets
     scaler_X_scalar = RobustScaler()
     scaler_y = RobustScaler()
     
@@ -300,7 +271,6 @@ def prepare_data_for_model(train_features, test_features):
     y_train_scaled = np.nan_to_num(y_train_scaled, nan=0.0)
     y_test_scaled = np.nan_to_num(y_test_scaled, nan=0.0)
     
-    # Data augmentation for significant features
     train_sequences_aug = []
     train_scalar_aug = []
     y_train_aug = []
@@ -343,7 +313,36 @@ def prepare_data_for_model(train_features, test_features):
             test_sequences_padded, test_scalar_tensor, y_test_tensor,
             scaler_y, scaler_X_seq, scaler_X_scalar, train_sequences_padded.shape[2], train_scalar_tensor.shape[1], train_scalar_df.columns)
 
-# Multi-Head Attention mechanism
+# Preprocess a single JSON file
+def preprocess_single_json(json_file, metadata, scaler_X_seq, scaler_X_scalar):
+    with open(json_file, 'r') as f:
+        json_data = json.load(f)
+    features = extract_features(json_data)
+    if features is None:
+        print(f"Invalid JSON file: {json_file}")
+        return None
+    
+    seq_features = [features.get(key, 0.0) for key in FIXED_FEATURES]
+    seq_array = np.array([seq_features] * 3)
+    seq_scaled = scaler_X_seq.transform(seq_array.reshape(-1, len(FIXED_FEATURES)))
+    seq_tensor = torch.FloatTensor(seq_scaled).view(1, 3, -1)
+    
+    scalar_df = pd.DataFrame([features])
+    low_importance_features = metadata['dropped_features']
+    scalar_df = scalar_df.drop(columns=[col for col in low_importance_features if col in scalar_df.columns])
+    skewed_features = metadata['skewed_features']
+    for feature in skewed_features:
+        if feature in scalar_df.columns:
+            scalar_df[f'log_{feature}'] = np.log1p(scalar_df[feature])
+            scalar_df = scalar_df.drop(columns=[feature])
+    scalar_df = scalar_df.fillna(0)
+    scalar_scaled = scaler_X_scalar.transform(scalar_df)
+    scalar_scaled = np.nan_to_num(scalar_scaled, nan=0.0)
+    scalar_tensor = torch.FloatTensor(scalar_scaled)
+    
+    return seq_tensor, scalar_tensor
+
+# Multi-Head Attention
 class MultiHeadAttention(nn.Module):
     def __init__(self, hidden_size, num_heads, dropout_rate=0.1):
         super(MultiHeadAttention, self).__init__()
@@ -356,14 +355,14 @@ class MultiHeadAttention(nn.Module):
         self.value = nn.Linear(hidden_size, hidden_size)
         self.fc_out = nn.Linear(hidden_size, hidden_size)
         self.dropout = nn.Dropout(dropout_rate)
-        self.scale = torch.sqrt(torch.FloatTensor([self.head_dim]))
+        self.register_buffer('scale', torch.sqrt(torch.FloatTensor([self.head_dim])))
     
     def forward(self, x):
         batch_size = x.shape[0]
         Q = self.query(x).view(batch_size, -1, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
         K = self.key(x).view(batch_size, -1, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
         V = self.value(x).view(batch_size, -1, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
-        energy = torch.matmul(Q, K.transpose(-1, -2)) / self.scale.to(x.device)
+        energy = torch.matmul(Q, K.transpose(-1, -2)) / self.scale
         attention = torch.softmax(energy, dim=-1)
         attention = self.dropout(attention)
         out = torch.matmul(attention, V).permute(0, 2, 1, 3).contiguous()
@@ -371,7 +370,7 @@ class MultiHeadAttention(nn.Module):
         out = self.fc_out(out)
         return out
 
-# Simple LSTM Model with Attention
+# LSTM Model
 class SimpleLSTMModel(nn.Module):
     def __init__(self, seq_input_size, scalar_input_size, hidden_sizes=[512, 256, 128], output_size=1, dropout_rate=0.2, num_heads=8, use_attention=True):
         super(SimpleLSTMModel, self).__init__()
@@ -379,18 +378,15 @@ class SimpleLSTMModel(nn.Module):
         self.lstm_layers = nn.ModuleList()
         self.ln_layers = nn.ModuleList()
         
-        # Define LSTM layers
         self.lstm_layers.append(nn.LSTM(seq_input_size, hidden_sizes[0], batch_first=True, bidirectional=True))
         self.ln_layers.append(nn.LayerNorm(hidden_sizes[0] * 2))
         for i in range(1, len(hidden_sizes)):
             self.lstm_layers.append(nn.LSTM(hidden_sizes[i-1] * 2, hidden_sizes[i], batch_first=True, bidirectional=True))
             self.ln_layers.append(nn.LayerNorm(hidden_sizes[i] * 2))
         
-        # Attention layer
         if self.use_attention:
             self.attention = MultiHeadAttention(hidden_sizes[-1] * 2, num_heads, dropout_rate)
         
-        # Fully connected layers
         combined_size = hidden_sizes[-1] * 2 + scalar_input_size
         self.fc1 = nn.Linear(combined_size, 256)
         self.bn1 = nn.BatchNorm1d(256)
@@ -441,7 +437,7 @@ class SimpleLSTMModel(nn.Module):
         output = self.output_layer(x)
         return output
 
-# Custom loss function
+# Custom loss
 def custom_loss(outputs, targets, scalar_inputs, feature_indices, feature_importances, huber_delta=0.5, mae_weight=0.3, l1_lambda=1e-5):
     huber = nn.HuberLoss(delta=huber_delta)(outputs, targets)
     mae = torch.mean(torch.abs(outputs - targets))
@@ -462,7 +458,7 @@ def custom_loss(outputs, targets, scalar_inputs, feature_indices, feature_import
     weighted_mae = (mae * weights).mean()
     return weighted_huber + mae_weight * weighted_mae + l1_reg
 
-# Create data loaders
+# Data loaders
 def create_data_loaders(train_sequences, train_scalar, y_train, test_sequences, test_scalar, y_test, batch_size=64):
     train_dataset = TensorDataset(train_sequences, train_scalar, y_train)
     test_dataset = TensorDataset(test_sequences, test_scalar, y_test)
@@ -471,7 +467,7 @@ def create_data_loaders(train_sequences, train_scalar, y_train, test_sequences, 
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
     return train_loader, test_loader
 
-# Train the model
+# Train model
 def train_model(model, train_loader, test_loader, criterion, optimizer, feature_indices, feature_importances, num_epochs=1000, patience=50, accumulation_steps=2):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
@@ -568,7 +564,7 @@ def train_model(model, train_loader, test_loader, criterion, optimizer, feature_
     
     return train_losses, val_losses
 
-# Evaluate the model
+# Evaluate model
 def evaluate_model(model, X_test_seq, X_test_scalar, y_test, y_scaler, file_names_test):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.to(device)
@@ -622,143 +618,191 @@ def evaluate_model(model, X_test_seq, X_test_scalar, y_test, y_scaler, file_name
     
     return y_test_actual, y_pred_actual
 
-# Main function
-def main(main_dir):
-    if torch.cuda.is_available():
-        torch.cuda.init()
-        print(f"CUDA initialized. Using GPU: {torch.cuda.get_device_name(0)}")
-    else:
-        print("CUDA not available. Using CPU.")
+# Main function with mode selection
+def main():
+    parser = argparse.ArgumentParser(description="LSTM Model for Execution Time Prediction")
+    parser.add_argument("mode", choices=["T", "P"], help="Mode: T for training, P for prediction")
+    parser.add_argument("--main_dir", default="/home/kowrisaan/jathu/Halide_New/Graph/Graph_Output", help="Main directory for training data")
+    parser.add_argument("--json_file", help="Path to JSON file for prediction")
     
-    print(f"Processing main directory: {main_dir}")
-    train_features, test_features, test_file_names = process_graph_output_directory(main_dir)
+    args = parser.parse_args()
     
-    if not train_features or not test_file_names:
-        print("Error: No valid training or test data found. Exiting.")
-        return None
-    
-    data = prepare_data_for_model(train_features, test_features)
-    if data is None:
-        print("Error: Failed to prepare data for model. Exiting.")
-        return None
-    
-    (train_sequences, train_scalar, y_train,
-     test_sequences, test_scalar, y_test,
-     y_scaler, scaler_X_seq, scaler_X_scalar, seq_input_size, scalar_input_size, feature_columns) = data
-    
-    # Save scaler parameters
-    scaler_node_params = {
-        'center': scaler_X_seq.center_.tolist(),
-        'scale': scaler_X_seq.scale_.tolist()
-    }
-    with open('scaler_node_params.json', 'w') as f:
-        json.dump(scaler_node_params, f)
-    
-    scaler_scalar_params = {
-        'center': scaler_X_scalar.center_.tolist(),
-        'scale': scaler_X_scalar.scale_.tolist()
-    }
-    with open('scaler_scalar_params.json', 'w') as f:
-        json.dump(scaler_scalar_params, f)
-    
-    scaler_y_params = {
-        'center': y_scaler.center_.tolist(),
-        'scale': y_scaler.scale_.tolist()
-    }
-    with open('scaler_y_params.json', 'w') as f:
-        json.dump(scaler_y_params, f)
-    
-    # Save model metadata
-    metadata = {
-        'max_sequence_length': 3,
-        'seq_input_size': seq_input_size,
-        'scalar_input_size': scalar_input_size,
-        'node_features': FIXED_FEATURES,
-        'scalar_features': list(feature_columns),
-        'skewed_features': ['cache_hits', 'bytes_processing_rate', 'sched_bytes_at_task', 'computation_efficiency'],
-        'dropped_features': [
-            'op_eq', 'nodes_count', 'sched_outer_parallelism', 'op_le', 'node_edge_ratio',
-            'memory_pressure', 'op_let', 'bytes_per_vector', 'sched_working_set', 'sched_num_realizations',
-            'computation_efficiency', 'avg_ops_per_node', 'memory_utilization_ratio', 'sched_num_scalars',
-            'cache_misses', 'bytes_per_parallelism', 'op_mul'
-        ]
-    }
-    with open('model_metadata.json', 'w') as f:
-        json.dump(metadata, f)
-    
-    train_loader, test_loader = create_data_loaders(
-        train_sequences, train_scalar, y_train,
-        test_sequences, test_scalar, y_test,
-        batch_size=64
-    )
-    
-    global model
-    model = SimpleLSTMModel(
-        seq_input_size=seq_input_size,
-        scalar_input_size=scalar_input_size,
-        hidden_sizes=[512, 256, 128],
-        output_size=1,
-        dropout_rate=0.2,
-        num_heads=8,
-        use_attention=True
-    )
-    
-    optimizer = optim.AdamW(model.parameters(), lr=0.00005, weight_decay=1e-4)
-    
-    # Feature importances (aligned with Tree_Output)
-    feature_importances = {
-        'cache_hits': 0.5860,
-        'bytes_processing_rate': 0.2893,
-        'sched_bytes_at_task': 0.0422,
-        'sched_bytes_at_realization': 0.0055,
-        'total_bytes_at_production': 0.0049,
-        'sched_bytes_at_production': 0.0030
-    }
-    
-    feature_indices = {}
-    for feature in feature_importances.keys():
-        log_feature = f'log_{feature}' if feature in ['cache_hits', 'bytes_processing_rate'] else feature
-        if log_feature in feature_columns:
-            feature_indices[feature] = feature_columns.get_loc(log_feature)
-        else:
-            feature_indices[feature] = feature_columns.get_loc(feature) if feature in feature_columns else -1
-    
-    print("Building and training Simple LSTM model...")
-    train_losses, val_losses = train_model(
-        model, train_loader, test_loader,
-        custom_loss, optimizer, feature_indices, feature_importances,
-        num_epochs=1000, patience=50, accumulation_steps=2
-    )
-    
-    if train_losses is None or val_losses is None:
-        print("Training failed due to invalid values")
-        return None
-    
-    # Save the trained model as TorchScript
-    model.eval()
-    model.to(torch.device('cpu'))
-    example_seq = torch.randn(1, 3, seq_input_size)
-    example_scalar = torch.randn(1, scalar_input_size)
-    scripted_model = torch.jit.trace(model, (example_seq, example_scalar))
-    scripted_model.save("model.pt")
-    print("Model saved to model.pt as TorchScript module")
-    
-    print("\nEvaluating model:")
-    y_test_actual, y_pred_actual = evaluate_model(
-        model, test_sequences, test_scalar, y_test,
-        y_scaler, test_file_names
-    )
-    
-    print(f"\nSummary for Comparison:")
-    print(f"Model: SimpleLSTM")
-    
-    return model, y_scaler, y_test_actual, y_pred_actual
-
-if __name__ == "__main__":
-    main_dir = "/home/kowrisaan/jathu/Halide_New/Graph/Graph_Output"
     random.seed(42)
     torch.manual_seed(42)
     np.random.seed(42)
-    result = main(main_dir)
-    if result is None:
-        print("Script failed to complete. Check logs and data directory.")
+    
+    if args.mode == "T":
+        if torch.cuda.is_available():
+            torch.cuda.init()
+            print(f"CUDA initialized. Using GPU: {torch.cuda.get_device_name(0)}")
+        else:
+            print("CUDA not available. Using CPU.")
+        
+        print(f"Processing main directory: {args.main_dir}")
+        train_features, test_features, test_file_names = process_graph_output_directory(args.main_dir)
+        
+        if not train_features or not test_file_names:
+            print("Error: No valid data found. Exiting.")
+            return
+        
+        data = prepare_data_for_model(train_features, test_features)
+        if data is None:
+            print("Error: Failed to prepare data. Exiting.")
+            return
+        
+        (train_sequences, train_scalar, y_train,
+         test_sequences, test_scalar, y_test,
+         y_scaler, scaler_X_seq, scaler_X_scalar, seq_input_size, scalar_input_size, feature_columns) = data
+        
+        scaler_node_params = {
+            'center': scaler_X_seq.center_.tolist(),
+            'scale': scaler_X_seq.scale_.tolist()
+        }
+        with open('scaler_node_params.json', 'w') as f:
+            json.dump(scaler_node_params, f)
+        
+        scaler_scalar_params = {
+            'center': scaler_X_scalar.center_.tolist(),
+            'scale': scaler_X_scalar.scale_.tolist()
+        }
+        with open('scaler_scalar_params.json', 'w') as f:
+            json.dump(scaler_scalar_params, f)
+        
+        scaler_y_params = {
+            'center': y_scaler.center_.tolist(),
+            'scale': y_scaler.scale_.tolist()
+        }
+        with open('scaler_y_params.json', 'w') as f:
+            json.dump(scaler_y_params, f)
+        
+        metadata = {
+            'max_sequence_length': 3,
+            'seq_input_size': seq_input_size,
+            'scalar_input_size': scalar_input_size,
+            'node_features': FIXED_FEATURES,
+            'scalar_features': list(feature_columns),
+            'skewed_features': ['cache_hits', 'bytes_processing_rate', 'sched_bytes_at_task', 'computation_efficiency'],
+            'dropped_features': [
+                'op_eq', 'nodes_count', 'sched_outer_parallelism', 'op_le', 'node_edge_ratio',
+                'memory_pressure', 'op_let', 'bytes_per_vector', 'sched_working_set', 'sched_num_realizations',
+                'computation_efficiency', 'memory_utilization_ratio', 'sched_num_scalars',
+                'cache_misses', 'bytes_per_parallelism', 'op_mul'
+            ]
+        }
+        with open('model_metadata.json', 'w') as f:
+            json.dump(metadata, f)
+        
+        train_loader, test_loader = create_data_loaders(
+            train_sequences, train_scalar, y_train,
+            test_sequences, test_scalar, y_test,
+            batch_size=64
+        )
+        
+        global model
+        model = SimpleLSTMModel(
+            seq_input_size=seq_input_size,
+            scalar_input_size=scalar_input_size,
+            hidden_sizes=[512, 256, 128],
+            output_size=1,
+            dropout_rate=0.2,
+            num_heads=8,
+            use_attention=True
+        )
+        
+        optimizer = optim.AdamW(model.parameters(), lr=0.00005, weight_decay=1e-4)
+        
+        feature_importances = {
+            'cache_hits': 0.5860,
+            'bytes_processing_rate': 0.2893,
+            'sched_bytes_at_task': 0.0422,
+            'sched_bytes_at_realization': 0.0055,
+            'total_bytes_at_production': 0.0049,
+            'sched_bytes_at_production': 0.0030
+        }
+        
+        feature_indices = {}
+        for feature in feature_importances.keys():
+            log_feature = f'log_{feature}' if feature in ['cache_hits', 'bytes_processing_rate'] else feature
+            if log_feature in feature_columns:
+                feature_indices[feature] = feature_columns.get_loc(log_feature)
+            else:
+                feature_indices[feature] = feature_columns.get_loc(feature) if feature in feature_columns else -1
+        
+        print("Building and training Simple LSTM model...")
+        train_losses, val_losses = train_model(
+            model, train_loader, test_loader,
+            custom_loss, optimizer, feature_indices, feature_importances,
+            num_epochs=1000, patience=50, accumulation_steps=2
+        )
+        
+        if train_losses is None or val_losses is None:
+            print("Training failed due to invalid values")
+            return
+        
+        model.eval()
+        model.to(torch.device('cpu'))
+        example_seq = torch.randn(1, 3, seq_input_size)
+        example_scalar = torch.randn(1, scalar_input_size)
+        scripted_model = torch.jit.trace(model, (example_seq, example_scalar))
+        scripted_model.save("model.pt")
+        print("Model saved to model.pt as TorchScript module")
+        
+        print("\nEvaluating model:")
+        y_test_actual, y_pred_actual = evaluate_model(
+            model, test_sequences, test_scalar, y_test,
+            y_scaler, test_file_names
+        )
+        
+        print(f"\nSummary for Comparison:")
+        print(f"Model: SimpleLSTM")
+    
+    elif args.mode == "P":
+        if args.json_file is None:
+            print("Error: JSON file path is required for prediction mode.")
+            return
+        
+        model = torch.jit.load("model.pt")
+        model.eval()
+        
+        with open('model_metadata.json', 'r') as f:
+            metadata = json.load(f)
+        
+        with open('scaler_node_params.json', 'r') as f:
+            scaler_node_params = json.load(f)
+        scaler_X_seq = RobustScaler()
+        scaler_X_seq.center_ = np.array(scaler_node_params['center'])
+        scaler_X_seq.scale_ = np.array(scaler_node_params['scale'])
+        
+        with open('scaler_scalar_params.json', 'r') as f:
+            scaler_scalar_params = json.load(f)
+        scaler_X_scalar = RobustScaler()
+        scaler_X_scalar.center_ = np.array(scaler_scalar_params['center'])
+        scaler_X_scalar.scale_ = np.array(scaler_scalar_params['scale'])
+        
+        with open('scaler_y_params.json', 'r') as f:
+            scaler_y_params = json.load(f)
+        y_scaler = RobustScaler()
+        y_scaler.center_ = np.array(scaler_y_params['center'])
+        y_scaler.scale_ = np.array(scaler_y_params['scale'])
+        
+        seq_tensor, scalar_tensor = preprocess_single_json(args.json_file, metadata, scaler_X_seq, scaler_X_scalar)
+        if seq_tensor is None:
+            return
+        
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        model.to(device)
+        seq_tensor = seq_tensor.to(device)
+        scalar_tensor = scalar_tensor.to(device)
+        
+        with torch.no_grad():
+            y_pred_scaled = model(seq_tensor, scalar_tensor)
+        
+        y_pred_scaled = y_pred_scaled.cpu().numpy()
+        y_pred_transformed = y_scaler.inverse_transform(y_pred_scaled)
+        y_pred_actual = np.expm1(y_pred_transformed)
+        prediction = max(y_pred_actual[0][0], 0)
+        
+        print(f"Predicted execution time for {args.json_file}: {prediction:.2f} ms")
+
+if __name__ == "__main__":
+    main()
