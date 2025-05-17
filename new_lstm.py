@@ -327,20 +327,36 @@ def preprocess_single_json(json_file, metadata, scaler_X_seq, scaler_X_scalar):
     seq_scaled = scaler_X_seq.transform(seq_array.reshape(-1, len(FIXED_FEATURES)))
     seq_tensor = torch.FloatTensor(seq_scaled).view(1, 3, -1)
     
-    scalar_df = pd.DataFrame([features])
-    low_importance_features = metadata['dropped_features']
-    scalar_df = scalar_df.drop(columns=[col for col in low_importance_features if col in scalar_df.columns])
-    skewed_features = metadata['skewed_features']
-    for feature in skewed_features:
-        if feature in scalar_df.columns:
-            scalar_df[f'log_{feature}'] = np.log1p(scalar_df[feature])
-            scalar_df = scalar_df.drop(columns=[feature])
+    # Create DataFrame with only the expected columns from metadata
+    scalar_features = {}
+    for feature in metadata['scalar_features']:
+        if feature.startswith('log_'):
+            base_feature = feature[4:]  # Remove 'log_' prefix
+            if base_feature in features:
+                scalar_features[feature] = np.log1p(features[base_feature])
+        elif feature in features:
+            scalar_features[feature] = features[feature]
+        else:
+            scalar_features[feature] = 0.0  # Default value for missing features
+    
+    # Create DataFrame with exact columns in the correct order
+    scalar_df = pd.DataFrame([scalar_features])
+    
+    # Ensure columns match exactly what the scaler expects
+    missing_cols = set(metadata['scalar_features']) - set(scalar_df.columns)
+    for col in missing_cols:
+        scalar_df[col] = 0.0
+    
+    # Keep only the columns the scaler knows about and in the right order
+    scalar_df = scalar_df[metadata['scalar_features']]
+    
     scalar_df = scalar_df.fillna(0)
     scalar_scaled = scaler_X_scalar.transform(scalar_df)
     scalar_scaled = np.nan_to_num(scalar_scaled, nan=0.0)
     scalar_tensor = torch.FloatTensor(scalar_scaled)
     
     return seq_tensor, scalar_tensor
+
 
 # Multi-Head Attention
 class MultiHeadAttention(nn.Module):
