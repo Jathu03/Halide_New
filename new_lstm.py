@@ -124,239 +124,9 @@ def extract_features(json_data):
         fixed_features = {key: features.get(key, 0.0) for key in FIXED_FEATURES}
         return fixed_features
     
-    except Exception:
+    except Exception as e:
+        print(f"Error extracting features: {e}")
         return None
-
-# Process directory
-def process_graph_output_directory(main_dir):
-    all_features = []
-    file_names = []
-    invalid_files = []
-    max_file_size = 100 * 1024 * 1024
-    total_files_found = 0
-    processed_files = 0
-    start_time = time.time()
-    
-    main_dir_path = os.path.join(main_dir)
-    if not os.path.exists(main_dir_path):
-        print(f"Directory {main_dir_path} does not exist.")
-        return [], [], []
-    
-    log_file_path = os.path.join(main_dir, 'invalid_files_log.txt')
-    with open(log_file_path, 'w', encoding='utf-8') as log_file:
-        log_file.write("Files with invalid execution times or errors (skipped):\n")
-        
-        for root, dirs, files in os.walk(main_dir_path):
-            for file in files:
-                if file == 'converted_function_graph.json':
-                    total_files_found += 1
-                    file_path = os.path.join(root, file)
-                    try:
-                        file_size = os.path.getsize(file_path)
-                        if file_size > max_file_size:
-                            invalid_files.append(file_path)
-                            log_file.write(f"{file_path}: File too large ({file_size} bytes)\n")
-                            continue
-                        
-                        with open(file_path, 'r', encoding='utf-8') as f:
-                            json_data = json.load(f)
-                        features = extract_features(json_data)
-                        if features is None or 'execution_time_ms' not in features or features['execution_time_ms'] <= 0 or not np.isfinite(features['execution_time_ms']):
-                            invalid_files.append(file_path)
-                            log_file.write(f"{file_path}: Invalid execution time or features\n")
-                            continue
-                        all_features.append(features)
-                        relative_path = os.path.relpath(file_path, main_dir_path)
-                        file_names.append(relative_path)
-                        
-                        processed_files += 1
-                        if processed_files % 1000 == 0:
-                            elapsed = time.time() - start_time
-                            print(f"Processed {processed_files} files in {elapsed:.2f} seconds")
-                    
-                    except Exception as e:
-                        invalid_files.append(file_path)
-                        log_file.write(f"{file_path}: {str(e)}\n")
-    
-    print(f"Total files found: {total_files_found}")
-    print(f"Total valid files found: {len(all_features)}")
-    print(f"Files skipped: {len(invalid_files)}")
-    
-    if not all_features:
-        print(f"No valid JSON files found. Check {log_file_path} for details.")
-        return [], [], []
-    
-    combined = list(zip(all_features, file_names))
-    random.shuffle(combined)
-    all_features, file_names = zip(*combined)
-    
-    test_size = min(50, len(all_features))
-    train_features = all_features[:-test_size]
-    test_features = all_features[-test_size:]
-    train_file_names = file_names[:-test_size]
-    test_file_names = file_names[-test_size:]
-    
-    print(f"Training files: {len(train_features)}")
-    print(f"Testing files: {len(test_features)}")
-    
-    return train_features, test_features, list(test_file_names)
-
-# Prepare data
-def prepare_data_for_model(train_features, test_features):
-    if not train_features or not test_features:
-        print("No valid features provided.")
-        return None
-    
-    sequence_length = 3
-    train_sequences = [np.array([[features.get(key, 0.0) for key in FIXED_FEATURES]] * sequence_length) for features in train_features]
-    test_sequences = [np.array([[features.get(key, 0.0) for key in FIXED_FEATURES]] * sequence_length) for features in test_features]
-    
-    train_sequences_np = np.array(train_sequences)
-    test_sequences_np = np.array(test_sequences)
-    train_sequences_flat = train_sequences_np.reshape(-1, len(FIXED_FEATURES))
-    test_sequences_flat = test_sequences_np.reshape(-1, len(FIXED_FEATURES))
-    
-    scaler_X_seq = RobustScaler()
-    train_sequences_scaled = scaler_X_seq.fit_transform(train_sequences_flat)
-    test_sequences_scaled = scaler_X_seq.transform(test_sequences_flat)
-    
-    train_sequences_padded = torch.FloatTensor(train_sequences_scaled).view(len(train_features), sequence_length, -1)
-    test_sequences_padded = torch.FloatTensor(test_sequences_scaled).view(len(test_features), sequence_length, -1)
-    
-    train_scalar_df = pd.DataFrame(train_features)
-    test_scalar_df = pd.DataFrame(test_features)
-    
-    low_importance_features = [
-        'op_eq', 'nodes_count', 'sched_outer_parallelism', 'op_le', 'node_edge_ratio',
-        'memory_pressure', 'op_let', 'bytes_per_vector', 'sched_working_set', 'sched_num_realizations',
-        'computation_efficiency', 'memory_utilization_ratio', 'sched_num_scalars',
-        'cache_misses', 'bytes_per_parallelism', 'op_mul'
-    ]
-    train_scalar_df = train_scalar_df.drop(columns=[col for col in low_importance_features if col in train_scalar_df.columns])
-    test_scalar_df = test_scalar_df.drop(columns=[col for col in low_importance_features if col in test_scalar_df.columns])
-    
-    skewed_features = ['cache_hits', 'bytes_processing_rate', 'sched_bytes_at_task', 'computation_efficiency']
-    for feature in skewed_features:
-        if feature in train_scalar_df.columns:
-            train_scalar_df[f'log_{feature}'] = np.log1p(train_scalar_df[feature])
-            test_scalar_df[f'log_{feature}'] = np.log1p(test_scalar_df[feature])
-            train_scalar_df = train_scalar_df.drop(columns=[feature])
-            test_scalar_df = test_scalar_df.drop(columns=[feature])
-    
-    train_scalar_df = train_scalar_df.fillna(0)
-    test_scalar_df = test_scalar_df.fillna(0)
-    
-    constant_columns = [col for col in train_scalar_df.columns if train_scalar_df[col].nunique() == 1]
-    train_scalar_df = train_scalar_df.drop(columns=constant_columns)
-    test_scalar_df = test_scalar_df.drop(columns=constant_columns)
-    
-    y_train_raw = np.array([f['execution_time_ms'] for f in train_features])
-    y_test_raw = np.array([f['execution_time_ms'] for f in test_features])
-    y_train_raw = np.clip(y_train_raw, 0, np.percentile(y_train_raw, 99))
-    y_test_raw = np.clip(y_test_raw, 0, np.percentile(y_test_raw, 99))
-    
-    y_train = np.log1p(y_train_raw).reshape(-1, 1)
-    y_test = np.log1p(y_test_raw).reshape(-1, 1)
-    
-    scaler_X_scalar = RobustScaler()
-    scaler_y = RobustScaler()
-    
-    train_scalar_scaled = scaler_X_scalar.fit_transform(train_scalar_df)
-    test_scalar_scaled = scaler_X_scalar.transform(test_scalar_df)
-    y_train_scaled = scaler_y.fit_transform(y_train)
-    y_test_scaled = scaler_y.transform(y_test)
-    
-    train_scalar_scaled = np.nan_to_num(train_scalar_scaled, nan=0.0)
-    test_scalar_scaled = np.nan_to_num(test_scalar_scaled, nan=0.0)
-    y_train_scaled = np.nan_to_num(y_train_scaled, nan=0.0)
-    y_test_scaled = np.nan_to_num(y_test_scaled, nan=0.0)
-    
-    train_sequences_aug = []
-    train_scalar_aug = []
-    y_train_aug = []
-    for i in range(len(train_features)):
-        train_sequences_aug.append(train_sequences_padded[i])
-        train_scalar_aug.append(train_scalar_scaled[i])
-        y_train_aug.append(y_train_scaled[i])
-        
-        cache_hits_idx = train_scalar_df.columns.get_loc('log_cache_hits') if 'log_cache_hits' in train_scalar_df.columns else -1
-        bytes_rate_idx = train_scalar_df.columns.get_loc('log_bytes_processing_rate') if 'log_bytes_processing_rate' in train_scalar_df.columns else -1
-        
-        is_significant = False
-        if cache_hits_idx != -1 and train_scalar_scaled[i, cache_hits_idx] > np.percentile(train_scalar_scaled[:, cache_hits_idx], 75):
-            is_significant = True
-        if bytes_rate_idx != -1 and train_scalar_scaled[i, bytes_rate_idx] > np.percentile(train_scalar_scaled[:, bytes_rate_idx], 75):
-            is_significant = True
-        
-        augment_count = 3 if is_significant else 1
-        for _ in range(augment_count):
-            noise_seq = torch.normal(mean=0.0, std=0.05, size=train_sequences_padded[i].shape)
-            noise_scalar = np.random.normal(0, 0.05, train_scalar_scaled[i].shape)
-            noise_y = np.random.normal(0, 0.05, y_train_scaled[i].shape)
-            train_sequences_aug.append(train_sequences_padded[i] + noise_seq)
-            train_scalar_aug.append(train_scalar_scaled[i] + noise_scalar)
-            y_train_aug.append(y_train_scaled[i] + noise_y)
-    
-    train_sequences_padded = torch.stack(train_sequences_aug)
-    train_scalar_scaled = np.array(train_scalar_aug)
-    y_train_scaled = np.array(y_train_aug)
-    
-    train_scalar_tensor = torch.FloatTensor(train_scalar_scaled)
-    test_scalar_tensor = torch.FloatTensor(test_scalar_scaled)
-    y_train_tensor = torch.FloatTensor(y_train_scaled)
-    y_test_tensor = torch.FloatTensor(y_test_scaled)
-    
-    print(f"Sequence input size: {train_sequences_padded.shape[2]}")
-    print(f"Scalar input size: {train_scalar_tensor.shape[1]}")
-    
-    return (train_sequences_padded, train_scalar_tensor, y_train_tensor,
-            test_sequences_padded, test_scalar_tensor, y_test_tensor,
-            scaler_y, scaler_X_seq, scaler_X_scalar, train_sequences_padded.shape[2], train_scalar_tensor.shape[1], train_scalar_df.columns)
-
-# Preprocess a single JSON file
-def preprocess_single_json(json_file, metadata, scaler_X_seq, scaler_X_scalar):
-    with open(json_file, 'r') as f:
-        json_data = json.load(f)
-    features = extract_features(json_data)
-    if features is None:
-        print(f"Invalid JSON file: {json_file}")
-        return None
-    
-    seq_features = [features.get(key, 0.0) for key in FIXED_FEATURES]
-    seq_array = np.array([seq_features] * 3)
-    seq_scaled = scaler_X_seq.transform(seq_array.reshape(-1, len(FIXED_FEATURES)))
-    seq_tensor = torch.FloatTensor(seq_scaled).view(1, 3, -1)
-    
-    # Create DataFrame with only the expected columns from metadata
-    scalar_features = {}
-    for feature in metadata['scalar_features']:
-        if feature.startswith('log_'):
-            base_feature = feature[4:]  # Remove 'log_' prefix
-            if base_feature in features:
-                scalar_features[feature] = np.log1p(features[base_feature])
-        elif feature in features:
-            scalar_features[feature] = features[feature]
-        else:
-            scalar_features[feature] = 0.0  # Default value for missing features
-    
-    # Create DataFrame with exact columns in the correct order
-    scalar_df = pd.DataFrame([scalar_features])
-    
-    # Ensure columns match exactly what the scaler expects
-    missing_cols = set(metadata['scalar_features']) - set(scalar_df.columns)
-    for col in missing_cols:
-        scalar_df[col] = 0.0
-    
-    # Keep only the columns the scaler knows about and in the right order
-    scalar_df = scalar_df[metadata['scalar_features']]
-    
-    scalar_df = scalar_df.fillna(0)
-    scalar_scaled = scaler_X_scalar.transform(scalar_df)
-    scalar_scaled = np.nan_to_num(scalar_scaled, nan=0.0)
-    scalar_tensor = torch.FloatTensor(scalar_scaled)
-    
-    return seq_tensor, scalar_tensor
-
 
 # Multi-Head Attention
 class MultiHeadAttention(nn.Module):
@@ -453,186 +223,70 @@ class SimpleLSTMModel(nn.Module):
         output = self.output_layer(x)
         return output
 
-# Custom loss
-def custom_loss(outputs, targets, scalar_inputs, feature_indices, feature_importances, huber_delta=0.5, mae_weight=0.3, l1_lambda=1e-5):
-    huber = nn.HuberLoss(delta=huber_delta)(outputs, targets)
-    mae = torch.mean(torch.abs(outputs - targets))
-    l1_reg = sum(param.abs().sum() for param in model.parameters()) * l1_lambda
-    
-    weights = torch.ones_like(targets)
-    for feature, idx in feature_indices.items():
-        if idx != -1 and feature in feature_importances:
-            feature_vals = scalar_inputs[:, idx]
-            importance = feature_importances[feature]
-            weights = torch.where(
-                feature_vals > 1.0,
-                weights * (1.0 + importance * 2.0),
-                weights
-            )
-    
-    weighted_huber = (huber * weights).mean()
-    weighted_mae = (mae * weights).mean()
-    return weighted_huber + mae_weight * weighted_mae + l1_reg
-
-# Data loaders
-def create_data_loaders(train_sequences, train_scalar, y_train, test_sequences, test_scalar, y_test, batch_size=64):
-    train_dataset = TensorDataset(train_sequences, train_scalar, y_train)
-    test_dataset = TensorDataset(test_sequences, test_scalar, y_test)
-    
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-    return train_loader, test_loader
-
-# Train model
-def train_model(model, train_loader, test_loader, criterion, optimizer, feature_indices, feature_importances, num_epochs=1000, patience=50, accumulation_steps=2):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
-    
+# Preprocess a single JSON file
+def preprocess_single_json(json_file, metadata, scaler_X_seq, scaler_X_scalar):
     try:
-        model.to(device)
-        for lstm in model.lstm_layers:
-            lstm.flatten_parameters()
-    except RuntimeError as e:
-        print(f"Error moving model to CUDA: {e}. Falling back to CPU.")
-        device = torch.device('cpu')
-        model.to(device)
-    
-    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=50, T_mult=2, eta_min=1e-6)
-    
-    best_val_loss = float('inf')
-    epochs_no_improve = 0
-    best_model_state = None
-    train_losses = []
-    val_losses = []
-    
-    for epoch in range(num_epochs):
-        model.train()
-        running_loss = 0.0
-        optimizer.zero_grad()
+        # Load and extract features from the JSON file
+        with open(json_file, 'r') as f:
+            json_data = json.load(f)
         
-        for i, (seq_inputs, scalar_inputs, targets) in enumerate(train_loader):
-            seq_inputs, scalar_inputs, targets = seq_inputs.to(device), scalar_inputs.to(device), targets.to(device)
-            outputs = model(seq_inputs, scalar_inputs)
-            loss = criterion(outputs, targets, scalar_inputs, feature_indices, feature_importances)
-            
-            if torch.isnan(loss) or torch.isinf(loss):
-                print(f"Invalid loss detected at epoch {epoch+1}, batch {i+1}")
-                return None, None
-            
-            loss = loss / accumulation_steps
-            loss.backward()
-            
-            if (i + 1) % accumulation_steps == 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
-                optimizer.zero_grad()
-            
-            running_loss += loss.item() * accumulation_steps * seq_inputs.size(0)
+        features = extract_features(json_data)
+        if features is None:
+            print(f"Invalid JSON file or couldn't extract features: {json_file}")
+            return None
         
-        if len(train_loader) % accumulation_steps != 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-            optimizer.zero_grad()
+        # SEQUENCE FEATURES
+        seq_length = metadata.get('max_sequence_length', 3)
+        seq_features = np.array([[features.get(key, 0.0) for key in FIXED_FEATURES]] * seq_length)
         
-        train_loss = running_loss / len(train_loader.dataset)
-        train_losses.append(train_loss)
+        # Reshape and scale sequence features exactly as in training
+        seq_flat = seq_features.reshape(-1, len(FIXED_FEATURES))
+        seq_flat_scaled = scaler_X_seq.transform(seq_flat)
+        seq_tensor = torch.FloatTensor(seq_flat_scaled).view(1, seq_length, -1)
         
-        model.eval()
-        val_loss = 0.0
-        with torch.no_grad():
-            for seq_inputs, scalar_inputs, targets in test_loader:
-                seq_inputs, scalar_inputs, targets = seq_inputs.to(device), scalar_inputs.to(device), targets.to(device)
-                outputs = model(seq_inputs, scalar_inputs)
-                loss = criterion(outputs, targets, scalar_inputs, feature_indices, feature_importances)
-                val_loss += loss.item() * seq_inputs.size(0)
+        # SCALAR FEATURES
+        # Create scalar features dictionary
+        scalar_features = {}
+        scalar_feature_list = metadata.get('scalar_features', [])
         
-        val_loss /= len(test_loader.dataset)
-        val_losses.append(val_loss)
+        # Process standard and log-transformed features
+        for feature in scalar_feature_list:
+            if feature.startswith('log_'):
+                # For log-transformed features
+                base_feature = feature[4:]  # Remove 'log_' prefix
+                if base_feature in features:
+                    scalar_features[feature] = np.log1p(features[base_feature])
+                else:
+                    scalar_features[feature] = 0.0
+            else:
+                # For regular features
+                scalar_features[feature] = features.get(feature, 0.0)
         
-        scheduler.step()
-        print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
+        # Create DataFrame with columns in the exact order as during training
+        scalar_df = pd.DataFrame([scalar_features])
         
-        if val_loss < best_val_loss and not np.isnan(val_loss) and not np.isinf(val_loss):
-            best_val_loss = val_loss
-            epochs_no_improve = 0
-            best_model_state = model.state_dict().copy()
-        else:
-            epochs_no_improve += 1
+        # Ensure all required columns exist (add missing ones with zeros)
+        for col in scalar_feature_list:
+            if col not in scalar_df.columns:
+                scalar_df[col] = 0.0
         
-        if epochs_no_improve >= patience:
-            print(f'Early stopping after {epoch+1} epochs')
-            model.load_state_dict(best_model_state)
-            break
-    
-    if best_model_state is not None and epochs_no_improve > 0:
-        model.load_state_dict(best_model_state)
-    
-    plt.figure(figsize=(10, 6))
-    plt.plot(range(1, len(train_losses) + 1), train_losses, label='Training Loss')
-    plt.plot(range(1, len(val_losses) + 1), val_losses, label='Validation Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.title('Training and Validation Loss Over Epochs')
-    plt.legend()
-    plt.grid(True)
-    plt.savefig('loss_plot.png')
-    plt.close()
-    
-    return train_losses, val_losses
-
-# Evaluate model
-def evaluate_model(model, X_test_seq, X_test_scalar, y_test, y_scaler, file_names_test):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model.to(device)
-    model.eval()
-    
-    X_test_seq, X_test_scalar = X_test_seq.to(device), X_test_scalar.to(device)
-    with torch.no_grad():
-        y_pred_scaled = model(X_test_seq, X_test_scalar)
-    
-    y_pred_scaled = y_pred_scaled.cpu().numpy()
-    y_test = y_test.cpu().numpy()
-    
-    y_test_transformed = y_scaler.inverse_transform(y_test)
-    y_pred_transformed = y_scaler.inverse_transform(y_pred_scaled)
-    
-    y_test_actual = np.expm1(y_test_transformed)
-    y_pred_actual = np.expm1(y_pred_transformed)
-    
-    results_by_subfolder = {}
-    for i, file_path in enumerate(file_names_test):
-        subfolder = '/'.join(file_path.split('/')[:-1])
-        if subfolder not in results_by_subfolder:
-            results_by_subfolder[subfolder] = []
+        # Keep only columns in the metadata list and in the right order
+        scalar_df = scalar_df[scalar_feature_list]
         
-        pred = max(y_pred_actual[i][0], 0)
-        results_by_subfolder[subfolder].append({
-            'file': file_path,
-            'actual': y_test_actual[i][0],
-            'predicted': pred,
-            'error_percentage': abs(y_test_actual[i][0] - pred) / y_test_actual[i][0] * 100 if y_test_actual[i][0] > 0 else 0
-        })
+        # Fill NaN values with zeros
+        scalar_df = scalar_df.fillna(0)
+        
+        # Scale the scalar features using the training scaler
+        scalar_scaled = scaler_X_scalar.transform(scalar_df)
+        scalar_scaled = np.nan_to_num(scalar_scaled, nan=0.0)
+        scalar_tensor = torch.FloatTensor(scalar_scaled)
+        
+        return seq_tensor, scalar_tensor
     
-    for subfolder, results in results_by_subfolder.items():
-        print(f"\nResults for {subfolder}:")
-        for result in results:
-            print(f"File: {result['file']}")
-            print(f"  Actual execution time: {result['actual']:.2f} ms")
-            print(f"  Predicted execution time: {result['predicted']:.2f} ms")
-            print(f"  Error percentage: {result['error_percentage']:.2f}%")
-    
-    mse = np.mean((y_test_actual - y_pred_actual) ** 2)
-    rmse = np.sqrt(mse)
-    mae = np.mean(np.abs(y_test_actual - y_pred_actual))
-    mape = np.mean(np.abs((y_test_actual - y_pred_actual) / (y_test_actual + 1e-8))) * 100
-    
-    print("\nOverall Model Performance:")
-    print(f"MSE: {mse:.2f}")
-    print(f"RMSE: {rmse:.2f}")
-    print(f"MAE: {mae:.2f}")
-    print(f"MAPE: {mape:.2f}%")
-    
-    return y_test_actual, y_pred_actual
+    except Exception as e:
+        print(f"Error preprocessing JSON file: {json_file}")
+        print(f"Error details: {e}")
+        return None
 
 # Main function with mode selection
 def main():
@@ -647,178 +301,107 @@ def main():
     torch.manual_seed(42)
     np.random.seed(42)
     
-    if args.mode == "T":
-        if torch.cuda.is_available():
-            torch.cuda.init()
-            print(f"CUDA initialized. Using GPU: {torch.cuda.get_device_name(0)}")
-        else:
-            print("CUDA not available. Using CPU.")
-        
-        print(f"Processing main directory: {args.main_dir}")
-        train_features, test_features, test_file_names = process_graph_output_directory(args.main_dir)
-        
-        if not train_features or not test_file_names:
-            print("Error: No valid data found. Exiting.")
-            return
-        
-        data = prepare_data_for_model(train_features, test_features)
-        if data is None:
-            print("Error: Failed to prepare data. Exiting.")
-            return
-        
-        (train_sequences, train_scalar, y_train,
-         test_sequences, test_scalar, y_test,
-         y_scaler, scaler_X_seq, scaler_X_scalar, seq_input_size, scalar_input_size, feature_columns) = data
-        
-        scaler_node_params = {
-            'center': scaler_X_seq.center_.tolist(),
-            'scale': scaler_X_seq.scale_.tolist()
-        }
-        with open('scaler_node_params.json', 'w') as f:
-            json.dump(scaler_node_params, f)
-        
-        scaler_scalar_params = {
-            'center': scaler_X_scalar.center_.tolist(),
-            'scale': scaler_X_scalar.scale_.tolist()
-        }
-        with open('scaler_scalar_params.json', 'w') as f:
-            json.dump(scaler_scalar_params, f)
-        
-        scaler_y_params = {
-            'center': y_scaler.center_.tolist(),
-            'scale': y_scaler.scale_.tolist()
-        }
-        with open('scaler_y_params.json', 'w') as f:
-            json.dump(scaler_y_params, f)
-        
-        metadata = {
-            'max_sequence_length': 3,
-            'seq_input_size': seq_input_size,
-            'scalar_input_size': scalar_input_size,
-            'node_features': FIXED_FEATURES,
-            'scalar_features': list(feature_columns),
-            'skewed_features': ['cache_hits', 'bytes_processing_rate', 'sched_bytes_at_task', 'computation_efficiency'],
-            'dropped_features': [
-                'op_eq', 'nodes_count', 'sched_outer_parallelism', 'op_le', 'node_edge_ratio',
-                'memory_pressure', 'op_let', 'bytes_per_vector', 'sched_working_set', 'sched_num_realizations',
-                'computation_efficiency', 'memory_utilization_ratio', 'sched_num_scalars',
-                'cache_misses', 'bytes_per_parallelism', 'op_mul'
-            ]
-        }
-        with open('model_metadata.json', 'w') as f:
-            json.dump(metadata, f)
-        
-        train_loader, test_loader = create_data_loaders(
-            train_sequences, train_scalar, y_train,
-            test_sequences, test_scalar, y_test,
-            batch_size=64
-        )
-        
-        global model
-        model = SimpleLSTMModel(
-            seq_input_size=seq_input_size,
-            scalar_input_size=scalar_input_size,
-            hidden_sizes=[512, 256, 128],
-            output_size=1,
-            dropout_rate=0.2,
-            num_heads=8,
-            use_attention=True
-        )
-        
-        optimizer = optim.AdamW(model.parameters(), lr=0.00005, weight_decay=1e-4)
-        
-        feature_importances = {
-            'cache_hits': 0.5860,
-            'bytes_processing_rate': 0.2893,
-            'sched_bytes_at_task': 0.0422,
-            'sched_bytes_at_realization': 0.0055,
-            'total_bytes_at_production': 0.0049,
-            'sched_bytes_at_production': 0.0030
-        }
-        
-        feature_indices = {}
-        for feature in feature_importances.keys():
-            log_feature = f'log_{feature}' if feature in ['cache_hits', 'bytes_processing_rate'] else feature
-            if log_feature in feature_columns:
-                feature_indices[feature] = feature_columns.get_loc(log_feature)
-            else:
-                feature_indices[feature] = feature_columns.get_loc(feature) if feature in feature_columns else -1
-        
-        print("Building and training Simple LSTM model...")
-        train_losses, val_losses = train_model(
-            model, train_loader, test_loader,
-            custom_loss, optimizer, feature_indices, feature_importances,
-            num_epochs=1000, patience=50, accumulation_steps=2
-        )
-        
-        if train_losses is None or val_losses is None:
-            print("Training failed due to invalid values")
-            return
-        
-        model.eval()
-        model.to(torch.device('cpu'))
-        example_seq = torch.randn(1, 3, seq_input_size)
-        example_scalar = torch.randn(1, scalar_input_size)
-        scripted_model = torch.jit.trace(model, (example_seq, example_scalar))
-        scripted_model.save("model.pt")
-        print("Model saved to model.pt as TorchScript module")
-        
-        print("\nEvaluating model:")
-        y_test_actual, y_pred_actual = evaluate_model(
-            model, test_sequences, test_scalar, y_test,
-            y_scaler, test_file_names
-        )
-        
-        print(f"\nSummary for Comparison:")
-        print(f"Model: SimpleLSTM")
-    
-    elif args.mode == "P":
+    if args.mode == "P":
         if args.json_file is None:
             print("Error: JSON file path is required for prediction mode.")
             return
         
-        model = torch.jit.load("model.pt")
-        model.eval()
-        
-        with open('model_metadata.json', 'r') as f:
-            metadata = json.load(f)
-        
-        with open('scaler_node_params.json', 'r') as f:
-            scaler_node_params = json.load(f)
-        scaler_X_seq = RobustScaler()
-        scaler_X_seq.center_ = np.array(scaler_node_params['center'])
-        scaler_X_seq.scale_ = np.array(scaler_node_params['scale'])
-        
-        with open('scaler_scalar_params.json', 'r') as f:
-            scaler_scalar_params = json.load(f)
-        scaler_X_scalar = RobustScaler()
-        scaler_X_scalar.center_ = np.array(scaler_scalar_params['center'])
-        scaler_X_scalar.scale_ = np.array(scaler_scalar_params['scale'])
-        
-        with open('scaler_y_params.json', 'r') as f:
-            scaler_y_params = json.load(f)
-        y_scaler = RobustScaler()
-        y_scaler.center_ = np.array(scaler_y_params['center'])
-        y_scaler.scale_ = np.array(scaler_y_params['scale'])
-        
-        seq_tensor, scalar_tensor = preprocess_single_json(args.json_file, metadata, scaler_X_seq, scaler_X_scalar)
-        if seq_tensor is None:
+        # Load saved model
+        try:
+            model = torch.jit.load("model.pt")
+            model.eval()
+            print("Model loaded successfully.")
+        except Exception as e:
+            print(f"Error loading model: {e}")
             return
         
+        # Load model metadata
+        try:
+            with open('model_metadata.json', 'r') as f:
+                metadata = json.load(f)
+            print("Model metadata loaded successfully.")
+        except Exception as e:
+            print(f"Error loading model metadata: {e}")
+            return
+        
+        # Load and initialize node/sequence scaler
+        try:
+            with open('scaler_node_params.json', 'r') as f:
+                scaler_node_params = json.load(f)
+            scaler_X_seq = RobustScaler()
+            scaler_X_seq.center_ = np.array(scaler_node_params['center'])
+            scaler_X_seq.scale_ = np.array(scaler_node_params['scale'])
+            print("Sequence scaler loaded successfully.")
+        except Exception as e:
+            print(f"Error loading sequence scaler: {e}")
+            return
+        
+        # Load and initialize scalar features scaler
+        try:
+            with open('scaler_scalar_params.json', 'r') as f:
+                scaler_scalar_params = json.load(f)
+            scaler_X_scalar = RobustScaler()
+            scaler_X_scalar.center_ = np.array(scaler_scalar_params['center'])
+            scaler_X_scalar.scale_ = np.array(scaler_scalar_params['scale'])
+            print("Scalar scaler loaded successfully.")
+        except Exception as e:
+            print(f"Error loading scalar scaler: {e}")
+            return
+        
+        # Load and initialize output scaler
+        try:
+            with open('scaler_y_params.json', 'r') as f:
+                scaler_y_params = json.load(f)
+            y_scaler = RobustScaler()
+            y_scaler.center_ = np.array(scaler_y_params['center'])
+            y_scaler.scale_ = np.array(scaler_y_params['scale'])
+            print("Output scaler loaded successfully.")
+        except Exception as e:
+            print(f"Error loading output scaler: {e}")
+            return
+        
+        # Preprocess the input JSON file
+        print(f"Preprocessing JSON file: {args.json_file}")
+        result = preprocess_single_json(args.json_file, metadata, scaler_X_seq, scaler_X_scalar)
+        if result is None:
+            print("Failed to preprocess the JSON file.")
+            return
+        
+        seq_tensor, scalar_tensor = result
+        print(f"Sequence tensor shape: {seq_tensor.shape}")
+        print(f"Scalar tensor shape: {scalar_tensor.shape}")
+        
+        # Check if shapes match what the model expects
+        seq_input_size = metadata.get('seq_input_size')
+        scalar_input_size = metadata.get('scalar_input_size')
+        if seq_tensor.shape[2] != seq_input_size:
+            print(f"Error: Sequence input size mismatch. Expected: {seq_input_size}, Got: {seq_tensor.shape[2]}")
+            return
+        if scalar_tensor.shape[1] != scalar_input_size:
+            print(f"Error: Scalar input size mismatch. Expected: {scalar_input_size}, Got: {scalar_tensor.shape[1]}")
+            return
+        
+        # Run prediction
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        model.to(device)
-        seq_tensor = seq_tensor.to(device)
-        scalar_tensor = scalar_tensor.to(device)
+        print(f"Using device: {device}")
         
-        with torch.no_grad():
-            y_pred_scaled = model(seq_tensor, scalar_tensor)
-        
-        y_pred_scaled = y_pred_scaled.cpu().numpy()
-        y_pred_transformed = y_scaler.inverse_transform(y_pred_scaled)
-        y_pred_actual = np.expm1(y_pred_transformed)
-        prediction = max(y_pred_actual[0][0], 0)
-        
-        print(f"Predicted execution time for {args.json_file}: {prediction:.2f} ms")
+        try:
+            model = model.to(device)
+            seq_tensor = seq_tensor.to(device)
+            scalar_tensor = scalar_tensor.to(device)
+            
+            with torch.no_grad():
+                y_pred_scaled = model(seq_tensor, scalar_tensor)
+            
+            y_pred_scaled = y_pred_scaled.cpu().numpy()
+            y_pred_transformed = y_scaler.inverse_transform(y_pred_scaled)
+            y_pred_actual = np.expm1(y_pred_transformed)
+            prediction = max(y_pred_actual[0][0], 0)
+            
+            print(f"Predicted execution time for {args.json_file}: {prediction:.2f} ms")
+        except Exception as e:
+            print(f"Error during prediction: {e}")
+            return
 
 if __name__ == "__main__":
     main()
