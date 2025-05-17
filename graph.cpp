@@ -51,7 +51,7 @@ json load_json(const std::string& file_path) {
     return j;
 }
 
-// Load scaler parameters
+// Load scaler dashing
 std::pair<std::vector<double>, std::vector<double>> load_scaler_params(const std::string& file_path) {
     json j = load_json(file_path);
     std::vector<double> center = j["center"].get<std::vector<double>>();
@@ -226,7 +226,11 @@ std::tuple<torch::Tensor, torch::Tensor> preprocess_data(
         int64_t seq_input_size = metadata["seq_input_size"].get<int64_t>();
         std::vector<float> seq_data(seq_input_size);
         for (size_t i = 0; i < FIXED_FEATURES.size(); ++i) {
-            seq_data[i] = static_cast<float>(features.at(FIXED_FEATURES[i]));
+            const auto& key = FIXED_FEATURES[i];
+            seq_data[i] = features.count(key) ? static_cast<float>(features.at(key)) : 0.0f;
+            if (!features.count(key)) {
+                std::cerr << "Warning: Missing sequence feature: " << key << std::endl;
+            }
         }
 
         // Create sequence by repeating features
@@ -250,6 +254,12 @@ std::tuple<torch::Tensor, torch::Tensor> preprocess_data(
         std::vector<std::string> final_scalar_features;
         for (const auto& feature : scalar_features) {
             if (std::find(dropped_features.begin(), dropped_features.end(), feature) == dropped_features.end()) {
+                if (!features.count(feature)) {
+                    std::cerr << "Warning: Missing scalar feature: " << feature << std::endl;
+                    scalar_data.push_back(0.0f);
+                    final_scalar_features.push_back(feature);
+                    continue;
+                }
                 if (std::find(skewed_features.begin(), skewed_features.end(), feature) != skewed_features.end()) {
                     scalar_data.push_back(std::log1p(features.at(feature)));
                     final_scalar_features.push_back("log_" + feature);
