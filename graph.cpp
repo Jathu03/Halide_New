@@ -9,6 +9,7 @@
 #include <cmath>
 #include <algorithm>
 #include <filesystem>
+#include <cctype>
 
 // Using nlohmann::json for JSON parsing
 using json = nlohmann::json;
@@ -32,6 +33,13 @@ const std::vector<std::string> FIXED_FEATURES = {
     "memory_pointwise_0", "memory_pointwise_1", "memory_pointwise_2", "memory_pointwise_3"
 };
 
+// Utility to convert string to lowercase
+std::string to_lowercase(const std::string& str) {
+    std::string result = str;
+    std::transform(result.begin(), result.end(), result.begin(), [](unsigned char c) { return std::tolower(c); });
+    return result;
+}
+
 // Load JSON file
 json load_json(const std::string& file_path) {
     std::ifstream file(file_path);
@@ -48,6 +56,9 @@ std::pair<std::vector<double>, std::vector<double>> load_scaler_params(const std
     json j = load_json(file_path);
     std::vector<double> center = j["center"].get<std::vector<double>>();
     std::vector<double> scale = j["scale"].get<std::vector<double>>();
+    if (center.size() != scale.size()) {
+        throw std::runtime_error("Mismatch in scaler parameters dimensions in " + file_path);
+    }
     return {center, scale};
 }
 
@@ -62,16 +73,19 @@ std::map<std::string, double> extract_features(const json& json_data) {
     try {
         // Validate JSON structure
         if (!json_data.contains("without_extern") || !json_data["without_extern"].contains("global_features")) {
+            std::cerr << "Missing required JSON keys: without_extern or global_features" << std::endl;
             return {};
         }
         const auto& global_features = json_data["without_extern"]["global_features"];
 
         // Extract and validate execution time
         if (!global_features.contains("execution_time_ms") || global_features["execution_time_ms"].is_null()) {
+            std::cerr << "Missing or null execution_time_ms" << std::endl;
             return {};
         }
         double execution_time_ms = global_features["execution_time_ms"].get<double>();
         if (execution_time_ms <= 0) {
+            std::cerr << "Invalid execution_time_ms: " << execution_time_ms << std::endl;
             return {};
         }
 
@@ -99,14 +113,18 @@ std::map<std::string, double> extract_features(const json& json_data) {
                 auto pipeline_features = stage.value("pipeline_features", json::object());
                 auto op_hist = pipeline_features.value("op_histogram", json::object()).value("Float", json::object());
                 for (const auto& [op, count] : op_hist.items()) {
-                    op_counts["op_" + op] += count.get<double>();
+                    op_counts["op_" + to_lowercase(op)] += count.get<double>();
                 }
 
                 auto mem_access = pipeline_features.value("memory_access_patterns", json::object()).value("Float", json::object());
                 for (const auto& [pattern, values] : mem_access.items()) {
+                    auto pattern_lower = to_lowercase(pattern);
+                    if (memory_patterns.find(pattern_lower) == memory_patterns.end()) {
+                        memory_patterns[pattern_lower] = std::vector<double>(4, 0.0);
+                    }
                     auto vals = values.get<std::vector<double>>();
                     for (size_t i = 0; i < std::min(vals.size(), size_t(4)); ++i) {
-                        memory_patterns[pattern][i] += vals[i];
+                        memory_patterns[pattern_lower][i] += vals[i];
                     }
                 }
             }
@@ -169,7 +187,7 @@ std::map<std::string, double> extract_features(const json& json_data) {
         // Create fixed-length feature vector
         std::map<std::string, double> fixed_features;
         for (const auto& key : FIXED_FEATURES) {
-            fixed_features[key] = features.value(key, 0.0);
+            fixed_features[key] = features.count(key) ? features.at(key) : 0.0;
         }
         return fixed_features;
     } catch (const std::exception& e) {
@@ -180,11 +198,14 @@ std::map<std::string, double> extract_features(const json& json_data) {
 
 // Apply RobustScaler transformation
 torch::Tensor robust_scale(const torch::Tensor& data, const std::vector<double>& center, const std::vector<double>& scale) {
+    if (data.size(1) != static_cast<int64_t>(center.size()) || center.size() != scale.size()) {
+        throw std::runtime_error("Dimension mismatch in robust_scale");
+    }
     auto data_acc = data.accessor<float, 2>();
     std::vector<float> scaled_data(data.numel());
     for (int64_t i = 0; i < data.size(0); ++i) {
         for (int64_t j = 0; j < data.size(1); ++j) {
-            scaled_data[i * data.size(1) + j] = (data_acc[i][j] - center[j]) / scale[j];
+            scaled_data[i * data.size(1) + j] = (data_acc[i][j] - center[j]) / (scale[j] + 1e-8);
         }
     }
     return torch::tensor(scaled_data).reshape({data.size(0), data.size(1)});
@@ -262,6 +283,9 @@ double perform_inference(
     const std::vector<double>& y_scale,
     const torch::Device& device
 ) {
+    if (seq_input.numel() == 0 || scalar_input.numel() == 0) {
+        throw std::runtime_error("Invalid input tensors for inference");
+    }
     try {
         model.eval();
         auto seq_input_device = seq_input.to(device);
@@ -299,7 +323,7 @@ int main(int argc, char* argv[]) {
         }
 
         // Load model
-        torch::jit::script::Module model = torch::jit::load("model.pt");
+        torch::jit::script::Module model = torch::jit::load("model.pt", device);
         model.to(device);
 
         // Load metadata and scaler parameters
