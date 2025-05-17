@@ -322,11 +322,13 @@ def preprocess_single_json(json_file, metadata, scaler_X_seq, scaler_X_scalar):
         print(f"Invalid JSON file: {json_file}")
         return None
     
+    # Sequence features processing
     seq_features = [features.get(key, 0.0) for key in FIXED_FEATURES]
     seq_array = np.array([seq_features] * 3)
     seq_scaled = scaler_X_seq.transform(seq_array.reshape(-1, len(FIXED_FEATURES)))
     seq_tensor = torch.FloatTensor(seq_scaled).view(1, 3, -1)
     
+    # Scalar features processing
     scalar_df = pd.DataFrame([features])
     low_importance_features = metadata['dropped_features']
     scalar_df = scalar_df.drop(columns=[col for col in low_importance_features if col in scalar_df.columns])
@@ -336,7 +338,12 @@ def preprocess_single_json(json_file, metadata, scaler_X_seq, scaler_X_scalar):
             scalar_df[f'log_{feature}'] = np.log1p(scalar_df[feature])
             scalar_df = scalar_df.drop(columns=[feature])
     scalar_df = scalar_df.fillna(0)
-    scalar_scaled = scaler_X_scalar.transform(scalar_df)
+    
+    # Ensure columns match training by reindexing
+    scalar_df = scalar_df.reindex(columns=metadata['scalar_features'], fill_value=0)
+    
+    # Transform scalar features
+    scalar_scaled = scaler_X_scalar.transform(scalar_df.values)
     scalar_scaled = np.nan_to_num(scalar_scaled, nan=0.0)
     scalar_tensor = torch.FloatTensor(scalar_scaled)
     
