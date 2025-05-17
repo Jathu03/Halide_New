@@ -51,7 +51,7 @@ json load_json(const std::string& file_path) {
     return j;
 }
 
-// Load scaler dashing
+// Load scaler parameters
 std::pair<std::vector<double>, std::vector<double>> load_scaler_params(const std::string& file_path) {
     json j = load_json(file_path);
     std::vector<double> center = j["center"].get<std::vector<double>>();
@@ -72,15 +72,20 @@ std::map<std::string, double> extract_features(const json& json_data) {
     std::map<std::string, double> features;
     try {
         // Validate JSON structure
-        if (!json_data.contains("without_extern") || !json_data["without_extern"].contains("global_features")) {
-            std::cerr << "Missing required JSON keys: without_extern or global_features" << std::endl;
+        if (!json_data.contains("without_extern")) {
+            std::cerr << "Missing 'without_extern' key in JSON" << std::endl;
             return {};
         }
-        const auto& global_features = json_data["without_extern"]["global_features"];
+        const auto& without_extern = json_data["without_extern"];
+        if (!without_extern.contains("global_features")) {
+            std::cerr << "Missing 'global_features' key in JSON" << std::endl;
+            return {};
+        }
+        const auto& global_features = without_extern["global_features"];
 
         // Extract and validate execution time
         if (!global_features.contains("execution_time_ms") || global_features["execution_time_ms"].is_null()) {
-            std::cerr << "Missing or null execution_time_ms" << std::endl;
+            std::cerr << "Missing or null 'execution_time_ms' in global_features" << std::endl;
             return {};
         }
         double execution_time_ms = global_features["execution_time_ms"].get<double>();
@@ -94,8 +99,8 @@ std::map<std::string, double> extract_features(const json& json_data) {
         features["cache_misses"] = global_features.value("cache_misses", 0.0);
 
         // Extract node and edge counts
-        auto nodes = json_data["without_extern"].value("nodes", json::array());
-        auto edges = json_data["without_extern"].value("edges", json::array());
+        auto nodes = without_extern.value("nodes", json::array());
+        auto edges = without_extern.value("edges", json::array());
         features["nodes_count"] = nodes.size();
         features["edges_count"] = edges.size();
         features["node_edge_ratio"] = features["nodes_count"] / (features["edges_count"] + 1e-8);
@@ -199,7 +204,8 @@ std::map<std::string, double> extract_features(const json& json_data) {
 // Apply RobustScaler transformation
 torch::Tensor robust_scale(const torch::Tensor& data, const std::vector<double>& center, const std::vector<double>& scale) {
     if (data.size(1) != static_cast<int64_t>(center.size()) || center.size() != scale.size()) {
-        throw std::runtime_error("Dimension mismatch in robust_scale");
+        throw std::runtime_error("Dimension mismatch in robust_scale: data_dim=" + std::to_string(data.size(1)) +
+                                 ", center_dim=" + std::to_string(center.size()));
     }
     auto data_acc = data.accessor<float, 2>();
     std::vector<float> scaled_data(data.numel());
@@ -208,7 +214,7 @@ torch::Tensor robust_scale(const torch::Tensor& data, const std::vector<double>&
             scaled_data[i * data.size(1) + j] = (data_acc[i][j] - center[j]) / (scale[j] + 1e-8);
         }
     }
-    return torch::tensor(scaled_data).reshape({data.size(0), data.size(1)});
+    return torch::tensor(scaled_data, torch::kFloat).reshape({data.size(0), data.size(1)});
 }
 
 // Preprocess data (mirrors Python's prepare_data_for_model)
@@ -222,8 +228,15 @@ std::tuple<torch::Tensor, torch::Tensor> preprocess_data(
 ) {
     try {
         // Sequence preprocessing
+        if (!metadata.contains("max_sequence_length") || !metadata.contains("seq_input_size")) {
+            throw std::runtime_error("Missing metadata keys: max_sequence_length or seq_input_size");
+        }
         int64_t sequence_length = metadata["max_sequence_length"].get<int64_t>();
         int64_t seq_input_size = metadata["seq_input_size"].get<int64_t>();
+        if (seq_input_size != static_cast<int64_t>(FIXED_FEATURES.size())) {
+            throw std::runtime_error("Mismatch in seq_input_size: metadata=" + std::to_string(seq_input_size) +
+                                     ", FIXED_FEATURES=" + std::to_string(FIXED_FEATURES.size()));
+        }
         std::vector<float> seq_data(seq_input_size);
         for (size_t i = 0; i < FIXED_FEATURES.size(); ++i) {
             const auto& key = FIXED_FEATURES[i];
@@ -238,13 +251,16 @@ std::tuple<torch::Tensor, torch::Tensor> preprocess_data(
         for (int64_t i = 0; i < sequence_length; ++i) {
             std::copy(seq_data.begin(), seq_data.end(), seq_data_padded.begin() + i * seq_input_size);
         }
-        torch::Tensor seq_tensor = torch::tensor(seq_data_padded).reshape({1, sequence_length, seq_input_size});
+        torch::Tensor seq_tensor = torch::tensor(scaled_data, torch::kFloat).reshape({1, sequence_length, seq_input_size});
 
         // Scale sequence features
         torch::Tensor seq_scaled = robust_scale(seq_tensor.reshape({-1, seq_input_size}), scaler_node_center, scaler_node_scale);
         seq_scaled = seq_scaled.reshape({1, sequence_length, seq_input_size});
 
         // Scalar preprocessing
+        if (!metadata.contains("scalar_features") || !metadata.contains("dropped_features") || !metadata.contains("skewed_features")) {
+            throw std::runtime_error("Missing metadata keys: scalar_features, dropped_features, or skewed_features");
+        }
         auto scalar_features = metadata["scalar_features"].get<std::vector<std::string>>();
         auto dropped_features = metadata["dropped_features"].get<std::vector<std::string>>();
         auto skewed_features = metadata["skewed_features"].get<std::vector<std::string>>();
@@ -270,8 +286,14 @@ std::tuple<torch::Tensor, torch::Tensor> preprocess_data(
             }
         }
 
+        // Verify scalar feature dimensions
+        if (scalar_data.size() != scaler_scalar_center.size()) {
+            throw std::runtime_error("Scalar feature dimension mismatch: data=" + std::to_string(scalar_data.size()) +
+                                     ", scaler=" + std::to_string(scaler_scalar_center.size()));
+        }
+
         // Remove constant columns (if any, based on metadata)
-        torch::Tensor scalar_tensor = torch::tensor(scalar_data).reshape({1, -1});
+        torch::Tensor scalar_tensor = torch::tensor(scalar_data, torch::kFloat).reshape({1, -1});
 
         // Scale scalar features
         torch::Tensor scalar_scaled = robust_scale(scalar_tensor, scaler_scalar_center, scaler_scalar_scale);
@@ -333,30 +355,50 @@ int main(int argc, char* argv[]) {
         }
 
         // Load model
+        std::cout << "Loading model from model.pt" << std::endl;
         torch::jit::script::Module model = torch::jit::load("model.pt", device);
         model.to(device);
+        std::cout << "Model loaded" << std::endl;
 
         // Load metadata and scaler parameters
+        std::cout << "Loading metadata from model_metadata.json" << std::endl;
         auto metadata = load_model_metadata("model_metadata.json");
+        std::cout << "Metadata loaded: seq_input_size=" << metadata["seq_input_size"].get<int64_t>()
+                  << ", scalar_input_size=" << metadata["scalar_input_size"].get<int64_t>() << std::endl;
+
+        std::cout << "Loading scaler from scaler_node_params.json" << std::endl;
         auto [scaler_node_center, scaler_node_scale] = load_scaler_params("scaler_node_params.json");
+        std::cout << "Scaler loaded: center size=" << scaler_node_center.size()
+                  << ", scale size=" << scaler_node_scale.size() << std::endl;
+
+        std::cout << "Loading scaler from scaler_scalar_params.json" << std::endl;
         auto [scaler_scalar_center, scaler_scalar_scale] = load_scaler_params("scaler_scalar_params.json");
+        std::cout << "Scaler loaded: center size=" << scaler_scalar_center.size()
+                  << ", scale size=" << scaler_scalar_scale.size() << std::endl;
+
+        std::cout << "Loading scaler from scaler_y_params.json" << std::endl;
         auto [y_center, y_scale] = load_scaler_params("scaler_y_params.json");
+        std::cout << "Scaler loaded: center size=" << y_center.size()
+                  << ", scale size=" << y_scale.size() << std::endl;
 
         // Load and process input JSON
         std::string input_file = argv[1];
+        std::cout << "Input file: " << input_file << std Valdation of input file existence
         if (!std::filesystem::exists(input_file)) {
-            std::cerr << "Input file does not exist: " << input_file << std::endl;
-            return 1;
+            throw std::runtime_error("Input file does not exist: " + input_file);
         }
+        std::cout << "Input JSON loaded" << std::endl;
 
+        std::cout << "Extracting features from JSON" << std::endl;
         json json_data = load_json(input_file);
         auto features = extract_features(json_data);
         if (features.empty()) {
-            std::cerr << "Failed to extract valid features from " << input_file << std::endl;
-            return 1;
+            throw std::runtime_error("Failed to extract valid features from " + input_file);
         }
+        std::cout << "Features extracted: " << features.size() << " features" << std::endl;
 
         // Preprocess data
+        std::cout << "Preprocessing data" << std::endl;
         auto [seq_tensor, scalar_tensor] = preprocess_data(
             features, metadata,
             scaler_node_center, scaler_node_scale,
@@ -364,21 +406,27 @@ int main(int argc, char* argv[]) {
         );
 
         if (seq_tensor.numel() == 0 || scalar_tensor.numel() == 0) {
-            std::cerr << "Preprocessing failed." << std::endl;
-            return 1;
+            throw std::runtime_error("Preprocessing failed: empty tensors");
         }
+        std::cout << "Data preprocessed: seq_tensor shape=[" << seq_tensor.sizes() << "], scalar_tensor shape=[" << scalar_tensor.sizes() << "]" << std::endl;
 
         // Perform inference
+        std::cout << "Performing inference" << std::endl;
         double prediction = perform_inference(model, seq_tensor, scalar_tensor, y_center, y_scale, device);
         if (prediction < 0) {
-            std::cerr << "Inference failed." << std::endl;
-            return 1;
+            throw std::runtime_error("Inference failed: invalid prediction");
         }
 
         std::cout << "Predicted execution time: " << prediction << " ms" << std::endl;
         return 0;
+    } catch (const c10::Error& e) {
+        std::cerr << "LibTorch error: " << e.what() << std::endl;
+        return 1;
     } catch (const std::exception& e) {
-        std::cerr << "Error: " << e.what() << std::endl;
+        std::cerr << "Standard exception: " << e.what() << std::endl;
+        return 1;
+    } catch (...) {
+        std::cerr << "Unknown error occurred" << std::endl;
         return 1;
     }
 }
